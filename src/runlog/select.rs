@@ -1,0 +1,201 @@
+//! Selectors: which part of a record `cargo heli log` prints.
+//!
+//! Without one, `log` prints every output event as it was recorded, each on
+//! its own stream, so stdout and stderr come out byte for byte.
+//!
+//! **Adding a selector** (`--errors`, `--test <name>`):
+//!
+//! 1. A variant of [`Select`]. It travels in the `log` request
+//!    (`crate::protocol`); a daemon that does not know it answers that it
+//!    does not support the request, and the client then reads the record
+//!    itself.
+//! 2. Its flag in `crate::cli`, in the `select` group, so that selectors
+//!    exclude each other.
+//! 3. Its case in [`apply`]: a function over the record's [`Event`]s, or
+//!    over its [`Lines`], that writes what it picks to `out`.
+
+use std::collections::VecDeque;
+use std::io;
+
+use regex::bytes::Regex;
+use serde::{Deserialize, Serialize};
+
+use super::Event;
+use crate::protocol::Channel;
+
+/// Which part of a record to print.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Select {
+    /// All of it, byte for byte.
+    All,
+    /// The last this many lines.
+    Tail(usize),
+    /// The lines that match this regular expression (`regex` syntax).
+    Grep(String),
+}
+
+/// Where a selector writes: bytes, and the stream they go to.
+pub type Out<'a> = dyn FnMut(Channel, &[u8]) -> io::Result<()> + 'a;
+
+/// Writes the part of `events` that `select` picks to `out`.
+pub fn apply(
+    select: &Select,
+    events: impl Iterator<Item = io::Result<Event>>,
+    out: &mut Out<'_>,
+) -> io::Result<()> {
+    match select {
+        Select::All => {
+            for event in events {
+                let event = event?;
+                out(event.channel, &event.bytes)?;
+            }
+            Ok(())
+        }
+        Select::Tail(count) => tail(*count, Lines::new(events), out),
+        Select::Grep(pattern) => {
+            let pattern = Regex::new(pattern).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("bad pattern: {error}"))
+            })?;
+            grep(&pattern, Lines::new(events), out)
+        }
+    }
+}
+
+/// The lines that match `pattern`, without their line ends.
+fn grep(
+    pattern: &Regex,
+    lines: impl Iterator<Item = io::Result<Line>>,
+    out: &mut Out<'_>,
+) -> io::Result<()> {
+    for line in lines {
+        let line = line?;
+        let text = line.bytes.strip_suffix(b"\n").unwrap_or(&line.bytes);
+        let text = text.strip_suffix(b"\r").unwrap_or(text);
+        if pattern.is_match(text) {
+            out(line.channel, &line.bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// The last `count` lines.
+fn tail(
+    count: usize,
+    lines: impl Iterator<Item = io::Result<Line>>,
+    out: &mut Out<'_>,
+) -> io::Result<()> {
+    let mut last = VecDeque::with_capacity(count.min(4096));
+    for line in lines {
+        last.push_back(line?);
+        if last.len() > count {
+            last.pop_front();
+        }
+    }
+    last.iter()
+        .try_for_each(|line| out(line.channel, &line.bytes))
+}
+
+/// One line of a record: one stream's bytes up to and including a `\n`, or
+/// the stream's last bytes, when they do not end a line.
+#[derive(Debug)]
+pub struct Line {
+    pub channel: Channel,
+    /// The index of the event that holds its last byte.
+    pub event: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The lines of a record's events, in the order their last bytes were
+/// recorded.
+pub struct Lines<I> {
+    events: I,
+    /// Per stream (stdout, stderr): the start of a line, and the event
+    /// holding its last byte so far.
+    pending: [(Vec<u8>, u64); 2],
+    ready: VecDeque<Line>,
+    done: bool,
+}
+
+impl<I: Iterator<Item = io::Result<Event>>> Lines<I> {
+    pub fn new(events: I) -> Self {
+        Self {
+            events,
+            pending: [(Vec::new(), 0), (Vec::new(), 0)],
+            ready: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    fn split(&mut self, event: Event) {
+        let (pending, last_event) = &mut self.pending[slot(event.channel)];
+        let mut start = 0;
+        for (end, _) in event
+            .bytes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &byte)| byte == b'\n')
+        {
+            pending.extend_from_slice(&event.bytes[start..=end]);
+            self.ready.push_back(Line {
+                channel: event.channel,
+                event: event.index,
+                bytes: std::mem::take(pending),
+            });
+            start = end + 1;
+        }
+        if start < event.bytes.len() {
+            pending.extend_from_slice(&event.bytes[start..]);
+            *last_event = event.index;
+        }
+    }
+
+    /// The streams' unended last lines, the one recorded first first.
+    fn finish(&mut self) {
+        let mut unended: Vec<Line> = [Channel::Stdout, Channel::Stderr]
+            .into_iter()
+            .filter_map(|channel| {
+                let (bytes, event) = std::mem::take(&mut self.pending[slot(channel)]);
+                (!bytes.is_empty()).then_some(Line {
+                    channel,
+                    event,
+                    bytes,
+                })
+            })
+            .collect();
+        unended.sort_by_key(|line| line.event);
+        self.ready.extend(unended);
+    }
+}
+
+impl<I: Iterator<Item = io::Result<Event>>> Iterator for Lines<I> {
+    type Item = io::Result<Line>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(line) = self.ready.pop_front() {
+                return Some(Ok(line));
+            }
+            if self.done {
+                return None;
+            }
+            match self.events.next() {
+                Some(Ok(event)) => self.split(event),
+                Some(Err(error)) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+                None => {
+                    self.done = true;
+                    self.finish();
+                }
+            }
+        }
+    }
+}
+
+fn slot(channel: Channel) -> usize {
+    match channel {
+        Channel::Stdout => 0,
+        Channel::Stderr => 1,
+    }
+}

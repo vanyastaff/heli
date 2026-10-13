@@ -21,7 +21,12 @@
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
 //!   working directory or its session; waits for a file, leaves an orphan
-//!   behind; exits with `ECHO_EXIT` (see its `main.rs`).
+//!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
+//! - `chatter`: numbered lines on stdout and stderr, and on request bytes
+//!   that test a run log's fidelity (see its `main.rs`).
+//!
+//! After every run the daemon executes, heli prints a footer line on stderr
+//! ([`split_footer`], [`without_footer`]).
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
@@ -54,8 +59,15 @@ const ISOLATED_VARS: [&str; 11] = [
 ];
 
 /// heli's variables a test command must not inherit from whoever runs the
-/// tests: they could point it at the user's real daemon.
-const HELI_VARS: [&str; 3] = ["HELI_STATE_DIR", "HELI_ENDPOINT", "HELI_DEPTH"];
+/// tests: they could point it at the user's real daemon, or change how it
+/// keeps run logs.
+const HELI_VARS: [&str; 5] = [
+    "HELI_STATE_DIR",
+    "HELI_ENDPOINT",
+    "HELI_DEPTH",
+    "HELI_LOG_RUNS",
+    "HELI_LOG_BYTES",
+];
 
 /// A fixture workspace copied into a temporary directory, with a target
 /// directory, a concurrency log and heli's state directory beside it.
@@ -280,6 +292,18 @@ impl Fixture {
             .join(format!("echo-args{}", std::env::consts::EXE_SUFFIX))
     }
 
+    /// Builds the binary of fixture package `package` and returns its path.
+    pub fn binary(&self, package: &str) -> PathBuf {
+        let output = self
+            .cargo(["build", "--quiet", "-p", package])
+            .output()
+            .expect("run cargo");
+        assert_success(&output, &format!("building {package}"));
+        self.target_dir()
+            .join("debug")
+            .join(format!("{package}{}", std::env::consts::EXE_SUFFIX))
+    }
+
     /// A concurrency log in this fixture's temporary directory.
     pub fn concurrency_log(&self) -> ConcurrencyLog {
         ConcurrencyLog {
@@ -344,6 +368,47 @@ pub fn lines(bytes: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// heli's footer after a run the daemon executed: the last line of the
+/// client's stderr, `cargo-heli: <run> … (output: cargo heli log <run>)`.
+#[derive(Debug)]
+pub struct Footer {
+    /// The run it names, `r<number>`.
+    pub run: String,
+    /// The whole line, without its line end.
+    pub line: String,
+}
+
+/// Splits a client's stderr into what the run wrote and heli's footer;
+/// panics when the last line is not a footer.
+pub fn split_footer(stderr: &[u8]) -> (Vec<u8>, Footer) {
+    let body = stderr
+        .strip_suffix(b"\n")
+        .unwrap_or_else(|| panic!("stderr does not end a line: {stderr:?}"));
+    let start = body
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |end| end + 1);
+    let line = String::from_utf8_lossy(&body[start..]).into_owned();
+    let run = line
+        .strip_prefix("cargo-heli: ")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|rest| rest.rsplit_once("(output: cargo heli log "))
+        .map(|(_, run)| run.to_owned())
+        .unwrap_or_else(|| {
+            panic!(
+                "no footer at the end of stderr: {}",
+                String::from_utf8_lossy(stderr)
+            )
+        });
+    (stderr[..start].to_vec(), Footer { run, line })
+}
+
+/// A client's stderr without heli's footer, lossily decoded; panics when it
+/// has no footer.
+pub fn without_footer(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(&split_footer(stderr).0).into_owned()
 }
 
 /// The `cargo-heli` binary under test.
