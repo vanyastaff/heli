@@ -1,5 +1,6 @@
-//! `cargo heli` before the daemon: it runs cargo, or any command, directly,
-//! with arguments, stdio and exit code unchanged.
+//! `cargo heli` as a drop-in: it runs cargo, or any command, with arguments,
+//! stdio and exit code unchanged. These calls go through the fixture's
+//! daemon; `tests/daemon.rs` covers the daemon itself.
 
 mod support;
 
