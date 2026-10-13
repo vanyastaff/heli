@@ -136,7 +136,11 @@ directly, with one warning line. A client newer than the daemon also asks it
 to retire: the daemon takes no new runs and exits once its runs in flight
 have finished, so the next call starts a current daemon. An older client asks
 nothing, so two installed versions never take turns retiring each other's
-daemon.
+daemon. The version stays 1 until the first release: until then a daemon
+answers a request it does not know (one a newer client added, such as `log`)
+with "unsupported", and the client treats that like a mismatch from an older
+daemon. It asks the daemon to retire and does without it, after one warning
+line: it runs the command, or reads the run log, itself.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
@@ -335,7 +339,12 @@ else, for example a project's own task runner.
 8. **Report.** A header line (slots, share, wait, key), then the tool's
    output in the chosen output mode (see "Output" below), then a footer line
    (duration, peak memory of the process tree, slots held, and the run id for
-   `cargo heli log`).
+   `cargo heli log`). Header and footer go to stderr, so stdout stays the
+   tool's own, and the footer starts a line of its own. So far the footer
+   holds the run id, the exit (`exit <code>`, or on Unix `signal <n>`) and
+   the duration:
+   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. A run
+   heli executes directly, without the daemon, has no footer and no record.
 
 **Worktree lock.** heli runs that read a worktree's sources hold its lock
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
@@ -372,8 +381,11 @@ cargo heli daemon [--detach]                       (internal)
   - 127 when the command does not exist, 126 when it cannot be started.
   - 2 for heli's usage errors and refusals: `heli` given as its own
     subcommand, or nesting deeper than 16 (`HELI_DEPTH`). The daemon and its
-    detaching starter count as levels too.
-  - 1 when the daemon is lost during a run (§3).
+    detaching starter count as levels too. For `log`, also a run id that is
+    not `r<number>` (or a bare number), a bad regular expression, or two
+    selectors at once.
+  - 1 when the daemon is lost during a run (§3), and when `log` has no
+    record of the run or cannot read it.
 - **Environment given to runs:**
   - `CARGO_MAKEFLAGS`: the run pool;
   - `HELI_RUN`: the run id, for tools that skip their own host lock under
@@ -388,7 +400,10 @@ cargo heli daemon [--detach]                       (internal)
   - tool-cache patterns (§6.3);
   - eviction ages;
   - the default output mode;
-  - log retention.
+  - log retention. Until the configuration file exists, the daemon reads it
+    from its environment, which is that of the client that started it:
+    `HELI_LOG_RUNS` (records kept, default 200) and `HELI_LOG_BYTES` (their
+    total size in bytes, default 2 GiB).
 
 ### Output (G7)
 
@@ -442,19 +457,33 @@ subcommand belong to heli; flags after it belong to the tool.
 Some things never change: the exit code, the stdout/stderr split, and output
 heli does not recognize, which passes through.
 
-**Nothing is lost.** The daemon already records each run's complete output so
-that clients can attach to it (lifecycle step 4). The output modes only
-change what the client prints, and the footer names the run. `cargo heli log`
-retrieves the record by run id, without re-running:
+**Nothing is lost.** The daemon records each run's complete output, for
+`cargo heli log` and so that clients can attach to it (lifecycle step 4).
+The output modes only change what the client prints, and the footer names
+the run. `cargo heli log <run>` prints the record by run id, without
+re-running: stdout on stdout and stderr on stderr, byte for byte. At most one
+selector picks a part of it:
 
 - `--errors`: errors only;
 - `--test <name>`: one test's output;
 - `--tail N`: the last N lines;
-- `--grep <re>`: matching lines.
+- `--grep <re>`: matching lines, each matched without its line end.
 
-The record holds what the tools printed in the chosen mode, so the dropped
-per-unit and per-passing-test lines are not in it. heli keeps the last 200
-run logs or 2 GB, whichever limit is hit first, dropping the oldest first.
+- **The record** is `runs/<run>.log` in the state directory. The daemon
+  writes it as the output arrives, whether or not a client still listens,
+  so `log` shows a run in flight up to now. It is a sequence of numbered
+  events, each the bytes one read of the run's stdout or stderr returned, in
+  the order the daemon received them: exact within each stream, and across
+  the two as close as two pipes allow. Selectors work on lines: one stream's
+  bytes up to a `\n` (or its unended last bytes), ordered by the event that
+  holds their last byte, so `--tail` counts both streams together.
+- **Reading.** `log` asks the daemon; when none answers, the client reads
+  the record itself, and starts no daemon. Records outlive the daemon.
+- **Retention.** The record holds what the tools printed in the chosen mode,
+  so the dropped per-unit and per-passing-test lines are not in it. heli
+  keeps the last 200 run logs or 2 GB, whichever limit is hit first: when a
+  run starts, the oldest records (lowest run number) are deleted first. The
+  record of a run in flight is never deleted.
 
 **With rtk installed.** A bare `cargo test` that rtk rewrites to
 `rtk cargo test` should still draw from the heli pool, as long as rtk passes
@@ -719,7 +748,7 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Failure | Effect | Handling |
 |---|---|---|
 | Daemon not running | A bare cargo warns and uses its own pool, as today | `cargo heli` starts the daemon; logon or session hook |
-| Daemon unreachable, silent for 5 s, or of another protocol version | `cargo heli` cannot hand over the run | The command runs directly after one warning line; a newer client asks an older daemon to exit once idle (§3) |
+| Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
 | An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. The logon task starts the daemon outside any agent's job |
