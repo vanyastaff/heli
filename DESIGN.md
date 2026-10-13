@@ -116,6 +116,62 @@ runs inherit its session, and tests that drive real windows (flui's live
 Win32 tests) need the user's desktop. It is started on demand by a client, or
 by a logon task that runs only while the user is logged on (§10).
 
+**One daemon per user**, and on Windows per logon session: a lock in the
+per-user state directory (`%LOCALAPPDATA%\heli`, `$XDG_STATE_HOME/heli` or
+`~/.local/state/heli`) admits one. Named pipes are visible machine-wide,
+unlike semaphores, so the Windows endpoint carries the session:
+`\\.\pipe\heli-<hash of the state directory>-<session id>`. `HELI_STATE_DIR`
+and `HELI_ENDPOINT` override both, which is how tests isolate their daemons.
+
+**The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
+(without one, Everyone may read), which rejects remote clients and is
+created as the first instance, so the daemon never joins a pipe someone else
+created. A client connects at identification level and talks only to a pipe
+owned by its own user. On Unix, a socket with mode 0600 in the 0700 state
+directory; a client talks only to a socket owned by its uid.
+
+**The protocol** starts with a handshake frozen across versions: `HELI` and
+the protocol version, each way. On a mismatch the client runs the command
+directly, with one warning line. A client newer than the daemon also asks it
+to retire: the daemon takes no new runs and exits once its runs in flight
+have finished, so the next call starts a current daemon. An older client asks
+nothing, so two installed versions never take turns retiring each other's
+daemon.
+
+**Starting on demand.** When no daemon answers, the client starts one, and
+any client falls back to running the command directly when the daemon does
+not start, listen or answer within 5 s.
+
+- The client starts `cargo heli daemon --detach`, which starts the daemon and
+  exits once it listens. The daemon's parent is then gone, so no tree walk
+  from the client reaches it. Agent harnesses stop a command by killing its
+  process tree found through parent processes: observed with Claude Code on
+  Windows, where stopping a command killed the client, the daemon it had
+  started directly, and that daemon's run.
+- It inherits no handle from the client (on Windows it is started with
+  `CreateProcessW` and no inheritance, since the standard library lets a
+  child inherit every inheritable handle). A daemon holding the client's
+  stdout would keep an agent's tool call waiting until the daemon exits.
+- It runs in the state directory, so it keeps no worktree busy, and leads a
+  process group (Unix) or has a console of its own without a window
+  (Windows), so the client's Ctrl-C does not reach it.
+- On Windows it leaves the client's job object when the job allows breakaway.
+  Claude Code's does not: its one job holds the whole app and every command
+  it runs, with no kill-on-close limit, so a daemon started from an agent's
+  command stays in that job and outlives the command. A harness that
+  terminated that job as a whole would take the daemon and every run with
+  it; only a daemon started outside the job, by the logon task, avoids that
+  (§10).
+
+**A run** is a child of the daemon, started in the client's working
+directory with exactly the client's environment and no stdin. Its stdout and
+stderr stream back to the client, which exits with the run's code (on Unix,
+of its signal). A run is over when its process exits: output still arriving
+within 500 ms is forwarded, and processes it left behind holding its pipes do
+not hold the client. Once the daemon has told the client that the run
+started, the client never runs the command itself: if the daemon is lost
+mid-run, it exits 1.
+
 ## 4. Host pool
 
 ### Mechanism (verified)
@@ -308,14 +364,16 @@ cargo heli cancel <run>
 cargo heli gc [--dry-run]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
-cargo heli daemon                                  (internal)
+cargo heli daemon [--detach]                       (internal)
 ```
 
 - **Exit codes.**
   - The tool's own code.
   - 127 when the command does not exist, 126 when it cannot be started.
   - 2 for heli's usage errors and refusals: `heli` given as its own
-    subcommand, or nesting deeper than 16 (`HELI_DEPTH`).
+    subcommand, or nesting deeper than 16 (`HELI_DEPTH`). The daemon and its
+    detaching starter count as levels too.
+  - 1 when the daemon is lost during a run (§3).
 - **Environment given to runs:**
   - `CARGO_MAKEFLAGS`: the run pool;
   - `HELI_RUN`: the run id, for tools that skip their own host lock under
@@ -627,13 +685,16 @@ runs   r17  agent-a64b...  nextest run -p my-crate     test     6 slots  4m12s
 disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremental >24h, ~40 GB
 ```
 
-`cargo heli status --json` has a versioned schema:
+`cargo heli status --json` has a versioned schema (`schema`, now 1). Times
+are whole seconds since 1970 (UTC); `status` never starts a daemon.
 
+- `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use`;
 - `memory`: `available`, plus `commit_available` on Windows;
-- `runs`: one entry per run, with `id`, `worktree`, `argv`, `class`,
-  `phase` (building, testing, done), `slots`, `share`, `waiting_since`,
-  `attached_clients` and `started_at`;
+- `runs`: one entry per run, with `id`, `worktree` (the nearest directory
+  holding `.git`, else the working directory), `argv`, `class`, `phase`
+  (running for a run of one phase; building, testing, done), `slots`,
+  `share`, `waiting_since`, `attached_clients` and `started_at`;
 - `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
   `by_category`;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
@@ -658,6 +719,10 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Failure | Effect | Handling |
 |---|---|---|
 | Daemon not running | A bare cargo warns and uses its own pool, as today | `cargo heli` starts the daemon; logon or session hook |
+| Daemon unreachable, silent for 5 s, or of another protocol version | `cargo heli` cannot hand over the run | The command runs directly after one warning line; a newer client asks an older daemon to exit once idle (§3) |
+| Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
+| An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
+| An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. The logon task starts the daemon outside any agent's job |
 | Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon task restricted to the logged-on user |
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO path persists | The restarted daemon adopts the existing pools |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
@@ -670,7 +735,7 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Tools looking in `target/<profile>/deps` | They miss moved intermediates | Validated on a real workspace before phase 2 (§6.1) |
 | False green from the cache | A flaky pass is reused | Printed caveat; `--no-cache` |
 | heli runs itself in a loop | Unbounded processes | `heli` is refused as a subcommand; `HELI_DEPTH` stops at 16 |
-| Another logon session (SSH, a service) | On Windows, a separate session namespace, so a separate pool | Documented; a global namespace needs admin rights (later) |
+| Another logon session (SSH, a service) | On Windows, a separate session namespace, so a separate pool, and a separate daemon (its endpoint and lock carry the session id) | Documented; a global namespace needs admin rights (later) |
 
 ## 11. Upstream map
 
