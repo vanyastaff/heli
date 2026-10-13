@@ -297,6 +297,17 @@ else, for example a project's own task runner.
 | mutate | fmt, fix, clippy --fix | no | no | no | exclusive |
 | exec | anything else | yes | no | opt-in | shared |
 
+How a command line is read:
+
+- The subcommand comes after a `+toolchain`, if there is one. Cargo's
+  built-in aliases count as their subcommands (`b`, `c`, `d`, `r`, `t`), and
+  so does nextest's `r` for `run`. Aliases a project defines are exec.
+- `fmt` is verify when `--check` is among its arguments: cargo-fmt's own, or
+  rustfmt's after `--`.
+- `clippy` is mutate when `--fix` comes before `--`; what follows `--` is the
+  compiler's.
+- `cargo heli exec -- <cmd>` is exec whatever the command, even `cargo fmt`.
+
 ### Lifecycle
 
 1. **Key** (verify and test runs only). The key covers the worktree's tree,
@@ -342,14 +353,33 @@ shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
 a file that another heli run is compiling. Bare cargo ignores this lock, so
 the rule "one writing agent per worktree" stays.
 
+- **The worktree** is the one `status` shows: the nearest directory holding
+  `.git`, else the working directory. Worktrees are compared by canonical
+  path, so another spelling of the same directory (on Windows, another case)
+  is the same worktree.
+- **Order.** Runs take their turns in the order the daemon admitted them: a
+  run waits for the runs admitted before it in the same worktree that
+  conflict with it, two runs conflicting when either is exclusive. So a
+  waiting `fmt` is never overtaken, and a stream of builds cannot starve it.
+- **Saying so.** A run that waits prints one line on stderr before anything
+  else, naming the runs it waits for:
+  `cargo-heli: waiting for r17 (cargo build -p foo) to finish with this worktree`.
+  `status` shows the wait (§8).
+- **Nested runs.** A run asked for from inside another heli run (its
+  `HELI_DEPTH` is above 1) does not wait: the run around it may hold the
+  lock, and `cargo heli exec -- cargo heli fmt` would then wait for itself
+  forever. It still takes its turn, so later runs wait for it. Since only
+  runs that are not nested wait, and only for runs admitted before them, no
+  wait closes a cycle.
+
 ### Where a run can wait
 
 These are the only waits; nothing else makes a heli run wait for another run.
 
 1. **Test slots:** up to 5 s before the test phase, after which it proceeds
    with one thread.
-2. **The worktree lock:** a mutate run waits for heli runs compiling the same
-   worktree, and they wait for it.
+2. **The worktree lock:** a mutate run waits for heli runs using the same
+   worktree, and they wait for it, in the order they came.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
 
@@ -680,8 +710,9 @@ the verdict.
 ```
 pool   32 slots: 21 compiling (4 runs), 6 testing (1 run), 0 withheld   memory 41.2/64 GB, commit 52 %
 runs   r17  agent-a64b...  nextest run -p my-crate     test     6 slots  4m12s
-       r18  agent-f1c0...  clippy --all-targets        compile  9 slots  1m03s
+       r18  agent-f1c0...  clippy --all-targets        verify   9 slots  1m03s
        r19  agent-a10...   check -p other-crate        attached to r12 (same key)
+       r20  agent-a64b...  fmt                         mutate   waiting for r17  12s
 disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremental >24h, ~40 GB
 ```
 
@@ -694,7 +725,9 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
   (running for a run of one phase; building, testing, done), `slots`,
-  `share`, `waiting_since`, `attached_clients` and `started_at`;
+  `share`, `waiting_since` (`null` unless the run waits), `waiting_for`
+  (the ids of the runs it waits for at the worktree lock),
+  `attached_clients` and `started_at`;
 - `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
   `by_category`;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
