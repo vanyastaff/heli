@@ -51,6 +51,9 @@ Goals:
   heli is absent or broken, plain cargo runs; heli never fails a build.
 - **G6, agent-proof.** A killed client neither kills nor wastes its run, and
   identical runs are not repeated.
+- **G7, small output for agents.** An agent reads what it needs to act: the
+  verdict, and on failure the failures. Everything else stays retrievable
+  without running the command again.
 
 Non-goals:
 
@@ -89,7 +92,7 @@ Non-goals:
 There are four parts, and each is usable alone:
 
 1. The **host pool** (§4) serves G1 and G2, and covers bare cargo too.
-2. **Runs** (§5), the `cargo heli <cmd>` front end, serve G1 and G6.
+2. **Runs** (§5), the `cargo heli <cmd>` front end, serve G1, G6 and G7.
 3. The **build store** (§6) serves G3 and G4.
 4. The **result store** (§7) serves G6.
 
@@ -229,13 +232,86 @@ else, for example `cargo xtask check-changed`.
    unchanged at the end (§7), and writes a source-state record for its build
    directory (§6.4).
 9. **Report.** A header line (slots, wait, fair share, key), then the tool's
-   own output, then a footer line (duration, peak memory of the process tree,
-   slots held).
+   output in the chosen output mode (see "Output" below), then a footer line
+   (duration, peak memory of the process tree, slots held, and the run id for
+   `cargo heli log`).
 
 **Worktree lock.** heli runs that read a worktree's sources hold its lock
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
 a file that another heli run is compiling. Bare cargo ignores this lock, so
 the rule "one writing agent per worktree" stays.
+
+### Output (G7)
+
+Prior art: [rtk](https://github.com/rtk-ai/rtk) (Apache-2.0). A PreToolUse
+hook rewrites an agent's shell commands into `rtk …`, which filters the
+output (for `cargo test`: failures only) and keeps the full output for
+`rtk recall`. Its cargo rewrite rule matches only
+`cargo (build|test|clippy|check|fmt|install)` (`src/discover/rules.rs`), so
+rtk passes `cargo heli …` through untouched. heli must keep its own output
+small, and output is never filtered twice.
+
+**Modes**, chosen by `--output=full|compact|quiet` or `-q` before the
+subcommand, by `HELI_OUTPUT`, or by configuration. Flags before the
+subcommand belong to heli; flags after it belong to the tool.
+
+- **full**: the tool's output as it streams, plus heli's header and footer.
+  This is the default on a terminal.
+- **compact**: the default when stdout is not a terminal, which covers every
+  agent tool call.
+- **quiet**: one line on success, for example
+  `ok  nextest run -p flui-view: 812 passed, 3 skipped, 41 s  [r17]`, and the
+  compact output on failure.
+
+**How compact output is produced**, most robust source first:
+
+1. **The tools' own verbosity controls.** Nothing is parsed, so nothing can
+   be misreported.
+   - cargo: `--quiet` drops the `Compiling …` line per unit (442 of them in a
+     cold flui build).
+   - nextest: `--cargo-quiet`, `--status-level fail`,
+     `--final-status-level fail`, `--success-output never` and
+     `--failure-output final`. All five exist in nextest 0.9.146 (`--help`),
+     and each has an environment variable.
+
+   heli adds a flag only when the user's argv does not already set it.
+2. **Structured messages.** For compile phases heli passes
+   `--message-format json` to cargo and `--cargo-message-format json` to
+   nextest, and renders diagnostics from the JSON fields (level, code, primary
+   span, message, rendered):
+   - Errors: the first 3 in rustc's full rendering, the rest as one short line
+     each (`path:line:col error[E0308] message`), 30 at most.
+   - Warnings, for `clippy` and `check`, where the findings are the point:
+     short lines grouped by lint, 50 at most.
+   - Warnings, for `build` and `test`: counts per lint, for example
+     `12 warnings: 9 unused_imports, 3 dead_code`.
+3. **Text**, only where no structure exists: libtest's own output under
+   `cargo test` (its `failures:` blocks), and `cargo heli exec` of arbitrary
+   commands, where compact means the first 20 and last 60 lines around a cut
+   marker.
+
+Some things never change: the exit code, the stdout/stderr split, and output
+heli does not recognize, which passes through.
+
+**Nothing is lost.** The daemon already records each run's complete output so
+that clients can attach to it (lifecycle step 5). The output modes only
+change what the client prints, and the footer names the run. `cargo heli log`
+retrieves the record by run id, without re-running:
+
+- `--errors`: errors only;
+- `--test <name>`: one test's output;
+- `--tail N`: the last N lines;
+- `--grep <re>`: matching lines.
+
+The record holds what the tools printed in the chosen mode, so the dropped
+per-unit and per-passing-test lines are not in it. heli keeps the last 200
+run logs or 2 GB, whichever limit is hit first, dropping the oldest first.
+
+**With rtk installed.** A bare `cargo test` that rtk rewrites to
+`rtk cargo test` should still draw from the heli pool, as long as rtk passes
+the environment through to cargo; this is still to be verified. Anyone who
+prefers rtk's filters to heli's can run `cargo heli --output=full …` under
+`rtk test` or `rtk err`, rtk's generic wrappers.
 
 ## 6. Build store
 
@@ -437,11 +513,16 @@ withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
   threads unbounded.
 - **Phase 1.** Daemon, pool, governor, top-up,
   `cargo heli build/check/clippy/test/nextest/exec`, detach and attach,
-  `status`. Exit criteria, on flui with at least 4 agents:
+  `status`, output modes with the run log and `cargo heli log`. Exit criteria,
+  on flui with at least 4 agents:
   - no run waits more than 10 s for its first rustc;
   - available commit never drops below 10 %;
   - no out-of-memory failure;
-  - total wall time no worse than with the lock.
+  - total wall time no worse than with the lock;
+  - compact output at least 80 % smaller than full output on green runs of
+    `nextest run -p flui-widgets` and `clippy --all-targets`;
+  - on a failing run, the compact output alone is enough to locate each
+    failure.
 - **Phase 2.** Build store: placement, accounting, the eviction ladder,
   conservative recycling, then precise recycling.
 - **Phase 3.** Result store, single-flight, supersede.
@@ -450,7 +531,7 @@ withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
 
 Measure throughout: time to the first rustc, run wall time, pool
 utilization, minimum available memory and commit, disk by category per day,
-and units rebuilt after a recycle.
+units rebuilt after a recycle, and output bytes per run in each mode.
 
 ## 13. Open questions
 
@@ -462,3 +543,4 @@ and units rebuilt after a recycle.
    worktree with the same command?
 5. Is a pool per logon session enough, or do agents run in other sessions
    (SSH, services)?
+6. Should the default without a terminal be `compact` or `quiet`?
