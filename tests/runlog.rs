@@ -3,6 +3,7 @@
 
 mod support;
 
+use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -334,13 +335,91 @@ fn log_reads_the_record_itself_when_the_daemon_does_not_support_it() {
     assert_eq!(fake.received(), b"R", "asked to retire");
 }
 
+/// The path of `run`'s record: `runs/<run>.log` in the state directory.
+fn record_path(fixture: &Fixture, run: &str) -> std::path::PathBuf {
+    fixture.state_dir().join("runs").join(format!("{run}.log"))
+}
+
+/// A record laid out by hand: the header (`HELI-LOG`, format 1), then
+/// `events`, each a kind byte, a little-endian u32 length and the bytes.
+fn record(events: &[(u8, &[u8])]) -> Vec<u8> {
+    let mut record = b"HELI-LOG".to_vec();
+    record.extend(1u32.to_le_bytes());
+    for (kind, bytes) in events {
+        record.push(*kind);
+        record.extend((bytes.len() as u32).to_le_bytes());
+        record.extend(*bytes);
+    }
+    record
+}
+
+/// A record is read as far as it is complete: events of kinds this heli
+/// does not know (a later one may add some) are skipped, a partial event at
+/// the end (one being written) is not read yet, and a record whose header
+/// is not complete yet reads as empty.
+#[test]
+fn a_record_is_read_as_far_as_it_is_complete() {
+    let fixture = Fixture::new("basic");
+    let (_, run) = chatter_run(&fixture, &["1"]);
+    let path = record_path(&fixture, &run);
+    let mut contents = record(&[(1, b"out\n"), (9, b"a later kind"), (2, b"err\n")]);
+    let partial = record(&[(1, b"partial")]);
+    contents.extend(&partial[12..20]);
+    std::fs::write(&path, &contents).expect("write the record");
+    let output = log(&fixture, &[&run]);
+    support::assert_success(&output, "cargo heli log");
+    assert_eq!(
+        (text(&output.stdout), text(&output.stderr)),
+        ("out\n".into(), "err\n".into())
+    );
+
+    std::fs::write(&path, b"HELI-").expect("write the record");
+    let output = log(&fixture, &[&run]);
+    support::assert_success(&output, "cargo heli log");
+    assert_eq!((output.stdout, output.stderr), (Vec::new(), Vec::new()));
+}
+
+/// Asked over the protocol for something that is not a run id, the daemon
+/// reads no file outside the run log.
+#[test]
+fn the_daemon_reads_only_records() {
+    let fixture = Fixture::new("basic");
+    let (_, run) = chatter_run(&fixture, &["1"]);
+    let outside = fixture.state_dir().join("outside.log");
+    std::fs::copy(record_path(&fixture, &run), &outside).expect("copy a record outside");
+
+    let mut client = support::endpoint::connect(&fixture.endpoint());
+    let mut hello = b"HELI".to_vec();
+    hello.extend(support::fake_daemon::PROTOCOL.to_le_bytes());
+    client.write_all(&hello).expect("send the hello");
+    let mut answer = [0u8; 8];
+    client.read_exact(&mut answer).expect("the daemon's hello");
+    // A message frame: kind 0, a little-endian u32 length, JSON.
+    let request = br#"{"Log":{"run":"../outside","select":"All"}}"#;
+    let mut frame = vec![0u8];
+    frame.extend((request.len() as u32).to_le_bytes());
+    frame.extend(request);
+    client.write_all(&frame).expect("send the request");
+    let mut header = [0u8; 5];
+    client.read_exact(&mut header).expect("the daemon's answer");
+    let mut reply =
+        vec![0u8; u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize];
+    client.read_exact(&mut reply).expect("the daemon's answer");
+    assert_eq!(header[0], 0, "a message, not output: {}", text(&reply));
+    let reply = text(&reply);
+    assert!(
+        reply.contains("LogFailed") && reply.contains("no run ../outside"),
+        "{reply}"
+    );
+}
+
 /// Records live in `runs/` in the state directory, as `<run>.log`. One this
 /// heli cannot read (not a record, or of a later format) is a clear error.
 #[test]
 fn a_record_heli_cannot_read_is_a_clear_error() {
     let fixture = Fixture::new("basic");
     let (_, run) = chatter_run(&fixture, &["1"]);
-    let record = fixture.state_dir().join("runs").join(format!("{run}.log"));
+    let record = record_path(&fixture, &run);
     assert!(record.is_file(), "{} is missing", record.display());
 
     let mut later = b"HELI-LOG".to_vec();
@@ -459,7 +538,9 @@ fn an_unknown_run_is_a_clear_error() {
     );
 
     let number = run.strip_prefix('r').expect("r<number>");
-    let output = log(&fixture, &[number]);
-    support::assert_success(&output, "cargo heli log <number>");
-    assert!(output.stdout == direct.stdout, "the same run");
+    for id in [number.to_owned(), format!("r0{number}")] {
+        let output = log(&fixture, &[&id]);
+        support::assert_success(&output, &format!("cargo heli log {id}"));
+        assert!(output.stdout == direct.stdout, "{id} is {run}");
+    }
 }
