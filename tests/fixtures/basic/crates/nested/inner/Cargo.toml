@@ -1,0 +1,8 @@
+# Built by `nested`'s test, never by the outer workspace.
+[workspace]
+
+[package]
+name = "inner"
+version = "0.0.0"
+edition = "2024"
+publish = false
