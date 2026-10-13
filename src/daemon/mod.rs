@@ -6,11 +6,12 @@
 //! (`crate::ipc`). Each connection gets a thread, which speaks
 //! `crate::protocol`:
 //!
-//! - **run**: admit it to the registry ([`registry`]), tell the client it
-//!   started, execute it ([`execute`]), take it out of the registry, report
-//!   its exit. `Daemon::run` is the one sequence every run goes through,
-//!   and the place for what happens around a run (admission, waits,
-//!   recording);
+//! - **run**: look its key up in the result store ([`results`], keyed by
+//!   [`key`]), admit it to the registry ([`registry`]), tell the client it
+//!   started, look its key up again, execute it ([`execute`]), record it if
+//!   it passed, take it out of the registry, report its exit. `Daemon::run`
+//!   is the one sequence every run goes through, and the place for what
+//!   happens around a run (admission, waits, recording);
 //! - **status**: describe the daemon and the registry's runs;
 //! - **retire**, from a newer client: accept no more runs and exit once the
 //!   runs in flight have reported their exits.
@@ -21,7 +22,9 @@
 //! (`daemon-<session>.log` on Windows), since it has no terminal.
 
 pub mod execute;
+pub mod key;
 pub mod registry;
+pub mod results;
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
@@ -30,11 +33,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
-use crate::protocol::{self, Reply, Request, RunRequest};
+use crate::protocol::{self, Channel, Reply, Request, RunRequest};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
 
 use registry::Registry;
+use results::Admitted;
 
 /// The daemon's exit code when another daemon already holds the lock: the
 /// client that started it then connects to that one.
@@ -85,6 +89,7 @@ pub fn main() -> ! {
 
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
+        results: results::Store::new(&locations.state_dir),
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
@@ -115,6 +120,7 @@ fn fail(log: Option<&Log>, error: &str) -> ! {
 
 struct Daemon {
     registry: Registry,
+    results: results::Store,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -168,6 +174,11 @@ impl Daemon {
             let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
             return;
         };
+        // Before the run waits for anything.
+        if let Some(passed) = self.results.before(&request) {
+            let _ = protocol::write_message(&mut stream, &passed.reply());
+            return;
+        }
         let id = self.registry.admit(
             worktree::of(&execute::cwd(&request)),
             execute::argv(&request),
@@ -181,6 +192,20 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
+        // Once admitted: another run may have passed with the same key.
+        let key = match self.results.admitted(&request) {
+            Admitted::Passed(passed) => {
+                self.registry.finish(id);
+                let _ = protocol::write_message(&mut stream, &passed.reply());
+                return;
+            }
+            Admitted::Run(key, note) => {
+                if let Some(note) = note {
+                    self.note(&mut stream, &note);
+                }
+                key
+            }
+        };
         let reply = match execute::spawn(&request) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
@@ -197,11 +222,33 @@ impl Daemon {
                 }
             },
         };
+        if let Some(key) = &key {
+            let passed = matches!(
+                reply,
+                Reply::Exited {
+                    code: 0,
+                    signal: None
+                }
+            );
+            if let Some(note) = self.results.after(&request, key, id, passed) {
+                self.note(&mut stream, &note);
+            }
+        }
         self.registry.finish(id);
         let _ = protocol::write_message(&mut stream, &reply);
         // The reply is out before a retiring daemon may exit.
         drop(stream);
         drop(serving);
+    }
+
+    /// Tells the client of a run why the result store did not do its part,
+    /// on the run's stderr.
+    fn note(&self, stream: &mut Stream, note: &str) {
+        let line = format!(
+            "cargo-heli: note: {note}
+"
+        );
+        let _ = protocol::write_output(stream, Channel::Stderr, line.as_bytes());
     }
 
     fn status(&self) -> Status {

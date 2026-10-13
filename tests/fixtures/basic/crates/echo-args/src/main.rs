@@ -12,11 +12,30 @@
 //!
 //! Then it prints `echo-args: stderr` on stderr, and exits with `ECHO_EXIT`
 //! (default 0).
+//!
+//! Standing in for a tool (as `cargo`, say), it answers version requests:
+//! with `ECHO_VERSION` naming a file and `-V`, `-vV` or `--version` as its
+//! last argument, it only prints that file's contents and exits 0, or exits
+//! 1 when there is no such file.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn main() {
+    if let Some(version) = std::env::var_os("ECHO_VERSION")
+        && std::env::args_os()
+            .skip(1)
+            .last()
+            .is_some_and(|arg| arg == "-V" || arg == "-vV" || arg == "--version")
+    {
+        match std::fs::read(version) {
+            Ok(text) => {
+                std::io::Write::write_all(&mut std::io::stdout(), &text).expect("print");
+                std::process::exit(0);
+            }
+            Err(_) => std::process::exit(1),
+        }
+    }
     for arg in std::env::args_os().skip(1) {
         println!("arg: {arg:?}");
     }

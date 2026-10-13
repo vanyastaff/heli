@@ -22,7 +22,9 @@
 //!   itself), or [`Reply::Started`], then output frames in the order the run
 //!   wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`]. The daemon
 //!   sends `Started` before it starts anything, so a client that never sees
-//!   it can safely run the command itself.
+//!   it can safely run the command itself. Either before `Started` or in
+//!   place of the output, [`Reply::Passed`] ends the run without starting
+//!   it: the result store holds a pass for its key.
 //!
 //! Adding a message or a field is a protocol change: raise [`VERSION`].
 //!
@@ -95,6 +97,23 @@ pub struct RunRequest {
     /// The program, then its arguments.
     pub argv: Vec<Text>,
     pub env: Vec<(Text, Text)>,
+    /// How the run uses the result store; absent from a client that knows
+    /// no result store.
+    #[serde(default)]
+    pub cache: Cache,
+}
+
+/// How a run uses the result store (`crate::daemon::results`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cache {
+    /// Neither looked up nor recorded: compile, mutate and exec runs.
+    #[default]
+    Off,
+    /// Looked up first, and recorded when it passes: verify and test runs.
+    On,
+    /// Run whatever is recorded (`--no-cache`), and recorded when it passes.
+    Refresh,
 }
 
 /// What the daemon answers.
@@ -107,6 +126,14 @@ pub enum Reply {
     /// The daemon takes no runs (it is retiring); nothing was started.
     Refused {
         reason: String,
+    },
+    /// The run's key already passed: nothing runs, and the client exits 0.
+    /// `run` is the run that passed, in `worktree`, at `at` (seconds since
+    /// 1970).
+    Passed {
+        run: String,
+        worktree: Text,
+        at: u64,
     },
     /// The command could not be started.
     SpawnFailed {
