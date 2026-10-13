@@ -40,7 +40,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::ipc::{self, Stream};
-use crate::locations::{ENDPOINT_VAR, Locations, STATE_DIR_VAR};
+use crate::locations::{CONFIG_VAR, ENDPOINT_VAR, Locations, POOL_VAR, STATE_DIR_VAR};
 use crate::{daemon, environment, nesting};
 
 /// How long a starting daemon may take to listen.
@@ -135,6 +135,8 @@ fn spawn_stage(locations: &Locations, depth: u32, args: &[&str]) -> io::Result<L
     let env = environment::current_with(&[
         (STATE_DIR_VAR, OsString::from(&locations.state_dir)),
         (ENDPOINT_VAR, OsString::from(&locations.endpoint)),
+        (POOL_VAR, locations.pool.clone()),
+        (CONFIG_VAR, OsString::from(&locations.config)),
         (nesting::VAR, OsString::from((depth + 1).to_string())),
     ]);
     spawn(&program, args, locations, env)

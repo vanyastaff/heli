@@ -9,9 +9,17 @@
 //!   `\\.\pipe\heli-<hash of the state directory>-<logon session>`, so each
 //!   logon session of a user has a daemon of its own; elsewhere it is the
 //!   socket `<state directory>/daemon.sock`.
+//! - **Host pool** (`crate::pool`): [`POOL_VAR`] if set, else on Windows the
+//!   semaphore `heli-<hash of the state directory>` (semaphore names are
+//!   already per logon session), and elsewhere the FIFO
+//!   `$XDG_RUNTIME_DIR/heli/jobserver`, else `~/.cache/heli/jobserver`.
+//! - **Configuration file** (`crate::config`): [`CONFIG_VAR`] if set, else
+//!   `%APPDATA%\heli\config.toml` on Windows and
+//!   `$XDG_CONFIG_HOME/heli/config.toml` (else
+//!   `~/.config/heli/config.toml`) elsewhere.
 //!
-//! Tests set both variables to temporary paths, so their daemons never meet
-//! each other or the user's real one.
+//! Tests set these variables to temporary paths and names, so their daemons
+//! and pools never meet each other or the user's real ones.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -20,12 +28,20 @@ use std::path::{Path, PathBuf};
 pub const STATE_DIR_VAR: &str = "HELI_STATE_DIR";
 /// Selects the daemon's endpoint.
 pub const ENDPOINT_VAR: &str = "HELI_ENDPOINT";
+/// Selects the host pool: a semaphore name on Windows, a FIFO path
+/// elsewhere.
+pub const POOL_VAR: &str = "HELI_POOL";
+/// Selects the configuration file.
+pub const CONFIG_VAR: &str = "HELI_CONFIG";
 
-/// The resolved locations, all absolute.
+/// The resolved locations; paths are absolute.
 #[derive(Debug, Clone)]
 pub struct Locations {
     pub state_dir: PathBuf,
     pub endpoint: PathBuf,
+    /// The host pool: a semaphore name on Windows, a FIFO path elsewhere.
+    pub pool: OsString,
+    pub config: PathBuf,
 }
 
 impl Locations {
@@ -40,9 +56,20 @@ impl Locations {
             Some(endpoint) => absolute(PathBuf::from(endpoint))?,
             None => default_endpoint(&state_dir),
         };
+        let pool = match var(POOL_VAR) {
+            Some(pool) if cfg!(windows) => pool,
+            Some(pool) => absolute(PathBuf::from(pool))?.into(),
+            None => default_pool(&state_dir)?,
+        };
+        let config = match var(CONFIG_VAR) {
+            Some(config) => absolute(PathBuf::from(config))?,
+            None => default_config()?,
+        };
         Ok(Self {
             state_dir,
             endpoint,
+            pool,
+            config,
         })
     }
 
@@ -108,16 +135,9 @@ fn default_state_dir() -> Result<PathBuf, String> {
 
 #[cfg(windows)]
 fn default_endpoint(state_dir: &Path) -> PathBuf {
-    use std::os::windows::ffi::OsStrExt;
-
-    let bytes: Vec<u8> = state_dir
-        .as_os_str()
-        .encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect();
     PathBuf::from(format!(
         r"\\.\pipe\heli-{:016x}-{}",
-        fnv1a(&bytes),
+        path_hash(state_dir),
         session_id()
     ))
 }
@@ -125,6 +145,56 @@ fn default_endpoint(state_dir: &Path) -> PathBuf {
 #[cfg(unix)]
 fn default_endpoint(state_dir: &Path) -> PathBuf {
     state_dir.join("daemon.sock")
+}
+
+/// The semaphore `heli-<hash of the state directory>`: one per user, in the
+/// logon session's namespace.
+#[cfg(windows)]
+fn default_pool(state_dir: &Path) -> Result<OsString, String> {
+    Ok(format!("heli-{:016x}", path_hash(state_dir)).into())
+}
+
+/// The FIFO `$XDG_RUNTIME_DIR/heli/jobserver`, else
+/// `~/.cache/heli/jobserver`.
+#[cfg(unix)]
+fn default_pool(_state_dir: &Path) -> Result<OsString, String> {
+    let dir = var("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| var("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    dir.map(|dir| dir.join("heli").join("jobserver").into())
+        .ok_or_else(|| format!("neither {POOL_VAR}, XDG_RUNTIME_DIR nor HOME is set"))
+}
+
+#[cfg(windows)]
+fn default_config() -> Result<PathBuf, String> {
+    var("APPDATA")
+        .map(|dir| PathBuf::from(dir).join("heli").join("config.toml"))
+        .ok_or_else(|| format!("neither {CONFIG_VAR} nor APPDATA is set"))
+}
+
+#[cfg(unix)]
+fn default_config() -> Result<PathBuf, String> {
+    let config_home = var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| var("HOME").map(|home| PathBuf::from(home).join(".config")));
+    config_home
+        .map(|dir| dir.join("heli").join("config.toml"))
+        .ok_or_else(|| format!("neither {CONFIG_VAR} nor HOME is set"))
+}
+
+/// The hash of `path` that names what belongs to its state directory.
+#[cfg(windows)]
+fn path_hash(path: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+
+    let bytes: Vec<u8> = path
+        .as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    fnv1a(&bytes)
 }
 
 /// `<stem>-<logon session><extension>`.

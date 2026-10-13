@@ -202,22 +202,11 @@ fn grep_prints_the_matching_lines() {
 }
 
 /// Runs `chatter` with `args` three times through heli, with the run log
-/// limited by `limit` (a variable and its value), and returns the run ids.
-fn three_runs(fixture: &Fixture, args: &[&str], limit: (&str, &str)) -> Vec<String> {
-    let chatter = fixture.binary("chatter");
-    (0..3)
-        .map(|_| {
-            let output = fixture
-                .heli(["exec", "--"])
-                .arg(&chatter)
-                .args(args)
-                .env(limit.0, limit.1)
-                .output()
-                .expect("run heli");
-            support::assert_success(&output, "cargo heli exec -- chatter");
-            support::split_footer(&output.stderr).1.run
-        })
-        .collect()
+/// limited by `limit` (the `[log]` key and value, configured before the
+/// daemon starts), and returns the run ids.
+fn three_runs(fixture: &Fixture, args: &[&str], limit: &str) -> Vec<String> {
+    fixture.configure(&format!("[log]\n{limit}\n"));
+    (0..3).map(|_| chatter_run(fixture, args).1).collect()
 }
 
 /// Whether `log` finds a record of `run`: yes (exit 0), or "no run" (exit 1).
@@ -230,21 +219,21 @@ fn has_record(fixture: &Fixture, run: &str) -> bool {
     }
 }
 
-/// Beyond `HELI_LOG_RUNS` records, the oldest are pruned first.
+/// Beyond `[log] runs` records, the oldest are pruned first.
 #[test]
 fn the_oldest_records_go_first_beyond_the_run_limit() {
     let fixture = Fixture::new("basic");
-    let runs = three_runs(&fixture, &["1"], ("HELI_LOG_RUNS", "2"));
+    let runs = three_runs(&fixture, &["1"], "runs = 2");
     let kept: Vec<bool> = runs.iter().map(|run| has_record(&fixture, run)).collect();
     assert_eq!(kept, [false, true, true], "{runs:?}");
 }
 
-/// Beyond `HELI_LOG_BYTES` (here: room for one record of chatter's `mix`,
-/// not two), the oldest records are pruned first.
+/// Beyond `[log] bytes` (here: room for one record of chatter's `mix`, not
+/// two), the oldest records are pruned first.
 #[test]
 fn the_oldest_records_go_first_beyond_the_byte_limit() {
     let fixture = Fixture::new("basic");
-    let runs = three_runs(&fixture, &["mix"], ("HELI_LOG_BYTES", "200000"));
+    let runs = three_runs(&fixture, &["mix"], "bytes = 200000");
     let kept: Vec<bool> = runs.iter().map(|run| has_record(&fixture, run)).collect();
     assert_eq!(kept, [false, true, true], "{runs:?}");
 }
@@ -254,13 +243,11 @@ fn the_oldest_records_go_first_beyond_the_byte_limit() {
 #[test]
 fn a_run_in_flight_keeps_its_record() {
     let fixture = Fixture::new("basic");
+    fixture.configure("[log]\nruns = 1\n");
     let echo = fixture.echo_args();
     let gate = fixture.path("gate");
     let mut call = fixture.heli(["exec", "--"]);
-    call.arg(&echo)
-        .arg("in flight")
-        .env("ECHO_WAIT_FOR", &gate)
-        .env("HELI_LOG_RUNS", "1");
+    call.arg(&echo).arg("in flight").env("ECHO_WAIT_FOR", &gate);
     let call = start(&mut call);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let first = runs(&status)[0]["id"].as_str().expect("an id").to_owned();

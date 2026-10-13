@@ -27,9 +27,10 @@
 //! serves `log` requests with it; a client reads the record itself when no
 //! daemon answers.
 //!
-//! **Retention.** When a run starts, its record is created and the oldest
-//! records are deleted first until at most [`Limits::runs`] remain, the new
-//! one included, and the others take at most [`Limits::bytes`]. Records of
+//! **Retention** (`[log]` in `crate::config`). When a run starts, its record
+//! is created and the oldest records are deleted first until at most
+//! [`Limits::runs`] remain, the new one included, and the others take at
+//! most [`Limits::bytes`]. Records of
 //! runs in flight are never deleted. Oldest means lowest run number: run
 //! ids only grow (`daemon::registry`).
 
@@ -41,6 +42,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use crate::config::LogConfig;
 use crate::protocol::Channel;
 
 use select::{Out, Select};
@@ -69,23 +71,15 @@ impl Limits {
         bytes: 2 << 30,
     };
 
-    /// The limits set in this process's environment ([`RUNS_VAR`],
-    /// [`BYTES_VAR`]); a limit unset or unreadable keeps its default.
-    pub fn from_env() -> Self {
-        fn var<T: std::str::FromStr>(name: &str) -> Option<T> {
-            std::env::var(name).ok()?.trim().parse().ok()
-        }
+    /// The limits `[log]` in the configuration sets; one it leaves out keeps
+    /// its default.
+    pub fn configured(config: &LogConfig) -> Self {
         Self {
-            runs: var(RUNS_VAR).unwrap_or(Self::DEFAULT.runs),
-            bytes: var(BYTES_VAR).unwrap_or(Self::DEFAULT.bytes),
+            runs: config.runs.unwrap_or(Self::DEFAULT.runs),
+            bytes: config.bytes.unwrap_or(Self::DEFAULT.bytes),
         }
     }
 }
-
-/// Sets how many records the daemon keeps.
-pub const RUNS_VAR: &str = "HELI_LOG_RUNS";
-/// Sets how many bytes of records the daemon keeps.
-pub const BYTES_VAR: &str = "HELI_LOG_BYTES";
 
 /// The run log of a daemon: where records go, and which are being written.
 pub struct RunLog {

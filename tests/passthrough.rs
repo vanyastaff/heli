@@ -197,15 +197,17 @@ fn runs_as_a_cargo_subcommand() {
     assert_eq!(text(&output.stdout), echoed(&["via cargo"]));
 }
 
+/// Plain cargo: under heli, cargo draws from the host pool, and `-j` has no
+/// effect under an inherited jobserver (DESIGN.md §4; `tests/pool.rs`).
 #[test]
 fn the_concurrency_log_records_every_build_script() {
     let fixture = Fixture::new("basic");
     let log = fixture.concurrency_log();
-    let mut build = fixture.heli([
+    let mut build = fixture.cargo([
         "build", "-p", "slow-a", "-p", "slow-b", "-p", "slow-c", "-j", "1",
     ]);
     log.attach(&mut build, 50);
-    assert_success(&build.output().expect("run heli"), "cargo heli build");
+    assert_success(&build.output().expect("run cargo"), "cargo build");
     let mut names: Vec<String> = log.intervals().into_iter().map(|run| run.name).collect();
     names.sort();
     assert_eq!(names, ["slow-a", "slow-b", "slow-c"]);
