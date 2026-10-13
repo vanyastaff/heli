@@ -137,6 +137,14 @@ impl Fixture {
         self.root.path().join("ws")
     }
 
+    /// A copy of the workspace as it is now, at `name` in the fixture's
+    /// temporary directory: a second workspace for the same daemon.
+    pub fn copy_workspace(&self, name: &str) -> PathBuf {
+        let copy = self.path(name);
+        copy_dir(&self.workspace(), &copy);
+        copy
+    }
+
     /// The target directory every command of this fixture uses.
     pub fn target_dir(&self) -> PathBuf {
         self.root.path().join("target")

@@ -1,0 +1,97 @@
+//! Run classes: each run is classified by its subcommand and arguments
+//! (`DESIGN.md` §5, "Classes"), and `status` shows the class.
+
+mod support;
+
+use std::collections::BTreeMap;
+use std::process::{Child, Stdio};
+
+use support::{Fixture, assert_success, runs};
+
+/// Every reading of a command line the classes depend on, run by heli with
+/// `echo-args` as its cargo, and listed by `status` with the class it got.
+#[test]
+fn status_shows_each_runs_class() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let cases: &[(&[&str], &str)] = &[
+        (&["build", "-p", "a"], "compile"),
+        (&["b"], "compile"),
+        (&["run"], "compile"),
+        (&["r"], "compile"),
+        (&["doc"], "compile"),
+        (&["d"], "compile"),
+        (&["check"], "verify"),
+        (&["c"], "verify"),
+        (&["clippy"], "verify"),
+        (&["clippy", "--", "--fix"], "verify"),
+        (&["fmt", "--check"], "verify"),
+        (&["fmt", "--all", "--", "--check"], "verify"),
+        (&["test"], "test"),
+        (&["t"], "test"),
+        (&["nextest", "run", "-p", "a"], "test"),
+        (&["nextest", "r"], "test"),
+        (&["fmt"], "mutate"),
+        (&["fmt", "--all"], "mutate"),
+        (&["fix", "--allow-dirty"], "mutate"),
+        (&["clippy", "--fix"], "mutate"),
+        (
+            &["clippy", "--all-targets", "--fix", "--", "-D", "warnings"],
+            "mutate",
+        ),
+        (&["+nightly", "fmt"], "mutate"),
+        (&["+nightly", "check"], "verify"),
+        (&["bench"], "exec"),
+        (&["nextest", "list"], "exec"),
+        (&["xtask", "fmt"], "exec"),
+    ];
+    let gate = fixture.path("gate");
+    let start = |args: &[&str], exec: bool| -> Child {
+        let mut command = if exec {
+            let mut command = fixture.heli(["exec", "--"]);
+            command.arg(&echo);
+            command
+        } else {
+            fixture.heli(Vec::<String>::new())
+        };
+        command
+            .args(args)
+            .env("CARGO", &echo)
+            .env("ECHO_WAIT_FOR", &gate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start heli")
+    };
+    let mut calls: Vec<Child> = cases.iter().map(|(args, _)| start(args, false)).collect();
+    // `exec` is its own class, whatever the command: here, one that looks
+    // like `cargo fmt`.
+    calls.push(start(&["fmt", "--through-exec"], true));
+
+    let status = fixture.wait_for_status("every run to be listed", |status| {
+        runs(status).len() == calls.len()
+    });
+    let classes: BTreeMap<String, String> = runs(&status)
+        .iter()
+        .map(|run| {
+            let args: Vec<&str> = run["argv"].as_array().expect("an argv")[1..]
+                .iter()
+                .map(|arg| arg.as_str().expect("a string"))
+                .collect();
+            let class = run["class"].as_str().unwrap_or_else(|| panic!("{run}"));
+            (args.join(" "), class.to_owned())
+        })
+        .collect();
+    let mut expected: BTreeMap<String, String> = cases
+        .iter()
+        .map(|(args, class)| (args.join(" "), (*class).to_owned()))
+        .collect();
+    expected.insert("fmt --through-exec".to_owned(), "exec".to_owned());
+    std::fs::write(&gate, "").expect("open the gate");
+    for call in calls {
+        let output = call.wait_with_output().expect("wait for heli");
+        assert_success(&output, "a classified run");
+    }
+    assert_eq!(classes, expected);
+}

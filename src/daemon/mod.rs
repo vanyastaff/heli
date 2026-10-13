@@ -7,10 +7,11 @@
 //! `crate::protocol`:
 //!
 //! - **run**: admit it to the registry ([`registry`]), tell the client it
-//!   started, execute it ([`execute`]), take it out of the registry, report
-//!   its exit. `Daemon::run` is the one sequence every run goes through,
-//!   and the place for what happens around a run (admission, waits,
-//!   recording);
+//!   started, wait for its turn at the worktree lock (telling the client
+//!   for which runs), execute it ([`execute`]), take it out of the
+//!   registry, report its exit. `Daemon::run` is the one sequence every run
+//!   goes through, and the place for what happens around a run (admission,
+//!   waits, recording);
 //! - **status**: describe the daemon and the registry's runs;
 //! - **retire**, from a newer client: accept no more runs and exit once the
 //!   runs in flight have reported their exits.
@@ -32,7 +33,7 @@ use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::protocol::{self, Reply, Request, RunRequest};
 use crate::status::{self, Status};
-use crate::{clock, worktree};
+use crate::{clock, nesting, worktree};
 
 use registry::Registry;
 
@@ -171,6 +172,8 @@ impl Daemon {
         let id = self.registry.admit(
             worktree::of(&execute::cwd(&request)),
             execute::argv(&request),
+            request.class,
+            nested(&request),
         );
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
@@ -181,6 +184,11 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
+        // The worktree lock: tell the client which runs this one waits for,
+        // if any. A client gone meanwhile does not stop the run.
+        self.registry.wait_for_worktree(id, |runs| {
+            let _ = protocol::write_message(&mut stream, &Reply::Waiting { runs });
+        });
         let reply = match execute::spawn(&request) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
@@ -256,6 +264,18 @@ impl Drop for Serving<'_> {
         lifecycle.serving -= 1;
         self.0.exit_if_retired(&lifecycle);
     }
+}
+
+/// Whether `request` comes from inside another heli run: its client runs
+/// under heli, so the run's depth (`HELI_DEPTH`, the client's plus one) is
+/// above 1.
+fn nested(request: &RunRequest) -> bool {
+    request
+        .env
+        .iter()
+        .find(|(name, _)| name.0 == nesting::VAR)
+        .and_then(|(_, depth)| depth.0.to_str()?.trim().parse::<u32>().ok())
+        .is_some_and(|depth| depth > 1)
 }
 
 /// The reply for a run that ended with `status`.

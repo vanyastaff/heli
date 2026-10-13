@@ -8,12 +8,20 @@
 //! {"schema":1,
 //!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
-//!           "phase":"running","started_at":1791911112}]}
+//!           "class":"compile","phase":"running","started_at":1791911112,
+//!           "waiting_since":null,"waiting_for":[]},
+//!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
+//!           "class":"mutate","phase":"running","started_at":1791911120,
+//!           "waiting_since":1791911120,"waiting_for":["r17"]}]}
 //! ```
 //!
-//! `daemon` is `null` when no daemon answers.
+//! `daemon` is `null` when no daemon answers. A run waiting for its
+//! worktree's lock has `waiting_since` and, in `waiting_for`, the runs it
+//! waits for; otherwise they are `null` and empty.
 
 use serde::{Deserialize, Serialize};
+
+use crate::class::Class;
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -43,8 +51,13 @@ pub struct Run {
     pub worktree: String,
     /// The command, program first.
     pub argv: Vec<String>,
+    pub class: Class,
     pub phase: Phase,
     pub started_at: u64,
+    /// Since when the run waits for its worktree's lock, if it does.
+    pub waiting_since: Option<u64>,
+    /// The runs it waits for, by id.
+    pub waiting_for: Vec<String>,
 }
 
 /// Where a run is in its lifecycle.
@@ -91,12 +104,17 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
+            let state = if run.waiting_for.is_empty() {
+                run.phase.name().to_owned()
+            } else {
+                format!("waiting for {}", run.waiting_for.join(", "))
+            };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {}s\n",
+                "{label:<6}  {}  {}  {}  {}  {state}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
-                run.phase.name(),
+                run.class.name(),
                 age(run.started_at)
             ));
         }

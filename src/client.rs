@@ -8,7 +8,9 @@
 //!   environment (`HELI_DEPTH` one deeper); print the run's stdout and
 //!   stderr to the same streams as they arrive; exit with the run's code
 //!   (on Unix, die of the run's signal). A command that cannot be started
-//!   is reported as direct execution reports it (exit 127 or 126).
+//!   is reported as direct execution reports it (exit 127 or 126). A run
+//!   that waits for its worktree's lock says so first, on stderr: "waiting
+//!   for …", naming the runs it waits for.
 //! - **Fallback.** Whenever the daemon cannot take the run (it does not
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
@@ -19,6 +21,7 @@
 
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -27,7 +30,7 @@ use crate::cli::Invocation;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::protocol::{self, Channel, Frame, Reply, Request, RunRequest, Text};
-use crate::status::Status;
+use crate::status::{self, Status};
 use crate::{clock, direct, environment, launch, nesting};
 
 /// How long a daemon may take to answer the handshake.
@@ -174,6 +177,7 @@ fn submit(
             .into_iter()
             .map(|(name, value)| (Text(name), Text(value)))
             .collect(),
+        class: invocation.class,
     };
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
@@ -193,6 +197,10 @@ fn follow(mut stream: Stream, invocation: &Invocation, run: &str) -> ! {
         match protocol::read_frame::<Reply>(&mut stream) {
             Ok(Frame::Output(Channel::Stdout, bytes)) => print(&mut stdout, &bytes),
             Ok(Frame::Output(Channel::Stderr, bytes)) => print(&mut stderr, &bytes),
+            Ok(Frame::Message(Reply::Waiting { runs })) => {
+                let line = format!("cargo-heli: {}\n", waiting_for(&runs));
+                print(&mut stderr, line.as_bytes());
+            }
             Ok(Frame::Message(Reply::Exited { code, signal })) => {
                 let _ = stdout.flush();
                 drop((stdout, stderr));
@@ -208,6 +216,30 @@ fn follow(mut stream: Stream, invocation: &Invocation, run: &str) -> ! {
             Err(error) => lost(run, &error.to_string(), stdout),
         }
     }
+}
+
+/// What the run waits for: `waiting for r17 (cargo build -p foo) to finish
+/// with this worktree`, naming each run by its id and its command, the
+/// program as a bare name.
+fn waiting_for(runs: &[status::Run]) -> String {
+    let runs: Vec<String> = runs
+        .iter()
+        .map(|run| {
+            let mut argv = run.argv.iter();
+            let program = argv.next().map(|program| {
+                Path::new(program).file_stem().map_or_else(
+                    || program.clone(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                )
+            });
+            let command: Vec<String> = program.into_iter().chain(argv.cloned()).collect();
+            format!("{} ({})", run.id, command.join(" "))
+        })
+        .collect();
+    format!(
+        "waiting for {} to finish with this worktree",
+        runs.join(", ")
+    )
 }
 
 fn lost(run: &str, error: &str, mut stdout: io::StdoutLock<'_>) -> ! {
