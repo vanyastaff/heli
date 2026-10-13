@@ -122,7 +122,8 @@ pub fn parse(
 
 /// Whether the cargo subcommand `args` is a verify or a test run, the runs
 /// whose verdict the result store keeps: `check`, `clippy` (not `--fix`),
-/// `fmt --check`, `test` and `nextest run`. A request for help is not.
+/// `fmt --check` (also after `--`, as rustfmt's), `test` and `nextest run`.
+/// A request for help is not.
 ///
 /// A stand-in until the run classes (DESIGN.md §5, "Classes") exist: they
 /// replace this function.
@@ -138,7 +139,7 @@ fn verifies(args: &[OsString]) -> bool {
     match subcommand {
         "check" | "c" | "test" | "t" => true,
         "clippy" => !has("--fix"),
-        "fmt" => has("--check"),
+        "fmt" => args.iter().any(|arg| arg == "--check"),
         "nextest" => tool_args.first().is_some_and(|arg| *arg == "run"),
         _ => false,
     }

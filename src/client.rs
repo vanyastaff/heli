@@ -233,7 +233,8 @@ fn already_passed(run: &str, worktree: &Text, at: u64) -> ! {
         worktree.0.to_string_lossy()
     );
     eprintln!(
-        "cargo-heli: caveats: a flaky pass is reused (--no-cache runs it again),          and ignored files are not part of the key"
+        "cargo-heli: caveats: a flaky pass is reused (--no-cache runs it again), \
+         and ignored files are not part of the key"
     );
     std::process::exit(0)
 }

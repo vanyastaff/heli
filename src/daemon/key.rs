@@ -210,20 +210,20 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
 /// sorted, each a field of its own. Names are case-folded on Windows only,
 /// where they ignore case. The search paths ([`SEARCH_PATHS`]) are keyed
 /// without their entries inside `worktree`, which cargo prepends for the
-/// programs it runs.
+/// programs it runs; one left without entries counts as unset.
 fn environment(request: &RunRequest, worktree: &Path, fields: &mut Fields) {
     let mut env: Vec<(Vec<u8>, Vec<u8>)> = request
         .env
         .iter()
         .map(|(name, value)| (folded(&name.0), &value.0))
         .filter(|(name, value)| !neutral(name, value))
-        .map(|(name, value)| {
-            let value = if SEARCH_PATHS.iter().any(|path| name == path.as_bytes()) {
-                outside(value, worktree)
+        .filter_map(|(name, value)| {
+            if SEARCH_PATHS.iter().any(|path| name == path.as_bytes()) {
+                let entries = outside(value, worktree);
+                (!entries.is_empty()).then_some((name, entries))
             } else {
-                value.as_encoded_bytes().to_vec()
-            };
-            (name, value)
+                Some((name, value.as_encoded_bytes().to_vec()))
+            }
         })
         .collect();
     env.sort();

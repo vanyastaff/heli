@@ -192,14 +192,15 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
-        // Once admitted: another run may have passed with the same key.
+        // Once admitted, after any wait (which belongs above): another run
+        // may have passed with the same key meanwhile.
         let key = match self.results.admitted(&request) {
             Admitted::Passed(passed) => {
                 self.registry.finish(id);
                 let _ = protocol::write_message(&mut stream, &passed.reply());
                 return;
             }
-            Admitted::Run(key, note) => {
+            Admitted::Run { key, note } => {
                 if let Some(note) = note {
                     self.note(&mut stream, &note);
                 }
@@ -244,10 +245,7 @@ impl Daemon {
     /// Tells the client of a run why the result store did not do its part,
     /// on the run's stderr.
     fn note(&self, stream: &mut Stream, note: &str) {
-        let line = format!(
-            "cargo-heli: note: {note}
-"
-        );
+        let line = format!("cargo-heli: note: {note}\n");
         let _ = protocol::write_output(stream, Channel::Stderr, line.as_bytes());
     }
 

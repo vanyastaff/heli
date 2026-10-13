@@ -21,15 +21,17 @@
 //! costs the saving, never the run.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
 use crate::clock;
+use crate::daemon::execute;
 use crate::daemon::key::{self, Key};
 use crate::daemon::registry::RunId;
 use crate::protocol::{Cache, Reply, RunRequest, Text};
-use crate::{daemon::execute, worktree};
+use crate::worktree;
 
 /// The most markers kept.
 pub const CAP: usize = 256;
@@ -60,7 +62,10 @@ pub enum Admitted {
     Passed(Record),
     /// The run goes ahead; with a key, it is recorded if it passes. The note
     /// says why a run that uses the store has no key.
-    Run(Option<Key>, Option<String>),
+    Run {
+        key: Option<Key>,
+        note: Option<String>,
+    },
 }
 
 /// The store in a state directory.
@@ -93,17 +98,20 @@ impl Store {
     /// is recorded now.
     pub fn admitted(&self, request: &RunRequest) -> Admitted {
         if request.cache == Cache::Off {
-            return Admitted::Run(None, None);
+            return Admitted::Run {
+                key: None,
+                note: None,
+            };
         }
         let key = match key::compute(request, &self.scratch) {
             Ok(key) => key,
             Err(error) => {
-                return Admitted::Run(
-                    None,
-                    Some(format!(
+                return Admitted::Run {
+                    key: None,
+                    note: Some(format!(
                         "cannot key this run, so it is not recorded: {error}"
                     )),
-                );
+                };
             }
         };
         if request.cache == Cache::On
@@ -111,12 +119,13 @@ impl Store {
         {
             return Admitted::Passed(record);
         }
-        Admitted::Run(key, None)
+        Admitted::Run { key, note: None }
     }
 
     /// After run `run` of `request`, keyed `key`, ended: records it when it
-    /// `passed` on the tree it started on. Returns a note when it passed but
-    /// is not recorded.
+    /// `passed` on the tree it started on. A run that failed drops the pass
+    /// recorded for its key, which a flaky run may have left. Returns a note
+    /// when it passed but is not recorded.
     pub fn after(
         &self,
         request: &RunRequest,
@@ -125,6 +134,7 @@ impl Store {
         passed: bool,
     ) -> Option<String> {
         if !passed {
+            let _ = std::fs::remove_file(self.marker(key));
             return None;
         }
         match key::snapshot(request, &self.scratch) {
@@ -167,17 +177,46 @@ impl Store {
     /// Writes `record` as the marker of `key`, then drops the least recently
     /// used markers beyond [`CAP`].
     fn record(&self, key: &Key, record: &Record) -> std::io::Result<()> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         std::fs::create_dir_all(&self.dir)?;
         let marker = self.marker(key);
-        let staged = self
-            .dir
-            .join(format!("{}.{}.tmp", key.digest, std::process::id()));
+        let staged = self.dir.join(format!(
+            "{}.{}-{}.tmp",
+            key.digest,
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let text = serde_json::to_vec(record).map_err(std::io::Error::other)?;
         std::fs::write(&staged, text)
             .and_then(|()| std::fs::rename(&staged, &marker))
             .inspect_err(|_| {
                 let _ = std::fs::remove_file(&staged);
             })?;
+        self.prune(&marker);
         Ok(())
     }
+
+    /// Removes the least recently used markers beyond [`CAP`], never
+    /// `written`.
+    fn prune(&self, written: &Path) {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return;
+        };
+        let mut markers: Vec<(SystemTime, PathBuf)> = entries
+            .filter_map(Result::ok)
+            .filter(|entry| is_marker(&entry.file_name()) && entry.path() != written)
+            .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+            .collect();
+        let excess = (markers.len() + 1).saturating_sub(CAP);
+        markers.sort();
+        for (_, path) in markers.iter().take(excess) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Whether `name` is a marker's: a digest, 64 hex digits.
+fn is_marker(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.len() == 64 && name.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
