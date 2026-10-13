@@ -490,27 +490,39 @@ fn log_shows_a_run_in_flight_so_far() {
 }
 
 /// Output is recorded whether or not a client listens: a run whose client
-/// was killed has all of its output in the log, including what it wrote
-/// after.
+/// was killed early has all of its output in the log, including the many
+/// writes it made after.
 #[test]
 fn output_is_recorded_after_the_client_is_gone() {
     let fixture = Fixture::new("basic");
-    let echo = fixture.echo_args();
-    let gate = fixture.path("gate");
+    let chatter = fixture.binary("chatter");
+    let args = ["20", "pace=100"];
+    let direct = fixture
+        .command(&chatter, args)
+        .output()
+        .expect("run chatter");
     let mut call = fixture.heli(["exec", "--"]);
-    call.arg(&echo).arg("before").env("ECHO_WAIT_FOR", &gate);
+    call.arg(&chatter).args(args);
     let call = start(&mut call);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !log(&fixture, &[&id]).stdout.starts_with(b"line 1 out\n") {
+        assert!(
+            Instant::now() < deadline,
+            "the run never wrote its first line"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     support::kill_tree(call.id());
     let _ = finish(call);
-    open(&gate);
+    assert_eq!(fixture.runs().len(), 1, "the run outlived its client");
     fixture.wait_for_status("the run to end", |status| runs(status).is_empty());
     let logged = log(&fixture, &[&id]);
     support::assert_success(&logged, "cargo heli log");
-    assert_eq!(text(&logged.stdout), "arg: \"before\"\n");
-    assert_eq!(text(&logged.stderr), "echo-args: stderr\n", "written after");
+    assert!(logged.stdout == direct.stdout, "{}", text(&logged.stdout));
+    assert!(logged.stderr == direct.stderr, "{}", text(&logged.stderr));
 }
 
 /// A run id with no record (it never ran, or its record was pruned) is a
