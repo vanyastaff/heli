@@ -1,5 +1,5 @@
 //! Runs a command in heli's place: its stdio, environment and exit status
-//! become heli's own.
+//! become heli's own. This is how heli runs a command when its daemon cannot.
 //!
 //! On Unix heli `exec`s the command, so the process is the command. Elsewhere
 //! heli waits for it and exits with its code; on Windows it first ignores
@@ -7,6 +7,7 @@
 //! so heli reports the command's exit instead of dying before it (cargo runs
 //! its own external subcommands the same way).
 
+use std::ffi::OsStr;
 use std::io;
 use std::process::Command;
 
@@ -18,15 +19,21 @@ const NOT_STARTED: i32 = 126;
 /// Runs `command` and exits with its status.
 pub fn run(mut command: Command) -> ! {
     let error = replace(&mut command);
+    report_spawn_failure(
+        command.get_program(),
+        error.kind() == io::ErrorKind::NotFound,
+        &error.to_string(),
+    )
+}
+
+/// Reports that `program` could not be started, because of `error`, and
+/// exits as a shell would: 127 when it does not exist, else 126.
+pub fn report_spawn_failure(program: &OsStr, not_found: bool, error: &str) -> ! {
     eprintln!(
         "cargo-heli: cannot run `{}`: {error}",
-        command.get_program().to_string_lossy()
+        program.to_string_lossy()
     );
-    std::process::exit(if error.kind() == io::ErrorKind::NotFound {
-        NOT_FOUND
-    } else {
-        NOT_STARTED
-    })
+    std::process::exit(if not_found { NOT_FOUND } else { NOT_STARTED })
 }
 
 /// Becomes `command`; returns only the error that kept it from starting.

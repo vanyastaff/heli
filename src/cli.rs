@@ -6,6 +6,17 @@ use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
+/// What heli was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Action {
+    /// Run a command.
+    Run(Invocation),
+    /// Show the daemon and its runs.
+    Status { json: bool },
+    /// Be the daemon, or with `detach`, start it outside this process tree.
+    Daemon { detach: bool },
+}
+
 /// The program heli runs, and its arguments.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
@@ -35,6 +46,20 @@ enum Command {
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
     },
+    /// Show the daemon and the runs in flight.
+    Status {
+        /// Print the versioned JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
+    #[command(hide = true)]
+    Daemon {
+        /// Start the daemon in the background, outside this process's tree,
+        /// and exit once it listens.
+        #[arg(long)]
+        detach: bool,
+    },
     /// Any cargo subcommand, e.g. `cargo heli build -p foo`: run as
     /// `cargo build -p foo`.
     #[command(external_subcommand)]
@@ -42,14 +67,14 @@ enum Command {
 }
 
 /// Parses heli's command line (`args` as the process received it) into what
-/// to run; `cargo` is the cargo program a cargo subcommand runs with.
+/// to do; `cargo` is the cargo program a cargo subcommand runs with.
 ///
 /// Run as `cargo heli`, the binary gets `heli` as its first argument; it is
 /// dropped, so `cargo heli build` and `cargo-heli build` mean the same.
 pub fn parse(
     args: impl IntoIterator<Item = OsString>,
     cargo: OsString,
-) -> Result<Invocation, clap::Error> {
+) -> Result<Action, clap::Error> {
     let mut args = args.into_iter().peekable();
     let binary = args.next();
     if args.peek().is_some_and(|first| first == "heli") {
@@ -67,14 +92,16 @@ pub fn parse(
     Ok(match cli.command {
         Command::Exec { command } => {
             let mut command = command.into_iter();
-            Invocation {
+            Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
-            }
+            })
         }
-        Command::Cargo(args) => Invocation {
+        Command::Status { json } => Action::Status { json },
+        Command::Daemon { detach } => Action::Daemon { detach },
+        Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,
             args,
-        },
+        }),
     })
 }

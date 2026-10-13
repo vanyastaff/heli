@@ -1,22 +1,40 @@
 //! `cargo heli`: cargo for machines shared by many agents (`DESIGN.md`).
 //!
-//! For now every command runs directly, as if heli were not there: the
-//! daemon, the host pool and the rest of the design build on this entry
-//! point.
+//! Modules, from the command line inward:
+//! - [`cli`]: heli's command line;
+//! - [`client`]: hands runs to the daemon, or runs them [`direct`]ly when it
+//!   cannot; asks it for its status;
+//! - [`launch`]: starts the daemon in the background;
+//! - [`protocol`]: the versioned messages between client and daemon, over
+//!   [`ipc`], the owner-only endpoint;
+//! - [`daemon`]: the per-user daemon, its run registry
+//!   ([`daemon::registry`]) and run execution ([`daemon::execute`]);
+//! - [`status`]: the `status --json` schema;
+//! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
+//!   what both sides share.
 
 mod cli;
+mod client;
+mod clock;
+mod daemon;
 mod direct;
+mod environment;
+mod ipc;
+mod launch;
+mod locations;
 mod nesting;
+mod protocol;
+mod status;
+mod worktree;
 
 use std::ffi::OsString;
-use std::process::Command;
 
 /// Exit code for heli's own refusals, the same as for a usage error.
 const REFUSED: i32 = 2;
 
 fn main() {
-    let invocation = match cli::parse(std::env::args_os(), cargo_program()) {
-        Ok(invocation) => invocation,
+    let action = match cli::parse(std::env::args_os(), cargo_program()) {
+        Ok(action) => action,
         Err(error) => error.exit(),
     };
     let depth = nesting::current();
@@ -28,11 +46,12 @@ fn main() {
         );
         std::process::exit(REFUSED);
     }
-    let mut command = Command::new(&invocation.program);
-    command
-        .args(&invocation.args)
-        .env(nesting::VAR, (depth + 1).to_string());
-    direct::run(command)
+    match action {
+        cli::Action::Run(invocation) => client::run(invocation, depth),
+        cli::Action::Status { json } => client::status(json),
+        cli::Action::Daemon { detach: false } => daemon::main(),
+        cli::Action::Daemon { detach: true } => launch::detach(depth),
+    }
 }
 
 /// The cargo that started heli (`CARGO`, which cargo sets for its external

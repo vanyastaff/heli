@@ -6,6 +6,12 @@
 //! caller's environment: their own target directory, and none of the
 //! variables that would change how cargo builds or how many jobs it runs.
 //!
+//! Each fixture also has a daemon of its own: every command it makes carries
+//! `HELI_STATE_DIR` and `HELI_ENDPOINT` inside the fixture's temporary
+//! directory, so no test meets another test's daemon or the user's real one.
+//! Dropping the fixture kills the daemon, and with it any run still going,
+//! even when the test panics.
+//!
 //! Fixture `basic` (see its `Cargo.toml`):
 //! - `slow-a`, `slow-b`, `slow-c`: build scripts that log their start and end
 //!   to `HELI_FIXTURE_LOG` around a sleep of `HELI_FIXTURE_SLEEP_MS`
@@ -13,14 +19,23 @@
 //! - `broken`: a compile error; `warnings`: warnings from several lints;
 //! - `tests-mixed`: passing, failing and slow tests;
 //! - `nested`: a test that runs a nested cargo build;
-//! - `echo-args`: prints its arguments and exits with `ECHO_EXIT`.
+//! - `echo-args`: prints its arguments, and on request a variable, its
+//!   working directory or its session; waits for a file, leaves an orphan
+//!   behind; exits with `ECHO_EXIT` (see its `main.rs`).
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
+
+pub mod endpoint;
+pub mod fake_daemon;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 /// Variables a test command must not inherit: they would move the target
 /// directory, change the flags or job count, or hand cargo a jobserver.
@@ -38,22 +53,83 @@ const ISOLATED_VARS: [&str; 11] = [
     "CARGO_INCREMENTAL",
 ];
 
+/// heli's variables a test command must not inherit from whoever runs the
+/// tests: they could point it at the user's real daemon.
+const HELI_VARS: [&str; 3] = ["HELI_STATE_DIR", "HELI_ENDPOINT", "HELI_DEPTH"];
+
 /// A fixture workspace copied into a temporary directory, with a target
-/// directory and a concurrency log beside it.
+/// directory, a concurrency log and heli's state directory beside it.
 pub struct Fixture {
     root: tempfile::TempDir,
+    endpoint: OsString,
+    /// Variables set (or, when `None`, removed) on every command, which
+    /// select this fixture's daemon.
+    isolation: Vec<(OsString, Option<OsString>)>,
 }
 
 impl Fixture {
-    /// Copies `tests/fixtures/<name>`.
+    /// Copies `tests/fixtures/<name>`; its daemon has the state directory
+    /// [`Fixture::state_dir`] and the endpoint [`Fixture::endpoint`].
     pub fn new(name: &str) -> Self {
+        let mut fixture = Self::bare(name);
+        let state_dir = fixture.state_dir();
+        let endpoint = fixture.endpoint();
+        fixture.isolation = vec![
+            ("HELI_STATE_DIR".into(), Some(state_dir.into())),
+            ("HELI_ENDPOINT".into(), Some(endpoint)),
+        ];
+        fixture
+    }
+
+    /// Copies `tests/fixtures/<name>`, and leaves heli to find its state
+    /// directory and endpoint where it would for a user whose home is
+    /// [`Fixture::home`] (`LOCALAPPDATA` and `HOME`), with
+    /// `XDG_STATE_HOME` set to `<home>/xdg-state` or unset. Only for
+    /// commands that do not need the real home (cargo and rustup live there).
+    pub fn with_home(name: &str, xdg_state_home: bool) -> Self {
+        let mut fixture = Self::bare(name);
+        let home = fixture.home();
+        std::fs::create_dir_all(&home).expect("create the temporary home");
+        let mut isolation: Vec<(OsString, Option<OsString>)> = HELI_VARS
+            .iter()
+            .map(|var| (OsString::from(var), None))
+            .collect();
+        for var in ["LOCALAPPDATA", "HOME"] {
+            isolation.push((var.into(), Some(home.clone().into())));
+        }
+        let xdg = xdg_state_home.then(|| home.join("xdg-state").into());
+        isolation.push(("XDG_STATE_HOME".into(), xdg));
+        fixture.isolation = isolation;
+        fixture
+    }
+
+    fn bare(name: &str) -> Self {
         let root = tempfile::tempdir().expect("temporary directory");
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
             .join(name);
         copy_dir(&source, &root.path().join("ws"));
-        Self { root }
+        let endpoint = if cfg!(windows) {
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock after 1970")
+                .subsec_nanos();
+            format!(
+                r"\\.\pipe\heli-test-{}-{}-{nanos}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )
+            .into()
+        } else {
+            root.path().join("heli.sock").into()
+        };
+        Self {
+            root,
+            endpoint,
+            isolation: Vec::new(),
+        }
     }
 
     /// The copied workspace.
@@ -64,6 +140,27 @@ impl Fixture {
     /// The target directory every command of this fixture uses.
     pub fn target_dir(&self) -> PathBuf {
         self.root.path().join("target")
+    }
+
+    /// `name` in the fixture's temporary directory, outside the workspace.
+    pub fn path(&self, name: &str) -> PathBuf {
+        self.root.path().join(name)
+    }
+
+    /// The state directory of this fixture's daemon ([`Fixture::new`]).
+    pub fn state_dir(&self) -> PathBuf {
+        self.root.path().join("state")
+    }
+
+    /// The temporary home of a [`Fixture::with_home`] fixture.
+    pub fn home(&self) -> PathBuf {
+        self.root.path().join("home")
+    }
+
+    /// The endpoint of this fixture's daemon ([`Fixture::new`]): a named
+    /// pipe on Windows, a socket in the temporary directory elsewhere.
+    pub fn endpoint(&self) -> OsString {
+        self.endpoint.clone()
     }
 
     /// `cargo-heli` with `args`, run in the workspace.
@@ -100,10 +197,75 @@ impl Fixture {
         for var in ISOLATED_VARS
             .into_iter()
             .filter(|var| *var != "CARGO_TARGET_DIR")
+            .chain(HELI_VARS)
         {
             command.env_remove(var);
         }
+        for (var, value) in &self.isolation {
+            match value {
+                Some(value) => command.env(var, value),
+                None => command.env_remove(var),
+            };
+        }
         command
+    }
+
+    /// `cargo heli status --json`, parsed.
+    pub fn status(&self) -> Value {
+        let output = self
+            .heli(["status", "--json"])
+            .output()
+            .expect("run heli status");
+        assert_success(&output, "cargo heli status --json");
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "status --json is not JSON ({error}): {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })
+    }
+
+    /// Polls [`Fixture::status`] until `done` holds, and returns that status;
+    /// panics after 30 s, naming `what` it waited for.
+    pub fn wait_for_status(&self, what: &str, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = self.status();
+            if done(&status) {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}; last status: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The runs `status --json` lists.
+    pub fn runs(&self) -> Vec<Value> {
+        runs(&self.status())
+    }
+
+    /// The process id of this fixture's daemon, if one answers.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        let output = self.heli(["status", "--json"]).output().ok()?;
+        let status: Value = serde_json::from_slice(&output.stdout).ok()?;
+        daemon_pid(&status)
+    }
+
+    /// Kills this fixture's daemon and every process it started, and waits
+    /// until it no longer answers. Never panics: it also runs while a failed
+    /// test unwinds.
+    pub fn kill_daemon(&self) {
+        let Some(pid) = self.daemon_pid() else {
+            return;
+        };
+        kill_tree(pid);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.daemon_pid() == Some(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Builds the `echo-args` fixture binary and returns its path.
@@ -124,6 +286,64 @@ impl Fixture {
             path: self.root.path().join("concurrency.log"),
         }
     }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.kill_daemon();
+    }
+}
+
+/// The `runs` of a `status --json` document.
+pub fn runs(status: &Value) -> Vec<Value> {
+    status["runs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("status without a runs array: {status}"))
+        .clone()
+}
+
+/// The daemon's process id in a `status --json` document, if one runs.
+pub fn daemon_pid(status: &Value) -> Option<u32> {
+    status["daemon"]["pid"]
+        .as_u64()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+/// Kills process `pid` and its descendants, found by their parent process
+/// (as agent harnesses kill a command), and on Unix its process group: only
+/// for processes the tests started themselves.
+pub fn kill_tree(pid: u32) {
+    let pid = pid.to_string();
+    let mut commands = Vec::new();
+    if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/F", "/T", "/PID", &pid]);
+        commands.push(taskkill);
+    } else {
+        // A daemon leads its own process group, which its runs share.
+        let mut group = Command::new("kill");
+        group.args(["-KILL", "--", &format!("-{pid}")]);
+        let mut children = Command::new("pkill");
+        children.args(["-KILL", "-P", &pid]);
+        let mut process = Command::new("kill");
+        process.args(["-KILL", "--", &pid]);
+        commands.extend([group, children, process]);
+    }
+    for mut command in commands {
+        let _ = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// The lines of `bytes`, lossily decoded.
+pub fn lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The `cargo-heli` binary under test.
