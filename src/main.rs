@@ -9,6 +9,8 @@
 //!   [`ipc`], the owner-only endpoint;
 //! - [`daemon`]: the per-user daemon, its run registry
 //!   ([`daemon::registry`]) and run execution ([`daemon::execute`]);
+//! - [`pool`]: the host pool, the jobserver every run draws from, sized by
+//!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
@@ -16,6 +18,7 @@
 mod cli;
 mod client;
 mod clock;
+mod config;
 mod daemon;
 mod direct;
 mod environment;
@@ -23,6 +26,7 @@ mod ipc;
 mod launch;
 mod locations;
 mod nesting;
+mod pool;
 mod protocol;
 mod status;
 mod worktree;

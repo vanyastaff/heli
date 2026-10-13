@@ -15,21 +15,25 @@
 //! - **retire**, from a newer client: accept no more runs and exit once the
 //!   runs in flight have reported their exits.
 //!
-//! What the daemon owns for its whole life (now the lock; later the pools)
-//! is set up in [`main`]. The daemon runs until it is killed or retired. Its
-//! own log (start, end, errors) is `daemon.log` in the state directory
-//! (`daemon-<session>.log` on Windows), since it has no terminal.
+//! What the daemon owns for its whole life (the lock, then the host pool,
+//! `crate::pool`, sized by the configuration) is set up in [`main`]. The
+//! daemon runs until it is killed or retired. Its own log (start, end,
+//! errors) is `daemon.log` in the state directory (`daemon-<session>.log` on
+//! Windows), since it has no terminal.
 
 pub mod execute;
 pub mod registry;
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
+use crate::pool::{self, Pool};
 use crate::protocol::{self, Reply, Request, RunRequest};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
@@ -69,6 +73,7 @@ pub fn main() -> ! {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }
     }
+    let pool = open_pool(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
         Ok(listener) => listener,
         Err(error) => fail(
@@ -85,6 +90,7 @@ pub fn main() -> ! {
 
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
+        pool,
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
@@ -113,8 +119,35 @@ fn fail(log: Option<&Log>, error: &str) -> ! {
     std::process::exit(1)
 }
 
+/// Opens the host pool, of the size configured, or exits with failure.
+fn open_pool(locations: &Locations, log: &Log) -> Pool {
+    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(log), &error));
+    let slots = config
+        .pool
+        .slots
+        .map_or_else(pool::default_slots, NonZeroU32::get);
+    let name = locations.pool.display();
+    match Pool::open(&locations.pool, slots) {
+        Ok((pool, opened)) => {
+            let status = pool.status();
+            log.write(&format!(
+                "pool {name}: {}, {} slots, {} free",
+                match opened {
+                    pool::Opened::Created => "created",
+                    pool::Opened::Adopted => "adopted",
+                },
+                status.slots,
+                status.free
+            ));
+            pool
+        }
+        Err(error) => fail(Some(log), &format!("cannot open the pool {name}: {error}")),
+    }
+}
+
 struct Daemon {
     registry: Registry,
+    pool: Pool,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -181,7 +214,7 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
-        let reply = match execute::spawn(&request) {
+        let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
                 message: error.to_string(),
@@ -212,6 +245,7 @@ impl Daemon {
                 protocol: protocol::VERSION,
                 started_at: clock::unix_seconds(self.started_at),
             }),
+            pool: Some(self.pool.status()),
             runs: self.registry.snapshot(),
         }
     }
