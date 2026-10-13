@@ -121,7 +121,10 @@ per-user state directory (`%LOCALAPPDATA%\heli`, `$XDG_STATE_HOME/heli` or
 `~/.local/state/heli`) admits one. Named pipes are visible machine-wide,
 unlike semaphores, so the Windows endpoint carries the session:
 `\\.\pipe\heli-<hash of the state directory>-<session id>`. `HELI_STATE_DIR`
-and `HELI_ENDPOINT` override both, which is how tests isolate their daemons.
+and `HELI_ENDPOINT` override both, and `HELI_POOL` and `HELI_CONFIG` the host
+pool (§4) and the configuration file (§5), which is how tests isolate their
+daemons. A client resolves them, relative paths against its own working
+directory, and passes them to the daemon it starts.
 
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
@@ -201,11 +204,36 @@ built a 34-package project on the example host:
 | 5 slots released mid-build | 6 |
 | no jobserver | 16 |
 
-So the daemon creates one semaphore (Windows: `heli-<user-hash>` in the
-session namespace, maximum count N) or one FIFO (Unix:
-`$XDG_RUNTIME_DIR/heli/jobserver`, else `~/.cache/heli/jobserver`, mode 0600)
-with N slots and keeps it open. This is the **host pool**. Every cargo started
-with `CARGO_MAKEFLAGS=-j --jobserver-auth=<name>` draws from it.
+So the daemon creates one semaphore (Windows: `heli-<hash of the state
+directory>` in the session namespace, so one per user, maximum count N) or one
+FIFO (Unix: `$XDG_RUNTIME_DIR/heli/jobserver`, else `~/.cache/heli/jobserver`,
+mode 0600 in a directory of mode 0700) with N slots and keeps it open.
+`HELI_POOL` overrides the name or the path. This is the **host pool**. Every
+cargo started with `CARGO_MAKEFLAGS=-j --jobserver-auth=<name>` (Unix:
+`fifo:<path>`) draws from it. That value ends at the first space and must be
+UTF-8, and cargo opens a semaphore with `OpenSemaphoreA`, so the daemon refuses
+a name with a space, or a semaphore name that is not ASCII.
+
+The daemon reads the free count with `NtQuerySemaphore` (ntdll; the handle
+needs `SEMAPHORE_QUERY_STATE`, which the one `CreateSemaphoreW` returns has,
+and the ones cargo opens do not) or `FIONREAD` on its own nonblocking file
+description of the FIFO. Counts are snapshots.
+
+**Adoption.** A restarted daemon adopts a pool that some process still holds,
+as it is: the slots that process holds come back to the same pool, so a
+restart never doubles it.
+
+- A semaphore lives while any handle to it is open, so one that exists is
+  held. `CreateSemaphoreW` opens it (`ERROR_ALREADY_EXISTS`), and it keeps the
+  maximum it was created with: a new N takes effect once nobody holds it.
+- A FIFO keeps its bytes only while some process holds it open; its path
+  outlives them (verified in WSL: write 3, close every descriptor, reopen:
+  `FIONREAD` 0). So the daemon first opens it write-only and nonblocking,
+  which fails with `ENXIO` when nobody has it open for reading; every
+  jobserver client opens it for reading and writing. A held FIFO is adopted as
+  it is. One that nobody held is empty, and the daemon writes N bytes into it.
+- Slots held by a process that died are not recovered here; that is the
+  top-up's job (below).
 
 ### Run pools
 
@@ -239,7 +267,9 @@ Bare cargo, started without heli, still draws from the host pool directly.
 - **Waiting costs no pool slot.** A cargo blocked on a build-directory lock
   holds no pool slot, because its implicit slot is not drawn from a pool. That
   makes cargo#6747 irrelevant here.
-- **Size.** By default N is the number of logical CPUs. Average memory per job
+- **Size.** By default N is the number of logical CPUs heli may use (as for
+  cargo's own default `-j`), and `[pool] slots` in the configuration sets it,
+  from 1 to 1024 (a FIFO's capacity must hold N bytes). Average memory per job
   is low (3.9 GB at 8 jobs is about 0.5 GB per job), so CPUs run out first.
   Spikes, such as a single rustc at 4.3 GB, are the governor's job.
 - **Memory governor.** The daemon samples available physical memory and, on
@@ -380,8 +410,13 @@ cargo heli daemon [--detach]                       (internal)
     heli;
   - `HELI_DEPTH`: the parent's depth plus one, a backstop against heli
     running itself in a loop.
-- **Configuration**, a per-user file in the OS configuration directory:
-  - pool slots;
+- **Configuration**, a per-user TOML file in the OS configuration directory:
+  `%APPDATA%\heli\config.toml` on Windows, `$XDG_CONFIG_HOME/heli/config.toml`
+  else `~/.config/heli/config.toml` elsewhere, or `HELI_CONFIG`. The daemon
+  reads it as it starts. A value it cannot use keeps it from starting, so
+  commands run directly and the daemon's log says why. Keys it does not know
+  are ignored, so a file written for a newer heli still works. It holds:
+  - pool slots (`[pool] slots`, §4);
   - memory watermarks;
   - disk budget and free-space floor;
   - the store per volume;
@@ -689,7 +724,8 @@ disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremen
 are whole seconds since 1970 (UTC); `status` never starts a daemon.
 
 - `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
-- `pool`: `slots`, `free`, `withheld`, `in_use`;
+- `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
+  never below 0), or `null` when no daemon answers;
 - `memory`: `available`, plus `commit_available` on Windows;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
@@ -718,13 +754,13 @@ drains and evictions, and `cargo heli gc --dry-run`.
 
 | Failure | Effect | Handling |
 |---|---|---|
-| Daemon not running | A bare cargo warns and uses its own pool, as today | `cargo heli` starts the daemon; logon or session hook |
+| Daemon not running | A bare cargo warns and uses its own pool, as today. On Unix, a FIFO left by an earlier daemon still opens but holds no bytes, so a bare cargo runs one job at a time, without a warning | `cargo heli` starts the daemon, which fills the FIFO again (§4); logon or session hook |
 | Daemon unreachable, silent for 5 s, or of another protocol version | `cargo heli` cannot hand over the run | The command runs directly after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
 | An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. The logon task starts the daemon outside any agent's job |
 | Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon task restricted to the logged-on user |
-| Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO path persists | The restarted daemon adopts the existing pools |
+| Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
 | Run killed while holding slots | none | The run pool's loans go back in full (§4) |
 | Unix FIFO holds more than the target | Oversubscription | The daemon drains the surplus (§4) |
