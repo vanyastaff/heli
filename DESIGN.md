@@ -2,6 +2,11 @@
 
 Status: design draft, 2026-10-13. "heli" is a working name.
 
+This document is the single source of truth for heli's mechanisms and
+contracts. Issue #1 states the problem, the user stories and the testing
+decisions, and links here for everything else; the tickets link to the
+sections they implement.
+
 `cargo nextest` took over what `cargo test` did per *test*: a process per
 test, timeouts, groups, retries. heli takes over what nobody owns today: the
 *machine*. Every cargo run on a host shared by many agents and worktrees draws
@@ -9,7 +14,7 @@ from one pool of compile and test slots, keeps its intermediate artifacts in
 one budgeted store, and never waits behind an unrelated run.
 
 ```
-cargo heli nextest run -p flui-view     # instead of: cargo nextest run -p flui-view
+cargo heli nextest run -p my-crate      # instead of: cargo nextest run -p my-crate
 cargo heli clippy --all-targets         # instead of: cargo clippy --all-targets
 cargo heli exec -- cargo xtask ci       # any other command, under the same budget
 cargo heli status                       # who builds what; slots, memory, disk
@@ -20,14 +25,16 @@ through unchanged.
 
 ## 1. The problem, measured
 
-Host: Windows 11, 32 logical CPUs, 64 GB RAM. Workspace: flui, 39 members and
-462 third-party packages on the host platform. 14 agent worktrees. Measured
+heli is not tied to one project. The numbers below come from the host and
+workspace that motivated it, and serve as the worked example throughout:
+Windows 11, 32 logical CPUs, 64 GB RAM; the flui workspace (39 members, 462
+third-party packages on the host platform); 14 agent worktrees. Measured
 2026-10-13.
 
 | Symptom | Evidence | Cause |
 |---|---|---|
-| Runs wait 2-3 h | flui's xtask host lock: one exclusive heavy run per user | Mutual exclusion: a run waits for every run ahead of it, whatever their size. One workspace build peaks at 3.9 GB with 8 jobs (flui `design/build-footprint.md`), so the machine idles while the queue grows. |
-| Memory still runs out | Running beside the lock: `cargo nextest run -p flui-animation`, another project's `cargo test`, one rustc at 4.3 GB | The lock covers only `cargo xtask`. Every other cargo sizes its own pool to all 32 CPUs, and nested cargo inside tests (template, facade and trybuild builds) does it again. |
+| Runs wait 2-3 h | flui's own host lock: one exclusive heavy run per user | Mutual exclusion: a run waits for every run ahead of it, whatever their size. One workspace build peaks at 3.9 GB with 8 jobs, so the machine idles while the queue grows. |
+| Memory still runs out | Running beside the lock: a plain `cargo nextest run -p …`, another project's `cargo test`, one rustc at 4.3 GB | The lock covers only the project's task runner. Every other cargo sizes its own pool to all 32 CPUs, and nested cargo inside tests (generated projects, trybuild) does it again. |
 | Disk fills | 592 GB of `target/` across 14 worktrees, 203 GB free on the volume. The largest is 208.8 GB: 114 GB `debug/incremental`, 31 GB `tests/trybuild`, 24 GB nested-build caches, 30 GB `debug/deps` | Nothing reclaims a build directory while its worktree lives. `incremental/` keeps a directory for every unit ever built (each feature set, each `-p` set), and all of it is regenerable. |
 | Every new worktree builds cold | a new agent worktree has no `target/` | The build directory lives inside the worktree and dies with it. |
 | Work repeats | agents re-run gates on unchanged trees; a tool timeout kills a long run, which is then restarted | Results are not remembered; runs are children of the agent's shell. |
@@ -40,7 +47,8 @@ None of the cargo issues that would fix this is close to landing as a whole
 Goals:
 
 - **G1, no head-of-line blocking.** A run starts compiling at once, with at
-  least one job, whatever else runs.
+  least one job, whatever else runs. The only places a run can wait at all are
+  listed in §5, "Where a run can wait".
 - **G2, one CPU and memory budget per host**, including cargo runs heli did
   not start.
 - **G3, a disk budget enforced automatically**, deleting only what cargo
@@ -48,7 +56,8 @@ Goals:
 - **G4, warm worktrees.** A new worktree starts warm, and two live worktrees
   never share a build directory.
 - **G5, drop-in.** heli takes the same arguments as cargo and nextest. When
-  heli is absent or broken, plain cargo runs; heli never fails a build.
+  heli is absent or broken, plain cargo runs: a failure of heli itself never
+  fails a run.
 - **G6, agent-proof.** A killed client neither kills nor wastes its run, and
   identical runs are not repeated.
 - **G7, small output for agents.** An agent reads what it needs to act: the
@@ -58,8 +67,9 @@ Goals:
 Non-goals:
 
 - Changing cargo's freshness rules, or sharing one build directory between
-  live worktrees. That is unsound: flui `docs/testing.md`, "One target
-  directory per checkout".
+  live worktrees. That is unsound: the same unit built from two worktrees gets
+  one artifact name and one fingerprint, and cargo's mtime freshness then
+  links the other worktree's code (observed in flui).
 - Remote or cross-machine caching. sccache stays usable, because heli does not
   take `RUSTC_WRAPPER`.
 - Feature unification across `-p` sets (cargo#14774). cargo-hakari exists for
@@ -77,11 +87,12 @@ Non-goals:
  | (thin client) |-----------------+           |
  +---------------+                 v           v
                      +------------------------------------------+
-                     | heli daemon (one per user)               |
-                     |  - host pool: jobserver with N slots     |<-- every cargo, rustc,
-                     |  - memory governor, leak top-up          |    build script and
-                     |  - runs: test slots, detach, dedup       |    nested cargo
-                     |  - build store: budget, GC, recycling    |
+                     | heli daemon (one per user, interactive)  |
+                     |  - host pool: jobserver with N slots     |<-- bare cargo and
+                     |  - run pools + broker, test slots        |    everything it starts
+                     |  - memory governor, bounded top-up       |
+                     |  - runs: detach, single-flight, logs     |<-- heli runs, through
+                     |  - build store: budget, GC, recycling    |    their run pool
                      |  - result store                          |
                      +------------------------------------------+
                                        | owns
@@ -100,6 +111,11 @@ The daemon runs commands as its own user, in the client's working directory
 and with the client's environment. Its IPC endpoint (a named pipe with an
 owner-only ACL, or a socket with mode 0600) accepts only that user.
 
+The daemon must run in the user's interactive session, never as a service:
+runs inherit its session, and tests that drive real windows (flui's live
+Win32 tests) need the user's desktop. It is started on demand by a client, or
+by a logon task that runs only while the user is logged on (§10).
+
 ## 4. Host pool
 
 ### Mechanism (verified)
@@ -113,8 +129,15 @@ and to build scripts (cc-rs), and a nested cargo inherits it from the
 environment. If the handle cannot be opened, cargo prints a warning and
 creates its own pool.
 
+**`-j` has no effect under an inherited jobserver.** Cargo requests a token
+for every pending job beyond the first (`src/compiler/job_queue/mod.rs` 582)
+and runs as many jobs as it holds tokens, plus one (`has_extra_tokens`, 613).
+`-j` and `CARGO_BUILD_JOBS` only size the pool cargo creates when it inherits
+none (`build_runner/mod.rs` 109). So the pool a cargo draws from is the only
+lever on its parallelism. That is why §4 "Run pools" exists.
+
 The probe [`experiments/jobserver-probe.ps1`](experiments/jobserver-probe.ps1)
-built a 34-package project on this host:
+built a 34-package project on the example host:
 
 | Pool | Most rustc processes at once |
 |---|---|
@@ -123,19 +146,43 @@ built a 34-package project on this host:
 | no jobserver | 16 |
 
 So the daemon creates one semaphore (Windows: `heli-<user-hash>` in the
-session namespace) or one FIFO (Unix: `$XDG_RUNTIME_DIR/heli/jobserver`, else
-`~/.cache/heli/jobserver`, mode 0600) with N slots and keeps it open. Every
-cargo started with `CARGO_MAKEFLAGS=-j --jobserver-auth=<name>` draws from it.
+session namespace, maximum count N) or one FIFO (Unix:
+`$XDG_RUNTIME_DIR/heli/jobserver`, else `~/.cache/heli/jobserver`, mode 0600)
+with N slots and keeps it open. This is the **host pool**. Every cargo started
+with `CARGO_MAKEFLAGS=-j --jobserver-auth=<name>` draws from it.
+
+### Run pools
+
+Each heli run gets a **run pool** of its own: a second semaphore or FIFO,
+which the run's processes see through `CARGO_MAKEFLAGS` instead of the host
+pool. A broker in the daemon moves slots between the host pool and the run
+pools, every 20 ms:
+
+- **Lend.** A run whose pool has no free slot may be waiting for one. The
+  broker lends it one from the host pool, preferring the waiting run with the
+  fewest slots in use.
+- **Return.** Free slots in a run pool beyond one go back to the host pool.
+- **Share.** While other runs wait, a run already using more than its share
+  (the host pool's capacity divided by the number of active runs) gets no new
+  slots, and its slots return as its jobs finish. Nothing running is
+  interrupted. A run alone can borrow every slot.
+- **Exact accounting.** A run uses `lent − free(run pool)` slots. When a run
+  ends, or is cancelled or killed, all of `lent` goes back to the host pool,
+  whatever its processes held. Leaks are impossible for heli runs.
+- **Latency.** A waiting cargo gets a slot within one broker tick, which is
+  small next to a rustc job. To be measured.
+
+Bare cargo, started without heli, still draws from the host pool directly.
 
 ### Properties
 
 - **Progress.** Each process the make protocol starts owns one implicit slot
-  outside the pool, so every cargo runs at least one job. No run starves, and
+  outside any pool, so every cargo runs at least one job. No run starves, and
   none queues behind another (G1). The flip side is that k cargo processes can
   run N + k jobs at once.
 - **Waiting costs no pool slot.** A cargo blocked on a build-directory lock
-  holds no pool slot, because its implicit slot is not drawn from the pool.
-  That makes cargo#6747 irrelevant here.
+  holds no pool slot, because its implicit slot is not drawn from a pool. That
+  makes cargo#6747 irrelevant here.
 - **Size.** By default N is the number of logical CPUs. Average memory per job
   is low (3.9 GB at 8 jobs is about 0.5 GB per job), so CPUs run out first.
   Spikes, such as a single rustc at 4.3 GB, are the governor's job.
@@ -143,29 +190,33 @@ cargo started with `CARGO_MAKEFLAGS=-j --jobserver-auth=<name>` draws from it.
   Windows, available commit, because allocations fail at the commit limit
   before RAM is full.
   - Below the low watermark (default: 10 % of RAM or 6 GB, whichever is
-    larger), it withholds slots: it acquires one per sample as they free up,
-    down to 1 slot left in the pool.
+    larger), it withholds slots: it acquires one per sample from the host pool
+    as they free up, down to 1 slot left.
   - Above the high watermark (the low one plus 4 GB), it returns them.
   - Jobs already running are never interrupted, so pressure eases as they
     finish.
-- **Leaked slots.** A slot held by a process that gets killed is lost:
-  semaphores and FIFOs have no owner. Whenever no rustc and no build script
-  has been alive for 2 s, no slot can be legitimately held, and the daemon tops
-  the pool back up to N minus the withheld slots.
-  - Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore` up to
-    the maximum.
-  - Unix: `FIONREAD` on the FIFO, then writes.
-
-  Runs started through heli (§5) are not killed when the agent's tool call
-  times out, which removes the main source of leaks.
+- **Bounded top-up.** Only bare cargo can leak a slot: a process killed while
+  holding one, and semaphores and FIFOs have no owner. The host pool's target
+  of free slots is `N − withheld − Σ lent`.
+  - The daemon raises the free count to the target only at quiescence: no
+    heli run active, and no rustc and no build script alive for 2 s.
+    Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore`.
+    Unix: `FIONREAD` on the FIFO, then writes.
+  - The pool never grows beyond the target. On Windows the semaphore's
+    maximum count is N, and a surplus release simply fails (the jobserver
+    client ignores the error). A FIFO has no maximum, so on Unix the daemon
+    also drains, at any time, every byte above the target. A token that a
+    cargo still held during a top-up (between taking it and starting the job,
+    or held by a jobserver client the process scan does not see) then comes
+    back as surplus and is removed.
 
 ### Reach
 
-- A run through `cargo heli` gets the variable from the daemon.
-- A bare cargo gets it from the environment that `cargo heli setup` writes:
-  the agent harness settings (Claude Code `settings.json`, `env`), the shell
-  profile, or the user environment. This is the safety net for G2: an agent
-  that forgets heli still shares the pool.
+- A run through `cargo heli` gets its run pool from the daemon.
+- A bare cargo gets the host pool from the environment that
+  `cargo heli setup` writes: the agent harness settings (Claude Code
+  `settings.json`, `env`), the shell profile, or the user environment. This is
+  the safety net for G2: an agent that forgets heli still shares the pool.
 - Without a running daemon, a bare cargo prints cargo's jobserver warning and
   runs as it does today. `cargo heli` starts the daemon on demand, and
   `cargo heli setup` can also register it to start at logon (Task Scheduler,
@@ -180,58 +231,52 @@ client.
 ### Classes
 
 Runs are classified by subcommand. `cargo heli exec -- <cmd>` covers anything
-else, for example `cargo xtask check-changed`.
+else, for example a project's own task runner.
 
-| Class | Subcommands | Pool | Test slots | Result store | Worktree lock |
+| Class | Subcommands | Run pool | Test slots | Result store | Worktree lock |
 |---|---|---|---|---|---|
 | compile | build, run, doc | yes | no | no | shared |
 | verify | check, clippy, fmt --check | yes | no | yes | shared |
 | test | test, nextest run | yes | yes | yes | shared |
 | mutate | fmt, fix, clippy --fix | no | no | no | exclusive |
-| exec | anything else | yes (environment) | no | opt-in | shared |
+| exec | anything else | yes | no | opt-in | shared |
 
 ### Lifecycle
 
-1. **Key** (verify and test runs only). The key covers:
-   - the worktree's tree with every change staged: `git add -A` into a
-     scratch copy of the index, then `git write-tree`, as in flui#1619;
-   - the normalized argv;
-   - the toolchain versions;
-   - the contents of the Cargo configuration;
-   - the environment, minus a neutral list (§7).
+1. **Key** (verify and test runs only). The key covers the worktree's tree,
+   the normalized argv, the toolchain, the Cargo configuration and the
+   environment; §7 lists exactly what goes in and how.
 2. **Result store.** On a hit, heli prints "already passed: <run>, <when>"
    and exits 0 (§7).
-3. **Single-flight.** If a run with the same key is in flight, the client
-   attaches to it: it streams that run's output and returns its exit code.
-4. **Supersede.** A run from the same worktree, with the same argv and a
-   different tree, that has not started yet is cancelled. It exits 3 with
-   "superseded". A run that has started is never killed for this.
-5. **Detach.** The daemon spawns the command, inside a Job Object on Windows
+3. **Single-flight.** If a run with the same key is in flight anywhere on the
+   machine, the client attaches to it: it streams that run's output and
+   returns its exit code.
+4. **Detach.** The daemon spawns the command, inside a Job Object on Windows
    or a process group on Unix, and the client streams its output.
-   - A killed client leaves the run going, and re-running the same command
-     attaches to it.
+   - A killed client leaves the run going, and re-running the same command in
+     the same worktree attaches to it.
    - `cargo heli cancel <run>` kills the whole process tree.
-6. **Compile phase.** The environment gets the pool, plus
-   `CARGO_BUILD_JOBS` set to a fair share: max(2, ceil(N / active runs)) at
-   start. Cargo cannot change its job count later, but the pool still balances.
-7. **Test phase** (test class only).
-   - heli first builds under the pool, with `nextest run --no-run <args>` or
-     `cargo test --no-run <args>`.
-   - It then takes K slots from the same pool. K is the smallest of the
-     thread count asked for, the fair share, and what is free within 5 s, and
-     at least 1.
+5. **Compile phase.** The environment gets the run pool (§4) and
+   `HELI_RUN=<run id>`. heli sets no `-j`: under a jobserver, cargo ignores it.
+6. **Test phase** (test class only).
+   - heli first builds under the run pool, with `nextest run --no-run <args>`
+     or `cargo test --no-run <args>`.
+   - It then takes K slots for the test threads. K is the smallest of the
+     thread count asked for, the run's share, and the slots free within 5 s.
+     With no slot free after 5 s, the tests run with one thread on the run's
+     implicit slot and hold no pool slot (G1).
    - It runs the tests with `--test-threads K` (nextest) or
      `-- --test-threads=K` (libtest) and holds the K slots until they finish.
    - The wait happens before nextest starts, so it never counts toward
      `slow-timeout`. nextest's test groups and per-test overrides still apply
      within K.
-   - Nested cargo builds inside tests draw from the pool through the
+   - Nested cargo builds inside tests draw from the run pool through the
      inherited environment. They can go beyond K, but stay within the pool.
    - The second invocation re-checks freshness; its cost is to be measured.
-8. **Record.** heli records a passing verify or test run whose tree is
+7. **Record.** heli records a passing verify or test run whose tree is
    unchanged at the end (§7), and writes a source-state record for its build
    directory (§6.4).
-9. **Report.** A header line (slots, wait, fair share, key), then the tool's
+8. **Report.** A header line (slots, share, wait, key), then the tool's
    output in the chosen output mode (see "Output" below), then a footer line
    (duration, peak memory of the process tree, slots held, and the run id for
    `cargo heli log`).
@@ -240,6 +285,52 @@ else, for example `cargo xtask check-changed`.
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
 a file that another heli run is compiling. Bare cargo ignores this lock, so
 the rule "one writing agent per worktree" stays.
+
+### Where a run can wait
+
+These are the only waits; nothing else makes a heli run wait for another run.
+
+1. **Test slots:** up to 5 s before the test phase, after which it proceeds
+   with one thread.
+2. **The worktree lock:** a mutate run waits for heli runs compiling the same
+   worktree, and they wait for it.
+3. **Cargo's own build-directory lock:** two runs building the same worktree
+   at once are serialized by cargo. The waiting cargo holds no pool slot.
+
+### Command line and contracts
+
+```
+cargo heli [--output full|compact|quiet] [-q] [--no-cache] <subcommand> [tool args…]
+cargo heli exec [heli flags] -- <command…>
+cargo heli status [--json]
+cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
+cargo heli cancel <run>
+cargo heli gc [--dry-run]
+cargo heli setup [--print] [--autostart | --no-autostart]
+cargo heli ensure
+cargo heli daemon                                  (internal)
+```
+
+- **Exit codes.**
+  - The tool's own code.
+  - 127 when the command does not exist, 126 when it cannot be started.
+  - 2 for heli's usage errors and refusals: `heli` given as its own
+    subcommand, or nesting deeper than 16 (`HELI_DEPTH`).
+- **Environment given to runs:**
+  - `CARGO_MAKEFLAGS`: the run pool;
+  - `HELI_RUN`: the run id, for tools that skip their own host lock under
+    heli;
+  - `HELI_DEPTH`: the parent's depth plus one, a backstop against heli
+    running itself in a loop.
+- **Configuration**, a per-user file in the OS configuration directory:
+  - pool slots;
+  - memory watermarks;
+  - disk budget and free-space floor;
+  - the store per volume;
+  - tool-cache patterns (§6.3);
+  - eviction ages;
+  - the default output mode;
+  - log retention.
 
 ### Output (G7)
 
@@ -260,7 +351,7 @@ subcommand belong to heli; flags after it belong to the tool.
 - **compact**: the default when stdout is not a terminal, which covers every
   agent tool call.
 - **quiet**: one line on success, for example
-  `ok  nextest run -p flui-view: 812 passed, 3 skipped, 41 s  [r17]`, and the
+  `ok  nextest run -p my-crate: 812 passed, 3 skipped, 41 s  [r17]`, and the
   compact output on failure.
 
 **How compact output is produced**, most robust source first:
@@ -268,7 +359,7 @@ subcommand belong to heli; flags after it belong to the tool.
 1. **The tools' own verbosity controls.** Nothing is parsed, so nothing can
    be misreported.
    - cargo: `--quiet` drops the `Compiling …` line per unit (442 of them in a
-     cold flui build).
+     cold build of the example workspace).
    - nextest: `--cargo-quiet`, `--status-level fail`,
      `--final-status-level fail`, `--success-output never` and
      `--failure-output final`. All five exist in nextest 0.9.146 (`--help`),
@@ -294,7 +385,7 @@ Some things never change: the exit code, the stdout/stderr split, and output
 heli does not recognize, which passes through.
 
 **Nothing is lost.** The daemon already records each run's complete output so
-that clients can attach to it (lifecycle step 5). The output modes only
+that clients can attach to it (lifecycle step 4). The output modes only
 change what the client prints, and the footer names the run. `cargo heli log`
 retrieves the record by run id, without re-running:
 
@@ -317,21 +408,27 @@ prefers rtk's filters to heli's can run `cargo heli --output=full …` under
 
 ### 6.1 Placement
 
-`cargo heli setup` sets `build.build-dir = "<store>/{workspace-path-hash}"`
-in the user's Cargo configuration, or through `CARGO_BUILD_BUILD_DIR`.
-Verified: `build-dir` supports the templates `{workspace-root}`,
+`cargo heli setup` sets `build.build-dir = "<store>/{workspace-path-hash}"`,
+either in the user's Cargo configuration or for one repository (open question
+2). Verified: `build-dir` supports the templates `{workspace-root}`,
 `{cargo-cache-home}` and `{workspace-path-hash}`, the last being a hash of the
 canonical manifest path (cargo `src/context/mod.rs`, `custom_build_dir`; Cargo
 Book, `build.build-dir`).
 
 The intermediates (`deps/`, `incremental/`, `.fingerprint/`, `build/`) leave
 the worktree. `target/` keeps the final artifacts and tool caches: doc,
-trybuild, and flui's nested-build directories.
+trybuild, and whatever a project's own tests build there.
 
 `<store>` must be on the same volume as the worktrees. Cargo hardlinks final
 artifacts out of the build directory, and across volumes it copies them
 instead. The default is `<volume>/.heli/build`, one store per volume that
 holds worktrees.
+
+**Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
+move, anything that searches `target/<profile>/deps` for rlibs, test binaries
+or `.d` files stops finding them. In flui, the candidates are the hot-reload
+fixtures, trybuild and the nested-cargo checks. Before phase 2, a real
+workspace's full test suite (flui's) must pass with `build-dir` set (§12).
 
 This is the direction of cargo#16147. heli turns it on and manages what
 accumulates.
@@ -358,11 +455,13 @@ directories, with a free-space floor F on each volume. Over budget, heli
 evicts down to 85 % of B, cheapest to regenerate first:
 
 1. `incremental/<unit>` directories untouched for 24 h, oldest first across
-   the store. Each unit ever built leaves one; they make up the 114 GB above.
+   the store. Each unit ever built leaves one; in the example they make up
+   114 GB of one worktree.
 2. Orphans that no new worktree claimed within 24 h (§6.4), oldest first.
 3. All of `incremental/` in build directories idle for 6 h.
-4. Configured tool caches in idle worktrees' `target/`: `tests/trybuild`, and
-   for flui `cli-template-check` and `facade-consumer-check`.
+4. Tool caches in idle worktrees' `target/`, named by patterns in the
+   configuration and nowhere else: for example `tests/trybuild`, and for flui
+   `cli-template-check` and `facade-consumer-check`.
 5. Units in `deps/` and `.fingerprint/` unused for 7 days. This is
    cargo-sweep's approach, planned for later.
 6. Whole build directories idle for 7 days, oldest first.
@@ -392,26 +491,47 @@ repository, renamed to the new worktree's `{workspace-path-hash}` path. On one
 volume that is a rename: no copy and no extra disk. One build directory still
 belongs to one live worktree.
 
-Why this is sound, verified in cargo's source:
+What makes this sound, verified in cargo's source:
 
-- **Paths.** Cargo's own dep-info encodes each input path relative to the
-  package root, the workspace root or the build root. It keeps absolute paths
-  only for files outside the workspace, such as registry sources and the
-  sysroot, and those are the same for every worktree on the host
-  (`src/compiler/fingerprint/dep_info.rs`, `DepInfoPathType`).
+- **Paths cargo tracks.** Cargo's own dep-info encodes each input path
+  relative to the package root, the workspace root or the build root. It keeps
+  absolute paths only for files outside the workspace, such as registry
+  sources and the sysroot, and those are the same for every worktree on the
+  host (`src/compiler/fingerprint/dep_info.rs`, `DepInfoPathType`).
 - **Build scripts.** Moves of a build script's `OUT_DIR` are handled through
   the `root-output` file (`src/compiler/custom_build.rs`).
 - **Unit hashes.** They do not depend on the workspace's absolute path: flui
-  saw identical artifact names across worktrees (`docs/testing.md`).
+  saw identical artifact names across worktrees.
 - **Freshness** is decided by mtime, including the rule that a unit is stale
   when a dependency is newer than it (`src/compiler/fingerprint/mod.rs`,
   `StaleDependency`).
 
+**What cargo does not track: paths compiled into binaries.** Cargo drops the
+environment variables it sets itself from its own freshness tracking:
+`OUT_DIR`, `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*`, `CARGO_TARGET_TMPDIR`. Its
+source says so: "technically buggy … we won't recompile that if you move the
+target directory" (`dep_info.rs` 335). After a rename, a unit that stays fresh
+keeps the donor's paths compiled in:
+
+- `env!("CARGO_MANIFEST_DIR")` points into the removed worktree. flui has
+  about 20 files that do this, mostly tests locating their fixtures.
+- `env!("OUT_DIR")` points under the old build directory path.
+
+rustc still records these values in its own dep-info (`# env-dep:NAME=value`
+lines in `deps/*.d`, observed on the example host). So right after the
+rename, heli scans the rustc dep-info. It deletes the fingerprint of every
+unit with an `env-dep` value under the donor's workspace or the old build
+directory path, and cargo rebuilds exactly those units. This applies in both
+modes below.
+
 There are two modes:
 
 - **Conservative**, always available. The new worktree's files are newer than
-  every artifact, so all 39 workspace members rebuild and the 462 third-party
-  packages stay fresh. This is correct by cargo's own rules.
+  every artifact, so every workspace member rebuilds. Third-party packages stay
+  fresh, except those invalidated by the scan above (a crate that compiles an
+  `OUT_DIR` path in, including through `include!`). This is correct by cargo's
+  own rules plus the scan. The cost of the `OUT_DIR` invalidations is to be
+  measured.
 - **Precise.** The donor has a *source-state record*: the blob id and mtime of
   every tracked or untracked file.
   - The record counts only if it was taken after the donor's last build: its
@@ -421,14 +541,15 @@ There are two modes:
     the recorded mtime. Every other file keeps the current time.
   - Every file with the donor's content then looks to cargo exactly as it did
     in the donor, and every changed file is newer than any artifact. Only the
-    changed crates and their dependents rebuild.
+    changed crates, their dependents and the units the scan invalidated
+    rebuild.
   - heli writes records after every run it executes, and the daemon writes one
     when it sees a build lock released.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
     recorded. Cargo rebuilds when one is missing; one that is present keeps
     the current time and also triggers a rebuild.
   - With `-Zchecksum-freshness` (cargo#14136), cargo compares content itself,
-    and precise mode becomes unnecessary.
+    and precise mode becomes unnecessary. The path scan does not.
 
 **Later: cloning.** On volumes with block cloning (Windows Dev Drive on ReFS,
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
@@ -437,20 +558,62 @@ rules apply.
 
 ## 7. Result store
 
-- For each passing verify or test key, heli keeps a marker
-  `<state>/verified/<digest>` holding the run id, the worktree and the time.
-  It keeps at most 256 markers and drops the least recently used first.
-- The key is the one from §5. One rule from flui#1619 is kept: an
-  environment variable is part of the key unless it is listed as neutral (job
-  counts, terminal styling, harness session ids). An unknown variable then
-  misses the cache instead of reusing a result.
-- A marker is written only when the tree at the end equals the tree at the
-  start.
-- Every hit prints the caveats: a flaky test that passed once stays green for
-  that key (`--no-cache` runs it again), and ignored files are not part of the
-  key.
-- Compile runs are never recorded, because their product is the artifact, not
-  the verdict.
+For each passing verify or test key, heli keeps a marker
+`<state>/verified/<digest>` holding the run id, the worktree and the time. It
+keeps at most 256 markers and drops the least recently used first.
+
+**The key.** These rules carry over the lessons of flui#1619, where each one
+was found by a failing test.
+
+- **Encoding.** Every field is hashed as its name's length, the name, the
+  value's length and the value. Values are raw bytes, never lossy UTF-8:
+  environment values, Cargo configuration files, tool output.
+- **Tree.** The worktree with every change staged: `git add -A` into a
+  scratch copy of the index (`GIT_INDEX_FILE`), then `git write-tree`. The real
+  index is never written (`GIT_OPTIONAL_LOCKS=0`).
+- **Base.** For a command that diffs against a base, the merge base too.
+- **Machine.** Host name, OS and architecture, because a state directory in a
+  shared home must not certify another machine.
+- **Toolchain.** `rustc -vV`, and the versions of cargo and of the tools the
+  run uses (clippy, nextest), each asked in the worktree, so that the pinned
+  toolchain answers. A missing tool is keyed as absent.
+- **Cargo configuration.** The content of every `config.toml` and `config` on
+  cargo's discovery path: `.cargo/` in the worktree and every directory above
+  it, then the Cargo home.
+- **Argv**, normalized.
+- **Environment.** Every variable except a neutral list:
+  - Names are case-folded on Windows only.
+  - `PATH`, `LD_LIBRARY_PATH` and the `DYLD_*` search paths are keyed without
+    their entries inside the worktree, which cargo prepends for the programs
+    it runs.
+  - Neutral, and so not keyed:
+    - job and thread counts holding a value the tool accepts (an invalid one
+      fails the run, so it is keyed);
+    - `CARGO_MAKEFLAGS`;
+    - heli's own variables (`HELI_*`);
+    - cargo's terminal styling (`CARGO_TERM_*`);
+    - what cargo sets for the program it runs (`CARGO`, `CARGO_MANIFEST_DIR`,
+      `CARGO_PKG_*` and the like);
+    - locations whose content is keyed elsewhere (`CARGO_HOME`,
+      `CARGO_TARGET_DIR`, `RUSTUP_*`);
+    - shell bookkeeping (`PWD`, `OLDPWD`, `SHLVL`, `_`);
+    - per-session identifiers (terminal and harness session ids).
+  - Any variable not on the list, a test control such as `PROPTEST_CASES`
+    among them, is keyed, so it misses the cache instead of reusing a result.
+- **The plan**, when the command has one, rendered, including the steps it
+  skips on this host.
+
+**When the key is computed.** It is checked twice: before the run waits for
+anything, and again once admitted, because another run may have recorded it
+meanwhile. The tree is snapshotted before planning and again after the steps.
+A marker is written only when the run passed and both snapshots match.
+
+**Caveats**, printed on every hit: a flaky test that passed once stays green
+for that key (`--no-cache` runs it again), and ignored files are not part of
+the key.
+
+Compile runs are never recorded, because their product is the artifact, not
+the verdict.
 
 ## 8. Observability
 
@@ -458,24 +621,35 @@ rules apply.
 
 ```
 pool   32 slots: 21 compiling (4 runs), 6 testing (1 run), 0 withheld   memory 41.2/64 GB, commit 52 %
-runs   r17  agent-a64b...  nextest run -p flui-widgets   test     6 slots  4m12s
-       r18  flui-anim...   clippy --all-targets          compile  -j 8     1m03s
-       r19  agent-a10...   check -p flui-view            attached to r12 (same key)
+runs   r17  agent-a64b...  nextest run -p my-crate     test     6 slots  4m12s
+       r18  agent-f1c0...  clippy --all-targets        compile  9 slots  1m03s
+       r19  agent-a10...   check -p other-crate        attached to r12 (same key)
 disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremental >24h, ~40 GB
 ```
 
-There is also `cargo heli status --json`, a rotating log of admissions,
-withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
+`cargo heli status --json` has a versioned schema:
 
-## 9. Adoption in flui
+- `pool`: `slots`, `free`, `withheld`, `in_use`;
+- `memory`: `available`, plus `commit_available` on Windows;
+- `runs`: one entry per run, with `id`, `worktree`, `argv`, `class`,
+  `phase` (building, testing, done), `slots`, `share`, `waiting_since`,
+  `attached_clients` and `started_at`;
+- `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
+  `by_category`;
+- `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
+
+There is also a rotating log of admissions, loans, withholdings, top-ups,
+drains and evictions, and `cargo heli gc --dry-run`.
+
+## 9. Adoption in flui (worked example)
 
 1. Run `cargo heli setup`: pool environment for the agents, `build-dir`, a
    store on D:.
 2. Update AGENTS.md: `cargo heli nextest run -p <crate>` while iterating, and
    `cargo heli exec -- cargo xtask check-changed` before a PR.
 3. In xtask, skip `host_lock` when it runs under heli (`HELI_RUN` is set) or
-   when the pool variable is present. The pool replaces the fixed
-   `CARGO_BUILD_JOBS=28` from flui#1619.
+   when the pool variable is present. The fixed `CARGO_BUILD_JOBS=28` from
+   flui#1619 has no effect under a jobserver (§4).
 4. `cargo xtask worktree prune` keeps handling branches. Deleting `target/` is
    no longer its job.
 
@@ -484,12 +658,18 @@ withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
 | Failure | Effect | Handling |
 |---|---|---|
 | Daemon not running | A bare cargo warns and uses its own pool, as today | `cargo heli` starts the daemon; logon or session hook |
-| Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO path persists | The restarted daemon adopts the existing semaphore or FIFO |
-| Slot leak | The pool shrinks | Top-up at quiescence (§4) |
+| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon task restricted to the logged-on user |
+| Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO path persists | The restarted daemon adopts the existing pools |
+| Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
+| Run killed while holding slots | none | The run pool's loans go back in full (§4) |
+| Unix FIFO holds more than the target | Oversubscription | The daemon drains the surplus (§4) |
 | Memory spike | New jobs wait | Slots are withheld; running jobs finish |
 | GC races a build | none | Try-lock, rename to trash, skip busy directories |
-| Recycled directory with a bad record | Could link stale code | A record counts only if it is newer than every file in the build directory; otherwise conservative mode |
+| Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |
+| Recycled directory with a stale record | Could link stale code | A record counts only if it is newer than every file in the build directory; otherwise conservative mode |
+| Tools looking in `target/<profile>/deps` | They miss moved intermediates | Validated on a real workspace before phase 2 (§6.1) |
 | False green from the cache | A flaky pass is reused | Printed caveat; `--no-cache` |
+| heli runs itself in a loop | Unbounded processes | `heli` is refused as a subcommand; `HELI_DEPTH` stops at 16 |
 | Another logon session (SSH, a service) | On Windows, a separate session namespace, so a separate pool | Documented; a global namespace needs admin rights (later) |
 
 ## 11. Upstream map
@@ -498,7 +678,7 @@ withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
 |---|---|---|
 | cargo#5931, per-user artifact cache | §6.4 recycling, one owner at a time | heli's store can defer to it |
 | cargo#16147, build-dir out of the workspace | §6.1 | heli stops setting it |
-| cargo#14136, checksum freshness | §6.4 precise mode | Precise mode becomes cargo's |
+| cargo#14136, checksum freshness | §6.4 precise mode | Precise mode becomes cargo's; the path scan stays |
 | cargo#4282, #17508, finer locking | Not solved: one build directory per worktree, and the pool makes waiting cheap | Concurrent runs in one worktree get faster |
 | cargo#6747, jobserver token while waiting on a file lock | Irrelevant under the pool (§4) | none |
 | cargo#13136, target GC | §6.3 | heli's eviction ladder can call it |
@@ -507,31 +687,40 @@ withholdings, top-ups and evictions, and `cargo heli gc --dry-run`.
 
 ## 12. Plan
 
-- **Phase 0**, no code, one day. A semaphore kept open, `CARGO_MAKEFLAGS` in
-  the agents' environment, the xtask lock turned off. It measures whether the
-  pool alone ends the queues. Known gaps: no governor, no leak top-up, test
-  threads unbounded.
-- **Phase 1.** Daemon, pool, governor, top-up,
-  `cargo heli build/check/clippy/test/nextest/exec`, detach and attach,
-  `status`, output modes with the run log and `cargo heli log`. Exit criteria,
-  on flui with at least 4 agents:
+- **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
+  open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned
+  off. It measures whether a shared pool alone ends the queues and bounds
+  memory. Known gaps: no governor, no leak top-up, no run pools, test threads
+  unbounded.
+- **Phase 1.** Daemon, host pool, run pools and broker, governor, bounded
+  top-up, `cargo heli build/check/clippy/test/nextest/exec`, detach and
+  attach, `status`, output modes with the run log and `cargo heli log`. Exit
+  criteria, on flui with at least 4 agents:
   - no run waits more than 10 s for its first rustc;
   - available commit never drops below 10 %;
   - no out-of-memory failure;
   - total wall time no worse than with the lock;
   - compact output at least 80 % smaller than full output on green runs of
-    `nextest run -p flui-widgets` and `clippy --all-targets`;
+    a one-crate nextest run and of `clippy --all-targets`;
   - on a failing run, the compact output alone is enough to locate each
     failure.
 - **Phase 2.** Build store: placement, accounting, the eviction ladder,
-  conservative recycling, then precise recycling.
-- **Phase 3.** Result store, single-flight, supersede.
-- **Phase 4.** Donation by block cloning, fair-share priorities, per-job
-  memory calibration.
+  conservative recycling, then precise recycling. Entry gate: flui's full test
+  suite passes with `build-dir` set (§6.1).
+- **Phase 3.** Result store and single-flight.
+- **Phase 4.** Donation by block cloning, priorities beyond equal shares,
+  per-job memory calibration.
 
-Measure throughout: time to the first rustc, run wall time, pool
-utilization, minimum available memory and commit, disk by category per day,
-units rebuilt after a recycle, and output bytes per run in each mode.
+Measure throughout:
+
+- time to the first rustc;
+- run wall time;
+- pool utilization;
+- broker latency;
+- minimum available memory and commit;
+- disk by category per day;
+- units rebuilt after a recycle;
+- output bytes per run in each mode.
 
 ## 13. Open questions
 
@@ -539,8 +728,6 @@ units rebuilt after a recycle, and output bytes per run in each mode.
 2. `build-dir` in the user's Cargo configuration affects every project on the
    machine. Should it be opt-in per repository instead?
 3. The default budget B (proposed: 150 GB on D:) and floor F (proposed: 50 GB).
-4. Should supersede ever kill a run that has already started in the same
-   worktree with the same command?
-5. Is a pool per logon session enough, or do agents run in other sessions
+4. Is a pool per logon session enough, or do agents run in other sessions
    (SSH, services)?
-6. Should the default without a terminal be `compact` or `quiet`?
+5. Should the default without a terminal be `compact` or `quiet`?
