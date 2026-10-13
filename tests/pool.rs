@@ -221,6 +221,132 @@ fn a_restarted_daemon_adopts_the_pool() {
         status["pool"],
         json!({"slots": 2, "free": 2, "withheld": 0, "in_use": 0})
     );
+    assert_eq!(pool_openings(&fixture), ["created", "adopted"]);
+}
+
+/// How each daemon of `fixture` found its pool, as its log says: `created`
+/// or `adopted`, oldest first.
+fn pool_openings(fixture: &Fixture) -> Vec<&'static str> {
+    daemon_log(fixture)
+        .lines()
+        .filter(|line| line.contains("] pool "))
+        .map(|line| {
+            if line.contains(": created, ") {
+                "created"
+            } else if line.contains(": adopted, ") {
+                "adopted"
+            } else {
+                panic!("a pool line that says neither: {line}")
+            }
+        })
+        .collect()
+}
+
+/// A pool that another process holds, with one slot taken, as a cargo would
+/// hold it.
+struct Holder {
+    #[cfg(windows)]
+    semaphore: std::os::windows::io::OwnedHandle,
+    #[cfg(unix)]
+    fifo: std::fs::File,
+}
+
+impl Holder {
+    /// Opens the pool `name` as cargo's jobserver does, and takes a slot.
+    #[cfg(windows)]
+    fn take(name: &std::ffi::OsStr) -> Self {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            OpenSemaphoreW, SEMAPHORE_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE,
+            WaitForSingleObject,
+        };
+
+        let wide: Vec<u16> = name.encode_wide().chain([0]).collect();
+        // SAFETY: `wide` is NUL-terminated; the handle is owned below.
+        let handle = unsafe {
+            OpenSemaphoreW(
+                SYNCHRONIZATION_SYNCHRONIZE | SEMAPHORE_MODIFY_STATE,
+                0,
+                wide.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "open the semaphore");
+        // SAFETY: a semaphore handle just opened.
+        let taken = unsafe { WaitForSingleObject(handle, 0) };
+        assert_eq!(taken, WAIT_OBJECT_0, "take a slot");
+        Self {
+            // SAFETY: the handle is this holder's from here on.
+            semaphore: unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) },
+        }
+    }
+
+    /// Opens the pool `name` as cargo's jobserver does, and takes a slot.
+    #[cfg(unix)]
+    fn take(name: &std::ffi::OsStr) -> Self {
+        use std::io::Read;
+        let mut fifo = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
+            .expect("open the FIFO");
+        fifo.read_exact(&mut [0u8]).expect("take a slot");
+        Self { fifo }
+    }
+
+    /// Gives the slot back.
+    #[cfg(windows)]
+    fn give_back(&self) {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: a semaphore handle with SEMAPHORE_MODIFY_STATE.
+        let released = unsafe {
+            windows_sys::Win32::System::Threading::ReleaseSemaphore(
+                self.semaphore.as_raw_handle(),
+                1,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_ne!(released, 0, "give the slot back");
+    }
+
+    /// Gives the slot back.
+    #[cfg(unix)]
+    fn give_back(&self) {
+        use std::io::Write;
+        (&self.fifo).write_all(b"|").expect("give the slot back");
+    }
+}
+
+/// A pool that some process still holds, with a slot taken, is adopted as it
+/// is by the next daemon: the slot is in use, and comes back to the same
+/// pool. On Windows the semaphore also keeps the size it was made with,
+/// whatever the configuration now says.
+#[test]
+fn a_held_pool_is_adopted_as_it_is() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 2\n");
+    start_daemon(&fixture);
+    let holder = Holder::take(&fixture.pool());
+    let daemon = fixture.daemon_pid().expect("a daemon");
+    support::kill_process(daemon);
+    fixture.wait_for_status("the daemon to be gone", |status| status["daemon"].is_null());
+    if cfg!(windows) {
+        fixture.configure("[pool]\nslots = 5\n");
+    }
+
+    start_daemon(&fixture);
+    assert_eq!(
+        fixture.status()["pool"],
+        json!({"slots": 2, "free": 1, "withheld": 0, "in_use": 1})
+    );
+    holder.give_back();
+    assert_eq!(
+        fixture.status()["pool"],
+        json!({"slots": 2, "free": 2, "withheld": 0, "in_use": 0})
+    );
+    assert_eq!(pool_openings(&fixture), ["created", "adopted"]);
 }
 
 /// A daemon killed while nothing builds leaves a pool that nobody holds: the
@@ -241,6 +367,26 @@ fn a_daemon_after_an_idle_one_has_every_slot() {
         status["pool"],
         json!({"slots": 3, "free": 3, "withheld": 0, "in_use": 0})
     );
+    assert_eq!(pool_openings(&fixture), ["created", "created"]);
+}
+
+/// Runs `echo-args` through `heli`, whose daemon cannot start, and returns
+/// that daemon's log: the command ran directly, after one warning.
+fn refused(fixture: &Fixture, heli: &mut Command) -> String {
+    let echo = fixture.echo_args();
+    let output = heli
+        .args(["exec", "--"])
+        .arg(&echo)
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli exec");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("cargo-heli: warning: the heli daemon exited with code 1"),
+        "{stderr}"
+    );
+    assert!(stderr.ends_with("echo-args: stderr\n"), "{stderr}");
+    daemon_log(fixture)
 }
 
 /// A pool size the daemon cannot use keeps it from starting: the command
@@ -250,21 +396,50 @@ fn an_unusable_pool_size_is_refused() {
     for slots in ["0", "5000", "\"many\""] {
         let fixture = Fixture::new("basic");
         fixture.configure(&format!("[pool]\nslots = {slots}\n"));
-        let echo = fixture.echo_args();
-        let output = fixture
-            .heli(["exec", "--"])
-            .arg(&echo)
-            .output()
-            .expect("run heli");
-        assert_success(&output, "cargo heli exec");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.starts_with("cargo-heli: warning: the heli daemon exited with code 1"),
-            "slots = {slots}: {stderr}"
-        );
-        let log = daemon_log(&fixture);
+        let log = refused(&fixture, &mut fixture.heli(Vec::<String>::new()));
         assert!(log.contains("slots"), "slots = {slots}: {log}");
     }
+}
+
+/// A pool that `CARGO_MAKEFLAGS` cannot carry (the value ends at the first
+/// space, and cargo opens a semaphore by an ASCII name) is refused too.
+#[test]
+fn a_pool_cargo_cannot_name_is_refused() {
+    let cases: &[&str] = if cfg!(windows) {
+        &["heli test", "heli-tést"]
+    } else {
+        &["job server"]
+    };
+    for case in cases {
+        let fixture = Fixture::new("basic");
+        let name = if cfg!(windows) {
+            (*case).into()
+        } else {
+            fixture.path(case).into_os_string()
+        };
+        let mut heli = fixture.heli(Vec::<String>::new());
+        heli.env("HELI_POOL", &name);
+        let log = refused(&fixture, &mut heli);
+        assert!(log.contains("cannot open the pool"), "{name:?}: {log}");
+    }
+}
+
+/// A relative `HELI_CONFIG` is relative to the caller's directory, for the
+/// daemon too.
+#[test]
+fn a_relative_configuration_file_is_the_callers() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    std::fs::write(fixture.workspace().join("heli.toml"), "[pool]\nslots = 3\n")
+        .expect("write the configuration");
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(&echo)
+        .env("HELI_CONFIG", "heli.toml")
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli exec");
+    assert_eq!(fixture.status()["pool"]["slots"], 3);
 }
 
 /// The daemon's own log, whatever its session suffix.
