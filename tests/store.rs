@@ -14,11 +14,53 @@ mod support;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
 use support::{Fixture, assert_success};
 
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Now, in whole seconds since 1970.
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_secs()
+}
+
+/// Polls `check` until it returns something, and returns that; panics after
+/// 30 s, naming `what` it waited for.
+fn wait_for<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(found) = check() {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `path` with every link and spelling resolved, for comparing places.
+fn canonical(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    std::fs::canonicalize(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// The owner manifest of build directory `dir`, if it has one.
+fn owner(dir: &Path) -> Option<Value> {
+    let text = std::fs::read_to_string(dir.join(".heli").join("owner")).ok()?;
+    Some(serde_json::from_str(&text).unwrap_or_else(|error| panic!("{text}: {error}")))
+}
+
+/// A whole number of seconds from a manifest.
+fn seconds(owner: &Value, field: &str) -> u64 {
+    owner[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("no {field} in {owner}"))
 }
 
 /// The comment setup puts before the line it adds to a Cargo configuration.
@@ -257,6 +299,193 @@ fn every_project_set_up_builds_into_the_store() {
         user_config.display()
     );
     assert!(stdout.lines().any(|line| line == done), "{stdout}");
+}
+
+/// Sets up the repository whose main worktree is `dir`, `<fixture>/store`
+/// as its store; the user's Cargo configuration is declined.
+fn set_up_repository(fixture: &Fixture, dir: &Path) {
+    let mut setup = fixture.setup(None, Vec::<String>::new());
+    setup.current_dir(dir);
+    let output = answered(setup, "y\nn\n");
+    assert_success(&output, "cargo heli setup");
+    assert!(dir.join(".cargo").join("config.toml").is_file());
+}
+
+/// Builds `echo-args` with heli in `dir`.
+fn build_in(fixture: &Fixture, dir: &Path) {
+    let output = heli_in(fixture, dir, &["build", "--quiet", "-p", "echo-args"])
+        .output()
+        .expect("run heli build");
+    assert_success(&output, &format!("cargo heli build in {}", dir.display()));
+}
+
+/// The owner manifests of the build directories in `store`, once there are
+/// `count` of them, by the canonical path of their workspace.
+fn owners(store: &Path, count: usize) -> Vec<(PathBuf, Value)> {
+    wait_for(&format!("{count} owner manifests"), || {
+        let owners: Vec<(PathBuf, Value)> = build_dirs(store)
+            .iter()
+            .filter_map(|dir| owner(dir))
+            .map(|owner| {
+                let workspace = owner["workspace"].as_str().expect("a workspace path");
+                (canonical(workspace), owner)
+            })
+            .collect();
+        (owners.len() == count).then_some(owners)
+    })
+}
+
+/// A run in a workspace leaves an owner manifest in its build directory: the
+/// workspace, its repository (the git common directory, shared by the
+/// worktrees of one repository), when the manifest was created and when
+/// the last run started. A later run updates only the last.
+#[test]
+fn each_build_directory_names_its_owner() {
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let main = fixture.workspace();
+    let other = fixture.copy_workspace("other");
+    init_repo(&main);
+    init_repo(&other);
+    set_up_repository(&fixture, &main);
+    set_up_repository(&fixture, &other);
+    // Inside the main worktree, as Claude Code puts its worktrees, so its
+    // configuration covers this one too.
+    let linked = main.join(".claude").join("worktrees").join("linked");
+    git(
+        &main,
+        &["worktree", "add", "--quiet", &linked.to_string_lossy()],
+    );
+
+    let before = now();
+    for dir in [&main, &linked, &other] {
+        build_in(&fixture, dir);
+    }
+    let owners = owners(&store, 3);
+    let after = now();
+    let find = |dir: &Path| {
+        let dir = canonical(dir);
+        owners
+            .iter()
+            .find(|(workspace, _)| *workspace == dir)
+            .map(|(_, owner)| owner.clone())
+            .unwrap_or_else(|| panic!("no manifest for {}: {owners:?}", dir.display()))
+    };
+    let repository = |owner: &Value| canonical(owner["repository"].as_str().expect("a repository"));
+    for (dir, repo) in [(&main, &main), (&linked, &main), (&other, &other)] {
+        let owner = find(dir);
+        assert_eq!(repository(&owner), canonical(repo.join(".git")), "{owner}");
+        let (created, last) = (seconds(&owner, "created_at"), seconds(&owner, "last_run"));
+        assert!(
+            before <= created && created <= last && last <= after,
+            "{owner}"
+        );
+    }
+
+    let first = find(&main);
+    std::thread::sleep(Duration::from_millis(1100));
+    build_in(&fixture, &main);
+    let later = wait_for("the last run to move", || {
+        let owner = find_owner(&store, &main);
+        (seconds(&owner, "last_run") > seconds(&first, "last_run")).then_some(owner)
+    });
+    assert_eq!(later["created_at"], first["created_at"], "{later}");
+    assert_eq!(later["workspace"], first["workspace"], "{later}");
+}
+
+/// The directories `cargo heli gc --dry-run --json` lists.
+fn gc(fixture: &Fixture) -> Vec<Value> {
+    let output = fixture
+        .heli(["gc", "--dry-run", "--json"])
+        .output()
+        .expect("run heli gc --dry-run");
+    assert_success(&output, "cargo heli gc --dry-run --json");
+    let listing: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!("not JSON ({error}): {}", text(&output.stdout));
+    });
+    assert_eq!(listing["schema"], 1, "{listing}");
+    listing["dirs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no dirs: {listing}"))
+        .clone()
+}
+
+/// The build directory `gc --dry-run` lists for `workspace`, if any.
+fn listed_build_dir(fixture: &Fixture, workspace: &Path) -> Option<Value> {
+    let workspace = canonical(workspace);
+    gc(fixture).into_iter().find(|dir| {
+        dir["kind"] == "build"
+            && dir["workspace"]
+                .as_str()
+                .is_some_and(|path| std::fs::canonicalize(path).ok() == Some(workspace.clone()))
+    })
+}
+
+/// A build directory is busy while cargo builds in it (its lock cannot be
+/// taken), live once the build is over and its workspace exists, and an
+/// orphan once its worktree is removed. `gc --dry-run` deletes nothing.
+#[test]
+fn a_build_directory_is_busy_then_live_then_orphan() {
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    set_up_repository(&fixture, &main);
+    let linked = main.join(".claude").join("worktrees").join("linked");
+    git(
+        &main,
+        &["worktree", "add", "--quiet", &linked.to_string_lossy()],
+    );
+
+    let gate = fixture.path("gate");
+    let build = heli_in(&fixture, &linked, &["build", "--quiet", "-p", "gated"])
+        .env("HELI_FIXTURE_GATE", &gate)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start heli build");
+    let busy = wait_for("the build directory to be busy", || {
+        listed_build_dir(&fixture, &linked).filter(|dir| dir["state"] == "busy")
+    });
+    std::fs::write(&gate, "").expect("open the gate");
+    let output = build.wait_with_output().expect("wait for the build");
+    assert_success(&output, "cargo heli build -p gated");
+
+    let live = listed_build_dir(&fixture, &linked).expect("listed after the build");
+    assert_eq!(live["state"], "live", "{live}");
+    assert_eq!(live["path"], busy["path"], "{live}");
+    let path = PathBuf::from(live["path"].as_str().expect("a path"));
+    assert_eq!(
+        canonical(path.parent().and_then(Path::parent).expect("a store")),
+        canonical(&store)
+    );
+    assert_eq!(
+        canonical(live["repository"].as_str().expect("a repository")),
+        canonical(main.join(".git"))
+    );
+
+    git(
+        &main,
+        &["worktree", "remove", "--force", &linked.to_string_lossy()],
+    );
+    let orphans: Vec<Value> = gc(&fixture)
+        .into_iter()
+        .filter(|dir| dir["path"] == live["path"])
+        .collect();
+    assert_eq!(orphans.len(), 1, "{orphans:?}");
+    assert_eq!(orphans[0]["state"], "orphan", "{orphans:?}");
+    assert!(path.is_dir(), "gc --dry-run deletes nothing");
+}
+
+/// The owner manifest of `workspace`'s build directory in `store`.
+fn find_owner(store: &Path, workspace: &Path) -> Value {
+    let workspace = canonical(workspace);
+    build_dirs(store)
+        .iter()
+        .filter_map(|dir| owner(dir))
+        .find(|owner| canonical(owner["workspace"].as_str().expect("a path")) == workspace)
+        .unwrap_or_else(|| panic!("no manifest for {}", workspace.display()))
 }
 
 /// A Cargo configuration whose `build-dir` an earlier setup wrote with

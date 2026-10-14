@@ -28,6 +28,7 @@
 //! is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
+pub mod accounts;
 pub mod execute;
 pub mod key;
 pub mod registry;
@@ -105,6 +106,11 @@ pub fn main() -> ! {
     ));
 
     let daemon = Arc::new(Daemon {
+        accounts: accounts::Accounts::new(
+            config.store.clone(),
+            locations.state_dir.clone(),
+            log.clone(),
+        ),
         registry: Registry::new(&locations.run_counter()),
         pool,
         runlog: RunLog::new(locations.run_logs(), Limits::configured(&config.log)),
@@ -179,6 +185,7 @@ fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter>
 }
 
 struct Daemon {
+    accounts: Arc<accounts::Accounts>,
     registry: Registry,
     pool: Pool,
     runlog: RunLog,
@@ -286,6 +293,8 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
+        self.accounts
+            .learn(&request, request.class.unwrap_or(Class::Exec));
         // Once admitted, after any wait (which belongs above): another run
         // may have passed with the same key meanwhile.
         let key = match self.results.admitted(&request) {
@@ -441,9 +450,10 @@ fn exited(status: std::process::ExitStatus) -> Reply {
     }
 }
 
-/// The daemon's own log file.
+/// The daemon's own log file; clones write to the same file.
+#[derive(Clone)]
 struct Log {
-    file: Option<Mutex<File>>,
+    file: Option<Arc<Mutex<File>>>,
 }
 
 impl Log {
@@ -454,7 +464,7 @@ impl Log {
             .open(locations.log_file())
             .ok();
         Self {
-            file: file.map(Mutex::new),
+            file: file.map(|file| Arc::new(Mutex::new(file))),
         }
     }
 

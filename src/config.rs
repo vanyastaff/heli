@@ -34,7 +34,7 @@ pub struct Config {
 }
 
 /// `[store]`: the build store (`crate::store`).
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 pub struct StoreConfig {
     /// The stores, absolute; on each volume the first one there serves it.

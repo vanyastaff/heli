@@ -15,6 +15,7 @@
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
+//! - [`store`]: the build store, and [`gc`], which lists its directories;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
 //!   draw from the pool, and cargo's `build-dir` in the build [`store`];
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
@@ -28,6 +29,7 @@ mod config;
 mod daemon;
 mod direct;
 mod environment;
+mod gc;
 mod ipc;
 mod launch;
 mod locations;
@@ -65,6 +67,7 @@ fn main() {
         cli::Action::Ensure => client::ensure(depth),
         cli::Action::Setup { print } => setup::main(print),
         cli::Action::Log { run, select } => client::log(&run, &select),
+        cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),
