@@ -113,6 +113,13 @@ fn the_same_command_attaches_to_the_run_in_flight() {
     let stderr = support::without_footer(&second.stderr);
     let (notice, rest) = split_notice(&stderr);
     assert!(notice.contains(&id), "{notice}");
+    // It says how long the run has been going: it may have started before
+    // the files it reads were last changed.
+    let age = notice
+        .split_once("the same command started ")
+        .and_then(|(_, rest)| rest.split_once(" s ago"))
+        .and_then(|(seconds, _)| seconds.parse::<f64>().ok());
+    assert!(age.is_some_and(|age| age > 0.0), "{notice}");
     assert_eq!(rest, "echo-args: stderr\n");
     let started = std::fs::read_to_string(&starts).expect("read the starts");
     assert_eq!(started.lines().count(), 1, "the command started once");

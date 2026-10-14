@@ -7,8 +7,10 @@
 //! `crate::protocol`:
 //!
 //! - **run**: look its key up in the result store ([`results`], keyed by
-//!   [`key`]), then attach the client to the same command in flight, if
-//!   any; else admit it to the registry ([`registry`]) and the event log
+//!   [`key`]), then attach the client to the same run in flight, if any:
+//!   the same command, or for a verify or test run the same key, from any
+//!   worktree (single-flight); else admit it to the registry
+//!   ([`registry`]) and the event log
 //!   ([`events`]), tell the client it started, and then, in a thread of the
 //!   run's own: wait for its turn at the worktree lock, look its key up
 //!   again, start its record in the run log (`crate::runlog`), give it a
@@ -63,16 +65,17 @@ use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::pool::broker::{Broker, Loans};
 use crate::pool::{self, Pool};
-use crate::protocol::{self, CancelRequest, Channel, LogRequest, Reply, Request, RunRequest};
+use crate::protocol::{self, CancelRequest, Channel, LogRequest, Reply, Request, RunRequest, Text};
 use crate::runlog::{self, Limits, Recorder, RunLog};
 use crate::status::{self, Phase, Status};
 use crate::{clock, nesting, worktree};
 
 use events::Events;
 use governor::Governor;
+use key::Key;
 use live::Live;
-use registry::{Admission, Attached, Command, Registry, RunId, RunIds};
-use results::Admitted;
+use registry::{Admission, Attached, Command, Registry, RunId, RunIds, Same};
+use results::{Admitted, Before};
 use test_run::TestRun;
 
 /// The daemon's exit code when another daemon already holds the lock: the
@@ -346,24 +349,35 @@ impl Daemon {
     }
 
     /// Executes `request` for the client on `stream`, or attaches the
-    /// client to the same command in flight.
+    /// client to the same run in flight (single-flight, for a verify or
+    /// test run: the same key, from any worktree).
     fn run(&self, mut stream: Stream, request: RunRequest) {
         let (serving, retiring) = self.serving();
-        // Before the run waits for anything.
-        if let Some(passed) = self.results.before(&request) {
-            let _ = protocol::write_message(&mut stream, &passed.reply());
-            return;
-        }
+        // Before the run waits for anything: its key, which a pass may hold
+        // already, and which finds the same run in flight.
+        let key = match self.results.before(&request) {
+            Before::Passed(passed) => {
+                let _ = protocol::write_message(&mut stream, &passed.reply());
+                return;
+            }
+            Before::Miss(key) => key,
+        };
         let worktree = worktree::of(&execute::cwd(&request));
         let admission = self.registry.admit(
             worktree.clone(),
             Command::of(&request),
+            Same::of(&request, key.as_ref()),
             request.class.unwrap_or(Class::Exec),
             nested(&request),
             retiring,
         );
         match admission {
-            Admission::New(id) => self.start(stream, &request, id, &worktree),
+            // A run that waits for nothing keeps its key: its tree is the
+            // one just snapshotted.
+            Admission::New { id, waits } => {
+                let key = key.filter(|_| !waits);
+                self.start(stream, &request, id, &worktree, key);
+            }
             Admission::Attached(run) => self.attach(stream, &request, run),
             Admission::Refused(reason) => {
                 if !retiring {
@@ -378,12 +392,13 @@ impl Daemon {
     }
 
     /// Follows run `run.id`, already in flight, for the client on `stream`,
-    /// which asked for the same command (`request`).
+    /// which asked for the same run (`request`).
     fn attach(&self, mut stream: Stream, request: &RunRequest, run: Attached) {
         let _pin = self.runlog.pin(&run.id.to_string());
         let started = Reply::Started {
             run: run.id.to_string(),
             attached: Some(u64::try_from(run.running_for.as_millis()).unwrap_or(u64::MAX)),
+            keyed_in: run.keyed_in.map(|worktree| Text(worktree.into_os_string())),
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.detach(run.id);
@@ -393,8 +408,16 @@ impl Daemon {
     }
 
     /// Starts run `id` of `request` in `worktree`, and follows it for the
-    /// client on `stream`; returns once the run has ended.
-    fn start(&self, mut stream: Stream, request: &RunRequest, id: RunId, worktree: &Path) {
+    /// client on `stream`; returns once the run has ended. `known` is the
+    /// key it keeps, if it keeps the one it was admitted with.
+    fn start(
+        &self,
+        mut stream: Stream,
+        request: &RunRequest,
+        id: RunId,
+        worktree: &Path,
+        known: Option<Key>,
+    ) {
         let argv = execute::argv(request);
         let admission = serde_json::json!({
             "worktree": worktree.to_string_lossy(),
@@ -406,6 +429,7 @@ impl Daemon {
         let started = Reply::Started {
             run: id.to_string(),
             attached: None,
+            keyed_in: None,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.abandon(id);
@@ -419,19 +443,21 @@ impl Daemon {
         self.registry.told(id, Arc::clone(&live));
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
-            scope.spawn(|| self.execute(id, request, &live, learning.as_ref()));
+            scope.spawn(|| self.execute(id, request, &live, known, learning.as_ref()));
             self.follow(id, &live, stream, request.class.is_some());
         });
     }
 
     /// Run `id` of `request`, from its turn at the worktree lock to its end;
-    /// all of it reaches its clients through `live`. Before it starts, its
-    /// build directory is recycled if `learning` says it may be.
+    /// all of it reaches its clients through `live`. `known` is the key it
+    /// keeps, if any (it waits for nothing). Before it starts, its build
+    /// directory is recycled if `learning` says it may be.
     fn execute(
         &self,
         id: RunId,
         request: &RunRequest,
         live: &Live,
+        known: Option<Key>,
         learning: Option<&accounts::Learning>,
     ) {
         // The worktree lock: its clients hear which runs it waits for, if
@@ -444,10 +470,16 @@ impl Daemon {
             return;
         }
         // Admitted, and done waiting: another run may have passed with the
-        // same key meanwhile, and the worktree may have changed, so the key
-        // is computed and looked up again. Its snapshot of the tree is the
-        // one the run starts on.
-        let key = match self.results.admitted(request) {
+        // same key meanwhile, so the key is looked up again; after a wait,
+        // the worktree may have changed too, so it is computed again first,
+        // and the run takes the clients of the key it now has. Its snapshot
+        // of the tree is the one the run starts on.
+        let keep = known.is_some();
+        let admitted = self.results.admitted(request, known);
+        if !keep && let Admitted::Run { key, .. } = &admitted {
+            self.registry.keyed(id, key.as_ref());
+        }
+        let key = match admitted {
             Admitted::Passed(passed) => {
                 self.registry.abandon(id);
                 live.end(passed.reply());
@@ -542,18 +574,25 @@ impl Daemon {
         })
     }
 
-    /// Runs test run `run` in its two phases (`test_run`): the build, then,
-    /// if it passed, the tests on as many threads as it got test slots. A
-    /// header line on its stderr says how many, its share, and how long it
-    /// waited for them.
+    /// Runs test run `run` in its two phases (`test_run`): the build (a
+    /// request of its own), then, if it passed, the tests on as many
+    /// threads as it got test slots. A header line on its stderr says how
+    /// many, its share, and how long it waited for them.
     fn test(
         &self,
         run: &mut Execution<'_, '_>,
         plan: &TestRun,
     ) -> Result<(i32, Option<i32>), Reply> {
-        if let Some(build) = plan.build() {
+        if let Some(build) = plan.build(run.request) {
             self.registry.set_phase(run.id, Phase::Building);
-            let built = self.phase(run, &build)?;
+            let mut phase = Execution {
+                request: &build,
+                id: run.id,
+                makeflags: run.makeflags,
+                live: run.live,
+                record: &mut *run.record,
+            };
+            let built = self.phase(&mut phase, &execute::argv(&build))?;
             if built.0 != 0 {
                 return Ok(built);
             }

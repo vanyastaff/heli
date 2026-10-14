@@ -601,27 +601,26 @@ fn the_mode_comes_from_the_flags_then_the_environment_then_the_configuration() {
 }
 
 /// Output heli does not render passes through in every mode, quiet too,
-/// with the footer: here, a command run with `exec`, whose own flags may
-/// also come after `exec`.
+/// with the footer: here, a cargo subcommand heli knows nothing of, run by
+/// `echo-args` standing in for cargo. (`exec`'s output has a view of its
+/// own: `tests/test_output.rs`.)
 #[test]
 fn output_heli_does_not_render_passes_through_in_every_mode() {
     let fixture = Fixture::new("basic");
     let echo = fixture.echo_args();
-    for flags in [
-        &["-q", "exec", "--"][..],
-        &["--output", "compact", "exec", "--"],
-        &["--output", "full", "exec", "--"],
-        &["exec", "-q", "--"],
-        &["exec", "--output", "compact", "--"],
-    ] {
+    for flags in [&["-q"][..], &["--output", "compact"], &["--output", "full"]] {
         let output = fixture
             .heli(flags)
-            .arg(&echo)
-            .arg("through")
+            .args(["tree", "through"])
+            .env("CARGO", &echo)
             .output()
             .expect("run heli");
-        support::assert_success(&output, "cargo heli exec");
-        assert_eq!(text(&output.stdout), "arg: \"through\"\n", "{flags:?}");
+        support::assert_success(&output, "cargo heli tree");
+        assert_eq!(
+            text(&output.stdout),
+            "arg: \"tree\"\narg: \"through\"\n",
+            "{flags:?}"
+        );
         assert_eq!(
             support::without_footer(&output.stderr),
             "echo-args: stderr\n",

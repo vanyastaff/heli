@@ -56,6 +56,8 @@ pub struct Invocation {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub class: Class,
+    /// Whether `cargo heli exec` runs it; else it is a cargo subcommand.
+    pub exec: bool,
     /// How the run uses the result store.
     pub cache: Cache,
     /// The output mode heli's flags chose, if they chose one.
@@ -154,6 +156,10 @@ enum Command {
         /// Only the errors, as the compiler rendered them, all of them.
         #[arg(long, group = "select")]
         errors: bool,
+        /// Only one test's output: `tests::it_works`, or nextest's binary
+        /// and name, `my-crate tests::it_works`.
+        #[arg(long, value_name = "NAME", group = "select")]
+        test: Option<String>,
     },
     /// Kill a run in flight with every process it started; its clients
     /// report it as cancelled.
@@ -231,6 +237,7 @@ pub fn parse(
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
                 class: Class::Exec,
+                exec: true,
                 cache: Cache::Off,
                 output: own.mode().or(output),
             })
@@ -255,13 +262,15 @@ pub fn parse(
             tail,
             grep,
             errors,
+            test,
         } => Action::Log {
             run,
-            select: match (tail, grep) {
-                (Some(count), _) => Select::Tail(count),
-                (None, Some(pattern)) => Select::Grep(pattern),
-                (None, None) if errors => Select::Errors,
-                (None, None) => Select::All,
+            select: match (tail, grep, test) {
+                (Some(count), ..) => Select::Tail(count),
+                (None, Some(pattern), _) => Select::Grep(pattern),
+                (None, None, Some(name)) => Select::Test(name),
+                (None, None, None) if errors => Select::Errors,
+                (None, None, None) => Select::All,
             },
         },
         Command::Cancel { run } => Action::Cancel { run },
@@ -273,6 +282,7 @@ pub fn parse(
             Action::Run(Invocation {
                 program: cargo,
                 class,
+                exec: false,
                 cache: results::cache(class, &args, cli.no_cache),
                 args,
                 output,
