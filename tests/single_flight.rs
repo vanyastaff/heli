@@ -594,7 +594,9 @@ fn keyings(log: &Path) -> usize {
 /// so a miss costs no key of its own; and a run that waits for nothing
 /// keeps that key, the one its clients matched, rather than compute it
 /// again once admitted. A run that waits at its worktree lock is keyed
-/// again after the wait.
+/// again after the wait. Each passing run is keyed once more after its
+/// steps, every input read anew, to be recorded only under an unchanged
+/// key (DESIGN.md §7).
 #[test]
 fn a_run_that_waits_for_nothing_is_keyed_once() {
     let twins = Twins::new();
@@ -607,7 +609,7 @@ fn a_run_that_waits_for_nothing_is_keyed_once() {
     };
     twins.open_gate();
     assert_success(&check().output().expect("run heli"), "the check");
-    assert_eq!(keyings(&log), 1, "a check that waits for nothing");
+    assert_eq!(keyings(&log), 2, "a check that waits for nothing, and after it");
 
     std::fs::remove_file(&log).expect("clear the log");
     edit(&workspace);
@@ -622,5 +624,5 @@ fn a_run_that_waits_for_nothing_is_keyed_once() {
     std::fs::write(&fmt_gate, "").expect("open fmt's gate");
     assert_success(&finish(fmt), "fmt");
     assert_success(&finish(waiting), "the check that waited");
-    assert_eq!(keyings(&log), 2, "a check that waited for fmt");
+    assert_eq!(keyings(&log), 3, "a check that waited for fmt, and after it");
 }
