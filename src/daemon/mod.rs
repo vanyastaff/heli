@@ -42,7 +42,7 @@ use crate::runlog::{self, Limits, RunLog};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
 
-use registry::Registry;
+use registry::{Registry, RunIds};
 
 /// The daemon's exit code when another daemon already holds the lock: the
 /// client that started it then connects to that one.
@@ -94,7 +94,11 @@ pub fn main() -> ! {
     ));
 
     let daemon = Arc::new(Daemon {
-        registry: Registry::new(&locations.run_counter()),
+        registry: Registry::new(RunIds::new(
+            locations.run_counter(),
+            locations.run_counter_lock(),
+            locations.run_logs(),
+        )),
         pool,
         runlog: RunLog::new(locations.run_logs(), Limits::configured(&config.log)),
         lifecycle: Mutex::new(Lifecycle::default()),
@@ -237,10 +241,18 @@ impl Daemon {
             let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
             return;
         };
-        let id = self.registry.admit(
+        let id = match self.registry.admit(
             worktree::of(&execute::cwd(&request)),
             execute::argv(&request),
-        );
+        ) {
+            Ok(id) => id,
+            Err(error) => {
+                let reason = format!("the heli daemon cannot number the run: {error}");
+                self.log.write(&reason);
+                let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
+                return;
+            }
+        };
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
         let started = Reply::Started {

@@ -1,18 +1,21 @@
 //! The runs in flight: what `status` lists, and the source of run ids.
 //!
 //! A run is admitted before anything starts and leaves when it has finished.
-//! Ids are `r<number>`; the next number is kept in the state directory, so a
-//! restarted daemon never reuses an id (run logs and markers are keyed by
-//! it).
+//!
+//! **Run ids** are `r<number>`, unique for the life of the state directory
+//! ([`RunIds`]): run logs and markers are keyed by them, and on Windows
+//! every logon session has a daemon of its own on the same state directory.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
-use crate::clock;
 use crate::status::{self, Phase};
+use crate::{clock, runlog};
 
 /// A run's id, `r<number>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -32,40 +35,88 @@ struct Entry {
     started_at: SystemTime,
 }
 
+/// Numbers runs for every daemon of one state directory.
+///
+/// The next number is the counter file's, read and advanced for each run
+/// under a file lock, so two daemons never give the same id. It is never
+/// below one past the highest record in the run log, so a counter that is
+/// lost or behind costs no record. A number that cannot be written back is
+/// not given at all.
+pub struct RunIds {
+    counter: PathBuf,
+    lock: PathBuf,
+    records: PathBuf,
+}
+
+impl RunIds {
+    /// Ids from the counter file `counter`, whose lock is the file `lock`,
+    /// above the records in `records` (`crate::runlog`).
+    pub fn new(counter: PathBuf, lock: PathBuf, records: PathBuf) -> Self {
+        Self {
+            counter,
+            lock,
+            records,
+        }
+    }
+
+    /// A new id.
+    pub fn next(&self) -> io::Result<RunId> {
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&self.lock)?;
+        // Released when `lock` is closed.
+        lock.lock()?;
+        let stored = std::fs::read_to_string(&self.counter)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .unwrap_or(1);
+        let number = stored.max(highest_record(&self.records) + 1);
+        write_atomically(&self.counter, &(number + 1).to_string())?;
+        Ok(RunId(number))
+    }
+}
+
+/// The highest run number with a record in `records`; 0 for none.
+fn highest_record(records: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(records) else {
+        return 0;
+    };
+    entries
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name();
+            runlog::run_number(name.to_str()?.strip_suffix(".log")?)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 pub struct Registry {
-    counter_file: PathBuf,
+    ids: RunIds,
     inner: Mutex<Inner>,
 }
 
 struct Inner {
-    next: u64,
     runs: BTreeMap<RunId, Entry>,
 }
 
 impl Registry {
-    /// A registry whose ids continue from `counter_file`.
-    pub fn new(counter_file: &Path) -> Self {
-        let next = std::fs::read_to_string(counter_file)
-            .ok()
-            .and_then(|text| text.trim().parse().ok())
-            .unwrap_or(1);
+    /// A registry whose runs `ids` numbers.
+    pub fn new(ids: RunIds) -> Self {
         Self {
-            counter_file: counter_file.to_path_buf(),
+            ids,
             inner: Mutex::new(Inner {
-                next,
                 runs: BTreeMap::new(),
             }),
         }
     }
 
-    /// Admits a run of `argv` in `worktree`, and returns its new id.
-    pub fn admit(&self, worktree: PathBuf, argv: Vec<OsString>) -> RunId {
+    /// Admits a run of `argv` in `worktree`, and returns its new id; the
+    /// error says why it has none.
+    pub fn admit(&self, worktree: PathBuf, argv: Vec<OsString>) -> io::Result<RunId> {
         let mut inner = self.lock();
-        let id = RunId(inner.next);
-        inner.next += 1;
-        // Written while locked, so ids never go backwards on disk. A failed
-        // write costs only uniqueness across a restart.
-        let _ = write_atomically(&self.counter_file, &inner.next.to_string());
+        let id = self.ids.next()?;
         inner.runs.insert(
             id,
             Entry {
@@ -75,7 +126,7 @@ impl Registry {
                 started_at: SystemTime::now(),
             },
         );
-        id
+        Ok(id)
     }
 
     /// Removes a finished run.

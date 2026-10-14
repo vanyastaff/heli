@@ -84,10 +84,15 @@ impl Locations {
         self.state_dir.join(session_suffixed("daemon", ".log"))
     }
 
-    /// The next run number, kept across daemon restarts so run ids stay
-    /// unique.
+    /// The next run number, shared by every daemon of this state directory
+    /// so run ids stay unique (`daemon::registry::RunIds`).
     pub fn run_counter(&self) -> PathBuf {
         self.state_dir.join("next-run")
+    }
+
+    /// The lock held while a run number is taken from [`Self::run_counter`].
+    pub fn run_counter_lock(&self) -> PathBuf {
+        self.state_dir.join("next-run.lock")
     }
 
     /// The run log: one record of output per run (`crate::runlog`).
