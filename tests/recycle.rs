@@ -1315,7 +1315,7 @@ fn a_hook_never_fails_a_checkout_and_follows_heli() {
     let place = repo.fixture.path("it's elsewhere");
     std::fs::create_dir_all(&place).expect("create heli's other place");
     let moved = place.join(format!("moved-heli{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(support::heli_binary(), &moved).expect("copy heli");
+    support::copy_program(&support::heli_binary(), &moved);
     let gone = repo.fixture.workspace().join("gone");
     repo.craft(
         "c0000000000000",
