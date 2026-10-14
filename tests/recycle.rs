@@ -1736,6 +1736,72 @@ fn a_build_after_the_record_makes_recycling_conservative() {
     assert_eq!(recycled[0]["mode"], "conservative", "{recycled:?}");
 }
 
+/// Dates `to` every file under `dir` (but in heli's `.heli/`) last written
+/// after `after`, in nanoseconds since 1970.
+fn redate_newer(dir: &Path, after: u128, to: std::time::SystemTime) {
+    for entry in std::fs::read_dir(dir).expect("read a directory").flatten() {
+        let path = entry.path();
+        let kind = entry.file_type().expect("a file type");
+        if kind.is_dir() {
+            if entry.file_name() != ".heli" {
+                redate_newer(&path, after, to);
+            }
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .expect("a modification time");
+        let nanos = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        if kind.is_file() && nanos > after {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(to))
+                .expect("date a file");
+        }
+    }
+}
+
+/// A build in the build directory right after the source-state record,
+/// dated before the record, as the kernel's coarse clock (a tick behind the
+/// clock heli reads) may date a write right after it, makes the record
+/// stale all the same: a record counts only if it was taken a slack after
+/// the time of each file there. Here plain cargo builds a after `leaf`
+/// changed, and what it wrote is dated a millisecond before the record.
+/// Recycling is then conservative; taken at its word, the record would keep
+/// `leaf` fresh in b, with a's change.
+#[test]
+fn a_build_dated_just_before_the_record_makes_recycling_conservative() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    let a_dir = repo.build_dir_of(&a);
+    // No daemon, which could write a record after this build.
+    repo.fixture.kill_daemon();
+    let record = std::fs::read_to_string(record_file(&a_dir)).expect("a's record");
+    let record: Value = serde_json::from_str(&record).expect("a record in JSON");
+    let taken_at = record["taken_at"].as_u64().expect("its time");
+    change(
+        &a,
+        "leaf/src/lib.rs",
+        "leaf from the commit",
+        "leaf changed in a",
+    );
+    repo.bare_cargo(&a, &["build", "--all-targets"]);
+    let before = std::time::UNIX_EPOCH + Duration::from_nanos(taken_at - 1_000_000);
+    redate_newer(&a_dir, u128::from(taken_at), before);
+    repo.remove_worktree("a");
+    let b = repo.add_worktree("b");
+
+    let (built, _) = repo.build_like_a_clean_build(&b);
+    assert_eq!(names(&built, false), CONSERVATIVE_UNITS, "{built:?}");
+    let recycled = repo.recycled();
+    assert_eq!(recycled[0]["mode"], "conservative", "{recycled:?}");
+}
+
 /// What rustc writes in its incremental caches after the record does not
 /// make the record stale: cargo decides nothing from them.
 #[test]
@@ -1775,6 +1841,81 @@ fn a_file_written_while_heli_stages_the_worktree_keeps_its_time() {
         scanned_and(&["extra (test)", "leaf", "leaf (test)", "root", "root (test)"]),
         "{built:?}"
     );
+}
+
+/// git's clean filter `later` (in Perl, which git for Windows has too), for
+/// `leaf/src/lib.rs`: it passes the file through, and the first time it
+/// runs after file `$marker` appears, it also writes the file again, right
+/// after git read it, with leaf's text changed to b's, of the same size,
+/// and dates it a whole second, one to two seconds back, as a file system
+/// that keeps whole seconds (HFS+) or two (FAT) may date a write.
+const CHANGE_AS_STAGED: &str = r#"
+my ($file, $marker) = @ARGV;
+binmode STDIN;
+binmode STDOUT;
+my $content = do { local $/; <STDIN> };
+print $content;
+if (unlink $marker) {
+    (my $changed = $content) =~ s/leaf from the commit/leaf from b's change/ or die "no leaf";
+    open my $out, '>', $file or die "$file: $!";
+    binmode $out;
+    print $out $changed;
+    close $out or die "$file: $!";
+    my $second = time() - 1;
+    utime $second, $second, $file or die "$file: $!";
+}
+"#;
+
+/// A file changed right after heli staged it, from the content the record
+/// holds to another of the same size, keeps its time even when it is dated
+/// before the staging, as a coarse file system or clock dates a write: the
+/// record's time is only for a file written a slack before. Here git's
+/// clean filter for b's `leaf/src/lib.rs` ([`CHANGE_AS_STAGED`]) changes it
+/// as heli's staging reads it. Taken as written before the staging, the
+/// file would get the recorded time, and b's build would link a's build of
+/// the commit's `leaf`; it compiles b's change instead.
+#[test]
+fn a_file_changed_right_after_staging_keeps_its_time() {
+    let repo = Repo::new();
+    let script = repo.fixture.path("change-as-staged.pl");
+    std::fs::write(&script, CHANGE_AS_STAGED).expect("write the filter");
+    let marker = repo.fixture.path("change-once");
+    let slashed = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let main = repo.main();
+    let filter = format!("perl '{}' %f '{}'", slashed(&script), slashed(&marker));
+    repo.git(&main, &["config", "filter.later.clean", &filter]);
+    let info = main.join(".git").join("info");
+    std::fs::create_dir_all(&info).expect("create .git/info");
+    std::fs::write(info.join("attributes"), "leaf/src/lib.rs filter=later\n")
+        .expect("write the attributes");
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    repo.build_dir_of(&a);
+    let b = repo.replace_worktree("a", "b");
+    // Dated otherwise than b's index says, so that git reads it again, and
+    // runs the filter, as heli stages b.
+    let lib = b.join("leaf").join("src").join("lib.rs");
+    std::fs::File::options()
+        .write(true)
+        .open(&lib)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .expect("date b's leaf now");
+    std::fs::write(&marker, "").expect("arm the filter");
+
+    let output = repo.build_output(&b);
+    assert!(
+        !marker.exists(),
+        "the filter changed b's leaf as heli staged it"
+    );
+    assert_eq!(
+        leaf_says(&output.stdout, &b),
+        "leaf: leaf from b's change over root from the commit",
+        "{}",
+        repo.diagnosis(&lib)
+    );
+    let recycled = repo.recycled();
+    assert_eq!(recycled.len(), 1, "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
 }
 
 /// git's blob id is of the content after its filters, so a file whose line
