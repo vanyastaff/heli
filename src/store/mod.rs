@@ -216,11 +216,9 @@ fn held(profile: &Path) -> bool {
             // A lock heli cannot even open, it cannot prove free.
             Err(_) => return true,
         };
+        // Taken, it is let go as `file` closes, at once.
         match file.try_lock() {
-            Ok(()) => {
-                let _ = file.unlock();
-                false
-            }
+            Ok(()) => false,
             Err(TryLockError::WouldBlock | TryLockError::Error(_)) => true,
         }
     })

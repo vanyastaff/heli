@@ -122,10 +122,8 @@ pub fn edit(path: &Path, value: &str) -> Edit {
         ))
     };
     let kept = without_ours(&text);
-    let Ok(kept_table) = parse(&kept) else {
-        return unsafe_edit();
-    };
-    if let Some(theirs) = build_dir(&kept_table) {
+    // What does not parse without heli's lines fails the check below.
+    if let Some(theirs) = build_dir(&parse(&kept).unwrap_or_default()) {
         return Edit::Refused(match theirs {
             toml::Value::String(theirs) => {
                 format!("it sets {SETTING} itself, to {}", basic_string(theirs))

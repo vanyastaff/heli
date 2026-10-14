@@ -282,7 +282,11 @@ fn every_project_set_up_builds_into_the_store() {
         })
         .unwrap_or_else(|| panic!("no repository to offer: {stdout}"));
     assert_eq!(canonical(none), canonical(&workspace));
-    assert_eq!(asked(&stdout), std::slice::from_ref(&user_config), "{stdout}");
+    assert_eq!(
+        asked(&stdout),
+        std::slice::from_ref(&user_config),
+        "{stdout}"
+    );
     assert_eq!(
         std::fs::read_to_string(&user_config).expect("the user's configuration"),
         format!(
@@ -702,10 +706,11 @@ fn sizes_by_category_match_the_files() {
     ];
     assert_eq!(categories(&listed), only_other, "no pattern, no tool cache");
 
+    // `*/incremental` would name a build directory's caches: patterns are
+    // for `target/` directories only.
     configure_store(
         &fixture,
-        "tool-caches = [\"tests/tr?build/project/*\", \"cli-*-check\"]
-",
+        "tool-caches = [\"tests/tr?build/project/*\", \"cli-*-check\", \"*/incremental\"]\n",
     );
     let listed = listed_target(&fixture, &target).expect("the target directory");
     let with_caches = [
@@ -717,6 +722,8 @@ fn sizes_by_category_match_the_files() {
         ("other", total - 1300),
     ];
     assert_eq!(categories(&listed), with_caches, "{listed}");
+    let build = listed_build_dir(&fixture, &main).expect("the build directory");
+    assert_eq!(categories(&build), expected, "{build}");
 }
 
 /// What `status --json` says of `store`, once its figures are
@@ -816,7 +823,9 @@ fn status_shows_disk_use_per_store() {
         .find(|line| line.starts_with("disk "))
         .unwrap_or_else(|| panic!("no disk line: {stdout}"));
     assert!(
-        line.contains(&store.display().to_string()) && line.contains("incremental"),
+        line.contains(&store.display().to_string())
+            && line.contains("incremental")
+            && line.contains(" KiB"),
         "{line}"
     );
 
@@ -849,6 +858,59 @@ fn status_shows_disk_use_per_store() {
             .any(|entry| std::fs::canonicalize(shown(entry)).ok() == Some(harness.clone()));
         (gone && other).then_some(())
     });
+}
+
+/// Each store's figures are its own build directories': two stores on one
+/// volume, the first serving it, the second named by a workspace's own
+/// configuration, each count only what is in them.
+#[test]
+fn status_counts_each_store_on_its_own() {
+    let fixture = Fixture::new("basic");
+    let first = fixture.path("first-store");
+    let second = fixture.path("second-store");
+    fixture.configure(&format!(
+        "[store]\npaths = ['{}', '{}']\n",
+        first.display(),
+        second.display()
+    ));
+    build_with_build_dir(&fixture, "a", &first.join("{workspace-path-hash}"));
+    build_with_build_dir(&fixture, "b", &second.join("{workspace-path-hash}"));
+    for store in [&first, &second] {
+        let listed = wait_for_store(&fixture, store, || store_sizes(store));
+        assert!(listed["used"].as_u64() > Some(0), "{listed}");
+    }
+}
+
+/// The store setup offers is the one on the worktree's volume: a store
+/// configured first, on another volume, does not serve this one.
+#[test]
+fn setup_offers_the_store_on_the_worktrees_volume() {
+    let fixture = Fixture::new("basic");
+    let elsewhere = if cfg!(windows) {
+        // A drive this machine does not have.
+        let letter = ('D'..='Z')
+            .rev()
+            .find(|letter| !Path::new(&format!("{letter}:\\")).exists())
+            .expect("a free drive letter");
+        PathBuf::from(format!("{letter}:\\heli-store"))
+    } else {
+        // `/dev` is a file system of its own on Linux and macOS.
+        PathBuf::from("/dev/heli-store")
+    };
+    let store = fixture.path("store");
+    fixture.configure(&format!(
+        "[store]\npaths = ['{}', '{}']\n",
+        elsewhere.display(),
+        store.display()
+    ));
+    let output = fixture
+        .setup(None, ["--print"])
+        .output()
+        .expect("run heli setup --print");
+    assert_success(&output, "cargo heli setup --print");
+    let stdout = text(&output.stdout);
+    let value = format!("build-dir = {}", build_dir_value(&store));
+    assert!(stdout.lines().any(|line| line == value), "{stdout}");
 }
 
 /// A `target/` directory several workspaces build into belongs to the last
@@ -973,6 +1035,14 @@ fn manifests_go_only_into_a_stores_build_directories() {
         owner(&plain).is_none(),
         "no manifest beside the store's layout"
     );
+    // Nor is such a directory one of the store's build directories.
+    let outer = store.join("zz").join("0123456789abcd").join("debug");
+    std::fs::create_dir_all(&outer).expect("create a directory in the store");
+    let listed: Vec<Value> = gc(&fixture)
+        .into_iter()
+        .filter(|dir| dir["kind"] == "build")
+        .collect();
+    assert_eq!(listed, Vec::<Value>::new(), "not build directories");
 
     if cfg!(windows) {
         let shouted = PathBuf::from(store.to_string_lossy().to_uppercase());
@@ -1203,6 +1273,10 @@ fn setup_replaces_only_its_own_build_dir() {
             "it sets build.build-dir itself, to \"mine\"",
         ),
         ("[build]\nbuild-dir = 3\n", "it sets build.build-dir itself"),
+        (
+            "[build]\nbuild-dir = \"a \\\"b\\\" c\\\\d\\te\"\n",
+            "it sets build.build-dir itself, to \"a \\\"b\\\" c\\\\d\\u0009e\"",
+        ),
         ("[build\n", "it is not TOML"),
         (&in_a_string, &unsafe_edit),
         (&in_a_value, &unsafe_edit),
