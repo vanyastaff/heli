@@ -395,6 +395,63 @@ fn a_held_pool_outlives_its_daemon_until_released() {
     );
 }
 
+/// A daemon's death as its warden sees it, drawn out (Perl): the stand-in
+/// daemon holds the pool's lock (its path the first argument), starts the
+/// warden (the rest) with the read end of a pipe as its stdin, its own
+/// process id in `HELI_WARDEN_OF` and no stdout or stderr, as a daemon does,
+/// then ends the warden's input, and lets go of the lock 2 s later, as it
+/// exits.
+#[cfg(unix)]
+const DRAWN_OUT_DEATH: &str = r#"
+use Fcntl qw(:flock);
+my ($lock_path, @warden) = @ARGV;
+open my $lock, '>>', $lock_path or die "$lock_path: $!";
+flock($lock, LOCK_EX) or die "flock: $!";
+pipe(my $read, my $write) or die "pipe: $!";
+my $daemon = $$;
+my $pid = fork // die "fork: $!";
+if ($pid == 0) {
+    close $write;
+    open STDIN, '<&', $read or die "stdin: $!";
+    open STDOUT, '>', '/dev/null' or die "stdout: $!";
+    open STDERR, '>', '/dev/null' or die "stderr: $!";
+    $ENV{HELI_WARDEN_OF} = $daemon;
+    exec @warden or die "exec: $!";
+}
+close $read;
+close $write;
+sleep 2;
+"#;
+
+/// The end of a warden's input comes as the kernel closes its dying
+/// daemon's files, one by one: the pool's lock may still be held then. The
+/// warden waits until its daemon is gone before it looks at the lock, and
+/// then removes the pool, which nobody holds. Here the daemon is a stand-in
+/// whose death is drawn out ([`DRAWN_OUT_DEATH`]); taken for the lock of a
+/// daemon that owns the pool, its lock would keep the pool for good.
+#[cfg(unix)]
+#[test]
+fn a_dying_daemons_lock_does_not_keep_its_pool() {
+    let fixture = Fixture::new("basic");
+    let pool = fixture.pool();
+    let made = Command::new("mkfifo")
+        .args([OsStr::new("-m"), OsStr::new("600"), &pool])
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "make the pool's FIFO");
+    let mut lock = pool.clone();
+    lock.push(".lock");
+    let output = fixture
+        .command("perl", ["-e", DRAWN_OUT_DEATH])
+        .arg(&lock)
+        .arg(support::heli_binary())
+        .args(["daemon", "--warden"])
+        .output()
+        .expect("run the stand-in daemon");
+    assert_success(&output, "the stand-in daemon");
+    wait_until("the pool to be gone", || !pool_exists(&pool));
+}
+
 /// A pool that a new daemon adopted stays after the process that held it
 /// lets go: it is that daemon's now, and a bare cargo draws from it.
 #[test]
