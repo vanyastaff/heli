@@ -61,7 +61,7 @@ fn a_top_up_waits_while_anything_compiles() {
         "cargo",
     ] {
         let program = fixture.path(&format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(&echo, &program).expect("copy echo-args");
+        support::copy_program(&echo, &program);
         let gate = fixture.path(&format!("{name}.gate"));
         let mut compiler = Command::new(&program)
             .arg("started")
