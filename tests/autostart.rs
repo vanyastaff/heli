@@ -1083,12 +1083,22 @@ fn a_client_of_another_program_or_locations_starts_its_own_daemon() {
     assert!(user.fixture.daemon_pid().is_some(), "a daemon runs");
     user.fixture.kill_daemon();
 
+    // In the daemon log's clock: seconds since the epoch.
+    let asked = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
     let output = user
         .heli(&["ensure"])
         .env("HELI_CONFIG", user.fixture.path("other.toml"))
         .output()
         .expect("run heli ensure");
-    assert_success(&output, "cargo heli ensure with another configuration");
+    assert!(
+        output.status.success(),
+        "cargo heli ensure with another configuration, at {asked} s: {output:?}\n\
+         the daemon's log:\n{}",
+        user.fixture.daemon_log()
+    );
     assert_eq!(user.manager.calls(), Vec::<Vec<String>>::new());
     assert!(user.fixture.daemon_pid().is_some(), "a daemon runs");
 }
