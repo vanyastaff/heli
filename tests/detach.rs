@@ -61,21 +61,27 @@ fn status_line(fixture: &Fixture, id: &str) -> String {
 #[test]
 fn a_killed_clients_build_goes_on_to_its_end() {
     let fixture = Fixture::new("basic");
-    let scripts = fixture.concurrency_log();
-    let mut build = fixture.heli(["build", "-p", "slow-a"]);
-    scripts.attach(&mut build, 3000);
+    let gate = fixture.path("gate");
+    let mut build = fixture.heli(["build", "-p", "gated"]);
+    build.env("HELI_FIXTURE_GATE", &gate);
     let client = start(&mut build);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let run = &runs(&status)[0];
     let id = run["id"].as_str().expect("an id").to_owned();
     assert_eq!(run["attached_clients"], 1, "its client: {status}");
     assert_eq!(run["exit"], Value::Null, "{status}");
-    wait_until("the build script", || scripts.running() == 1);
+    wait_until("the build to be under way", || {
+        logged_stderr(&fixture, &id).contains("Compiling gated v0.0.0")
+    });
     let line = status_line(&fixture, &id);
     assert!(line.contains("  running, 1 attached  "), "{line}");
 
     support::kill_tree(client.id());
     let _ = finish(client);
+    fixture.wait_for_status("the client to be gone", |status| {
+        listed(status, &id).is_some_and(|run| run["attached_clients"] == 0)
+    });
+    std::fs::write(&gate, "").expect("open the gate");
     let status = fixture.wait_for_status("the build to end", |status| {
         listed(status, &id).is_some_and(|run| run["phase"] == "done")
     });
@@ -89,16 +95,20 @@ fn a_killed_clients_build_goes_on_to_its_end() {
     let started = run["started_at"].as_u64().expect("a start");
     let ended = run["ended_at"].as_u64().expect("an end");
     assert!(started <= ended, "{status}");
-    assert_eq!(scripts.intervals().len(), 1, "the script ran to its end");
     let line = status_line(&fixture, &id);
     assert!(line.contains("  done, exit 0  "), "{line}");
 
-    let logged = fixture.heli(["log", &id]).output().expect("run heli log");
-    assert_success(&logged, "cargo heli log");
-    let stderr = text(&logged.stderr);
-    for part in ["Compiling slow-a v0.0.0", "Finished"] {
+    let stderr = logged_stderr(&fixture, &id);
+    for part in ["Compiling gated v0.0.0", "Finished"] {
         assert!(stderr.contains(part), "{part:?} missing from {stderr}");
     }
+}
+
+/// What `cargo heli log <run>` prints on stderr.
+fn logged_stderr(fixture: &Fixture, run: &str) -> String {
+    let logged = fixture.heli(["log", run]).output().expect("run heli log");
+    assert_success(&logged, "cargo heli log");
+    text(&logged.stderr)
 }
 
 /// Starts this fixture's daemon, with a run of `echo-args`.

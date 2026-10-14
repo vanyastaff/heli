@@ -464,7 +464,7 @@ impl Daemon {
             self.log.write(&format!("cannot record {id}: {error}"));
         }
         if let Some(key) = &key {
-            let passed = code == 0 && signal.is_none() && !self.registry.cancelled(id);
+            let passed = code == 0 && signal.is_none();
             if let Some(note) = self.results.after(request, key, id, passed) {
                 live.note(&note);
             }

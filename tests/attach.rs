@@ -239,29 +239,40 @@ fn a_run_waiting_for_its_worktree_takes_clients() {
 #[test]
 fn a_call_again_after_a_killed_one_attaches_to_its_build() {
     let fixture = Fixture::new("basic");
-    let scripts = fixture.concurrency_log();
+    let gate = fixture.path("gate");
     let build = || {
-        let mut build = fixture.heli(["build", "-p", "slow-a"]);
-        scripts.attach(&mut build, 3000);
+        let mut build = fixture.heli(["build", "-p", "gated"]);
+        build.env("HELI_FIXTURE_GATE", &gate);
         start(&mut build)
     };
     let killed = build();
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
-    wait_until("the build script", || scripts.running() == 1);
+    wait_until("the build to be under way", || {
+        let logged = fixture.heli(["log", &id]).output().expect("run heli log");
+        text(&logged.stderr).contains("Compiling gated v0.0.0")
+    });
     support::kill_tree(killed.id());
     let _ = finish(killed);
+    fixture.wait_for_status("the killed client to be gone", |status| {
+        runs(status)[0]["attached_clients"] == 0
+    });
 
-    let again = finish(build());
+    let again = build();
+    let status = fixture.wait_for_status("the call again to attach", |status| {
+        runs(status)[0]["attached_clients"] == 1
+    });
+    assert_eq!(runs(&status).len(), 1, "one build: {status}");
+    std::fs::write(&gate, "").expect("open the gate");
+    let again = finish(again);
     assert_success(&again, "the second call");
     let (stderr, footer) = support::split_footer(&again.stderr);
     assert_eq!(footer.run, id);
     let stderr = text(&stderr);
     let (_, output) = split_notice(&stderr);
-    for part in ["Compiling slow-a v0.0.0", "Finished"] {
+    for part in ["Compiling gated v0.0.0", "Finished"] {
         assert!(output.contains(part), "{part:?} missing from {stderr}");
     }
-    assert_eq!(scripts.intervals().len(), 1, "one build");
 }
 
 /// A command that differs in argv, worktree, working directory or
