@@ -115,7 +115,7 @@ impl Governor {
             let now = seam.clock_ms.unwrap_or_else(|| {
                 u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
             });
-            match pool.drain(lent()) {
+            match pool.drain(&lent) {
                 Ok(Some(drain)) => events.record("drain", adjustment(drain)),
                 Ok(None) => {}
                 Err(error) => log.write(&format!("cannot drain the pool: {error}")),
@@ -128,7 +128,7 @@ impl Governor {
                 }
                 quiet_since = quiet(pool, registry).then(|| quiet_since.unwrap_or(now));
                 if quiet_since.is_some_and(|since| now.saturating_sub(since) >= QUIET) {
-                    match pool.top_up(lent()) {
+                    match pool.top_up(&lent) {
                         Ok(Some(top_up)) => events.record("top-up", adjustment(top_up)),
                         Ok(None) => {}
                         Err(error) => log.write(&format!("cannot top the pool up: {error}")),

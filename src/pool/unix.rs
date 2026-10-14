@@ -25,6 +25,10 @@
 //!   elsewhere unknown.
 //! - The daemon takes slots by reading bytes on its own nonblocking
 //!   description, and gives them by writing; a FIFO has no maximum count.
+//! - A run pool is a FIFO like the host pool, beside it, created empty, with
+//!   no lock and no warden: the daemon removes it when the run ends. One
+//!   left at its path by an earlier daemon is replaced: whoever still holds
+//!   it keeps it, under no name.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -49,9 +53,11 @@ const OWNER_PATIENCE: Duration = Duration::from_secs(1);
 const WARDEN_POLL: Duration = Duration::from_millis(250);
 
 pub struct Jobserver {
+    /// The daemon's own open file description: nonblocking.
     fifo: File,
-    /// The pool's lock, held while the daemon lives.
-    _owner: File,
+    path: PathBuf,
+    /// The pool's lock, held while the daemon lives; a run pool has none.
+    _owner: Option<File>,
     auth: String,
     slots: u32,
 }
@@ -69,29 +75,16 @@ impl Jobserver {
         let owner = own(&path)?;
         let held = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
-                if !metadata.file_type().is_fifo()
-                    || metadata.uid() != rustix::process::geteuid().as_raw()
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        format!("{} exists and is not a FIFO of this user", path.display()),
-                    ));
-                }
+                check_owned_fifo(&path, &metadata)?;
                 is_held(&path)?
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                mkfifo(&path)?;
-                // Exactly 0600, whatever the umask.
-                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                make_fifo(&path)?;
                 false
             }
             Err(error) => return Err(error),
         };
-        let fifo = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(OFlags::NONBLOCK.bits() as i32)
-            .open(&path)?;
+        let fifo = open_nonblocking(&path)?;
         let opened = if held {
             Opened::Adopted
         } else {
@@ -100,11 +93,41 @@ impl Jobserver {
         };
         let jobserver = Self {
             fifo,
-            _owner: owner,
+            path,
+            _owner: Some(owner),
             auth,
             slots,
         };
         Ok((jobserver, opened))
+    }
+
+    /// A new, empty FIFO at `path`, whose directory exists, for up to
+    /// `maximum` slots. A FIFO of this user's already there is replaced.
+    pub fn create_empty(path: &OsStr, maximum: u32) -> io::Result<Self> {
+        let auth = auth(path)?;
+        let path = PathBuf::from(path);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                check_owned_fifo(&path, &metadata)?;
+                fs::remove_file(&path)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        make_fifo(&path)?;
+        let fifo = open_nonblocking(&path)?;
+        Ok(Self {
+            fifo,
+            path,
+            _owner: None,
+            auth,
+            slots: maximum,
+        })
+    }
+
+    /// The FIFO's path, which other pools are named after.
+    pub fn name(&self) -> &OsStr {
+        self.path.as_os_str()
     }
 
     /// What `--jobserver-auth=` names: `fifo:<path>`.
@@ -144,6 +167,18 @@ impl Jobserver {
     pub fn give(&self, slots: u32) -> io::Result<u32> {
         (&self.fifo).write_all(&vec![TOKEN; slots as usize])?;
         Ok(slots)
+    }
+
+    /// A waiter that takes slots as the processes on this FIFO do: a
+    /// blocking read, in line with theirs.
+    pub fn waiter(&self) -> io::Result<Waiter> {
+        let fifo = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        Ok(Waiter { fifo })
+    }
+
+    /// Removes the FIFO's path; whoever holds it open keeps it.
+    pub fn remove(&self) {
+        let _ = fs::remove_file(&self.path);
     }
 
     /// Whether a process other than this one has the FIFO open: one of the
@@ -285,6 +320,74 @@ impl Jobserver {
             "cannot tell who holds a FIFO here",
         ))
     }
+}
+
+/// Takes slots in line with the other processes reading a FIFO.
+pub struct Waiter {
+    /// Its own open file description, blocking.
+    fifo: File,
+}
+
+impl Waiter {
+    /// Waits until it takes a slot. A blocking read cannot be cancelled, so
+    /// it is `true` even after a [`Waiter::wake`], whose byte it then took.
+    pub fn take(&self) -> io::Result<bool> {
+        loop {
+            match (&self.fifo).read(&mut [0u8]) {
+                Ok(1) => return Ok(true),
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the FIFO has no writer",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Nothing to do: a blocking read is not cancelled.
+    pub fn arm(&self) {}
+
+    /// Nothing to do: a blocking read is not cancelled, so the wait in
+    /// progress goes on until it takes a slot.
+    pub fn cancel(&self) {}
+
+    /// Ends the wait in progress for good: writes a byte for it to take,
+    /// which whoever takes it must drop.
+    pub fn wake(&self) {
+        let _ = (&self.fifo).write_all(&[TOKEN]);
+    }
+}
+
+/// Refuses `path` unless it is a FIFO of this user.
+fn check_owned_fifo(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_fifo() && metadata.uid() == rustix::process::geteuid().as_raw() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} exists and is not a FIFO of this user", path.display()),
+        ))
+    }
+}
+
+/// Makes a FIFO at `path`, with mode exactly 0600, whatever the umask.
+fn make_fifo(path: &Path) -> io::Result<()> {
+    mkfifo(path)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
+
+/// Opens the FIFO at `path` for reading and writing, nonblocking: an open
+/// file description of the daemon's own, so the processes that open the
+/// FIFO by path keep blocking reads.
+fn open_nonblocking(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)
 }
 
 /// What `--jobserver-auth=` names for the FIFO at `path`: `fifo:<path>`.

@@ -34,6 +34,13 @@
 //!
 //! The counts are snapshots: other processes take and return slots at any
 //! moment.
+//!
+//! **Run pools** ([`RunPool`]). Each heli run draws from a jobserver of its
+//! own, named after the host pool and the run (`<pool>-r17`), which starts
+//! with no free slot. The [`broker`] lends it slots from the host pool and
+//! takes them back.
+
+pub mod broker;
 
 #[cfg(unix)]
 mod unix;
@@ -47,7 +54,10 @@ use windows as platform;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+
+pub use platform::Waiter;
 
 use crate::status;
 
@@ -65,7 +75,9 @@ pub fn default_slots() -> u32 {
 /// The host pool, held open.
 pub struct Pool {
     jobserver: platform::Jobserver,
-    /// The slots the memory governor holds out of the pool.
+    /// The slots the memory governor holds out of the pool. Its lock is the
+    /// pool's: every change to the slots counted out of the pool (withheld,
+    /// lent) happens under it, with the slot's move.
     withheld: Mutex<u32>,
 }
 
@@ -100,6 +112,49 @@ impl Pool {
     /// The value of `CARGO_MAKEFLAGS` that points a cargo at this pool.
     pub fn makeflags(&self) -> OsString {
         makeflags_for(self.jobserver.auth()).into()
+    }
+
+    /// N.
+    pub fn slots(&self) -> u32 {
+        self.jobserver.slots()
+    }
+
+    /// The free slots, as counted now.
+    pub fn free(&self) -> io::Result<u32> {
+        self.jobserver.free()
+    }
+
+    /// Takes a free slot out of the pool for a loan to a run pool, if there
+    /// is one, and counts it in `lent`, as one step for [`Pool::drain`] and
+    /// [`Pool::top_up`].
+    pub fn lend(&self, lent: &AtomicU32) -> io::Result<bool> {
+        let _accounts = self.withheld();
+        let taken = self.jobserver.take(1)? == 1;
+        if taken {
+            lent.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(taken)
+    }
+
+    /// Stops counting a loan in `lent` and gives its slot back, as one step
+    /// for [`Pool::drain`] and [`Pool::top_up`]. `false` when the pool is
+    /// already full (on Windows, at its maximum count), and the slot is
+    /// dropped.
+    pub fn repay(&self, lent: &AtomicU32) -> io::Result<bool> {
+        let _accounts = self.withheld();
+        // Every change to `lent` happens under this lock.
+        let loans = lent.load(Ordering::SeqCst);
+        lent.store(loans.saturating_sub(1), Ordering::SeqCst);
+        Ok(self.jobserver.give(1)? == 1)
+    }
+
+    /// Creates the run pool of run `run`: `<this pool's name>-<run>`, with
+    /// no free slot and room for all of this pool's.
+    pub fn run_pool(&self, run: &str) -> io::Result<RunPool> {
+        let mut name = self.jobserver.name().to_owned();
+        name.push(format!("-{run}"));
+        let jobserver = platform::Jobserver::create_empty(&name, self.slots())?;
+        Ok(RunPool { jobserver })
     }
 
     /// The slots, as counted now.
@@ -139,12 +194,13 @@ impl Pool {
         Ok(returned)
     }
 
-    /// Raises the free slots to the [`target`], `lent` being the slots lent
-    /// to run pools; `None` when they are not below it. Only safe when no
-    /// process holds a slot it will give back (the governor's quiescence).
-    pub fn top_up(&self, lent: u32) -> io::Result<Option<Adjustment>> {
+    /// Raises the free slots to the [`target`], `lent` telling the slots
+    /// lent to run pools; `None` when they are not below it. Only safe when
+    /// no process holds a slot it will give back (the governor's
+    /// quiescence).
+    pub fn top_up(&self, lent: impl Fn() -> u32) -> io::Result<Option<Adjustment>> {
         let withheld = self.withheld();
-        let target = target(self.jobserver.slots(), *withheld, lent);
+        let target = target(self.jobserver.slots(), *withheld, lent());
         let free = self.jobserver.free()?;
         if free >= target {
             return Ok(None);
@@ -158,11 +214,11 @@ impl Pool {
     }
 
     /// Takes the free slots above the [`target`] out of the pool, `lent`
-    /// being the slots lent to run pools; `None` when there are none. Safe
+    /// telling the slots lent to run pools; `None` when there are none. Safe
     /// at any time: such a slot is a surplus, whoever gave it.
-    pub fn drain(&self, lent: u32) -> io::Result<Option<Adjustment>> {
+    pub fn drain(&self, lent: impl Fn() -> u32) -> io::Result<Option<Adjustment>> {
         let withheld = self.withheld();
-        let target = target(self.jobserver.slots(), *withheld, lent);
+        let target = target(self.jobserver.slots(), *withheld, lent());
         let free = self.jobserver.free()?;
         if free <= target {
             return Ok(None);
@@ -191,9 +247,12 @@ impl Pool {
 /// the slots `lent` to run pools (Σ lent). A top-up raises the free slots to
 /// it, never above.
 ///
-/// For a broker that lends slots: count a loan after taking its slot from
-/// the pool, and stop counting it before giving the slot back, so that the
-/// free slots never stand above the target meanwhile.
+/// A broker that lends slots counts a loan as it takes the slot from the
+/// pool, and stops counting it as it gives the slot back, each as one step
+/// under the pool's lock ([`Pool::lend`], [`Pool::repay`]); the top-up and
+/// the drain read the loans under it too. So they never see a slot both
+/// back and still counted, which would look like a surplus, nor both gone
+/// and not counted.
 pub fn target(slots: u32, withheld: u32, lent: u32) -> u32 {
     slots.saturating_sub(withheld).saturating_sub(lent)
 }
@@ -227,6 +286,47 @@ pub fn makeflags(name: &OsStr) -> io::Result<String> {
 /// `CARGO_MAKEFLAGS` for the jobserver that `--jobserver-auth=` names `auth`.
 fn makeflags_for(auth: &str) -> String {
     format!("-j --jobserver-auth={auth}")
+}
+
+/// A run's own jobserver, which only the [`broker`] fills. Dropping it
+/// removes its name (on Unix, its path); processes that still hold it keep
+/// it.
+pub struct RunPool {
+    jobserver: platform::Jobserver,
+}
+
+impl RunPool {
+    /// The value of `CARGO_MAKEFLAGS` that points the run's processes here.
+    pub fn makeflags(&self) -> OsString {
+        makeflags_for(self.jobserver.auth()).into()
+    }
+
+    /// The free slots, as counted now.
+    pub fn free(&self) -> io::Result<u32> {
+        self.jobserver.free()
+    }
+
+    /// Takes a free slot if there is one, without waiting.
+    pub fn try_take(&self) -> io::Result<bool> {
+        Ok(self.jobserver.take(1)? == 1)
+    }
+
+    /// Puts a slot in; `false` when the pool is already full, and the slot
+    /// was not put in.
+    pub fn give(&self) -> io::Result<bool> {
+        Ok(self.jobserver.give(1)? == 1)
+    }
+
+    /// A waiter that takes slots in line with the run's processes.
+    pub fn waiter(&self) -> io::Result<Waiter> {
+        self.jobserver.waiter()
+    }
+}
+
+impl Drop for RunPool {
+    fn drop(&mut self) {
+        self.jobserver.remove();
+    }
 }
 
 /// Whether `name` can travel in `CARGO_MAKEFLAGS`: the jobserver protocol

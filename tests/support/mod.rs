@@ -29,6 +29,8 @@
 //!   to `HELI_FIXTURE_LOG` around a sleep of `HELI_FIXTURE_SLEEP_MS`
 //!   ([`ConcurrencyLog`]);
 //! - `broken`: a compile error; `warnings`: warnings from several lints;
+//! - `many-errors`: 40 compile errors, one per line; `many-warnings`: 60
+//!   warnings from three lints, one per line (see their `lib.rs`);
 //! - `tests-mixed`: passing, failing and slow tests;
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
@@ -48,6 +50,7 @@
 pub mod endpoint;
 pub mod fake_daemon;
 pub mod jobserver;
+pub mod terminal;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -77,13 +80,14 @@ const ISOLATED_VARS: [&str; 11] = [
 
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
-/// configuration.
-const HELI_VARS: [&str; 5] = [
+/// configuration, or change what it prints.
+const HELI_VARS: [&str; 6] = [
     "HELI_STATE_DIR",
     "HELI_ENDPOINT",
     "HELI_DEPTH",
     "HELI_POOL",
     "HELI_CONFIG",
+    "HELI_OUTPUT",
 ];
 
 /// Variables that locate the user's own configuration files, which

@@ -111,6 +111,8 @@ fn wait_for_sample(fixture: &Fixture, available_mb: u64) -> Value {
 
 /// A heli run in flight, waiting for its gate, until dropped: while it
 /// runs, the pool is never quiet, so no top-up hides what the governor does.
+/// Idle, it keeps one free slot in its run pool (DESIGN.md §4, "Run pools"),
+/// which the host pool counts in use.
 struct InFlight {
     run: Option<Child>,
     gate: std::path::PathBuf,
@@ -128,7 +130,9 @@ impl InFlight {
             .stderr(Stdio::piped())
             .spawn()
             .expect("start heli");
-        fixture.wait_for_status("the run", |status| !support::runs(status).is_empty());
+        fixture.wait_for_status("the run and its spare slot", |status| {
+            !support::runs(status).is_empty() && status["pool"]["in_use"] == 1
+        });
         Self {
             run: Some(run),
             gate,
@@ -201,26 +205,26 @@ fn slots_come_back_above_the_high_watermark_without_oscillation() {
     let _run = InFlight::start(&fixture);
     wait_for_sample(&fixture, BELOW_LOW - 100);
     let status = sample_memory(&fixture, physical(BELOW_LOW - 101));
-    assert_eq!(status["pool"], pool(4, 2, 2, 0));
+    assert_eq!(status["pool"], pool(4, 1, 2, 1));
 
     for available in [ABOVE_LOW, BELOW_HIGH, BELOW_HIGH - 1] {
         assert_eq!(
             sample_memory(&fixture, physical(available))["pool"],
-            pool(4, 2, 2, 0),
+            pool(4, 1, 2, 1),
             "{available} MB, on the way up"
         );
     }
     let status = sample_memory(&fixture, physical(ABOVE_HIGH));
-    assert_eq!(status["pool"], pool(4, 4, 0, 0));
+    assert_eq!(status["pool"], pool(4, 3, 0, 1));
     for available in [BELOW_HIGH, ABOVE_LOW, ABOVE_LOW + 1] {
         assert_eq!(
             sample_memory(&fixture, physical(available))["pool"],
-            pool(4, 4, 0, 0),
+            pool(4, 3, 0, 1),
             "{available} MB, on the way down"
         );
     }
     let status = sample_memory(&fixture, physical(BELOW_LOW));
-    assert_eq!(status["pool"], pool(4, 3, 1, 0));
+    assert_eq!(status["pool"], pool(4, 2, 1, 1));
 
     let returned = fixture.events_named("return");
     assert_eq!(returned.len(), 1, "{returned:?}");
@@ -457,8 +461,8 @@ fn a_top_up_waits_2_s_after_the_last_run() {
     for available in 40_000..40_004 {
         assert_eq!(
             sample(&fixture, available)["pool"],
-            pool(2, 1, 0, 1),
-            "while the run is in flight"
+            pool(2, 0, 0, 2),
+            "while the run is in flight, with its spare slot"
         );
     }
 
@@ -691,11 +695,11 @@ fn low_commit_withholds_slots_too() {
     };
     fixture.inject_memory(memory(40_000, 1000));
     let _run = InFlight::start(&fixture);
-    assert_eq!(wait_for_sample(&fixture, 40_000)["pool"], pool(3, 2, 1, 0));
+    assert_eq!(wait_for_sample(&fixture, 40_000)["pool"], pool(3, 1, 1, 1));
     let status = sample_memory(&fixture, memory(40_001, BELOW_HIGH));
-    assert_eq!(status["pool"], pool(3, 2, 1, 0));
+    assert_eq!(status["pool"], pool(3, 1, 1, 1));
     let status = sample_memory(&fixture, memory(40_002, ABOVE_HIGH));
-    assert_eq!(status["pool"], pool(3, 3, 0, 0));
+    assert_eq!(status["pool"], pool(3, 2, 0, 1));
 }
 
 /// `status` shows the memory the governor saw last and its watermarks: by

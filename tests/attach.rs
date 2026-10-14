@@ -193,8 +193,9 @@ fn a_run_waiting_for_its_worktree_takes_clients() {
     let gate = fixture.path("gate");
     let starts = fixture.path("starts");
     // `echo-args` stands in for cargo: a build, held by the gate, and a
-    // `fmt`, which waits for the build.
-    let mut build = fixture.heli(["build"]);
+    // `fmt`, which waits for the build. Full output keeps the build's
+    // command line as given.
+    let mut build = fixture.heli(["--output", "full", "build"]);
     build.env("CARGO", &echo).env("ECHO_WAIT_FOR", &gate);
     let build = start(&mut build);
     let status = fixture.wait_for_status("the build", |status| runs(status).len() == 1);
@@ -240,8 +241,9 @@ fn a_run_waiting_for_its_worktree_takes_clients() {
 fn a_call_again_after_a_killed_one_attaches_to_its_build() {
     let fixture = Fixture::new("basic");
     let gate = fixture.path("gate");
+    // Full output: cargo's own lines show the build under way.
     let build = || {
-        let mut build = fixture.heli(["build", "-p", "gated"]);
+        let mut build = fixture.heli(["--output", "full", "build", "-p", "gated"]);
         build.env("HELI_FIXTURE_GATE", &gate);
         start(&mut build)
     };

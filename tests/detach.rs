@@ -62,7 +62,8 @@ fn status_line(fixture: &Fixture, id: &str) -> String {
 fn a_killed_clients_build_goes_on_to_its_end() {
     let fixture = Fixture::new("basic");
     let gate = fixture.path("gate");
-    let mut build = fixture.heli(["build", "-p", "gated"]);
+    // Full output: cargo's own lines show the build under way.
+    let mut build = fixture.heli(["--output", "full", "build", "-p", "gated"]);
     build.env("HELI_FIXTURE_GATE", &gate);
     let client = start(&mut build);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);

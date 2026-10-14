@@ -13,16 +13,16 @@
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
 //!           "class":"compile","phase":"running","started_at":1791911112,
-//!           "waiting_since":null,"waiting_for":[],"attached_clients":1,
-//!           "ended_at":null,"exit":null},
+//!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0,
+//!           "attached_clients":1,"ended_at":null,"exit":null},
 //!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
 //!           "class":"mutate","phase":"running","started_at":1791911120,
-//!           "waiting_since":1791911120,"waiting_for":["r17"],
+//!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0,
 //!           "attached_clients":2,"ended_at":null,"exit":null},
 //!          {"id":"r16","worktree":"D:\\work\\agent-f1c0","argv":["cargo","test"],
 //!           "class":"test","phase":"done","started_at":1791910990,
-//!           "waiting_since":null,"waiting_for":[],"attached_clients":0,
-//!           "ended_at":1791911050,
+//!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
+//!           "attached_clients":0,"ended_at":1791911050,
 //!           "exit":{"code":101,"signal":null,"cancelled":false}}]}
 //! ```
 //!
@@ -30,10 +30,11 @@
 //! is also `null` while the daemon cannot read the machine's memory. A run
 //! waiting for its worktree's lock has `waiting_since` and, in
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
-//! empty. `class` is `null` only from a daemon older than run classes.
-//! `runs` lists the runs in flight, and the last runs that ended while no
-//! client followed them (`daemon::registry`), so whoever started them can
-//! still learn how they ended.
+//! empty. `class` is `null` only from a daemon older than run classes. A
+//! run's `slots` are the host pool's slots it uses, and `share` its share of
+//! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
+//! last runs that ended while no client followed them (`daemon::registry`),
+//! so whoever started them can still learn how they ended.
 
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +111,14 @@ pub struct Run {
     /// The runs it waits for, by id.
     #[serde(default)]
     pub waiting_for: Vec<String>,
+    /// The slots it uses: lent to its run pool and not free there, and its
+    /// test slots.
+    #[serde(default)]
+    pub slots: u32,
+    /// Its share of the host pool's capacity, which it may exceed while no
+    /// other run waits.
+    #[serde(default)]
+    pub share: f64,
     /// The clients following the run now: the call that started it and
     /// those that attached to it.
     #[serde(default)]
@@ -156,6 +165,10 @@ impl Exit {
 pub enum Phase {
     /// Executing, as one phase (no build and test phases of its own).
     Running,
+    /// A test run building its tests.
+    Building,
+    /// A test run waiting for its test slots, then running its tests.
+    Testing,
     /// Ended.
     Done,
 }
@@ -165,6 +178,8 @@ impl Phase {
     pub fn name(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Building => "building",
+            Self::Testing => "testing",
             Self::Done => "done",
         }
     }
@@ -233,15 +248,27 @@ impl Status {
                 ),
             };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {state}  {}s\n",
+                "{label:<6}  {}  {}  {}  {}  {state}  {} slot{}, share {}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
                 run.class.map_or("-", Class::name),
+                run.slots,
+                if run.slots == 1 { "" } else { "s" },
+                slots(run.share),
                 age(run.started_at)
             ));
         }
         text
+    }
+}
+
+/// A number of slots for people: whole, or with one decimal.
+pub fn slots(slots: f64) -> String {
+    if slots.fract() == 0.0 {
+        format!("{slots:.0}")
+    } else {
+        format!("{slots:.1}")
     }
 }
 

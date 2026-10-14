@@ -23,9 +23,12 @@ fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Starts `command` with its output captured.
+/// Starts `command` with its output captured, in full output mode, so that
+/// heli adds nothing to the arguments `status` lists and the waiting line
+/// names (compact output adds cargo's JSON flags; `tests/output.rs`).
 fn start(command: &mut Command) -> Child {
     command
+        .env("HELI_OUTPUT", "full")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

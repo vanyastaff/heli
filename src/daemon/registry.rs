@@ -126,6 +126,8 @@ struct Entry {
     nested: bool,
     command: Command,
     class: Class,
+    /// Its phase while in flight; once it has ended, it is done.
+    phase: Phase,
     started_at: SystemTime,
     /// The clients following it.
     attached: u32,
@@ -320,6 +322,7 @@ impl Registry {
                 nested,
                 command,
                 class,
+                phase: Phase::Running,
                 started_at: SystemTime::now(),
                 // The client that asked for it.
                 attached: 1,
@@ -336,6 +339,13 @@ impl Registry {
             entry.state = State::Starting { live };
         }
         self.changed.notify_all();
+    }
+
+    /// Run `id` moves to `phase`.
+    pub fn set_phase(&self, id: RunId, phase: Phase) {
+        if let Some(entry) = self.lock().runs.get_mut(&id) {
+            entry.phase = phase;
+        }
     }
 
     /// Waits for run `id`'s turn at its worktree's lock (see the module
@@ -367,18 +377,23 @@ impl Registry {
         self.lock().cancelled(id)
     }
 
-    /// Run `id`'s process has started as the first of `tree`. False when
-    /// the run was cancelled meanwhile: kill the tree.
+    /// Run `id`'s process (of its first phase, or a later one) has started
+    /// as the first of `tree`. False when the run was cancelled meanwhile:
+    /// kill the tree.
     pub fn run(&self, id: RunId, tree: Arc<Tree>) -> bool {
         let mut inner = self.lock();
         let Some(entry) = inner.runs.get_mut(&id) else {
             return false;
         };
-        if let State::Starting { live } = &entry.state {
-            entry.state = State::Running {
-                live: Arc::clone(live),
-                tree,
-            };
+        match &mut entry.state {
+            State::Starting { live } => {
+                entry.state = State::Running {
+                    live: Arc::clone(live),
+                    tree,
+                };
+            }
+            State::Running { tree: current, .. } => *current = tree,
+            State::Telling | State::Done { .. } => {}
         }
         !entry.cancelled
     }
@@ -505,7 +520,7 @@ impl Inner {
                 Some(clock::unix_seconds(*ended_at)),
                 Some(*exit),
             ),
-            _ => (Phase::Running, None, None),
+            _ => (entry.phase, None, None),
         };
         status::Run {
             id: id.to_string(),
@@ -521,6 +536,9 @@ impl Inner {
             started_at: clock::unix_seconds(entry.started_at),
             waiting_since: (!waiting_for.is_empty()).then(|| clock::unix_seconds(entry.started_at)),
             waiting_for,
+            // The broker's to tell (`crate::pool::broker`).
+            slots: 0,
+            share: 0.0,
             attached_clients: entry.attached,
             ended_at,
             exit,
