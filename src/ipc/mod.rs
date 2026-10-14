@@ -2,14 +2,16 @@
 //! only the user who runs the daemon can open, and the byte streams of its
 //! connections. What travels over them is `crate::protocol`'s business.
 //!
-//! - **Windows**: a named pipe. Its DACL grants access to the user's SID
-//!   alone (no Everyone, no Administrators, no SYSTEM entry); it rejects
-//!   remote clients; and the daemon creates it with
-//!   `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it never joins a pipe someone else
-//!   created first. A client connects at identification level only (a
-//!   server cannot impersonate it) and talks only to a pipe owned by its own
-//!   user (or its token's default owner, the Administrators group when
-//!   elevated).
+//! - **Windows**: a named pipe, owned by the user's SID (set explicitly:
+//!   elevated, a process would give it to the Administrators group). Its
+//!   DACL grants access to the user's SID alone (no Everyone, no
+//!   Administrators, no SYSTEM entry); it rejects remote clients; and the
+//!   daemon creates it with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so it never
+//!   joins a pipe someone else created first. A client connects at
+//!   identification level only (a server cannot impersonate it) and talks
+//!   only to a pipe owned by its own user's SID, elevated or not: never to
+//!   one owned by the Administrators group, which any administrator's
+//!   elevated process can create.
 //! - **Unix**: a Unix socket with mode 0600, in a directory heli creates
 //!   with mode 0700. A client talks only to a socket owned by its own uid.
 //!

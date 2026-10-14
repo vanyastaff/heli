@@ -135,9 +135,13 @@ at a fake, so that none registers anything with the real ones.
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
 created as the first instance, so the daemon never joins a pipe someone else
-created. A client connects at identification level and talks only to a pipe
-owned by its own user. On Unix, a socket with mode 0600 in the 0700 state
-directory; a client talks only to a socket owned by its uid.
+created. The daemon sets its owner to the user's SID, elevated or not (an
+elevated process would otherwise give it to the Administrators group). A
+client connects at identification level and talks only to a pipe owned by
+its own user's SID, elevated or not: never to one owned by the
+Administrators group, which any administrator's elevated process can
+create. On Unix, a socket with mode 0600 in the 0700 state directory; a
+client talks only to a socket owned by its uid.
 
 **The protocol** starts with a handshake frozen across versions: `HELI` and
 the protocol version, each way. On a mismatch the client runs the command

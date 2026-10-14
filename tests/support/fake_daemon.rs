@@ -146,36 +146,19 @@ fn listen(endpoint: &OsStr) -> impl FnOnce() -> std::os::unix::net::UnixStream +
     move || listener.accept().expect("accept a client").0
 }
 
+/// Starts listening at `endpoint` now (so a client cannot miss it), and
+/// returns how to accept the one client.
+///
+/// On Windows, the pipe is the user's, as a daemon's is: a client trusts
+/// only a pipe its own user owns, and an elevated process (a CI runner's)
+/// would otherwise give it to the Administrators group.
 #[cfg(windows)]
 fn listen(endpoint: &OsStr) -> impl FnOnce() -> std::fs::File + Send + 'static {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError};
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
-    use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
-    };
-
-    let name: Vec<u16> = endpoint.encode_wide().chain([0]).collect();
-    // SAFETY: `name` is NUL-terminated; default security, no inheritance.
-    let pipe = unsafe {
-        CreateNamedPipeW(
-            name.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            65_536,
-            65_536,
-            0,
-            std::ptr::null(),
-        )
-    };
-    assert_ne!(pipe, INVALID_HANDLE_VALUE, "create the fake daemon's pipe");
-    // SAFETY: a fresh pipe handle this file now owns.
-    let file = unsafe { std::fs::File::from_raw_handle(pipe) };
+    let file = super::endpoint::pipe_owned_by(endpoint, &super::endpoint::current_user_sid())
+        .expect("create the fake daemon's pipe");
     move || {
         use std::os::windows::io::AsRawHandle;
         // SAFETY: the handle is a pipe instance owned by `file`.
