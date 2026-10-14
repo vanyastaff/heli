@@ -104,18 +104,32 @@ fn heli_copy(fixture: &Fixture, name: &str) -> PathBuf {
     copy
 }
 
-/// What `shown` shows under the line `header`: the lines up to the next
-/// empty one.
+/// What `stdout` shows under the line `header`: a definition's whole text,
+/// up to the empty line that ends it, before the next step or the line that
+/// closes setup's account. The text may hold empty lines of its own (a
+/// systemd unit's, between its sections).
 fn shown(stdout: &str, header: &str) -> String {
+    const NEXT: [&str; 6] = [
+        "Definition ",
+        "Link ",
+        "Remove ",
+        "Run ",
+        "Nothing ",
+        "Registered.",
+    ];
     let mut lines = stdout.lines();
     assert!(
         lines.any(|line| line == header),
         "no line {header:?} in:\n{stdout}"
     );
-    lines
-        .take_while(|line| !line.is_empty())
+    let shown: String = lines
+        .take_while(|line| !NEXT.iter().any(|next| line.starts_with(next)))
         .map(|line| format!("{line}\n"))
-        .collect()
+        .collect();
+    shown
+        .strip_suffix("\n\n")
+        .map(|text| format!("{text}\n"))
+        .unwrap_or_else(|| panic!("no empty line ends the text under {header:?} in:\n{stdout}"))
 }
 
 /// What autostart registers on Windows: the Task Scheduler task

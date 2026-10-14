@@ -565,6 +565,12 @@ impl Registry {
             .any(|entry| entry.state.in_flight())
     }
 
+    /// Whether run `run` (`r<number>`) is listed: in flight, or ended
+    /// unfollowed.
+    pub fn lists(&self, run: &str) -> bool {
+        runlog::run_number(run).is_some_and(|number| self.lock().runs.contains_key(&RunId(number)))
+    }
+
     /// The runs in flight and those that ended unfollowed, oldest first.
     pub fn snapshot(&self) -> Vec<status::Run> {
         let inner = self.lock();
