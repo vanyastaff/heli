@@ -147,7 +147,12 @@ client talks only to a socket owned by its uid.
 the protocol version, each way. On a mismatch the client runs the command
 directly, with one warning line. A client newer than the daemon also asks it
 to retire: the daemon takes no new runs and exits once its runs in flight
-have finished, so the next call starts a current daemon. An older client asks
+have finished, so the next call starts a current daemon. As it exits it
+first stops listening and releases the state directory's lock: the process
+itself may take a while to be gone (seen to take over 10 s on a loaded
+Windows host), and until then it would hold its endpoint, where a client
+would connect and get no answer, and the lock, which a new daemon needs.
+An older client asks
 nothing, so two installed versions never take turns retiring each other's
 daemon. The version stays 1 until the first release: until then a daemon
 answers a request it does not know (one a newer client added, such as `log`)
@@ -174,6 +179,20 @@ not start, listen or answer within 5 s.
   process tree found through parent processes: observed with Claude Code on
   Windows, where stopping a command killed the client, the daemon it had
   started directly, and that daemon's run.
+- A daemon that finds the lock held exits at once (code 3). The holder may
+  be starting, and will listen; or going away, killed or retired, and
+  holding the lock until its process is gone, after its endpoint has gone.
+  So while nothing listens, `daemon --detach` starts the daemon again, after
+  a pause that grows from 50 ms to 400 ms, within the same 5 s. A daemon
+  that finds its pipe already there on Windows (a predecessor's last
+  connections, as its process goes) tries again to create it within 5 s too.
+- An endpoint that is there but busy (on Windows every instance of the pipe
+  taken: between two of the daemon's accepts, or on a host so loaded that
+  the daemon has not run since) is a daemon, not an absent one: the client
+  waits for a free instance and tries again, within the same 5 s as for an
+  answer, and only then runs the command directly. The daemon creates the
+  next instance before it serves the client it accepted, and creates its
+  pipe only once it is ready to accept.
 - It inherits no handle from the client (on Windows it is started with
   `CreateProcessW` and no inheritance, since the standard library lets a
   child inherit every inheritable handle). A daemon holding the client's

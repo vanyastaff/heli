@@ -182,6 +182,37 @@ fn one_daemon_serves_two_concurrent_calls() {
     );
 }
 
+/// Many calls started at once all reach the daemon, and none runs
+/// directly: first with no daemon running yet (they start one between
+/// them), then with it running. They connect while it starts and while it
+/// accepts the others, when every instance of its pipe may be taken for a
+/// moment (`ERROR_PIPE_BUSY` on Windows), which a call waits out.
+#[test]
+fn many_calls_at_once_all_reach_the_daemon() {
+    const CALLS: usize = 32;
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    for wave in ["with no daemon yet", "with a daemon"] {
+        let calls: Vec<Child> = (0..CALLS)
+            .map(|index| {
+                let mut call = fixture.heli(["exec", "--"]);
+                call.arg(&echo).arg(index.to_string());
+                start(&mut call)
+            })
+            .collect();
+        for (index, call) in calls.into_iter().enumerate() {
+            let output = finish(call);
+            assert_success(&output, "cargo heli exec");
+            assert_eq!(text(&output.stdout), format!("arg: \"{index}\"\n"));
+            assert_eq!(
+                support::without_footer(&output.stderr),
+                "echo-args: stderr\n",
+                "call {index} {wave} ran through the daemon"
+            );
+        }
+    }
+}
+
 /// A daemon killed while idle is replaced by the next call, which runs
 /// normally; run ids are not reused across daemons.
 #[test]
@@ -650,6 +681,35 @@ fn a_call_waits_for_the_daemon_that_holds_the_lock() {
     let warning = assert_ran_directly_with_one_warning(&fixture, &mut heli);
     assert!(warning.contains("did not listen within 5 s"), "{warning}");
     assert!(started.elapsed() >= std::time::Duration::from_secs(5));
+}
+
+/// A daemon that finds the state directory's lock held by one still going
+/// away (a killed daemon holds it until its process is gone, after its
+/// endpoint has gone) exits 3; nothing would listen, so the start tries
+/// again, until the lock is free, within the 5 s a start may take.
+#[test]
+fn a_start_tries_again_while_a_departing_daemon_holds_the_lock() {
+    let fixture = Fixture::new("basic");
+    std::fs::create_dir_all(fixture.state_dir()).expect("create the state directory");
+    let lock = std::fs::File::create(fixture.lock_file()).expect("create the lock");
+    lock.lock().expect("hold the lock");
+    let ensure = start(&mut fixture.heli(["ensure"]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !fixture
+        .daemon_log()
+        .contains("another daemon holds the lock")
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no daemon found the lock held: {}",
+            fixture.daemon_log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(lock);
+    let output = finish(ensure);
+    assert_success(&output, "cargo heli ensure");
+    assert!(fixture.daemon_pid().is_some(), "a daemon listens");
 }
 
 /// A run has no input: the client's stdin is not forwarded, and the run

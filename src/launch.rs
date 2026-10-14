@@ -60,6 +60,12 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`StartError::TimedOut`], so it reports a timeout either way.
 const DETACH_TIMED_OUT: i32 = 4;
 
+/// The first pause before `daemon --detach` starts again a daemon that
+/// found the lock held while nothing listens ([`detach`]); each pause
+/// doubles, up to [`RESTART_PAUSE_MAX`].
+const RESTART_PAUSE: Duration = Duration::from_millis(50);
+const RESTART_PAUSE_MAX: Duration = Duration::from_millis(400);
+
 /// A start this process launched: the stage it started, or, when the
 /// autostart registration was asked to start the daemon, nothing it can
 /// watch.
@@ -101,6 +107,13 @@ pub fn start(locations: &Locations, depth: u32) -> io::Result<Launched> {
 /// [`DETACH_TIMED_OUT`] when nothing listened in time, or with the code the
 /// daemon exited with, or 1. It creates the state directory, where the
 /// daemon runs, since the logon task may run it before anything else has.
+///
+/// A daemon that exits [`daemon::ALREADY_RUNNING`] found the state
+/// directory's lock held. The holder may be starting, and will listen; or
+/// going away (killed, or retired), still holding the lock after its
+/// endpoint has gone, and then nothing will listen. So while nothing
+/// listens, it starts the daemon again, after a pause that grows from
+/// [`RESTART_PAUSE`] to [`RESTART_PAUSE_MAX`], until the deadline.
 pub fn detach(depth: u32) -> ! {
     let Ok(locations) = Locations::resolve() else {
         std::process::exit(1)
@@ -108,16 +121,19 @@ pub fn detach(depth: u32) -> ! {
     if locations.create_state_dir().is_err() {
         std::process::exit(1)
     }
-    let Ok(mut daemon) = spawn_stage(&locations, depth, &["daemon"]) else {
+    let start = || spawn_stage(&locations, depth, &["daemon"]);
+    let Ok(mut daemon) = start() else {
         std::process::exit(1)
     };
     let deadline = Instant::now() + START_TIMEOUT;
-    std::process::exit(match listening(&locations, &mut daemon, deadline) {
-        Ok(_probe) => 0,
-        Err(StartError::Exited(code)) => code,
-        Err(StartError::TimedOut) => DETACH_TIMED_OUT,
-        Err(StartError::Unreachable(_)) => 1,
-    })
+    std::process::exit(
+        match listening(&locations, &mut daemon, deadline, Some(&start)) {
+            Ok(_probe) => 0,
+            Err(StartError::Exited(code)) => code,
+            Err(StartError::TimedOut) => DETACH_TIMED_OUT,
+            Err(StartError::Unreachable(_)) => 1,
+        },
+    )
 }
 
 /// Waits until a daemon listens at the endpoint, while `launched` (from
@@ -128,7 +144,7 @@ pub fn detach(depth: u32) -> ! {
 /// too. The stage exits as soon as it sees the daemon listen.
 pub fn wait(locations: &Locations, launched: &mut Launched) -> Result<Stream, StartError> {
     let deadline = Instant::now() + START_TIMEOUT;
-    let stream = listening(locations, launched, deadline)?;
+    let stream = listening(locations, launched, deadline, None)?;
     while launched.running() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -138,22 +154,40 @@ pub fn wait(locations: &Locations, launched: &mut Launched) -> Result<Stream, St
 /// Waits until a daemon listens at the endpoint, while `launched` (the
 /// detaching stage, or the daemon itself) has not failed, and connects;
 /// gives up at `deadline`. Exiting with 0 or [`daemon::ALREADY_RUNNING`] is
-/// no failure: a daemon listens, or will. A daemon the autostart
+/// no failure: a daemon listens, or will. With `restart`, a daemon that
+/// exited [`daemon::ALREADY_RUNNING`] is started again with it, after a
+/// pause, while nothing listens (see [`detach`]). A daemon the autostart
 /// registration starts is not this process's to watch, so only the
 /// deadline ends that wait.
 fn listening(
     locations: &Locations,
     launched: &mut Launched,
     deadline: Instant,
+    restart: Option<&dyn Fn() -> io::Result<Launched>>,
 ) -> Result<Stream, StartError> {
+    let mut pause = RESTART_PAUSE;
+    let mut restart_at = None;
     loop {
-        match ipc::connect(&locations.endpoint) {
+        match ipc::connect(&locations.endpoint, deadline) {
             Ok(stream) => return Ok(stream),
-            Err(error) if ipc::is_absent(&error) => {}
+            // Busy, a daemon is there: it listens, but was not reached by
+            // the deadline (checked below).
+            Err(error) if ipc::is_absent(&error) || ipc::is_busy(&error) => {}
             Err(error) => return Err(StartError::Unreachable(error)),
         }
         match launched.exit_code() {
-            None | Some(0 | daemon::ALREADY_RUNNING) => {}
+            None | Some(0) => {}
+            Some(daemon::ALREADY_RUNNING) => {
+                if let Some(restart) = restart {
+                    let now = Instant::now();
+                    let at = *restart_at.get_or_insert(now + pause);
+                    if now >= at {
+                        *launched = restart().map_err(|_| StartError::Exited(1))?;
+                        restart_at = None;
+                        pause = (pause * 2).min(RESTART_PAUSE_MAX);
+                    }
+                }
+            }
             Some(DETACH_TIMED_OUT) => return Err(StartError::TimedOut),
             Some(code) => return Err(StartError::Exited(code)),
         }

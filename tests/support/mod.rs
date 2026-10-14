@@ -403,6 +403,25 @@ impl Fixture {
         }
     }
 
+    /// The lock in the state directory that a daemon holds for its whole
+    /// life: `daemon-<session>.lock` on Windows, `daemon.lock` elsewhere.
+    pub fn lock_file(&self) -> PathBuf {
+        #[cfg(windows)]
+        let name = {
+            use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+            use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+
+            let mut session = 0;
+            // SAFETY: writes the session id of this process into `session`.
+            let found = unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
+            assert!(found != 0, "the session of this process");
+            format!("daemon-{session}.lock")
+        };
+        #[cfg(unix)]
+        let name = "daemon.lock";
+        self.state_dir().join(name)
+    }
+
     /// The daemon's own log, of every daemon this fixture had, whatever its
     /// session suffix.
     pub fn daemon_log(&self) -> String {
