@@ -5,7 +5,8 @@
 //! (`runs/` in the state directory), written by the daemon as the output
 //! arrives: a [`Recorder`], fed by `daemon::execute::pump`, the one place
 //! all of a run's output passes. Output is recorded whether or not a client
-//! still listens. A record holds the run's stdout and stderr as they reached
+//! still listens, and clients following the run read it from the record
+//! (`daemon::live`). A record holds the run's stdout and stderr as they reached
 //! the daemon: the exact bytes, in order within each stream; across the two
 //! streams, in the order the daemon read them (two pipes have no common
 //! order finer than that). Runs heli executes directly, without a daemon,

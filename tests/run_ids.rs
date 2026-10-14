@@ -62,6 +62,32 @@ fn a_lost_counter_does_not_reuse_ids() {
     assert_eq!(logged(&fixture, "r2"), "arg: \"second\"\n");
 }
 
+/// A number that cannot be written back to the counter is not given: the
+/// daemon refuses the run, and the client runs the command directly after
+/// one warning.
+#[test]
+fn a_number_that_cannot_be_kept_is_not_given() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    std::fs::create_dir_all(counter(&fixture)).expect("make the counter a directory");
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(&echo)
+        .arg("direct")
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli exec");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "arg: \"direct\"\n");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let (warning, rest) = stderr.split_once('\n').expect("a warning line");
+    assert!(
+        warning.starts_with("cargo-heli: warning: the heli daemon cannot number the run: ")
+            && warning.ends_with("; running the command directly"),
+        "{stderr}"
+    );
+    assert_eq!(rest, "echo-args: stderr\n", "no footer: {stderr}");
+}
+
 /// A counter behind the run log (another daemon wrote records past it, or
 /// it was restored from an old copy) is overtaken: no record is written
 /// over.

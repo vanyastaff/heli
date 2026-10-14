@@ -67,10 +67,10 @@ impl Live {
     }
 
     /// Adds what the run wrote to `channel`; `recorded` says whether the
-    /// record holds it.
+    /// record holds it (once recording has failed, it never resumes).
     pub fn append(&self, channel: Channel, bytes: Vec<u8>, recorded: bool) {
         let mut journal = self.journal();
-        if recorded && journal.kept.is_empty() {
+        if recorded {
             journal.recorded += 1;
         } else {
             journal.kept.push((channel, bytes));

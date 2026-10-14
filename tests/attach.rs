@@ -56,8 +56,8 @@ fn split_notice(stderr: &str) -> (&str, &str) {
 /// A second call of the same command attaches to the first one's run: it
 /// prints a notice, then the run's output from its start (written before it
 /// attached), and exits with the run's code; the command started once.
-/// What a shell keeps for itself (`SHLVL`, `OLDPWD`) may differ. `status`
-/// counts the clients attached as they come and go.
+/// What a shell keeps for itself (`PWD`, `OLDPWD`, `SHLVL`, `_`) may
+/// differ. `status` counts the clients attached as they come and go.
 #[test]
 fn the_same_command_attaches_to_the_run_in_flight() {
     let fixture = Fixture::new("basic");
@@ -70,9 +70,10 @@ fn the_same_command_attaches_to_the_run_in_flight() {
             .arg("once")
             .env("ECHO_WAIT_FOR", &gate)
             .env("ECHO_STARTS", &starts)
-            .env("ECHO_EXIT", "3")
-            .env("SHLVL", shell)
-            .env("OLDPWD", fixture.path(shell));
+            .env("ECHO_EXIT", "3");
+        for name in ["PWD", "OLDPWD", "SHLVL", "_"] {
+            call.env(name, format!("{name} of shell {shell}"));
+        }
         start(&mut call)
     };
     let first = call("1");
@@ -115,6 +116,71 @@ fn the_same_command_attaches_to_the_run_in_flight() {
     assert_eq!(rest, "echo-args: stderr\n");
     let started = std::fs::read_to_string(&starts).expect("read the starts");
     assert_eq!(started.lines().count(), 1, "the command started once");
+}
+
+/// A daemon asked to retire starts no new run, but still attaches a client
+/// to the same command in flight rather than leave it to run the command a
+/// second time; it exits once both have heard the end.
+#[test]
+fn a_retiring_daemon_still_attaches_to_its_runs() {
+    use std::io::{Read, Write};
+
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    let call = || {
+        let mut call = fixture.heli(["exec", "--"]);
+        call.arg(&echo).arg("in flight").env("ECHO_WAIT_FOR", &gate);
+        start(&mut call)
+    };
+    let first = call();
+    fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    // The handshake every version speaks, from a client of a newer protocol.
+    let mut newer = support::endpoint::connect(&fixture.endpoint());
+    newer.write_all(b"HELI").expect("send the magic");
+    newer
+        .write_all(&u32::MAX.to_le_bytes())
+        .expect("send the version");
+    newer.read_exact(&mut [0u8; 8]).expect("the daemon's hello");
+    newer.write_all(b"R").expect("ask to retire");
+    let _ = newer.read_to_end(&mut Vec::new());
+
+    let second = call();
+    fixture.wait_for_status("the second client", |status| {
+        runs(status)[0]["attached_clients"] == 2
+    });
+    std::fs::write(&gate, "").expect("open the gate");
+    for output in [finish(first), finish(second)] {
+        assert_success(&output, "cargo heli exec");
+        assert_eq!(text(&output.stdout), "arg: \"in flight\"\n");
+    }
+    fixture.wait_for_status("the daemon to exit", |status| status["daemon"].is_null());
+}
+
+/// On Windows, where variable names ignore case, a variable spelled in
+/// another case is the same variable: the same command attaches.
+#[cfg(windows)]
+#[test]
+fn variable_names_ignore_case_on_windows() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    let call = |name: &str| {
+        let mut call = fixture.heli(["exec", "--"]);
+        call.arg(&echo).env("ECHO_WAIT_FOR", &gate).env(name, "on");
+        start(&mut call)
+    };
+    let first = call("HELI_TEST_CASE");
+    fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let second = call("heli_test_case");
+    let status = fixture.wait_for_status("the second client", |status| {
+        runs(status)[0]["attached_clients"] == 2
+    });
+    assert_eq!(runs(&status).len(), 1, "{status}");
+    std::fs::write(&gate, "").expect("open the gate");
+    for output in [finish(first), finish(second)] {
+        assert_success(&output, "cargo heli exec");
+    }
 }
 
 /// An agent whose call was killed mid-build calls the same command again:

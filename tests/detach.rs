@@ -44,6 +44,17 @@ fn listed(status: &Value, id: &str) -> Option<Value> {
     runs(status).into_iter().find(|run| run["id"] == id)
 }
 
+/// The line `cargo heli status` (text) prints for run `id`.
+fn status_line(fixture: &Fixture, id: &str) -> String {
+    let output = fixture.heli(["status"]).output().expect("run heli status");
+    assert_success(&output, "cargo heli status");
+    text(&output.stdout)
+        .lines()
+        .find(|line| line.split_whitespace().any(|word| word == id))
+        .unwrap_or_else(|| panic!("no line for {id}: {}", text(&output.stdout)))
+        .to_owned()
+}
+
 /// A build whose client is killed mid-build goes on to its end: `status`
 /// then lists it as done, with its exit and no client attached, and `log`
 /// has its whole output, including what it printed after the client died.
@@ -60,6 +71,8 @@ fn a_killed_clients_build_goes_on_to_its_end() {
     assert_eq!(run["attached_clients"], 1, "its client: {status}");
     assert_eq!(run["exit"], Value::Null, "{status}");
     wait_until("the build script", || scripts.running() == 1);
+    let line = status_line(&fixture, &id);
+    assert!(line.contains("  running, 1 attached  "), "{line}");
 
     support::kill_tree(client.id());
     let _ = finish(client);
@@ -77,6 +90,8 @@ fn a_killed_clients_build_goes_on_to_its_end() {
     let ended = run["ended_at"].as_u64().expect("an end");
     assert!(started <= ended, "{status}");
     assert_eq!(scripts.intervals().len(), 1, "the script ran to its end");
+    let line = status_line(&fixture, &id);
+    assert!(line.contains("  done, exit 0  "), "{line}");
 
     let logged = fixture.heli(["log", &id]).output().expect("run heli log");
     assert_success(&logged, "cargo heli log");

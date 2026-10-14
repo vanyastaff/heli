@@ -7,7 +7,11 @@
 //! told; the oldest of those go once there are more than [`DONE_KEPT`].
 //!
 //! **Attaching.** A client asking for the same [`Command`] as a run in
-//! flight attaches to that run instead of starting another.
+//! flight attaches to that run instead of starting another; for one still
+//! starting, it waits until it has started ([`STARTING_WAIT`] at most).
+//!
+//! **Cancelling** marks a run cancelled (it takes no new clients, and ends
+//! as cancelled) and hands out its process tree (`super::tree`) to kill.
 //!
 //! **Run ids** are `r<number>`, unique for the life of the state directory
 //! ([`RunIds`]): run logs and markers are keyed by them, and on Windows
@@ -18,8 +22,8 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::live::Live;
 use super::tree::Tree;
@@ -184,9 +188,15 @@ fn highest_record(records: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// How long a client asking for the same command as a run that is starting
+/// waits for it to start, before it starts a run of its own.
+const STARTING_WAIT: Duration = Duration::from_secs(10);
+
 pub struct Registry {
     ids: RunIds,
     inner: Mutex<Inner>,
+    /// Notified when a run that was starting has started, or never will.
+    changed: Condvar,
 }
 
 struct Inner {
@@ -201,34 +211,60 @@ impl Registry {
             inner: Mutex::new(Inner {
                 runs: BTreeMap::new(),
             }),
+            changed: Condvar::new(),
         }
     }
 
     /// Attaches a client to the run of `command` in flight, if there is
-    /// one; else admits a new run of it in `worktree`, unless the daemon is
-    /// `retiring`.
+    /// one (waiting for it to start, if it is starting); else admits a new
+    /// run of it in `worktree`, unless the daemon is `retiring`.
     pub fn admit(&self, worktree: PathBuf, command: Command, retiring: bool) -> Admission {
+        let deadline = Instant::now() + STARTING_WAIT;
         let mut inner = self.lock();
-        let same = inner.runs.iter_mut().find(|(_, entry)| {
-            matches!(
-                entry.state,
-                State::Running {
-                    cancelled: false,
-                    ..
+        loop {
+            let same = inner
+                .runs
+                .iter()
+                .find(|(_, entry)| {
+                    entry.command == command
+                        && matches!(
+                            entry.state,
+                            State::Starting
+                                | State::Running {
+                                    cancelled: false,
+                                    ..
+                                }
+                        )
+                })
+                .map(|(&id, entry)| (id, matches!(entry.state, State::Starting)));
+            match same {
+                Some((id, false)) => {
+                    if let Some(entry) = inner.runs.get_mut(&id)
+                        && let State::Running { live, .. } = &entry.state
+                    {
+                        entry.attached += 1;
+                        return Admission::Attached(Attached {
+                            id,
+                            live: Arc::clone(live),
+                            // Opened while it runs, so it is not pruned first.
+                            events: live.open(),
+                            running_for: entry.started_at.elapsed().unwrap_or_default(),
+                        });
+                    }
                 }
-            ) && entry.command == command
-        });
-        if let Some((&id, entry)) = same
-            && let State::Running { live, .. } = &entry.state
-        {
-            entry.attached += 1;
-            return Admission::Attached(Attached {
-                id,
-                live: Arc::clone(live),
-                // Opened while it runs, so the record is not pruned first.
-                events: live.open(),
-                running_for: entry.started_at.elapsed().unwrap_or_default(),
-            });
+                // Attach once it has started; if it does not, start anew.
+                Some((_, true)) if Instant::now() < deadline => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    inner = self
+                        .changed
+                        .wait_timeout(inner, left)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                    continue;
+                }
+                _ => {}
+            }
+            break;
         }
         if retiring {
             return Admission::Refused("the heli daemon is shutting down".to_owned());
@@ -265,6 +301,7 @@ impl Registry {
                 cancelled: false,
             };
         }
+        self.changed.notify_all();
     }
 
     /// Marks run `run` (`r<number>`) as cancelled, and returns its process
@@ -290,6 +327,7 @@ impl Registry {
     /// Removes run `id`, which never started.
     pub fn abandon(&self, id: RunId) {
         self.lock().runs.remove(&id);
+        self.changed.notify_all();
     }
 
     /// A client no longer follows run `id`.
