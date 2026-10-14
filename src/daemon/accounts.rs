@@ -24,7 +24,8 @@
 //! must happen before the run's cargo creates the build directory, so the
 //! first run from a directory waits for its learning
 //! ([`Learning::prepared`], at most [`PREPARE_WAIT`]) while a store holds
-//! an orphan that could be recycled; no other run waits for it. Each
+//! an orphan of its own repository, which it could get; no other run waits
+//! for it. Each
 //! recycling is a `recycle` event in the event log, with what it moved and
 //! how many units the path scan invalidated, and a note to the run's
 //! clients.

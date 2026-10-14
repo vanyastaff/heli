@@ -757,10 +757,14 @@ These are the only waits; nothing else makes a heli run wait for another run.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
 4. **Recycling:** the first run from a directory, while a store holds an
-   orphan, waits until its worktree's build directory has been recycled or
-   will not be (§6.4): for its `cargo metadata`, and with a donor for a scan
-   and a rename, and with a donor's source-state record for setting times
-   in the worktree. At most 30 s; later runs from there never wait for it.
+   orphan of its own repository (the one git names for the directory),
+   waits until its worktree's build directory has been recycled or will
+   not be (§6.4): for its `cargo metadata`, and with a donor for staging the
+   worktree, a scan and a rename, and with a donor's source-state record
+   for setting times in the worktree. At most 30 s; later runs from there
+   never wait for it, and an orphan of another repository keeps no run
+   waiting. While a store holds any orphan, the first run asks git for its
+   repository before it starts.
 5. **The source-state record:** as a run ends, its clients hear the end
    once the record of its build directory is written (§6.4), at most 10 s
    later. This waits for no other run.
@@ -1143,8 +1147,9 @@ those arguments, not even one standing in for cargo under another name. Its
 `target_directory` and `build_directory` (cargo 1.91 and later) say where
 the run builds. It takes no lock (verified: it answers while a build holds
 the build directory's), and it fails no run. It delays none either, but the
-first run from a directory while a store holds an orphan, which waits for
-it in case its worktree gets a recycled build directory (§6.4).
+first run from a directory while a store holds an orphan of its
+repository, which waits for it in case its worktree gets a recycled build
+directory (§6.4).
 
 - The `target/` directory is **registered**, with its workspace, in
   `store.json` in the state directory, which outlives the daemon.
@@ -1316,7 +1321,8 @@ belongs to one live worktree.
   its creation time.
 - **The first run.** The run's own `cargo metadata` (§6.2) names the build
   directory, and recycling happens before the run starts: the first run
-  from a directory waits for it while a store holds an orphan (§5, "Where a
+  from a directory waits for it while a store holds an orphan of its
+  repository (§5, "Where a
   run can wait"). The run's clients get a note:
   `cargo-heli: note: recycled the build directory of <donor>, a removed
   worktree; the path scan invalidated 2 units`, or after `worktree` for
