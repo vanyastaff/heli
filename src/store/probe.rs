@@ -9,6 +9,7 @@
 //!   holding a directory, the same for every worktree of one repository.
 //! - [`Probe::worktrees`]: the worktrees of a repository, as `git worktree
 //!   list` names them.
+//! - [`Probe::git_in`]: any other git command, as the run would run it.
 //!
 //! Only a program named `cargo` is ever started with `metadata`'s
 //! arguments ([`Probe::of`]), never one standing in for cargo under another
@@ -111,6 +112,35 @@ impl Probe {
             return None;
         }
         String::from_utf8(output.stdout).ok()
+    }
+
+    /// git with `args` in `dir`, taking no optional lock, with `index` as
+    /// its index file when given: its stdout, or why it failed.
+    pub fn git_in(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        index: Option<&Path>,
+    ) -> Result<Vec<u8>, String> {
+        let mut command = self.command(&OsString::from("git"), args, dir);
+        command
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stderr(Stdio::piped());
+        if let Some(index) = index {
+            command.env("GIT_INDEX_FILE", index);
+        }
+        let output = command
+            .output()
+            .map_err(|error| format!("cannot run git: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "`git {}` failed ({}): {}",
+                args.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(output.stdout)
     }
 
     /// The workspace as `cargo metadata` describes it.

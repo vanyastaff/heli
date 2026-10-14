@@ -77,14 +77,34 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }))
 }
 
-/// The tree of `request`'s worktree with every change staged: `git add -A`
-/// into a scratch copy of the index, then `git write-tree`. The real index is
-/// only read.
+/// The tree of `request`'s worktree with every change staged ([`staged`]),
+/// as `git write-tree` names it.
 pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String> {
+    let git = |args: &[&str], index: Option<&Path>| git(request, args, index);
+    let tree = staged(&git, &execute::cwd(request), scratch, |index| {
+        git(&["write-tree"], Some(index))
+    })?;
+    Ok(Snapshot { tree: trim(tree) })
+}
+
+/// Runs git as a caller wants it run: with these arguments, and with this
+/// index file instead of the real one when given; returns its stdout.
+pub type Git<'a> = dyn Fn(&[&str], Option<&Path>) -> Result<Vec<u8>, String> + 'a;
+
+/// Calls `inspect` with a scratch copy of the index of the worktree that
+/// `git` runs in (from `cwd`), in which every change is staged: `git add
+/// -A`, untracked files included and ignored ones not. The real index is
+/// only read; the copy, in `scratch`, is removed afterwards.
+pub fn staged<T>(
+    git: &Git<'_>,
+    cwd: &Path,
+    scratch: &Path,
+    inspect: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
     static NEXT: AtomicU64 = AtomicU64::new(0);
-    let index = git(request, &["rev-parse", "--git-path", "index"], None)?;
+    let index = git(&["rev-parse", "--git-path", "index"], None)?;
     let index = String::from_utf8(index).map_err(|_| "the index's path is not UTF-8".to_owned())?;
-    let real = execute::cwd(request).join(index.trim_end());
+    let real = cwd.join(index.trim_end());
     std::fs::create_dir_all(scratch)
         .map_err(|error| format!("cannot create {}: {error}", scratch.display()))?;
     let copy = scratch.join(format!(
@@ -92,18 +112,18 @@ pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let tree = (|| {
+    let inspected = (|| {
         if real.exists() {
             // The copy keeps the stat cache, so unchanged files are not
             // hashed again.
             std::fs::copy(&real, &copy)
                 .map_err(|error| format!("cannot copy the index: {error}"))?;
         }
-        git(request, &["add", "-A"], Some(&copy))?;
-        git(request, &["write-tree"], Some(&copy))
+        git(&["add", "-A"], Some(&copy))?;
+        inspect(&copy)
     })();
     let _ = std::fs::remove_file(&copy);
-    Ok(Snapshot { tree: trim(tree?) })
+    inspected
 }
 
 /// This machine: its name (lower-cased), OS and architecture.
