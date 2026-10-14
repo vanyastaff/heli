@@ -4,6 +4,10 @@
 //! ```toml
 //! [pool]
 //! slots = 16   # the host pool's size; default: the number of logical CPUs
+//!
+//! [log]
+//! runs = 200           # run logs kept; default 200
+//! bytes = 2147483648   # their total size; default 2 GiB
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -20,6 +24,7 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     pub pool: PoolConfig,
+    pub log: LogConfig,
 }
 
 /// `[pool]`: the host pool (`crate::pool`).
@@ -28,6 +33,16 @@ pub struct Config {
 pub struct PoolConfig {
     /// N, the pool's slots.
     pub slots: Option<NonZeroU32>,
+}
+
+/// `[log]`: how much of the run log the daemon keeps (`crate::runlog`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct LogConfig {
+    /// How many records.
+    pub runs: Option<usize>,
+    /// How many bytes of records.
+    pub bytes: Option<u64>,
 }
 
 impl Config {

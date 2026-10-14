@@ -7,19 +7,23 @@
 //! `crate::protocol`:
 //!
 //! - **run**: admit it to the registry ([`registry`]), tell the client it
-//!   started, execute it ([`execute`]), take it out of the registry, report
-//!   its exit. `Daemon::run` is the one sequence every run goes through,
-//!   and the place for what happens around a run (admission, waits,
-//!   recording);
+//!   started, start its record in the run log (`crate::runlog`), execute it
+//!   ([`execute`]), take it out of the registry, report its exit.
+//!   `Daemon::run` is the one sequence every run goes through, and the
+//!   place for what happens around a run (admission, waits, recording);
 //! - **status**: describe the daemon and the registry's runs;
-//! - **retire**, from a newer client: accept no more runs and exit once the
-//!   runs in flight have reported their exits.
+//! - **log**: send part of a run's record;
+//! - a request it does not know: answer that it is unsupported;
+//! - **retire**, from a newer client (of another protocol version, or with a
+//!   request this daemon does not know): accept no more runs and exit once
+//!   the runs in flight have reported their exits.
 //!
 //! What the daemon owns for its whole life (the lock, then the host pool,
-//! `crate::pool`, sized by the configuration, and on Unix the pool's
-//! [`warden`]) is set up in [`main`]. The daemon runs until it is killed or
-//! retired. Its own log (start, end, errors) is `daemon.log` in the state
-//! directory (`daemon-<session>.log` on Windows), since it has no terminal.
+//! `crate::pool`, and the run log, `crate::runlog`, both as configured,
+//! and on Unix the pool's [`warden`]) is set up in [`main`]. The daemon
+//! runs until it is killed or retired. Its own log (start, end, errors)
+//! is `daemon.log` in the state directory (`daemon-<session>.log` on
+//! Windows), since it has no terminal.
 
 pub mod execute;
 pub mod registry;
@@ -35,7 +39,8 @@ use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::pool::{self, Pool};
-use crate::protocol::{self, Reply, Request, RunRequest};
+use crate::protocol::{self, LogRequest, Reply, Request, RunRequest};
+use crate::runlog::{self, Limits, RunLog};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
 
@@ -74,7 +79,8 @@ pub fn main() -> ! {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }
     }
-    let pool = open_pool(&locations, &log);
+    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
+    let pool = open_pool(&locations, &config, &log);
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
@@ -94,6 +100,7 @@ pub fn main() -> ! {
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
         pool,
+        runlog: RunLog::new(locations.run_logs(), Limits::configured(&config.log)),
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
@@ -123,8 +130,7 @@ fn fail(log: Option<&Log>, error: &str) -> ! {
 }
 
 /// Opens the host pool, of the size configured, or exits with failure.
-fn open_pool(locations: &Locations, log: &Log) -> Pool {
-    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(log), &error));
+fn open_pool(locations: &Locations, config: &Config, log: &Log) -> Pool {
     let slots = config
         .pool
         .slots
@@ -167,6 +173,7 @@ fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter>
 struct Daemon {
     registry: Registry,
     pool: Pool,
+    runlog: RunLog,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -193,24 +200,54 @@ impl Daemon {
             return;
         }
         if version != protocol::VERSION {
-            let mut byte = [0u8];
-            if matches!(std::io::Read::read(&mut stream, &mut byte), Ok(1))
-                && byte[0] == protocol::RETIRE
-            {
-                self.log.write(&format!(
-                    "a client of protocol {version} asked this daemon to retire"
-                ));
-                self.retire();
-            }
+            self.retire_if_asked(&mut stream, &format!("a client of protocol {version}"));
             return;
         }
-        match protocol::read_message::<Request>(&mut stream) {
+        // JSON first, so that a request this daemon does not know (from a
+        // newer client) is told apart from a garbled one.
+        let Ok(message) = protocol::read_message::<serde_json::Value>(&mut stream) else {
+            return;
+        };
+        match serde_json::from_value::<Request>(message) {
             Ok(Request::Status) => {
                 let _ = protocol::write_message(&mut stream, &Reply::Status(self.status()));
             }
             Ok(Request::Run(request)) => self.run(stream, request),
-            Err(_) => {}
+            Ok(Request::Log(request)) => self.log(stream, &request),
+            Err(_) => {
+                if protocol::write_message(&mut stream, &Reply::Unsupported).is_ok() {
+                    self.retire_if_asked(&mut stream, "a client with a request this daemon lacks");
+                }
+            }
         }
+    }
+
+    /// Retires when the client's next byte asks for it; `client` says who
+    /// it is, for the log.
+    fn retire_if_asked(&self, stream: &mut Stream, client: &str) {
+        let mut byte = [0u8];
+        if matches!(std::io::Read::read(stream, &mut byte), Ok(1)) && byte[0] == protocol::RETIRE {
+            self.log
+                .write(&format!("{client} asked this daemon to retire"));
+            self.retire();
+        }
+    }
+
+    /// Sends the part of a run's record that `request` asks for.
+    fn log(&self, mut stream: Stream, request: &LogRequest) {
+        let read = runlog::read(
+            self.runlog.dir(),
+            &request.run,
+            &request.select,
+            &mut |channel, bytes| protocol::write_output(&mut stream, channel, bytes),
+        );
+        let reply = match read {
+            Ok(()) => Reply::LogEnd,
+            Err(error) => Reply::LogFailed {
+                message: error.to_string(),
+            },
+        };
+        let _ = protocol::write_message(&mut stream, &reply);
     }
 
     /// Executes `request` for the client on `stream`.
@@ -233,12 +270,13 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
+        let mut record = self.runlog.record(&id.to_string());
         let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
                 message: error.to_string(),
             },
-            Ok(child) => match execute::pump(child, &mut stream) {
+            Ok(child) => match execute::pump(child, &mut stream, &mut record) {
                 Ok(status) => exited(status),
                 Err(error) => {
                     self.log.write(&format!("cannot wait for {id}: {error}"));
@@ -249,6 +287,10 @@ impl Daemon {
                 }
             },
         };
+        if let Some(error) = record.take_error() {
+            self.log.write(&format!("cannot record {id}: {error}"));
+        }
+        drop(record);
         self.registry.finish(id);
         let _ = protocol::write_message(&mut stream, &reply);
         // The reply is out before a retiring daemon may exit.

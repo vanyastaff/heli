@@ -13,6 +13,7 @@
 //! - [`pool`]: the host pool, the jobserver every run draws from, sized by
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
+//! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
 //!   draw from the pool;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
@@ -31,6 +32,7 @@ mod locations;
 mod nesting;
 mod pool;
 mod protocol;
+mod runlog;
 mod setup;
 mod status;
 mod worktree;
@@ -59,6 +61,7 @@ fn main() {
         cli::Action::Status { json } => client::status(json),
         cli::Action::Ensure => client::ensure(depth),
         cli::Action::Setup { print } => setup::main(print),
+        cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),
