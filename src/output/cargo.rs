@@ -44,34 +44,32 @@ const SHORT_ERRORS: usize = 30;
 /// Warning locations shown by lint, at most.
 const WARNING_LOCATIONS: usize = 50;
 
-/// How compact output shows warnings.
+/// How compact output shows warnings, as the run's class says
+/// (`super::view_of`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Warnings {
-    /// A count per lint, on one line (build, doc: compile runs, whose
-    /// product is the artifact).
+    /// A count per lint, on one line: compile runs (build, doc), whose
+    /// product is the artifact.
     Counts,
-    /// Their locations, grouped by lint (check, clippy: verify runs, where
-    /// the findings are the point).
+    /// Their locations, grouped by lint: verify runs (check, clippy), where
+    /// the findings are the point.
     ByLint,
 }
 
-/// How compact output shows the warnings of `cargo <args>` (`args` from the
-/// subcommand on), or `None` when heli does not render its output: `run`
-/// prints the program's own output, `clippy --fix`, `fix` and `fmt` rewrite
-/// sources and say what they fixed in lines `--quiet` drops, and heli
-/// knows nothing of other subcommands' output.
-///
-/// This is the one place that reads the subcommand for the output view; it
-/// stands in for the run classes of #12 (see `super::view_of`).
-pub fn warnings_of(args: &[OsString]) -> Option<Warnings> {
-    let (subcommand, rest) = args.split_first()?;
-    let mut before_separator = rest.iter().take_while(|arg| *arg != "--");
-    match subcommand.to_str()? {
-        "build" | "b" | "doc" | "d" => Some(Warnings::Counts),
-        "check" | "c" => Some(Warnings::ByLint),
-        "clippy" if !before_separator.any(|arg| arg == "--fix") => Some(Warnings::ByLint),
-        _ => None,
-    }
+/// Whether cargo reports the diagnostics of `cargo <args>` (`args` from the
+/// subcommand on) as JSON messages and prints nothing else heli would drop:
+/// build, check, clippy and doc, and cargo's aliases `b`, `c` and `d`. Of
+/// the other compile and verify runs, `run` prints the program's own output
+/// and `fmt --check` is rustfmt's; `clippy --fix` is a mutate run.
+pub fn reports_json(args: &[OsString]) -> bool {
+    args.first()
+        .and_then(|subcommand| subcommand.to_str())
+        .is_some_and(|subcommand| {
+            matches!(
+                subcommand,
+                "build" | "b" | "check" | "c" | "clippy" | "doc" | "d"
+            )
+        })
 }
 
 /// Whether `cargo <args>` (`args` from the subcommand on) already chooses

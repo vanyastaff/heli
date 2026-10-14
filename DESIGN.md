@@ -143,7 +143,11 @@ daemon. The version stays 1 until the first release: until then a daemon
 answers a request it does not know (one a newer client added, such as `log`)
 with "unsupported", and the client treats that like a mismatch from an older
 daemon. It asks the daemon to retire and does without it, after one warning
-line: it runs the command, or reads the run log, itself.
+line: it runs the command, or reads the run log, itself. Fields added to a
+message are optional, so both sides still read each other's: a run request
+without a class (§5) comes from a client older than run classes, its run
+counts as exec, and the daemon does not send it the "waiting" message, which
+it could not read.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
@@ -239,6 +243,33 @@ restart never doubles it.
 - Slots held by a process that died are not recovered here; that is the
   top-up's job (below).
 
+**Lifetime.** A pool lives while some process holds it, and no longer. Once
+its daemon is gone and nobody holds it, a bare cargo pointed at it (§4
+"Reach") cannot open it, prints cargo's warning, and builds with a pool of
+its own, as without heli.
+
+- A semaphore goes with its last handle.
+- A FIFO's path stays, and once nobody holds it, it has no bytes: a bare
+  cargo would open it, find no slot, and build one job at a time, without a
+  warning. So each daemon starts a **warden** as it opens the pool:
+  `cargo heli daemon --warden`, a process of its own (its own process group,
+  no stdio but the read end of a pipe whose write end only the daemon
+  holds). However the daemon ends (it retires, is killed, crashes), the
+  warden reads the end of the pipe. It then removes the FIFO as soon as no
+  process holds it (the `ENXIO` probe above), looking again every 250 ms
+  while one does: a cargo still building keeps the pool alive, as it would
+  keep a semaphore.
+- **The pool's lock**, `<fifo>.lock`, keeps a warden from removing a FIFO
+  that a daemon owns. A daemon takes it before it opens the FIFO and holds
+  it for life (it waits up to 1 s for it, since a warden holds it for a
+  moment; longer means another daemon owns the pool, and this one does not
+  start). A warden holds it only while it looks, and exits once a daemon
+  owns it again.
+- A warden killed together with its daemon (a kill of both, a power loss)
+  leaves the FIFO behind. The next daemon fills it again (Adoption, above);
+  until then, a bare cargo builds one job at a time. A session-start hook
+  that runs `cargo heli ensure`, or the logon task, keeps that window short.
+
 ### Run pools
 
 Each heli run gets a **run pool** of its own: a second semaphore or FIFO,
@@ -278,40 +309,99 @@ Bare cargo, started without heli, still draws from the host pool directly.
   Spikes, such as a single rustc at 4.3 GB, are the governor's job.
 - **Memory governor.** The daemon samples available physical memory and, on
   Windows, available commit, because allocations fail at the commit limit
-  before RAM is full.
+  before RAM is full. It samples once a second: Windows
+  `GlobalMemoryStatusEx` and `K32GetPerformanceInfo` (system-wide
+  `CommitLimit − CommitTotal`), Linux `MemAvailable` in `/proc/meminfo`,
+  macOS `host_statistics64`.
   - Below the low watermark (default: 10 % of RAM or 6 GB, whichever is
     larger), it withholds slots: it acquires one per sample from the host pool
-    as they free up, down to 1 slot left.
-  - Above the high watermark (the low one plus 4 GB), it returns them.
+    as they free up, down to 1 slot left. Available commit below the low
+    watermark counts as pressure too.
+  - Above the high watermark (the low one plus 4 GB), it returns them, all
+    at once; available commit, where there is one, must be above it too.
+    Between the two nothing changes, so it never swings back and forth.
   - Jobs already running are never interrupted, so pressure eases as they
     finish.
+  - `[memory] low_watermark_mb` and `high_watermark_mb` in the configuration
+    set the watermarks, in megabytes (2^20 bytes); the high one must be above
+    the low one. `status` shows the last sample, the watermarks and the
+    slots withheld (§8).
 - **Bounded top-up.** Only bare cargo can leak a slot: a process killed while
   holding one, and semaphores and FIFOs have no owner. The host pool's target
   of free slots is `N − withheld − Σ lent`.
-  - The daemon raises the free count to the target only at quiescence: no
-    heli run active, and no rustc and no build script alive for 2 s.
-    Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore`.
-    Unix: `FIONREAD` on the FIFO, then writes.
-  - The pool never grows beyond the target. On Windows the semaphore's
-    maximum count is N, and a surplus release simply fails (the jobserver
-    client ignores the error). A FIFO has no maximum, so on Unix the daemon
-    also drains, at any time, every byte above the target. A token that a
-    cargo still held during a top-up (between taking it and starting the job,
-    or held by a jobserver client the process scan does not see) then comes
-    back as surplus and is removed.
+  - The daemon raises the free count to the target only at quiescence,
+    observed at its samples for 2 s: no heli run active, and either no
+    process but the daemon holds the pool open, or no rustc, rustdoc,
+    clippy-driver or build script is alive. A pool nobody else holds can
+    have no slot that will come back, whatever compiles elsewhere on the
+    machine (other users' pools, other agents' builds without heli); the
+    process scan alone would wait for every compiler in the session.
+    - Who holds the pool: on Windows, the semaphore's handle count
+      (`NtQueryObject`) above the daemon's one; on Linux, a descriptor of
+      the FIFO under `/proc/<pid>/fd` of the user's processes; on macOS, the
+      same through `proc_pidinfo`.
+    - The process scan: on Windows `WTSEnumerateProcessesW`, the processes
+      of the logon session (where the semaphore lives); on Linux
+      `/proc/<pid>/comm` of the user's processes, cut to 15 bytes
+      (`build-script-bu`); on macOS the file name of `proc_pidpath`.
+    - Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore`.
+      Unix: `FIONREAD` on the FIFO, then writes.
+  - The pool never grows beyond the target. The daemon drains, at any time,
+    every free slot above the target. A FIFO has no maximum, and a
+    semaphore's maximum count N bounds it only while nothing is withheld or
+    lent. A token that a cargo still held during a top-up (between taking it
+    and starting the job, or held by a jobserver client the process scan
+    does not see) then comes back as surplus and is removed.
+  - A run pool broker counts a loan after taking its slot from the host
+    pool, and stops counting it before giving the slot back, so the free
+    count never stands above the target meanwhile.
 
 ### Reach
 
 - A run through `cargo heli` gets its run pool from the daemon.
 - A bare cargo gets the host pool from the environment that
-  `cargo heli setup` writes: the agent harness settings (Claude Code
-  `settings.json`, `env`), the shell profile, or the user environment. This is
-  the safety net for G2: an agent that forgets heli still shares the pool.
+  `cargo heli setup` writes. This is the safety net for G2: an agent that
+  forgets heli still shares the pool. A bare cargo that finds the pool says
+  so: cargo warns that it ignores a `-j` given beside an external jobserver.
 - Without a running daemon, a bare cargo prints cargo's jobserver warning and
-  runs as it does today. `cargo heli` starts the daemon on demand, and
-  `cargo heli setup` can also register it to start at logon (Task Scheduler,
-  systemd `--user`, launchd) or as a harness session-start hook
-  (`cargo heli ensure`).
+  runs as it does today (Lifetime, above). `cargo heli` starts the daemon on
+  demand, and so does `cargo heli ensure`, for a harness's session-start
+  hook. `cargo heli setup --autostart` can also register it to start at
+  logon (Task Scheduler, systemd `--user`, launchd).
+
+**`cargo heli setup [--print]`** offers `CARGO_MAKEFLAGS`, with the value
+every run gets for the host pool (`-j --jobserver-auth=<semaphore>`, or
+`fifo:<path>`), and writes it only with consent:
+
+- **Where.** Claude Code's user settings, `env` in `settings.json` in
+  `CLAUDE_CONFIG_DIR`, else in `~/.claude` (on Windows `USERPROFILE`, where
+  Claude Code looks), offered only when that directory exists. setup
+  rewrites the file as Claude Code does, as JSON with two-space indentation,
+  keeping every other setting in its order. And the profile of the shell
+  `SHELL` names: `~/.bashrc` for bash, `$ZDOTDIR/.zshrc` (else `~/.zshrc`)
+  for zsh, fish's `config.fish` (`set -gx`), `~/.profile` for any other.
+  setup adds two lines at its end, a comment that marks them as heli's and
+  the assignment, and replaces lines an earlier setup wrote with another
+  value. On Windows, Git Bash, MSYS2 and Cygwin set `SHELL`; without it
+  (PowerShell, cmd) setup prints the PowerShell line that sets the variable
+  in the user environment, and writes nothing there itself.
+- **Consent.** For each file, setup first shows exactly what it would write:
+  the file's whole new content ("would become:") or the lines it would end
+  with ("would end with:"), followed by an empty line. It then asks
+  `Write <path>? [y/N]` and reads the answer from stdin, so a script can
+  answer. Only `y` or `yes` writes; anything else, the end of input, or no
+  input at all leaves the file as it was. A file that already sets the
+  value is left alone without a question, and so is one setup cannot edit
+  safely (settings that are not a JSON object), with the reason.
+- **`--print`** shows the same, asks nothing and writes nothing.
+- setup exits 1 when a file it was told to write cannot be written.
+
+**`cargo heli ensure`** reaches the daemon, starting it as a run would, and
+exits 0 without a word, since a session-start hook's output may land in the
+agent's context. With a daemon running it only connects and exchanges
+versions. When no daemon can be reached, or the one there speaks another
+protocol version (an older one is asked to retire, as for a run), it exits
+1 with one line saying why.
 
 ## 5. Runs: `cargo heli <subcommand> [args...]`
 
@@ -330,6 +420,17 @@ else, for example a project's own task runner.
 | test | test, nextest run | yes | yes | yes | shared |
 | mutate | fmt, fix, clippy --fix | no | no | no | exclusive |
 | exec | anything else | yes | no | opt-in | shared |
+
+How a command line is read:
+
+- The subcommand comes after a `+toolchain`, if there is one. Cargo's
+  built-in aliases count as their subcommands (`b`, `c`, `d`, `r`, `t`), and
+  so does nextest's `r` for `run`. Aliases a project defines are exec.
+- `fmt` is verify when `--check` is among its arguments: cargo-fmt's own, or
+  rustfmt's after `--`.
+- `clippy` is mutate when `--fix` comes before `--`; what follows `--` is the
+  compiler's.
+- `cargo heli exec -- <cmd>` is exec whatever the command, even `cargo fmt`.
 
 ### Lifecycle
 
@@ -384,14 +485,33 @@ shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
 a file that another heli run is compiling. Bare cargo ignores this lock, so
 the rule "one writing agent per worktree" stays.
 
+- **The worktree** is the one `status` shows: the nearest directory holding
+  `.git`, else the working directory. Worktrees are compared by canonical
+  path, so another spelling of the same directory (on Windows, another case)
+  is the same worktree.
+- **Order.** Runs take their turns in the order the daemon admitted them: a
+  run waits for the runs admitted before it in the same worktree that
+  conflict with it, two runs conflicting when either is exclusive. So a
+  waiting `fmt` is never overtaken, and a stream of builds cannot starve it.
+- **Saying so.** A run that waits prints one line on stderr before anything
+  else, naming the runs it waits for:
+  `cargo-heli: waiting for r17 (cargo build -p foo) to finish with this worktree`.
+  `status` shows the wait (§8).
+- **Nested runs.** A run asked for from inside another heli run (its
+  `HELI_DEPTH` is above 1) does not wait: the run around it may hold the
+  lock, and `cargo heli exec -- cargo heli fmt` would then wait for itself
+  forever. It still takes its turn, so later runs wait for it. Since only
+  runs that are not nested wait, and only for runs admitted before them, no
+  wait closes a cycle.
+
 ### Where a run can wait
 
 These are the only waits; nothing else makes a heli run wait for another run.
 
 1. **Test slots:** up to 5 s before the test phase, after which it proceeds
    with one thread.
-2. **The worktree lock:** a mutate run waits for heli runs compiling the same
-   worktree, and they wait for it.
+2. **The worktree lock:** a mutate run waits for heli runs using the same
+   worktree, and they wait for it, in the order they came.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
 
@@ -406,7 +526,7 @@ cargo heli cancel <run>
 cargo heli gc [--dry-run]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
-cargo heli daemon [--detach]                       (internal)
+cargo heli daemon [--detach | --warden]            (internal)
 ```
 
 - **Exit codes.**
@@ -433,7 +553,9 @@ cargo heli daemon [--detach]                       (internal)
   commands run directly and the daemon's log says why. Keys it does not know
   are ignored, so a file written for a newer heli still works. It holds:
   - pool slots (`[pool] slots`, §4);
-  - memory watermarks;
+  - memory watermarks (`[memory] low_watermark_mb`, `high_watermark_mb`,
+    §4);
+  - the event log's size (`[event_log] max_kb`, §8);
   - disk budget and free-space floor;
   - the store per volume;
   - tool-cache patterns (§6.3);
@@ -443,6 +565,11 @@ cargo heli daemon [--detach]                       (internal)
   - log retention (`[log] runs`, the records kept, default 200, and
     `[log] bytes`, their total size in bytes, default 2 GiB; "Output"
     below).
+
+  Debug builds also read a `[test]` table, the one seam tests have into the
+  daemon: memory figures (`[test.memory]`) and a clock for the memory
+  governor (`clock_ms`), read again at each of its looks. Release builds
+  ignore it.
 
 ### Output (G7)
 
@@ -474,9 +601,10 @@ tool.
 
 **Views.** Before a run starts, the client picks the view that shows its
 output, from the command line and the mode, and adds to the command what
-the view needs. The daemon runs and records the command so changed, and
-`status` shows it so. Full mode passes every run through. In compact and
-quiet mode:
+the view needs. The daemon runs and records the command so changed,
+`status` and the worktree lock's waiting line show it so, and the result
+store keys it so (§7): a compact and a full run of one command have keys of
+their own. Full mode passes every run through. In compact and quiet mode:
 
 - build, check, clippy and doc (and cargo's aliases `b`, `c`, `d`) show
   cargo's diagnostics (below);
@@ -586,10 +714,31 @@ selector picks a part of it:
   never deleted.
 
 **With rtk installed.** A bare `cargo test` that rtk rewrites to
-`rtk cargo test` should still draw from the heli pool, as long as rtk passes
-the environment through to cargo; this is still to be verified. Anyone who
-prefers rtk's filters to heli's can run `cargo heli --output=full …` under
-`rtk test` or `rtk err`, rtk's generic wrappers.
+`rtk cargo test` still draws from the heli pool: rtk passes the environment
+through to cargo unchanged. Checked in rtk's source at commit
+[`8157d4d`](https://github.com/rtk-ai/rtk/tree/8157d4dcdc3c011f6251de2c972ff6ef8006df7b)
+(2026-10-13); rtk was not installed to try it.
+
+- `rtk cargo build|test|clippy|check` builds the command in
+  `run_cargo_streamed` ([`src/cmds/rust/cargo_cmd.rs` 334](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/cmds/rust/cargo_cmd.rs#L334)):
+  `resolved_command("cargo")`, then arguments only.
+- `resolved_command` ([`src/core/utils.rs` 609-633](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/core/utils.rs#L609-L633))
+  is `Command::new` on the resolved path, and touches the environment only
+  for `git`, in rtk's own test builds.
+- `run_streaming` ([`src/core/stream.rs` 425-471](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/core/stream.rs#L425-L471))
+  sets stdin, stdout and stderr, then spawns. Nothing on the path calls
+  `env_clear`, `env_remove` or `env`, so `CARGO_MAKEFLAGS` reaches cargo.
+  cargo sees pipes, not a terminal.
+- The rewrite keeps variable assignments before the command: rtk's hook
+  rewrites `CARGO_MAKEFLAGS='…' cargo test` to
+  `CARGO_MAKEFLAGS='…' rtk cargo test` ([`src/discover/registry.rs` 66-77, 1767-1786](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/discover/registry.rs#L1767-L1786)).
+- The rule ([`src/discover/rules.rs` 94](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/discover/rules.rs#L94))
+  matches only `cargo (build|test|clippy|check|fmt|install)`, so
+  `cargo heli …` and `cargo nextest …` pass through untouched.
+
+Anyone who prefers rtk's filters to heli's can run
+`cargo heli --output=full …` under `rtk test` or `rtk err`, rtk's generic
+wrappers.
 
 ## 6. Build store
 
@@ -747,7 +896,9 @@ rules apply.
 
 For each passing verify or test key, heli keeps a marker
 `<state>/verified/<digest>` holding the run id, the worktree and the time. It
-keeps at most 256 markers and drops the least recently used first.
+keeps at most 256 markers and drops the least recently used first; a hit
+counts as a use. The daemon keeps the store: a run that the client executes
+directly, without a daemon, neither looks it up nor records.
 
 **The key.** These rules carry over the lessons of flui#1619, where each one
 was found by a failing test.
@@ -758,21 +909,28 @@ was found by a failing test.
 - **Tree.** The worktree with every change staged: `git add -A` into a
   scratch copy of the index (`GIT_INDEX_FILE`), then `git write-tree`. The real
   index is never written (`GIT_OPTIONAL_LOCKS=0`).
-- **Base.** For a command that diffs against a base, the merge base too.
+- **Base.** For a command that diffs against a base, the merge base too. No
+  verify or test subcommand does; `exec`, which can run such a command, does
+  not use the store yet.
 - **Machine.** Host name, OS and architecture, because a state directory in a
   shared home must not certify another machine.
-- **Toolchain.** `rustc -vV`, and the versions of cargo and of the tools the
-  run uses (clippy, nextest), each asked in the worktree, so that the pinned
+- **Toolchain.** `rustc -vV` (`RUSTC` when set), and the versions of cargo
+  and of the tool the run uses (clippy, rustfmt, nextest), each asked in the
+  client's working directory with its environment, so that the pinned
   toolchain answers. A missing tool is keyed as absent.
 - **Cargo configuration.** The content of every `config.toml` and `config` on
-  cargo's discovery path: `.cargo/` in the worktree and every directory above
-  it, then the Cargo home.
-- **Argv**, normalized.
+  cargo's discovery path: `.cargo/` in the working directory and every
+  directory above it, then the Cargo home. They are keyed in the order cargo
+  reads them, not by path, so worktrees in different places can share a key.
+- **Argv**, normalized: without the program, which the toolchain stands for,
+  and with the working directory relative to the worktree, which selects
+  packages and configuration as an argument would. The worktree's own path is
+  not keyed.
 - **Environment.** Every variable except a neutral list:
   - Names are case-folded on Windows only.
   - `PATH`, `LD_LIBRARY_PATH` and the `DYLD_*` search paths are keyed without
     their entries inside the worktree, which cargo prepends for the programs
-    it runs.
+    it runs; one left without entries counts as unset.
   - Neutral, and so not keyed:
     - job and thread counts holding a value the tool accepts (an invalid one
       fails the run, so it is keyed);
@@ -788,16 +946,20 @@ was found by a failing test.
   - Any variable not on the list, a test control such as `PROPTEST_CASES`
     among them, is keyed, so it misses the cache instead of reusing a result.
 - **The plan**, when the command has one, rendered, including the steps it
-  skips on this host.
+  skips on this host. No verify or test subcommand has one yet.
 
 **When the key is computed.** It is checked twice: before the run waits for
 anything, and again once admitted, because another run may have recorded it
-meanwhile. The tree is snapshotted before planning and again after the steps.
-A marker is written only when the run passed and both snapshots match.
+meanwhile. A hit is never admitted as a run: it takes no run id. The key is
+computed afresh once admitted, and that snapshot of the tree, taken before
+the steps, is compared with one taken after them. A marker is written only
+when the run passed and both snapshots match. A run that fails drops the
+marker of its key, so a flaky pass is reused only until a run of the same key
+fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key.
+the key. `--no-cache` skips both lookups, not the recording.
 
 Compile runs are never recorded, because their product is the artifact, not
 the verdict.
@@ -809,8 +971,9 @@ the verdict.
 ```
 pool   32 slots: 21 compiling (4 runs), 6 testing (1 run), 0 withheld   memory 41.2/64 GB, commit 52 %
 runs   r17  agent-a64b...  nextest run -p my-crate     test     6 slots  4m12s
-       r18  agent-f1c0...  clippy --all-targets        compile  9 slots  1m03s
+       r18  agent-f1c0...  clippy --all-targets        verify   9 slots  1m03s
        r19  agent-a10...   check -p other-crate        attached to r12 (same key)
+       r20  agent-a64b...  fmt                         mutate   waiting for r17  12s
 disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremental >24h, ~40 GB
 ```
 
@@ -820,17 +983,34 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
 - `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
   never below 0), or `null` when no daemon answers;
-- `memory`: `available`, plus `commit_available` on Windows;
+- `memory`: the governor's last sample, in bytes: `total`, `available`,
+  plus `commit_available` on Windows, and the `low_watermark` and
+  `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
   (running for a run of one phase; building, testing, done), `slots`,
-  `share`, `waiting_since`, `attached_clients` and `started_at`;
+  `share`, `waiting_since` (`null` unless the run waits), `waiting_for`
+  (the ids of the runs it waits for at the worktree lock),
+  `attached_clients` and `started_at`;
 - `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
   `by_category`;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,
 drains and evictions, and `cargo heli gc --dry-run`.
+
+**The event log** is `events.log` in the state directory
+(`events-<session>.log` on Windows), one JSON object per line, each with `at`
+(seconds since 1970, UTC) and `event`:
+
+- `admit`: `run`, `worktree`, `argv`;
+- `withhold`: `withheld` (after it), `available`, `commit_available` and
+  `low_watermark`;
+- `return`: `slots`, `available`, `commit_available` and `high_watermark`;
+- `top-up` and `drain`: `slots`, `free` (after it) and `target`.
+
+Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
+the one before, and the next event starts a new file.
 
 ## 9. Adoption in flui (worked example)
 
@@ -848,7 +1028,8 @@ drains and evictions, and `cargo heli gc --dry-run`.
 
 | Failure | Effect | Handling |
 |---|---|---|
-| Daemon not running | A bare cargo warns and uses its own pool, as today. On Unix, a FIFO left by an earlier daemon still opens but holds no bytes, so a bare cargo runs one job at a time, without a warning | `cargo heli` starts the daemon, which fills the FIFO again (§4); logon or session hook |
+| Daemon not running | A bare cargo warns and uses its own pool, as today | The pool goes with its daemon once nobody holds it: a semaphore by itself, a FIFO through the daemon's warden (§4, Lifetime). `cargo heli` or `cargo heli ensure` starts the daemon; logon task or session hook |
+| Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
@@ -857,7 +1038,7 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
 | Run killed while holding slots | none | The run pool's loans go back in full (§4) |
-| Unix FIFO holds more than the target | Oversubscription | The daemon drains the surplus (§4) |
+| The pool holds more than the target (a FIFO has no maximum; a semaphore's is N, above the target while slots are withheld) | Oversubscription | The daemon drains the surplus at once (§4) |
 | Memory spike | New jobs wait | Slots are withheld; running jobs finish |
 | GC races a build | none | Try-lock, rename to trash, skip busy directories |
 | Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |

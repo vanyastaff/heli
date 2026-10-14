@@ -19,10 +19,15 @@
 //!
 //! - [`Request::Status`]: one [`Reply::Status`].
 //! - [`Request::Run`]: [`Reply::Refused`] (the client then runs the command
-//!   itself), or [`Reply::Started`], then output frames in the order the run
-//!   wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`]. The daemon
-//!   sends `Started` before it starts anything, so a client that never sees
-//!   it can safely run the command itself.
+//!   itself), or [`Reply::Started`], then [`Reply::Waiting`] if the run
+//!   has to wait for its worktree's lock, then output frames in the order
+//!   the run wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`].
+//!   The daemon sends `Started` before it starts anything, so a client that
+//!   never sees it can safely run the command itself. Either before
+//!   `Started` or in place of the output, [`Reply::Passed`] ends the run
+//!   without starting it: the result store holds a pass for its key. A
+//!   client that sends no [`RunRequest::class`] predates the worktree lock
+//!   and is never sent `Waiting`, which it could not read.
 //! - [`Request::Log`]: output frames holding the part of the run's record
 //!   asked for (`crate::runlog`), each on the channel the run wrote it to,
 //!   then [`Reply::LogEnd`]; or [`Reply::LogFailed`].
@@ -48,8 +53,9 @@ use std::io::{self, Read, Write};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::class::Class;
 use crate::runlog::select::Select;
-use crate::status::Status;
+use crate::status::{self, Status};
 
 /// This build's protocol version.
 pub const VERSION: u32 = 1;
@@ -118,18 +124,52 @@ pub struct RunRequest {
     /// The program, then its arguments.
     pub argv: Vec<Text>,
     pub env: Vec<(Text, Text)>,
+    /// What kind of run it is, as the client read its command line; `None`
+    /// from a client older than run classes.
+    #[serde(default)]
+    pub class: Option<Class>,
+    /// How the run uses the result store; absent from a client that knows
+    /// no result store.
+    #[serde(default)]
+    pub cache: Cache,
+}
+
+/// How a run uses the result store (`crate::daemon::results`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Cache {
+    /// Neither looked up nor recorded: compile, mutate and exec runs.
+    #[default]
+    Off,
+    /// Looked up first, and recorded when it passes: verify and test runs.
+    On,
+    /// Run whatever is recorded (`--no-cache`), and recorded when it passes.
+    Refresh,
 }
 
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
-    /// The daemon accepted the run, and starts it now.
+    /// The daemon accepted the run, and starts it now or once its wait ends.
     Started {
         run: String,
+    },
+    /// The run waits for these runs, which use its worktree, before it
+    /// starts (the worktree lock).
+    Waiting {
+        runs: Vec<status::Run>,
     },
     /// The daemon takes no runs (it is retiring); nothing was started.
     Refused {
         reason: String,
+    },
+    /// The run's key already passed: nothing runs, and the client exits 0.
+    /// `run` is the run that passed, in `worktree`, at `at` (seconds since
+    /// 1970).
+    Passed {
+        run: String,
+        worktree: Text,
+        at: u64,
     },
     /// The command could not be started.
     SpawnFailed {

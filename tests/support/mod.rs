@@ -12,8 +12,17 @@
 //! Dropping the fixture kills the daemon, and with it any run still going,
 //! even when the test panics. Its host pool (`HELI_POOL`: a semaphore name
 //! unique to the fixture on Windows, a FIFO in its temporary directory
-//! elsewhere) and its configuration file (`HELI_CONFIG`, absent until
+//! elsewhere) and its configuration file (`HELI_CONFIG`, written by
 //! [`Fixture::configure`]) are the fixture's own too.
+//!
+//! **The test seam.** heli's debug builds read memory figures and the memory
+//! governor's clock from the `[test]` table of their configuration file,
+//! each time the governor looks ([`Seam`]). A [`Fixture::new`] daemon sees
+//! [`Memory::PLENTY`] unless a test injects other figures
+//! ([`Fixture::inject_memory`]) or asks for the machine's
+//! ([`Fixture::use_real_memory`]), so the machine running the tests never
+//! makes it withhold slots; its clock is the real one until a test sets it
+//! ([`Fixture::set_clock`]).
 //!
 //! Fixture `basic` (see its `Cargo.toml`):
 //! - `slow-a`, `slow-b`, `slow-c`: build scripts that log their start and end
@@ -37,6 +46,7 @@
 
 pub mod endpoint;
 pub mod fake_daemon;
+pub mod jobserver;
 pub mod terminal;
 
 use std::collections::BTreeMap;
@@ -44,6 +54,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -76,6 +87,18 @@ const HELI_VARS: [&str; 6] = [
     "HELI_OUTPUT",
 ];
 
+/// Variables that locate the user's own configuration files, which
+/// `cargo heli setup` edits: [`Fixture::setup`] points them at the fixture's
+/// temporary home, or removes them, so that no test edits the real ones.
+const USER_FILE_VARS: [&str; 6] = [
+    "HOME",
+    "USERPROFILE",
+    "CLAUDE_CONFIG_DIR",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "SHELL",
+];
+
 /// A fixture workspace copied into a temporary directory, with a target
 /// directory, a concurrency log and heli's state directory beside it.
 pub struct Fixture {
@@ -85,11 +108,80 @@ pub struct Fixture {
     /// Variables set (or, when `None`, removed) on every command, which
     /// select this fixture's daemon.
     isolation: Vec<(OsString, Option<OsString>)>,
+    /// What [`Fixture::config_file`] holds.
+    config: Mutex<ConfigFile>,
+}
+
+/// The configuration file of a [`Fixture::new`] daemon: the settings a test
+/// gave, then the test seam.
+#[derive(Debug, Default)]
+struct ConfigFile {
+    settings: String,
+    seam: Seam,
+}
+
+/// The test seam of heli's debug builds: what the daemon reads from the
+/// `[test]` table of its configuration instead of asking the machine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Seam {
+    /// The memory governor's clock, in milliseconds; `None`: the real one.
+    pub clock_ms: Option<u64>,
+    /// Memory figures; `None`: the machine's.
+    pub memory: Option<Memory>,
+}
+
+/// Memory figures to inject, in megabytes (2^20 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Memory {
+    pub total_mb: u64,
+    pub available_mb: u64,
+    pub commit_available_mb: Option<u64>,
+}
+
+impl Memory {
+    /// A 64 GB machine with 48 GB available, and as much commit: far above
+    /// the default watermarks (6.4 GB and 10.4 GB).
+    pub const PLENTY: Self = Self {
+        total_mb: 65_536,
+        available_mb: 49_152,
+        commit_available_mb: Some(49_152),
+    };
+
+    /// A 64 GB machine (default watermarks 6.4 GB and 10.4 GB) with
+    /// `available_mb` available, and as much commit.
+    pub fn available(available_mb: u64) -> Self {
+        Self {
+            total_mb: 65_536,
+            available_mb,
+            commit_available_mb: Some(available_mb),
+        }
+    }
+}
+
+impl Seam {
+    /// The `[test]` table that says this.
+    fn to_toml(self) -> String {
+        let mut toml = String::new();
+        if let Some(clock) = self.clock_ms {
+            toml.push_str(&format!("[test]\nclock_ms = {clock}\n"));
+        }
+        if let Some(memory) = self.memory {
+            toml.push_str(&format!(
+                "[test.memory]\ntotal_mb = {}\navailable_mb = {}\n",
+                memory.total_mb, memory.available_mb
+            ));
+            if let Some(commit) = memory.commit_available_mb {
+                toml.push_str(&format!("commit_available_mb = {commit}\n"));
+            }
+        }
+        toml
+    }
 }
 
 impl Fixture {
     /// Copies `tests/fixtures/<name>`; its daemon has the state directory
-    /// [`Fixture::state_dir`] and the endpoint [`Fixture::endpoint`].
+    /// [`Fixture::state_dir`] and the endpoint [`Fixture::endpoint`], and
+    /// sees [`Memory::PLENTY`].
     pub fn new(name: &str) -> Self {
         let mut fixture = Self::bare(name);
         let state_dir = fixture.state_dir();
@@ -100,6 +192,7 @@ impl Fixture {
             ("HELI_POOL".into(), Some(fixture.pool())),
             ("HELI_CONFIG".into(), Some(fixture.config_file().into())),
         ];
+        fixture.change_config(|config| config.seam.memory = Some(Memory::PLENTY));
         fixture
     }
 
@@ -162,12 +255,21 @@ impl Fixture {
             endpoint,
             pool,
             isolation: Vec::new(),
+            config: Mutex::default(),
         }
     }
 
     /// The copied workspace.
     pub fn workspace(&self) -> PathBuf {
         self.root.path().join("ws")
+    }
+
+    /// A copy of the workspace as it is now, at `name` in the fixture's
+    /// temporary directory: a second workspace for the same daemon.
+    pub fn copy_workspace(&self, name: &str) -> PathBuf {
+        let copy = self.path(name);
+        copy_dir(&self.workspace(), &copy);
+        copy
     }
 
     /// The target directory every command of this fixture uses.
@@ -207,10 +309,140 @@ impl Fixture {
         self.root.path().join("config.toml")
     }
 
-    /// Writes `toml` as the configuration file; a daemon reads it as it
-    /// starts.
+    /// Writes `toml` as the configuration file, followed by the test seam; a
+    /// daemon reads it as it starts. `toml` must not have a `[test]` table.
     pub fn configure(&self, toml: &str) {
-        std::fs::write(self.config_file(), toml).expect("write the configuration");
+        self.change_config(|config| config.settings = toml.to_owned());
+    }
+
+    /// Makes the daemon see `memory` from its next look on.
+    pub fn inject_memory(&self, memory: Memory) {
+        self.change_config(|config| config.seam.memory = Some(memory));
+    }
+
+    /// Makes the daemon see the machine's memory.
+    pub fn use_real_memory(&self) {
+        self.change_config(|config| config.seam.memory = None);
+    }
+
+    /// Sets the memory governor's clock to `ms`; it stands still there until
+    /// set again.
+    pub fn set_clock(&self, ms: u64) {
+        self.change_config(|config| config.seam.clock_ms = Some(ms));
+    }
+
+    /// Moves the clock set with [`Fixture::set_clock`] on by `ms`, and
+    /// returns the new time.
+    pub fn advance_clock(&self, ms: u64) -> u64 {
+        let mut now = 0;
+        self.change_config(|config| {
+            now = config.seam.clock_ms.expect("a clock set with set_clock") + ms;
+            config.seam.clock_ms = Some(now);
+        });
+        now
+    }
+
+    /// The test seam as the configuration file has it.
+    pub fn seam(&self) -> Seam {
+        self.config
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .seam
+    }
+
+    /// Changes the configuration, and replaces the file at once, so that a
+    /// daemon reading it never sees half of it.
+    fn change_config(&self, change: impl FnOnce(&mut ConfigFile)) {
+        let mut config = self.config.lock().unwrap_or_else(PoisonError::into_inner);
+        change(&mut config);
+        let text = format!("{}\n{}", config.settings, config.seam.to_toml());
+        let file = self.config_file();
+        let temporary = file.with_extension("toml.tmp");
+        std::fs::write(&temporary, text).expect("write the configuration");
+        // A reader may have the file open for a moment.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while let Err(error) = std::fs::rename(&temporary, &file) {
+            assert!(
+                Instant::now() < deadline,
+                "replace the configuration: {error}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Starts this fixture's daemon, by running `echo-args` through heli.
+    pub fn start_daemon(&self) {
+        let echo = self.echo_args();
+        let output = self
+            .heli(["exec", "--"])
+            .arg(&echo)
+            .output()
+            .expect("run heli");
+        assert_success(&output, "cargo heli exec");
+    }
+
+    /// The value of `CARGO_MAKEFLAGS` that points a cargo at this fixture's
+    /// pool, as heli gives it to runs.
+    pub fn makeflags(&self) -> String {
+        let pool = self.pool().into_string().expect("a Unicode pool name");
+        if cfg!(windows) {
+            format!("-j --jobserver-auth={pool}")
+        } else {
+            format!("-j --jobserver-auth=fifo:{pool}")
+        }
+    }
+
+    /// The daemon's own log, of every daemon this fixture had, whatever its
+    /// session suffix.
+    pub fn daemon_log(&self) -> String {
+        self.state_files("daemon", ".log")
+            .into_iter()
+            .map(|path| std::fs::read_to_string(path).expect("read the daemon's log"))
+            .collect()
+    }
+
+    /// The daemon's event log, oldest first: the rotated file, then the
+    /// current one; one JSON object per line.
+    pub fn events(&self) -> Vec<Value> {
+        let mut files = self.state_files("events", ".log.1");
+        files.extend(self.state_files("events", ".log"));
+        files
+            .iter()
+            .flat_map(|path| {
+                std::fs::read_to_string(path)
+                    .expect("read the event log")
+                    .lines()
+                    .map(|line| {
+                        serde_json::from_str(line)
+                            .unwrap_or_else(|error| panic!("not JSON ({error}): {line}"))
+                    })
+                    .collect::<Vec<Value>>()
+            })
+            .collect()
+    }
+
+    /// The events named `event` in the event log, oldest first.
+    pub fn events_named(&self, event: &str) -> Vec<Value> {
+        self.events()
+            .into_iter()
+            .filter(|logged| logged["event"] == event)
+            .collect()
+    }
+
+    /// The files in the state directory named `<stem>…<suffix>`.
+    fn state_files(&self, stem: &str, suffix: &str) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(self.state_dir()) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .map(|entry| entry.expect("an entry").path())
+            .filter(|path| {
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                name.starts_with(stem) && name.ends_with(suffix)
+            })
+            .collect();
+        files.sort();
+        files
     }
 
     /// `cargo-heli` with `args`, run in the workspace.
@@ -256,6 +488,31 @@ impl Fixture {
                 Some(value) => command.env(var, value),
                 None => command.env_remove(var),
             };
+        }
+        command
+    }
+
+    /// `cargo-heli setup` with `args`, run as a user whose home is
+    /// [`Fixture::home`] (`HOME` and `USERPROFILE`; created if missing) and
+    /// whose shell is `shell` (`SHELL`, unset when `None`).
+    /// `CLAUDE_CONFIG_DIR`, `ZDOTDIR` and `XDG_CONFIG_HOME` are unset, so
+    /// every file setup can edit is in that home. The pool it offers is the
+    /// fixture's own.
+    pub fn setup<I, S>(&self, shell: Option<&str>, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let home = self.home();
+        std::fs::create_dir_all(&home).expect("create the temporary home");
+        let mut command = self.heli(["setup"]);
+        command.args(args.into_iter().map(Into::into));
+        for var in USER_FILE_VARS {
+            command.env_remove(var);
+        }
+        command.env("HOME", &home).env("USERPROFILE", &home);
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
         }
         command
     }

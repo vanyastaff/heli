@@ -10,7 +10,13 @@
 //!   sets); print the run's stdout and stderr to the same streams through
 //!   the plan's printer, then its closing line; exit with the run's code
 //!   (on Unix, die of the run's signal). A command that cannot be started
-//!   is reported as direct execution reports it (exit 127 or 126).
+//!   is reported as direct execution reports it (exit 127 or 126). A run
+//!   that waits for its worktree's lock says so first, on stderr: "waiting
+//!   for …", naming the runs it waits for (through the printer, so quiet
+//!   mode holds it back with the rest).
+//! - **A hit.** When the daemon answers that the run's key already passed
+//!   (`crate::daemon::results`), say which run passed and when, with the
+//!   caveats of reusing a verdict, and exit 0 without running anything.
 //! - **Fallback.** Whenever the daemon cannot take the run (it does not
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
@@ -19,10 +25,12 @@
 //!   the daemon has said the run started, there is no fallback: the command
 //!   may already have run, so losing the daemon is an error (exit 1).
 //! - **Status.** Ask the daemon, or report that none runs; never start one.
+//! - **Ensure.** Reach the daemon, starting it if need be, and nothing else.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -34,7 +42,7 @@ use crate::locations::Locations;
 use crate::output::{self, Plan, Printer, print};
 use crate::protocol::{self, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text};
 use crate::runlog::{self, select::Select};
-use crate::status::Status;
+use crate::status::{self, Status};
 use crate::{clock, direct, environment, launch, nesting};
 
 /// How long a daemon may take to answer the handshake.
@@ -43,6 +51,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit code when the connection to the daemon breaks during a run.
 const LOST: i32 = 1;
 
+/// Exit code of `ensure` when no daemon could be reached.
+const NO_DAEMON: i32 = 1;
 /// Exit code when `log` cannot print the record.
 const FAILED: i32 = 1;
 
@@ -98,6 +108,22 @@ pub fn status(json: bool) -> ! {
         print!("{}", status.to_text(clock::now()));
     }
     std::process::exit(0)
+}
+
+/// `cargo heli ensure`: makes sure a daemon runs, starting one unless one
+/// answers; this process's nesting depth is `depth`. Silent when a daemon
+/// runs, since a harness's session-start hook may show its output to the
+/// agent; and quick when one already did. Exits 1, with one line saying
+/// why, when none could be reached.
+pub fn ensure(depth: u32) -> ! {
+    let reached = Locations::resolve().and_then(|locations| reach(&locations, Some(depth)));
+    match reached {
+        Ok(_daemon) => std::process::exit(0),
+        Err(reason) => {
+            eprintln!("cargo-heli: {reason}");
+            std::process::exit(NO_DAEMON)
+        }
+    }
 }
 
 /// Prints the part of run `run`'s record that `select` picks: stdout on
@@ -296,6 +322,8 @@ fn submit(
             .into_iter()
             .map(|(name, value)| (Text(name), Text(value)))
             .collect(),
+        class: Some(invocation.class),
+        cache: invocation.cache,
     };
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
@@ -303,6 +331,7 @@ fn submit(
         Ok(Reply::Started { run }) => {
             follow(stream, invocation, &run, Instant::now(), plan.printer())
         }
+        Ok(Reply::Passed { run, worktree, at }) => already_passed(&run, &worktree, at),
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
@@ -322,6 +351,9 @@ fn follow(
     loop {
         match protocol::read_frame::<Reply>(&mut stream) {
             Ok(Frame::Output(channel, bytes)) => printer.output(channel, &bytes),
+            Ok(Frame::Message(Reply::Waiting { runs })) => {
+                printer.note(&format!("cargo-heli: {}", waiting_for(&runs)));
+            }
             Ok(Frame::Message(Reply::Exited { code, signal })) => {
                 printer.exited(run, code, signal, started.elapsed());
                 exit_as(code, signal)
@@ -329,12 +361,69 @@ fn follow(
             Ok(Frame::Message(Reply::SpawnFailed { not_found, message })) => {
                 direct::report_spawn_failure(&invocation.program, not_found, &message)
             }
+            Ok(Frame::Message(Reply::Passed {
+                run: passed,
+                worktree,
+                at,
+            })) => {
+                drop(printer);
+                already_passed(&passed, &worktree, at)
+            }
             Ok(Frame::Message(other)) => {
                 lost(run, &format!("unexpected message {other:?}"), printer)
             }
             Err(error) => lost(run, &error.to_string(), printer),
         }
     }
+}
+
+/// Reports a hit of the result store: run `run` in `worktree` passed with
+/// the same key at `at`. Exits 0.
+fn already_passed(run: &str, worktree: &Text, at: u64) -> ! {
+    eprintln!(
+        "cargo-heli: already passed: {run}, {} ({}); nothing to run",
+        ago(clock::now().saturating_sub(at)),
+        worktree.0.to_string_lossy()
+    );
+    eprintln!(
+        "cargo-heli: caveats: a flaky pass is reused (--no-cache runs it again), \
+         and ignored files are not part of the key"
+    );
+    std::process::exit(0)
+}
+
+/// `seconds` as a short age: `12 s ago`, `3 min ago`, `5 h ago`, `2 d ago`.
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..120 => format!("{seconds} s ago"),
+        120..7_200 => format!("{} min ago", seconds / 60),
+        7_200..172_800 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
+/// What the run waits for: `waiting for r17 (cargo build -p foo) to finish
+/// with this worktree`, naming each run by its id and its command, the
+/// program as a bare name.
+fn waiting_for(runs: &[status::Run]) -> String {
+    let runs: Vec<String> = runs
+        .iter()
+        .map(|run| {
+            let mut argv = run.argv.iter();
+            let program = argv.next().map(|program| {
+                Path::new(program).file_stem().map_or_else(
+                    || program.clone(),
+                    |stem| stem.to_string_lossy().into_owned(),
+                )
+            });
+            let command: Vec<String> = program.into_iter().chain(argv.cloned()).collect();
+            format!("{} ({})", run.id, command.join(" "))
+        })
+        .collect();
+    format!(
+        "waiting for {} to finish with this worktree",
+        runs.join(", ")
+    )
 }
 
 fn lost(run: &str, error: &str, printer: Printer) -> ! {

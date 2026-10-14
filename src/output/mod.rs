@@ -16,22 +16,23 @@
 //!   Every run in full mode; in compact and quiet mode, every run no other
 //!   view takes, and every run whose arguments already choose cargo's output
 //!   (`--message-format`, `-q`, `-v`: [`cargo::sets_output`]).
-//! - **Cargo's diagnostics** ([`cargo`]): build, check, clippy and doc in
-//!   compact and quiet mode. heli adds `--quiet --message-format json` and
-//!   renders the diagnostics from cargo's JSON.
+//! - **Cargo's diagnostics** ([`cargo`]): compile and verify runs
+//!   (`crate::class`) of build, check, clippy and doc, in compact and quiet
+//!   mode. heli adds `--quiet --message-format json` and renders the
+//!   diagnostics from cargo's JSON.
 //!
-//! **Quiet mode** holds a rendered view's output back until the run ends:
-//! on success the client prints one line instead ([`Printer::exited`]); on
+//! **Quiet mode** holds a rendered view's output back until the run ends,
+//! and heli's own lines about the run with it ([`Printer::note`]): on
+//! success the client prints one line instead ([`Printer::exited`]); on
 //! failure, the held output and the footer, as compact mode would have.
 //! Pass-through output is never held.
 //!
 //! **Adding a view** (#11: test runs, exec): a [`View`] variant; its case in
-//! [`view_of`], which decides when it applies (until the run classes of #12
-//! land, from the subcommand: [`cargo::warnings_of`]); what it adds to the
-//! command in [`plan`]; and a [`Render`] that turns the run's output into
-//! what the client prints and returns the facts for quiet mode's line
-//! (`812 passed, 3 skipped`). Quiet mode and the closing line then work for
-//! it unchanged.
+//! [`view_of`], which decides from the run's class when it applies; what it
+//! adds to the command in [`plan`]; and a [`Render`] that turns the run's
+//! output into what the client prints and returns the facts for quiet
+//! mode's line (`812 passed, 3 skipped`). Quiet mode and the closing line
+//! then work for it unchanged.
 //!
 //! **The closing line**, on stderr, starting a line of its own:
 //! - the footer, after every run: `cargo-heli: r17 exit 0 in 41.2 s
@@ -51,11 +52,13 @@ pub mod cargo;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
+use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::class::Class;
 use crate::cli::Invocation;
 use crate::protocol::Channel;
 
@@ -156,10 +159,16 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
             invocation.args.clone()
         }
     };
-    // A cargo subcommand is named without `cargo`, as in `cargo heli`.
-    let program = (!invocation.cargo).then_some(&invocation.program);
+    // A cargo subcommand is named as in `cargo heli`, without `cargo`; any
+    // other command by its program's name.
+    let program = (invocation.class == Class::Exec).then(|| {
+        Path::new(&invocation.program)
+            .file_stem()
+            .unwrap_or(&invocation.program)
+            .to_os_string()
+    });
     let command = program
-        .into_iter()
+        .iter()
         .chain(&invocation.args)
         .map(|arg| arg.to_string_lossy())
         .collect::<Vec<_>>()
@@ -173,16 +182,23 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
     }
 }
 
-/// The view that shows `invocation`'s output in compact and quiet mode.
-///
-/// Until the run classes of #12 land (`crate::class`), the subcommand
-/// decides, in [`cargo::warnings_of`]: replace that with the class (compile:
-/// warnings counted, verify: warnings by lint) once they do.
+/// The view that shows `invocation`'s output in compact and quiet mode: the
+/// run's class decides how warnings show (compile runs count them, verify
+/// runs list them by lint), when cargo can report its diagnostics as JSON
+/// for the subcommand ([`cargo::reports_json`]) and the user's arguments
+/// leave cargo's output to heli ([`cargo::sets_output`]). Every other run
+/// passes through.
 fn view_of(invocation: &Invocation) -> View {
-    if !invocation.cargo || cargo::sets_output(&invocation.args) {
-        return View::PassThrough;
+    let warnings = match invocation.class {
+        Class::Compile => cargo::Warnings::Counts,
+        Class::Verify => cargo::Warnings::ByLint,
+        Class::Test | Class::Mutate | Class::Exec => return View::PassThrough,
+    };
+    if cargo::reports_json(&invocation.args) && !cargo::sets_output(&invocation.args) {
+        View::Cargo(warnings)
+    } else {
+        View::PassThrough
     }
-    cargo::warnings_of(&invocation.args).map_or(View::PassThrough, View::Cargo)
 }
 
 /// Whether a run whose output passes through should print colours.
@@ -310,6 +326,12 @@ impl Printer {
     /// Takes what the run wrote to `channel`.
     pub fn output(&mut self, channel: Channel, bytes: &[u8]) {
         self.render.output(channel, bytes, &mut self.sink);
+    }
+
+    /// Prints a line of heli's own about the run (`waiting for …`) on
+    /// stderr; quiet mode holds it back with the run's output.
+    pub fn note(&mut self, text: &str) {
+        self.sink.line(text);
     }
 
     /// Run `run` exited with `code` (or on Unix of `signal`) after

@@ -618,11 +618,31 @@ fn output_heli_does_not_render_passes_through_in_every_mode() {
     );
 }
 
-/// `clippy --fix` rewrites sources, and cargo says which in lines its
-/// `--quiet` would drop: its output passes through.
+/// Runs whose output is more than cargo's diagnostics pass through: `run`
+/// (a compile run) prints the program's output, and cargo says what it
+/// runs; `fmt --check` (a verify run) prints rustfmt's diff; `clippy --fix`
+/// (a mutate run) says what it fixed. Cargo says those in lines `--quiet`
+/// would drop.
 #[test]
-fn clippy_fix_output_passes_through() {
+fn runs_that_print_more_than_diagnostics_pass_through() {
     let fixture = Fixture::new("basic");
+    let output = fixture
+        .heli(["run", "-p", "echo-args", "--", "x"])
+        .output()
+        .expect("run heli");
+    support::assert_success(&output, "cargo heli run");
+    assert_eq!(text(&output.stdout), "arg: \"x\"\n");
+    let stderr = support::without_footer(&output.stderr);
+    assert!(stderr.contains("Running `"), "cargo's own lines: {stderr}");
+
+    let output = fixture
+        .heli(["fmt", "--check", "-p", "many-warnings"])
+        .output()
+        .expect("run heli");
+    assert_eq!(output.status.code(), Some(1), "unformatted: {output:?}");
+    let stdout = text(&output.stdout);
+    assert!(stdout.contains("Diff in "), "rustfmt's diff: {stdout}");
+
     let output = fixture
         .heli(["clippy", "--fix", "--allow-no-vcs", "-p", "warnings"])
         .output()

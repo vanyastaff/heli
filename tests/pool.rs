@@ -327,6 +327,9 @@ impl Holder {
 fn a_held_pool_is_adopted_as_it_is() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
+    // The holder is no process the top-up's scan sees; with the governor's
+    // clock standing still, no top-up counts its slot as lost.
+    fixture.set_clock(0);
     start_daemon(&fixture);
     let holder = Holder::take(&fixture.pool());
     let daemon = fixture.daemon_pid().expect("a daemon");

@@ -5,7 +5,8 @@
 //!
 //! It speaks the handshake every version of heli shares: `HELI` and the
 //! protocol version as a little-endian u32, first from the client, then from
-//! the daemon. Only [`Answer::Unsupported`] goes further.
+//! the daemon. Only [`Answer::Unsupported`] and [`Answer::Reply`] go
+//! further.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -27,6 +28,10 @@ pub enum Answer {
     /// answers a request it does not know: a message frame (kind 0, a
     /// little-endian u32 length) holding the JSON `"Unsupported"`.
     Unsupported,
+    /// `HELI` and [`PROTOCOL`]; then it answers the client's request,
+    /// whatever it is, with a message frame holding this JSON: what a daemon
+    /// of another build of the same protocol would answer.
+    Reply(&'static str),
 }
 
 /// The protocol version of this build of heli.
@@ -61,7 +66,7 @@ impl FakeDaemon {
                     let _ = stream.read_to_end(&mut Vec::new());
                     return Vec::new();
                 }
-                Answer::Unsupported => {
+                Answer::Unsupported | Answer::Reply(_) => {
                     let mut bytes = *b"HELI\0\0\0\0";
                     bytes[4..].copy_from_slice(&PROTOCOL.to_le_bytes());
                     bytes
@@ -70,7 +75,12 @@ impl FakeDaemon {
             if stream.write_all(&bytes).is_err() {
                 return Vec::new();
             }
-            if let Answer::Unsupported = answer {
+            let reply = match answer {
+                Answer::Unsupported => Some("\"Unsupported\""),
+                Answer::Reply(json) => Some(json),
+                _ => None,
+            };
+            if let Some(reply) = reply {
                 let mut header = [0u8; 5];
                 stream
                     .read_exact(&mut header)
@@ -80,7 +90,7 @@ impl FakeDaemon {
                 stream
                     .read_exact(&mut request)
                     .expect("the client's request");
-                let reply = b"\"Unsupported\"";
+                let reply = reply.as_bytes();
                 let mut frame = vec![0u8];
                 frame.extend((reply.len() as u32).to_le_bytes());
                 frame.extend(reply);
