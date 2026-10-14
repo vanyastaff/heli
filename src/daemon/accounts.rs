@@ -154,10 +154,9 @@ impl Accounts {
             .iter()
             .map(|store| {
                 let mut sizes = Sizes::default();
+                // Only build directories are in a store.
                 for figures in ledger.figures.values() {
-                    if figures.kind == Kind::Build
-                        && figures.store.as_deref() == Some(store.as_path())
-                    {
+                    if figures.store.as_deref() == Some(store.as_path()) {
                         sizes += figures.sizes;
                     }
                 }

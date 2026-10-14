@@ -710,7 +710,7 @@ fn sizes_by_category_match_the_files() {
     // for `target/` directories only.
     configure_store(
         &fixture,
-        "tool-caches = [\"tests/tr?build/project/*\", \"cli-*-check\", \"*/incremental\"]\n",
+        "tool_caches = [\"tests/tr?build/project/*\", \"cli-*-check\", \"*/incremental\"]\n",
     );
     let listed = listed_target(&fixture, &target).expect("the target directory");
     let with_caches = [
@@ -886,16 +886,22 @@ fn status_counts_each_store_on_its_own() {
 #[test]
 fn setup_offers_the_store_on_the_worktrees_volume() {
     let fixture = Fixture::new("basic");
+    // Only named, never written: `--print` writes nothing.
     let elsewhere = if cfg!(windows) {
-        // A drive this machine does not have.
-        let letter = ('D'..='Z')
-            .rev()
-            .find(|letter| !Path::new(&format!("{letter}:\\")).exists())
-            .expect("a free drive letter");
-        PathBuf::from(format!("{letter}:\\heli-store"))
+        // Another drive this machine has, else one it does not have.
+        let home_drive = fixture.path("").to_string_lossy().to_uppercase();
+        let drives: Vec<char> = ('C'..='Z')
+            .filter(|letter| !home_drive.starts_with(&format!("{letter}:")))
+            .collect();
+        let letter = drives
+            .iter()
+            .find(|letter| Path::new(&format!("{letter}:\\")).exists())
+            .or_else(|| drives.last())
+            .expect("a drive letter");
+        PathBuf::from(format!("{letter}:\\heli-store-never-written"))
     } else {
         // `/dev` is a file system of its own on Linux and macOS.
-        PathBuf::from("/dev/heli-store")
+        PathBuf::from("/dev/heli-store-never-written")
     };
     let store = fixture.path("store");
     fixture.configure(&format!(
@@ -1182,10 +1188,10 @@ fn a_store_configuration_heli_cannot_use_is_refused() {
     for (config, says) in [
         ("[store]\npaths = ['relative/store']\n", "store.paths"),
         (
-            "[store]\ntool-caches = [\"../outside\"]\n",
-            "store.tool-caches",
+            "[store]\ntool_caches = [\"../outside\"]\n",
+            "store.tool_caches",
         ),
-        ("[store]\ntool-caches = [\"\"]\n", "store.tool-caches"),
+        ("[store]\ntool_caches = [\"\"]\n", "store.tool_caches"),
     ] {
         fixture.configure(config);
         let output = fixture

@@ -9,7 +9,7 @@
 //! - `build/`: build scripts and their output;
 //! - `.fingerprint/`: cargo's freshness records;
 //! - tool caches: in a `target/` directory only, the paths the
-//!   configuration's patterns name (`[store] tool-caches`) and nothing else;
+//!   configuration's patterns name (`[store] tool_caches`) and nothing else;
 //!   a pattern's components match the path's first ones, `*` and `?`
 //!   within a component;
 //! - other: the rest (final artifacts, `doc/`, cargo's bookkeeping).

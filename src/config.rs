@@ -12,7 +12,7 @@
 //! [store]
 //! paths = ['D:\.heli\build']        # build stores, the first on a volume
 //!                                   # serves it; default <volume>/.heli/build
-//! tool-caches = ["tests/trybuild"]  # tool caches inside target/; default none
+//! tool_caches = ["tests/trybuild"]  # tool caches inside target/; default none
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -35,7 +35,7 @@ pub struct Config {
 
 /// `[store]`: the build store (`crate::store`).
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, rename_all = "kebab-case")]
+#[serde(default)]
 pub struct StoreConfig {
     /// The stores, absolute; on each volume the first one there serves it.
     pub paths: Vec<PathBuf>,
@@ -99,7 +99,7 @@ impl StoreConfig {
         };
         match self.tool_caches.iter().find(|pattern| !below(pattern)) {
             Some(pattern) => Err(format!(
-                "store.tool-caches: {pattern:?} is not a path below target/"
+                "store.tool_caches: {pattern:?} is not a path below target/"
             )),
             None => Ok(()),
         }

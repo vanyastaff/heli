@@ -528,7 +528,7 @@ cargo heli daemon [--detach | --warden]            (internal)
   - disk budget and free-space floor;
   - the store per volume (`[store] paths`: absolute paths; on each volume
     the first one there serves it, §6.1);
-  - tool-cache patterns (`[store] tool-caches`: paths below `target/`, `/`
+  - tool-cache patterns (`[store] tool_caches`: paths below `target/`, `/`
     between components, `*` and `?` within one; §6.2, §6.3);
   - eviction ages;
   - the default output mode;
@@ -732,7 +732,7 @@ each registered workspace's volume, where it exists.
 **Sizes.** A file's category follows from its path in a profile directory
 (`<profile>/`, or `<triple>/<profile>/`, a triple always holding a `-`):
 `incremental/`, `deps/`, `build/` (build scripts) and `.fingerprint/`. In a
-registered `target/` directory, what a `[store] tool-caches` pattern names
+registered `target/` directory, what a `[store] tool_caches` pattern names
 counts as tool caches; nothing is a tool cache by default. The rest is
 other. Sizes are file lengths; links are never followed, and a final
 artifact cargo hardlinked into `target/` counts in both directories. The
