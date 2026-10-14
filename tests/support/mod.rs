@@ -63,7 +63,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -993,4 +993,42 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), &target).expect("copy fixture file");
         }
     }
+}
+
+/// Runs `steps` within one second of the clock that dates files, as git
+/// counts time when it ignores nanoseconds (Linux builds of git do): it
+/// starts just after a second begins, and once every file of `dated` was
+/// last written in that same second, waits for the next one. A second
+/// boundary that falls among the steps makes it try again. Panics after 20
+/// tries.
+pub fn within_one_second(dated: &[PathBuf], mut steps: impl FnMut()) {
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock after 1970")
+    };
+    let next_second = || {
+        let rest = 1_000_000_000 - u64::from(now().subsec_nanos());
+        // A coarse clock that dates files has caught up by then.
+        std::thread::sleep(Duration::from_nanos(rest) + Duration::from_millis(100));
+    };
+    for _ in 0..20 {
+        next_second();
+        steps();
+        let second = now().as_secs();
+        let in_it = dated.iter().all(|path| {
+            std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| {
+                    modified
+                        .duration_since(UNIX_EPOCH)
+                        .is_ok_and(|since| since.as_secs() == second)
+                })
+        });
+        if in_it {
+            next_second();
+            return;
+        }
+    }
+    panic!("the steps never fitted in one second");
 }

@@ -2341,3 +2341,46 @@ fn a_file_that_cannot_get_a_newer_time_rebuilds_every_unit() {
     let built = units(&output.stdout);
     assert_eq!(names(&built, false), ALL_UNITS, "{built:?}");
 }
+
+/// a's `leaf` changes to other content of the same size in the second in
+/// which a's index was last written (here by a `git add`), as an agent's
+/// edit right after `git worktree add` does, and a builds it. The record of
+/// a's build directory holds a's change, not the content git's stat cache
+/// remembers (see the result store's test of the same name): the main
+/// worktree, whose `leaf` is the commit's, recycles a's build directory
+/// precisely and builds `leaf` from its own source.
+#[test]
+fn a_change_in_the_second_of_the_index_is_recorded_by_its_content() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    let lib = a.join("leaf").join("src").join("lib.rs");
+    let original = std::fs::read_to_string(&lib).expect("read leaf's source");
+    let changed = original.replace("leaf from the commit", "leaf from a's change");
+    assert_eq!(changed.len(), original.len(), "the same size");
+    let index = repo.git(
+        &a,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    );
+    let index = PathBuf::from(text(&index.stdout).trim_end());
+    support::within_one_second(&[lib.clone(), index], || {
+        std::fs::write(&lib, &original).expect("write leaf's source");
+        repo.git(&a, &["add", "leaf/src/lib.rs"]);
+        std::fs::write(&lib, &changed).expect("change leaf's source");
+    });
+    let output = repo.build_output(&a);
+    assert_eq!(
+        leaf_says(&output.stdout, &a),
+        "leaf: leaf from a's change over root from the commit"
+    );
+    let main = repo.main();
+    set_mtimes(&main, an_hour_ago());
+    repo.fixture.kill_daemon();
+    repo.remove_worktree("a");
+
+    let output = repo.build_output(&main);
+    assert_eq!(leaf_says(&output.stdout, &main), LEAF_FROM_THE_COMMIT);
+    let recycled = repo.recycled();
+    assert_eq!(recycled.len(), 1, "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
+}
