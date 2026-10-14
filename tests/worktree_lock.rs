@@ -32,9 +32,25 @@ fn start(command: &mut Command) -> Child {
         .expect("start heli")
 }
 
+/// Waits for `child` to exit, at most [`FINISH_WITHIN`]: a wait that is
+/// never released fails the test instead of hanging it.
 fn finish(child: Child) -> Output {
-    child.wait_with_output().expect("wait for heli")
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    match receiver.recv_timeout(FINISH_WITHIN) {
+        Ok(output) => output.expect("wait for heli"),
+        Err(_) => {
+            support::kill_tree(pid);
+            panic!(
+                "heli (pid {pid}) did not finish within {FINISH_WITHIN:?}: a wait that never ends?"
+            );
+        }
+    }
 }
+
+/// How long a test waits for a run it no longer holds open.
+const FINISH_WITHIN: Duration = Duration::from_secs(60);
 
 fn open(gate: &Path) {
     std::fs::write(gate, "").expect("open the gate");
@@ -418,13 +434,7 @@ fn a_run_inside_a_heli_run_does_not_wait_for_it() {
     assert_eq!(check_run["waiting_for"], json!([id(&inner_run)]));
 
     open(&gate);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let outer_pid = outer.id();
-    std::thread::spawn(move || sender.send(finish(outer)));
-    let Ok(outer) = receiver.recv_timeout(Duration::from_secs(30)) else {
-        support::kill_tree(outer_pid);
-        panic!("the inner fmt waits for the run around it");
-    };
+    let outer = finish(outer);
     assert_success(&outer, "cargo heli exec -- cargo heli fmt");
     assert_eq!(text(&outer.stdout), "arg: \"fmt\"\narg: \"--inner\"\n");
     assert!(!said_waiting(&outer), "{}", text(&outer.stderr));
