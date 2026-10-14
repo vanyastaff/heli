@@ -19,6 +19,13 @@
 //! is open, and a FIFO keeps its bytes only while some process holds it
 //! open; one that nobody held has none, and the daemon fills it again.
 //!
+//! **Accounting.** The pool keeps the slots the memory governor withholds
+//! ([`Pool::withhold`]), and adjusts its free slots to its [`target`]: a
+//! top-up raises them to it once nobody can still give a slot back
+//! ([`Pool::top_up`]), a drain lowers them to it at any time
+//! ([`Pool::drain`]). Whether another process holds the pool open is
+//! [`Pool::held_by_others`].
+//!
 //! The counts are snapshots: other processes take and return slots at any
 //! moment.
 
@@ -34,6 +41,7 @@ use windows as platform;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::status;
 
@@ -51,6 +59,8 @@ pub fn default_slots() -> u32 {
 /// The host pool, held open.
 pub struct Pool {
     jobserver: platform::Jobserver,
+    /// The slots the memory governor holds out of the pool.
+    withheld: Mutex<u32>,
 }
 
 /// How [`Pool::open`] found the pool.
@@ -74,7 +84,11 @@ impl Pool {
             ));
         }
         let (jobserver, opened) = platform::Jobserver::open(name, slots)?;
-        Ok((Self { jobserver }, opened))
+        let pool = Self {
+            jobserver,
+            withheld: Mutex::new(0),
+        };
+        Ok((pool, opened))
     }
 
     /// The value of `CARGO_MAKEFLAGS` that points a cargo at this pool.
@@ -84,11 +98,10 @@ impl Pool {
 
     /// The slots, as counted now.
     pub fn status(&self) -> status::Pool {
+        let withheld = *self.withheld();
         let slots = self.jobserver.slots();
         // A count that cannot be read shows as no free slot.
         let free = self.jobserver.free().unwrap_or(0);
-        // The memory governor will withhold slots; nothing does yet.
-        let withheld = 0;
         status::Pool {
             slots,
             free,
@@ -96,6 +109,97 @@ impl Pool {
             in_use: slots.saturating_sub(free).saturating_sub(withheld),
         }
     }
+
+    /// Takes one free slot out of the pool and withholds it, unless that
+    /// would leave the pool fewer than one slot. Returns the slots withheld
+    /// after it, or `None` when it took none (no slot was free).
+    pub fn withhold(&self) -> io::Result<Option<u32>> {
+        let mut withheld = self.withheld();
+        if *withheld + 1 >= self.jobserver.slots() || self.jobserver.take(1)? == 0 {
+            return Ok(None);
+        }
+        *withheld += 1;
+        Ok(Some(*withheld))
+    }
+
+    /// Gives every withheld slot back to the pool, and returns how many
+    /// there were. A slot the pool has no room for (it holds a surplus
+    /// already) is not given.
+    pub fn return_withheld(&self) -> io::Result<u32> {
+        let mut withheld = self.withheld();
+        let returned = *withheld;
+        self.jobserver.give(returned)?;
+        *withheld = 0;
+        Ok(returned)
+    }
+
+    /// Raises the free slots to the [`target`], `lent` being the slots lent
+    /// to run pools; `None` when they are not below it. Only safe when no
+    /// process holds a slot it will give back (the governor's quiescence).
+    pub fn top_up(&self, lent: u32) -> io::Result<Option<Adjustment>> {
+        let withheld = self.withheld();
+        let target = target(self.jobserver.slots(), *withheld, lent);
+        let free = self.jobserver.free()?;
+        if free >= target {
+            return Ok(None);
+        }
+        let given = self.jobserver.give(target - free)?;
+        Ok((given > 0).then_some(Adjustment {
+            slots: given,
+            free: free + given,
+            target,
+        }))
+    }
+
+    /// Takes the free slots above the [`target`] out of the pool, `lent`
+    /// being the slots lent to run pools; `None` when there are none. Safe
+    /// at any time: such a slot is a surplus, whoever gave it.
+    pub fn drain(&self, lent: u32) -> io::Result<Option<Adjustment>> {
+        let withheld = self.withheld();
+        let target = target(self.jobserver.slots(), *withheld, lent);
+        let free = self.jobserver.free()?;
+        if free <= target {
+            return Ok(None);
+        }
+        let taken = self.jobserver.take(free - target)?;
+        Ok((taken > 0).then_some(Adjustment {
+            slots: taken,
+            free: free - taken,
+            target,
+        }))
+    }
+
+    /// Whether a process other than this one may hold the pool open, and so
+    /// may hold slots it will give back. Where it cannot be known, it may.
+    pub fn held_by_others(&self) -> bool {
+        self.jobserver.held_by_others().unwrap_or(true)
+    }
+
+    fn withheld(&self) -> MutexGuard<'_, u32> {
+        self.withheld.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The host pool's target of free slots (DESIGN.md §4, "Bounded top-up"):
+/// its `slots` (N), less the slots the memory governor has `withheld`, less
+/// the slots `lent` to run pools (Σ lent). A top-up raises the free slots to
+/// it, never above.
+///
+/// For a broker that lends slots: count a loan after taking its slot from
+/// the pool, and stop counting it before giving the slot back, so that the
+/// free slots never stand above the target meanwhile.
+pub fn target(slots: u32, withheld: u32, lent: u32) -> u32 {
+    slots.saturating_sub(withheld).saturating_sub(lent)
+}
+
+/// Slots given to the pool or taken out of it, to meet its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Adjustment {
+    /// How many.
+    pub slots: u32,
+    /// The free slots after it.
+    pub free: u32,
+    pub target: u32,
 }
 
 /// Whether `name` can travel in `CARGO_MAKEFLAGS`: the jobserver protocol

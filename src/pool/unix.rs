@@ -11,10 +11,15 @@
 //!   open for reading, and every jobserver client opens it for reading and
 //!   writing. Held, it is adopted as it is; not held, it is empty, and the
 //!   daemon writes N bytes into it.
+//! - Whether another process holds it open, later: a descriptor of it among
+//!   the user's processes (Linux: `/proc/<pid>/fd`; macOS: `proc_pidinfo`);
+//!   elsewhere unknown.
+//! - The daemon takes slots by reading bytes on its own nonblocking
+//!   description, and gives them by writing; a FIFO has no maximum count.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -90,6 +95,161 @@ impl Jobserver {
     pub fn free(&self) -> io::Result<u32> {
         let bytes = rustix::io::ioctl_fionread(&self.fifo)?;
         Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+    }
+
+    /// Takes up to `slots` free slots, never waiting (the daemon's file
+    /// description is nonblocking); returns how many.
+    pub fn take(&self, slots: u32) -> io::Result<u32> {
+        let mut buffer = vec![0u8; slots as usize];
+        let mut taken = 0;
+        while taken < buffer.len() {
+            match (&self.fifo).read(&mut buffer[taken..]) {
+                Ok(0) => break,
+                Ok(read) => taken += read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(u32::try_from(taken).unwrap_or(slots))
+    }
+
+    /// Gives `slots` slots to the pool; a FIFO has no maximum.
+    pub fn give(&self, slots: u32) -> io::Result<u32> {
+        (&self.fifo).write_all(&vec![TOKEN; slots as usize])?;
+        Ok(slots)
+    }
+
+    /// Whether a process other than this one has the FIFO open: one of the
+    /// user's processes has a descriptor of it under `/proc/<pid>/fd`.
+    #[cfg(target_os = "linux")]
+    pub fn held_by_others(&self) -> io::Result<bool> {
+        let fifo = self.fifo.metadata()?;
+        let me = std::process::id();
+        let user = rustix::process::geteuid().as_raw();
+        for process in fs::read_dir("/proc")?.flatten() {
+            let Some(pid) = process
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == me || !process.metadata().is_ok_and(|owner| owner.uid() == user) {
+                continue;
+            }
+            // A process that is gone, or not readable, holds nothing of ours.
+            let Ok(descriptors) = fs::read_dir(process.path().join("fd")) else {
+                continue;
+            };
+            for descriptor in descriptors.flatten() {
+                if fs::metadata(descriptor.path())
+                    .is_ok_and(|file| file.dev() == fifo.dev() && file.ino() == fifo.ino())
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether a process other than this one has the FIFO open: one of the
+    /// processes this user may inspect has a descriptor of it
+    /// (`proc_pidinfo`, `proc_pidfdinfo`).
+    #[cfg(target_os = "macos")]
+    pub fn held_by_others(&self) -> io::Result<bool> {
+        use std::ffi::c_int;
+
+        /// `struct proc_fileinfo` (sys/proc_info.h).
+        #[repr(C)]
+        struct ProcFileInfo {
+            open_flags: u32,
+            status: u32,
+            offset: i64,
+            kind: i32,
+            guard_flags: u32,
+        }
+        /// `struct vnode_fdinfo` (sys/proc_info.h).
+        #[repr(C)]
+        struct VnodeFdInfo {
+            file: ProcFileInfo,
+            vnode: libc::vnode_info,
+        }
+        const PROC_PIDFDVNODEINFO: c_int = 1;
+        const DESCRIPTOR: usize = size_of::<libc::proc_fdinfo>();
+
+        let fifo = self.fifo.metadata()?;
+        let me = std::process::id();
+        for pid in crate::processes::pids()? {
+            if u32::try_from(pid).is_ok_and(|pid| pid == me) {
+                continue;
+            }
+            // SAFETY: no buffer: asks for the size of the list.
+            let size = unsafe {
+                libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+            };
+            // A process that is gone, or not ours to see, holds nothing.
+            let Ok(size) = usize::try_from(size) else {
+                continue;
+            };
+            // Room for descriptors opened meanwhile.
+            let mut list: Vec<libc::proc_fdinfo> = (0..size / DESCRIPTOR + 16)
+                .map(|_| libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                })
+                .collect();
+            let bytes = c_int::try_from(list.len() * DESCRIPTOR).unwrap_or(c_int::MAX);
+            // SAFETY: a buffer of the size given.
+            let filled = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    list.as_mut_ptr().cast(),
+                    bytes,
+                )
+            };
+            let Ok(filled) = usize::try_from(filled) else {
+                continue;
+            };
+            list.truncate(filled / DESCRIPTOR);
+            for descriptor in list
+                .iter()
+                .filter(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32)
+            {
+                // SAFETY: plain old data, all zeros until filled.
+                let mut info: VnodeFdInfo = unsafe { std::mem::zeroed() };
+                let wanted = size_of::<VnodeFdInfo>() as c_int;
+                // SAFETY: a buffer of the size given.
+                let filled = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        descriptor.proc_fd,
+                        PROC_PIDFDVNODEINFO,
+                        (&raw mut info).cast(),
+                        wanted,
+                    )
+                };
+                if filled == wanted
+                    && info.vnode.vi_stat.vst_dev == fifo.dev() as u32
+                    && info.vnode.vi_stat.vst_ino == fifo.ino()
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether a process other than this one has the FIFO open: not known
+    /// here.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn held_by_others(&self) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot tell who holds a FIFO here",
+        ))
     }
 }
 

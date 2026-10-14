@@ -21,7 +21,9 @@
 //! errors) is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
+pub mod events;
 pub mod execute;
+pub mod governor;
 pub mod registry;
 
 use std::fs::{File, TryLockError};
@@ -38,6 +40,8 @@ use crate::protocol::{self, Reply, Request, RunRequest};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
 
+use events::Events;
+use governor::Governor;
 use registry::Registry;
 
 /// The daemon's exit code when another daemon already holds the lock: the
@@ -73,7 +77,17 @@ pub fn main() -> ! {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }
     }
-    let pool = open_pool(&locations, &log);
+    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
+    let pool = open_pool(&locations, &config, &log);
+    let governor = Governor::new(&config, locations.config.clone())
+        .unwrap_or_else(|error| fail(Some(&log), &error));
+    let events = Events::new(
+        locations.event_log(),
+        config
+            .event_log
+            .max_kb
+            .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
+    );
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
         Ok(listener) => listener,
         Err(error) => fail(
@@ -91,11 +105,27 @@ pub fn main() -> ! {
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
         pool,
+        governor,
+        events,
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
         _lock: lock,
     });
+    {
+        let daemon = Arc::clone(&daemon);
+        // No slot is lent to a run pool: runs draw from the host pool.
+        let lent = || 0;
+        std::thread::spawn(move || {
+            daemon.governor.run(
+                &daemon.pool,
+                &daemon.registry,
+                &daemon.events,
+                &daemon.log,
+                lent,
+            )
+        });
+    }
     loop {
         match listener.accept() {
             Ok(stream) => {
@@ -120,8 +150,7 @@ fn fail(log: Option<&Log>, error: &str) -> ! {
 }
 
 /// Opens the host pool, of the size configured, or exits with failure.
-fn open_pool(locations: &Locations, log: &Log) -> Pool {
-    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(log), &error));
+fn open_pool(locations: &Locations, config: &Config, log: &Log) -> Pool {
     let slots = config
         .pool
         .slots
@@ -148,6 +177,8 @@ fn open_pool(locations: &Locations, log: &Log) -> Pool {
 struct Daemon {
     registry: Registry,
     pool: Pool,
+    governor: Governor,
+    events: Events,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -201,10 +232,14 @@ impl Daemon {
             let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
             return;
         };
-        let id = self.registry.admit(
-            worktree::of(&execute::cwd(&request)),
-            execute::argv(&request),
-        );
+        let worktree = worktree::of(&execute::cwd(&request));
+        let argv = execute::argv(&request);
+        let admission = serde_json::json!({
+            "worktree": worktree.to_string_lossy(),
+            "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+        });
+        let id = self.registry.admit(worktree, argv);
+        self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
         let started = Reply::Started {
@@ -246,6 +281,7 @@ impl Daemon {
                 started_at: clock::unix_seconds(self.started_at),
             }),
             pool: Some(self.pool.status()),
+            memory: self.governor.memory(),
             runs: self.registry.snapshot(),
         }
     }
