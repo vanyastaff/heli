@@ -276,7 +276,11 @@ fn a_run_cancelled_while_it_waits_never_starts() {
     let id = runs(&status)[1]["id"].as_str().expect("an id").to_owned();
 
     assert_success(&cancel(&fixture, &id), "cargo heli cancel");
-    let output = finish(fmt);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(finish(fmt)));
+    let output = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the cancelled fmt still waits");
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let (_, footer) = support::split_footer(&output.stderr);
