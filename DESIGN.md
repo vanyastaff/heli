@@ -153,7 +153,11 @@ line: it runs the command, or reads the run log, itself. Fields added to a
 message are optional, so both sides still read each other's: a run request
 without a class (§5) comes from a client older than run classes, its run
 counts as exec, and the daemon does not send it the "waiting" message, which
-it could not read.
+it could not read. Values added to a set are read as unknown: a run's phase
+or class in `status` that the client does not know shows as `unknown` and
+as no class, and a reply it does not know is skipped while it follows a run
+(elsewhere it is an answer it did not expect). A daemon still sends a new
+reply only to a client whose request says it reads it.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
@@ -1574,7 +1578,8 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
-  (running for a run of one phase; building, testing, done), `slots` (the
+  (running for a run of one phase; building, testing, done; `unknown` for
+  a newer daemon's phase the client does not know), `slots` (the
   host pool's slots it uses: lent to its run pool and not free there, plus
   its test slots), `share` (its share of the capacity, §4, a number that
   need not be whole), `waiting_since` (`null` unless the run waits),
