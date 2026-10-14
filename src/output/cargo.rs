@@ -56,17 +56,17 @@ pub enum Warnings {
 }
 
 /// How compact output shows the warnings of `cargo <args>` (`args` from the
-/// subcommand on, after a `+toolchain`), or `None` when heli does not
-/// render its output: `run` prints the program's own output, and
-/// `clippy --fix` and `fmt` rewrite sources and take no
-/// `--message-format json`.
+/// subcommand on), or `None` when heli does not render its output: `run`
+/// prints the program's own output, `clippy --fix`, `fix` and `fmt` rewrite
+/// sources and say what they fixed in lines `--quiet` drops, and heli
+/// knows nothing of other subcommands' output.
 ///
 /// This is the one place that reads the subcommand for the output view; it
 /// stands in for the run classes of #12 (see `super::view_of`).
 pub fn warnings_of(args: &[OsString]) -> Option<Warnings> {
-    let at = subcommand_at(args)?;
-    let mut before_separator = args[at + 1..].iter().take_while(|arg| *arg != "--");
-    match args[at].to_str()? {
+    let (subcommand, rest) = args.split_first()?;
+    let mut before_separator = rest.iter().take_while(|arg| *arg != "--");
+    match subcommand.to_str()? {
         "build" | "b" | "doc" | "d" => Some(Warnings::Counts),
         "check" | "c" => Some(Warnings::ByLint),
         "clippy" if !before_separator.any(|arg| arg == "--fix") => Some(Warnings::ByLint),
@@ -74,20 +74,17 @@ pub fn warnings_of(args: &[OsString]) -> Option<Warnings> {
     }
 }
 
-/// Whether `cargo <args>` already chooses cargo's output: `--message-format`,
-/// `--quiet` or `-q`, `--verbose` or `-v`, before any `--`. heli then leaves
-/// its output alone, and must: cargo refuses a second `--quiet` or
-/// `--message-format`.
+/// Whether `cargo <args>` (`args` from the subcommand on) already chooses
+/// cargo's output: `--message-format`, `--quiet` or `-q`, `--verbose` or
+/// `-v`, before any `--`. heli then leaves its output alone, and must:
+/// cargo refuses a second `--quiet` or `--message-format`.
 ///
 /// A cluster of short flags counts when it holds a `q` or a `v` anywhere
 /// (`-vv`, `-rq`), even in a value (`-pserver`): leaving the output alone
 /// is safe, adding `--quiet` to a command that has it is not.
 pub fn sets_output(args: &[OsString]) -> bool {
-    let Some(at) = subcommand_at(args) else {
-        return false;
-    };
-    args[at + 1..]
-        .iter()
+    args.iter()
+        .skip(1)
         .take_while(|arg| *arg != "--")
         .filter_map(|arg| arg.to_str())
         .any(|arg| match arg.strip_prefix("--") {
@@ -115,15 +112,6 @@ pub fn with_json_messages(args: &[OsString]) -> Vec<OsString> {
     with.extend(["--quiet", "--message-format", "json"].map(OsString::from));
     with.extend_from_slice(&args[at..]);
     with
-}
-
-/// Where the subcommand is in `args`: first, or after a `+toolchain`.
-fn subcommand_at(args: &[OsString]) -> Option<usize> {
-    let at = usize::from(
-        args.first()
-            .is_some_and(|first| first.to_string_lossy().starts_with('+')),
-    );
-    (at < args.len()).then_some(at)
 }
 
 /// One line of cargo's JSON output.

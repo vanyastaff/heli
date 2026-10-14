@@ -124,18 +124,26 @@ fn compact_errors(errors: &[String], run: &str) -> String {
 /// `cargo heli log <run> --errors` prints every error of the run as rustc
 /// rendered it, on stderr: of a compact run (whose record holds cargo's
 /// JSON), those compact output left out too; of a full run, the errors in
-/// cargo's text. It is one selector among the others.
+/// cargo's text, each to the blank line after it or to the next warning
+/// (cargo's "build failed, waiting for other jobs" right after its verdict,
+/// while `slow-a`'s build script sleeps). It is one selector among the
+/// others.
 #[test]
 fn log_errors_shows_every_error() {
     let fixture = Fixture::new("basic");
     let plain = cargo_failing(&fixture, &["build", "-p", "many-errors"]);
     let errors = rendered_blocks(&plain, "error");
     for mode in ["compact", "full"] {
-        let output = fixture
-            .heli(["--output", mode, "build", "-p", "many-errors"])
-            .output()
-            .expect("run heli");
-        let (_, run) = failed_run(&output, "many-errors");
+        let mut build = fixture.heli(["--output", mode, "build"]);
+        build
+            .args(["-p", "many-errors", "-p", "slow-a"])
+            .env("CARGO_TARGET_DIR", fixture.path(&format!("target-{mode}")));
+        fixture.concurrency_log().attach(&mut build, 3000);
+        let output = build.output().expect("run heli");
+        let (stderr, run) = failed_run(&output, "many-errors");
+        if mode == "full" {
+            assert!(stderr.contains("warning: build failed"), "{stderr}");
+        }
         let logged = log(&fixture, &[&run, "--errors"]);
         support::assert_success(&logged, "cargo heli log --errors");
         assert_eq!(text(&logged.stdout), "", "{mode}: nothing on stdout");
@@ -235,19 +243,21 @@ fn green_run(fixture: &Fixture, args: &[&str]) -> (String, String) {
 }
 
 /// In compact mode, a build's warnings are counted per lint, on one line,
-/// the lints with the most first. Check groups them by lint, like clippy,
-/// and doc, a compile run like build, prints nothing but the footer when
-/// it has no warnings.
+/// the lints with the most first, then by name. Check groups them by lint,
+/// like clippy, and doc, a compile run like build, prints nothing but the
+/// footer when it has no warnings. Cargo's aliases `b`, `c` and `d` count
+/// as their subcommands.
 #[test]
 fn compact_build_warnings_are_counted_per_lint() {
     let fixture = Fixture::new("basic");
-    assert_eq!(
-        green_run(&fixture, &["build", "-p", "warnings"]),
-        (
-            String::new(),
-            "4 warnings: 1 dead_code, 1 unused_imports, 1 unused_mut, 1 unused_variables\n".into()
-        )
-    );
+    let counted = "4 warnings: 1 dead_code, 1 unused_imports, 1 unused_mut, 1 unused_variables\n";
+    for build in ["build", "b"] {
+        assert_eq!(
+            green_run(&fixture, &[build, "-p", "warnings"]),
+            (String::new(), counted.into()),
+            "{build}"
+        );
+    }
     assert_eq!(
         green_run(&fixture, &["build", "-p", "many-warnings"]),
         (
@@ -256,12 +266,50 @@ fn compact_build_warnings_are_counted_per_lint() {
         )
     );
     assert_eq!(
-        green_run(&fixture, &["check", "-p", "warnings"]),
-        (String::new(), warnings_by_lint())
+        green_run(&fixture, &["build", "-p", "chatter"]),
+        (String::new(), "1 warning: 1 unused_mut\n".into())
     );
+    for check in ["check", "c"] {
+        assert_eq!(
+            green_run(&fixture, &[check, "-p", "warnings"]),
+            (String::new(), warnings_by_lint()),
+            "{check}"
+        );
+    }
+    for doc in ["doc", "d"] {
+        assert_eq!(
+            green_run(&fixture, &[doc, "-p", "warnings"]),
+            (String::new(), String::new()),
+            "{doc}"
+        );
+    }
+}
+
+/// What follows `--` is the compiler's: heli adds its flags before it, and
+/// an argument there with a `v` in it (here `-Aunused_variables`, which
+/// allows that lint) does not choose cargo's output.
+#[test]
+fn arguments_after_the_separator_are_the_compilers() {
+    let fixture = Fixture::new("basic");
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    let at =
+        |line: u32, column: u32| format!("crates{sep}warnings{sep}src{sep}lib.rs:{line}:{column}");
     assert_eq!(
-        green_run(&fixture, &["doc", "-p", "warnings"]),
-        (String::new(), String::new())
+        green_run(
+            &fixture,
+            &["clippy", "-p", "warnings", "--", "-Aunused_variables"]
+        ),
+        (
+            String::new(),
+            format!(
+                "4 warnings:\n  clippy::let_and_return (1): {}\n  dead_code (1): {}\n  \
+                 unused_imports (1): {}\n  unused_mut (1): {}\n",
+                at(9, 5),
+                at(12, 4),
+                at(4, 5),
+                at(8, 9)
+            )
+        )
     );
 }
 
@@ -554,6 +602,34 @@ fn output_heli_does_not_render_passes_through_in_every_mode() {
             "{flags:?}"
         );
     }
+
+    // `exec` runs the command as given, even when it is cargo.
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(support::cargo_binary())
+        .args(["build", "-p", "warnings"])
+        .output()
+        .expect("run heli");
+    support::assert_success(&output, "cargo heli exec -- cargo build");
+    let stderr = support::without_footer(&output.stderr);
+    assert!(
+        stderr.contains("warning: unused import: `std::collections::HashMap`"),
+        "rustc's full rendering: {stderr}"
+    );
+}
+
+/// `clippy --fix` rewrites sources, and cargo says which in lines its
+/// `--quiet` would drop: its output passes through.
+#[test]
+fn clippy_fix_output_passes_through() {
+    let fixture = Fixture::new("basic");
+    let output = fixture
+        .heli(["clippy", "--fix", "--allow-no-vcs", "-p", "warnings"])
+        .output()
+        .expect("run heli");
+    support::assert_success(&output, "cargo heli clippy --fix");
+    let stderr = support::without_footer(&output.stderr);
+    assert!(stderr.contains("Fixed "), "cargo's own lines: {stderr}");
 }
 
 /// On a terminal (here a pseudo-terminal), the default is full output. The
