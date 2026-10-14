@@ -239,6 +239,33 @@ restart never doubles it.
 - Slots held by a process that died are not recovered here; that is the
   top-up's job (below).
 
+**Lifetime.** A pool lives while some process holds it, and no longer. Once
+its daemon is gone and nobody holds it, a bare cargo pointed at it (§4
+"Reach") cannot open it, prints cargo's warning, and builds with a pool of
+its own, as without heli.
+
+- A semaphore goes with its last handle.
+- A FIFO's path stays, and once nobody holds it, it has no bytes: a bare
+  cargo would open it, find no slot, and build one job at a time, without a
+  warning. So each daemon starts a **warden** as it opens the pool:
+  `cargo heli daemon --warden`, a process of its own (its own process group,
+  no stdio but the read end of a pipe whose write end only the daemon
+  holds). However the daemon ends (it retires, is killed, crashes), the
+  warden reads the end of the pipe. It then removes the FIFO as soon as no
+  process holds it (the `ENXIO` probe above), looking again every 250 ms
+  while one does: a cargo still building keeps the pool alive, as it would
+  keep a semaphore.
+- **The pool's lock**, `<fifo>.lock`, keeps a warden from removing a FIFO
+  that a daemon owns. A daemon takes it before it opens the FIFO and holds
+  it for life (it waits up to 1 s for it, since a warden holds it for a
+  moment; longer means another daemon owns the pool, and this one does not
+  start). A warden holds it only while it looks, and exits once a daemon
+  owns it again.
+- A warden killed together with its daemon (a kill of both, a power loss)
+  leaves the FIFO behind. The next daemon fills it again (Adoption, above);
+  until then, a bare cargo builds one job at a time. A session-start hook
+  that runs `cargo heli ensure`, or the logon task, keeps that window short.
+
 ### Run pools
 
 Each heli run gets a **run pool** of its own: a second semaphore or FIFO,
@@ -304,14 +331,48 @@ Bare cargo, started without heli, still draws from the host pool directly.
 
 - A run through `cargo heli` gets its run pool from the daemon.
 - A bare cargo gets the host pool from the environment that
-  `cargo heli setup` writes: the agent harness settings (Claude Code
-  `settings.json`, `env`), the shell profile, or the user environment. This is
-  the safety net for G2: an agent that forgets heli still shares the pool.
+  `cargo heli setup` writes. This is the safety net for G2: an agent that
+  forgets heli still shares the pool. A bare cargo that finds the pool says
+  so: cargo warns that it ignores a `-j` given beside an external jobserver.
 - Without a running daemon, a bare cargo prints cargo's jobserver warning and
-  runs as it does today. `cargo heli` starts the daemon on demand, and
-  `cargo heli setup` can also register it to start at logon (Task Scheduler,
-  systemd `--user`, launchd) or as a harness session-start hook
-  (`cargo heli ensure`).
+  runs as it does today (Lifetime, above). `cargo heli` starts the daemon on
+  demand, and so does `cargo heli ensure`, for a harness's session-start
+  hook. `cargo heli setup --autostart` can also register it to start at
+  logon (Task Scheduler, systemd `--user`, launchd).
+
+**`cargo heli setup [--print]`** offers `CARGO_MAKEFLAGS`, with the value
+every run gets for the host pool (`-j --jobserver-auth=<semaphore>`, or
+`fifo:<path>`), and writes it only with consent:
+
+- **Where.** Claude Code's user settings, `env` in `settings.json` in
+  `CLAUDE_CONFIG_DIR`, else in `~/.claude` (on Windows `USERPROFILE`, where
+  Claude Code looks), offered only when that directory exists. setup
+  rewrites the file as Claude Code does, as JSON with two-space indentation,
+  keeping every other setting in its order. And the profile of the shell
+  `SHELL` names: `~/.bashrc` for bash, `$ZDOTDIR/.zshrc` (else `~/.zshrc`)
+  for zsh, fish's `config.fish` (`set -gx`), `~/.profile` for any other.
+  setup adds two lines at its end, a comment that marks them as heli's and
+  the assignment, and replaces lines an earlier setup wrote with another
+  value. On Windows, Git Bash, MSYS2 and Cygwin set `SHELL`; without it
+  (PowerShell, cmd) setup prints the PowerShell line that sets the variable
+  in the user environment, and writes nothing there itself.
+- **Consent.** For each file, setup first shows exactly what it would write:
+  the file's whole new content ("would become:") or the lines it would end
+  with ("would end with:"), followed by an empty line. It then asks
+  `Write <path>? [y/N]` and reads the answer from stdin, so a script can
+  answer. Only `y` or `yes` writes; anything else, the end of input, or no
+  input at all leaves the file as it was. A file that already sets the
+  value is left alone without a question, and so is one setup cannot edit
+  safely (settings that are not a JSON object), with the reason.
+- **`--print`** shows the same, asks nothing and writes nothing.
+- setup exits 1 when a file it was told to write cannot be written.
+
+**`cargo heli ensure`** reaches the daemon, starting it as a run would, and
+exits 0 without a word, since a session-start hook's output may land in the
+agent's context. With a daemon running it only connects and exchanges
+versions. When no daemon can be reached, or the one there speaks another
+protocol version (an older one is asked to retire, as for a run), it exits
+1 with one line saying why.
 
 ## 5. Runs: `cargo heli <subcommand> [args...]`
 
@@ -403,7 +464,7 @@ cargo heli cancel <run>
 cargo heli gc [--dry-run]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
-cargo heli daemon [--detach]                       (internal)
+cargo heli daemon [--detach | --warden]            (internal)
 ```
 
 - **Exit codes.**
@@ -520,10 +581,31 @@ selector picks a part of it:
   record of a run in flight is never deleted.
 
 **With rtk installed.** A bare `cargo test` that rtk rewrites to
-`rtk cargo test` should still draw from the heli pool, as long as rtk passes
-the environment through to cargo; this is still to be verified. Anyone who
-prefers rtk's filters to heli's can run `cargo heli --output=full …` under
-`rtk test` or `rtk err`, rtk's generic wrappers.
+`rtk cargo test` still draws from the heli pool: rtk passes the environment
+through to cargo unchanged. Checked in rtk's source at commit
+[`8157d4d`](https://github.com/rtk-ai/rtk/tree/8157d4dcdc3c011f6251de2c972ff6ef8006df7b)
+(2026-10-13); rtk was not installed to try it.
+
+- `rtk cargo build|test|clippy|check` builds the command in
+  `run_cargo_streamed` ([`src/cmds/rust/cargo_cmd.rs` 334](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/cmds/rust/cargo_cmd.rs#L334)):
+  `resolved_command("cargo")`, then arguments only.
+- `resolved_command` ([`src/core/utils.rs` 609-633](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/core/utils.rs#L609-L633))
+  is `Command::new` on the resolved path, and touches the environment only
+  for `git`, in rtk's own test builds.
+- `run_streaming` ([`src/core/stream.rs` 425-471](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/core/stream.rs#L425-L471))
+  sets stdin, stdout and stderr, then spawns. Nothing on the path calls
+  `env_clear`, `env_remove` or `env`, so `CARGO_MAKEFLAGS` reaches cargo.
+  cargo sees pipes, not a terminal.
+- The rewrite keeps variable assignments before the command: rtk's hook
+  rewrites `CARGO_MAKEFLAGS='…' cargo test` to
+  `CARGO_MAKEFLAGS='…' rtk cargo test` ([`src/discover/registry.rs` 66-77, 1767-1786](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/discover/registry.rs#L1767-L1786)).
+- The rule ([`src/discover/rules.rs` 94](https://github.com/rtk-ai/rtk/blob/8157d4dcdc3c011f6251de2c972ff6ef8006df7b/src/discover/rules.rs#L94))
+  matches only `cargo (build|test|clippy|check|fmt|install)`, so
+  `cargo heli …` and `cargo nextest …` pass through untouched.
+
+Anyone who prefers rtk's filters to heli's can run
+`cargo heli --output=full …` under `rtk test` or `rtk err`, rtk's generic
+wrappers.
 
 ## 6. Build store
 
@@ -782,7 +864,8 @@ drains and evictions, and `cargo heli gc --dry-run`.
 
 | Failure | Effect | Handling |
 |---|---|---|
-| Daemon not running | A bare cargo warns and uses its own pool, as today. On Unix, a FIFO left by an earlier daemon still opens but holds no bytes, so a bare cargo runs one job at a time, without a warning | `cargo heli` starts the daemon, which fills the FIFO again (§4); logon or session hook |
+| Daemon not running | A bare cargo warns and uses its own pool, as today | The pool goes with its daemon once nobody holds it: a semaphore by itself, a FIFO through the daemon's warden (§4, Lifetime). `cargo heli` or `cargo heli ensure` starts the daemon; logon task or session hook |
+| Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |

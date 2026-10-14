@@ -19,13 +19,15 @@
 //!   the runs in flight have reported their exits.
 //!
 //! What the daemon owns for its whole life (the lock, then the host pool,
-//! `crate::pool`, and the run log, `crate::runlog`, both as configured) is
-//! set up in [`main`]. The daemon runs until it is killed or retired. Its
-//! own log (start, end, errors) is `daemon.log` in the state directory
-//! (`daemon-<session>.log` on Windows), since it has no terminal.
+//! `crate::pool`, and the run log, `crate::runlog`, both as configured,
+//! and on Unix the pool's [`warden`]) is set up in [`main`]. The daemon
+//! runs until it is killed or retired. Its own log (start, end, errors)
+//! is `daemon.log` in the state directory (`daemon-<session>.log` on
+//! Windows), since it has no terminal.
 
 pub mod execute;
 pub mod registry;
+pub mod warden;
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
@@ -79,6 +81,8 @@ pub fn main() -> ! {
     }
     let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
     let pool = open_pool(&locations, &config, &log);
+    #[cfg(unix)]
+    let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
         Ok(listener) => listener,
         Err(error) => fail(
@@ -147,6 +151,22 @@ fn open_pool(locations: &Locations, config: &Config, log: &Log) -> Pool {
             pool
         }
         Err(error) => fail(Some(log), &format!("cannot open the pool {name}: {error}")),
+    }
+}
+
+/// Starts the pool's warden ([`warden`]); what it returns must live as
+/// long as the daemon. A daemon without a warden still serves.
+#[cfg(unix)]
+fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter> {
+    match warden::start(locations) {
+        Ok((alive, pid)) => {
+            log.write(&format!("pool warden: pid {pid}"));
+            Some(alive)
+        }
+        Err(error) => {
+            log.write(&format!("cannot start the pool's warden: {error}"));
+            None
+        }
     }
 }
 
