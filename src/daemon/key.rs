@@ -319,7 +319,7 @@ fn spelled(path: &OsStr) -> Vec<u8> {
         .as_encoded_bytes()
         .iter()
         .map(|&byte| {
-            if cfg!(windows) && byte == b'\\' {
+            if byte == b'\\' {
                 b'/'
             } else {
                 byte
