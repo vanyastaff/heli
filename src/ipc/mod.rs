@@ -40,3 +40,20 @@ pub fn is_absent(error: &io::Error) -> bool {
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     )
 }
+
+/// True when `error` from [`connect`] means a daemon holds the endpoint but
+/// had no connection free for this client by the deadline (on Windows,
+/// every instance of its pipe stayed taken): it is there, not yet
+/// reachable.
+pub fn is_busy(error: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+        error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+    }
+    #[cfg(unix)]
+    {
+        let _ = error;
+        false
+    }
+}

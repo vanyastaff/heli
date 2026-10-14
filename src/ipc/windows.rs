@@ -34,8 +34,8 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 /// Each pipe instance's buffer, in each direction.
 const BUFFER: u32 = 64 * 1024;
 
-/// How long a client waits for a busy daemon to offer a free instance.
-const BUSY_WAIT: Duration = Duration::from_secs(5);
+/// The longest single wait for a free instance of a busy pipe.
+const BUSY_POLL: Duration = Duration::from_millis(50);
 
 /// The daemon's pipe: always one instance waiting for the next client.
 pub struct Listener {
@@ -119,9 +119,14 @@ impl Write for Stream {
 }
 
 /// Connects to the daemon's pipe `path`, if it belongs to this user.
-pub fn connect(path: &Path) -> io::Result<Stream> {
+///
+/// Every instance of the pipe taken (`ERROR_PIPE_BUSY`) means a daemon
+/// holds it: one between two accepts, or slowed down by a loaded host. So
+/// it waits for a free instance, and tries again, until `deadline`; only
+/// then does it fail with that error. When the pipe goes meanwhile (its
+/// daemon has exited), it fails as when there is none.
+pub fn connect(path: &Path, deadline: Instant) -> io::Result<Stream> {
     let name = wide(path.as_os_str());
-    let deadline = Instant::now() + BUSY_WAIT;
     loop {
         // SAFETY: `name` is NUL-terminated. Identification level: the
         // server may learn who connects but cannot act as the client.
@@ -143,12 +148,16 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
             return Ok(Stream(pipe));
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) || Instant::now() >= deadline {
+        let now = Instant::now();
+        if error.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) || now >= deadline {
             return Err(error);
         }
+        // In short waits: one ends at once when the pipe has gone, but
+        // might not notice it go while it waits.
+        let wait = (deadline - now).min(BUSY_POLL).as_millis().max(1);
         // SAFETY: `name` is NUL-terminated.
         unsafe {
-            WaitNamedPipeW(name.as_ptr(), 50);
+            WaitNamedPipeW(name.as_ptr(), u32::try_from(wait).unwrap_or(u32::MAX));
         }
     }
 }

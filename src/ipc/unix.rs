@@ -5,6 +5,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
+use std::time::Instant;
 
 unsafe extern "C" {
     safe fn geteuid() -> u32;
@@ -88,8 +89,9 @@ impl Write for Stream {
 }
 
 /// Connects to the daemon at `path`, if the socket there belongs to this
-/// user.
-pub fn connect(path: &Path) -> io::Result<Stream> {
+/// user. A listening socket takes a connection at once, so `deadline`, for
+/// a busy endpoint on Windows, does not apply.
+pub fn connect(path: &Path, _deadline: Instant) -> io::Result<Stream> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_socket() || metadata.uid() != geteuid() {
         return Err(io::Error::new(

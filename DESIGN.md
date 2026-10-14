@@ -147,7 +147,12 @@ client talks only to a socket owned by its uid.
 the protocol version, each way. On a mismatch the client runs the command
 directly, with one warning line. A client newer than the daemon also asks it
 to retire: the daemon takes no new runs and exits once its runs in flight
-have finished, so the next call starts a current daemon. An older client asks
+have finished, so the next call starts a current daemon. As it exits it
+first stops listening and releases the state directory's lock: the process
+itself may take a while to be gone (seen to take over 10 s on a loaded
+Windows host), and until then it would hold its endpoint, where a client
+would connect and get no answer, and the lock, which a new daemon needs.
+An older client asks
 nothing, so two installed versions never take turns retiring each other's
 daemon. The version stays 1 until the first release: until then a daemon
 answers a request it does not know (one a newer client added, such as `log`)
@@ -174,6 +179,20 @@ not start, listen or answer within 5 s.
   process tree found through parent processes: observed with Claude Code on
   Windows, where stopping a command killed the client, the daemon it had
   started directly, and that daemon's run.
+- A daemon that finds the lock held exits at once (code 3). The holder may
+  be starting, and will listen; or going away, killed or retired, and
+  holding the lock until its process is gone, after its endpoint has gone.
+  So while nothing listens, `daemon --detach` starts the daemon again, after
+  a pause that grows from 50 ms to 400 ms, within the same 5 s. A daemon
+  that finds its pipe already there on Windows (a predecessor's last
+  connections, as its process goes) tries again to create it within 5 s too.
+- An endpoint that is there but busy (on Windows every instance of the pipe
+  taken: between two of the daemon's accepts, or on a host so loaded that
+  the daemon has not run since) is a daemon, not an absent one: the client
+  waits for a free instance and tries again, within the same 5 s as for an
+  answer, and only then runs the command directly. The daemon creates the
+  next instance before it serves the client it accepted, and creates its
+  pipe only once it is ready to accept.
 - It inherits no handle from the client (on Windows it is started with
   `CreateProcessW` and no inheritance, since the standard library lets a
   child inherit every inheritable handle). A daemon holding the client's
@@ -351,6 +370,14 @@ runs; withheld slots and slots bare cargo holds are not in it.
   broker waits on that run's pool in line with its processes (a thread
   blocked on the semaphore and a cancel event, or in a blocking read of the
   FIFO), and the slot it gets goes to the host pool and on to the poorer run.
+  That wait can be long after the decision, so the broker counts the pools
+  again as it gets the slot, and decides again: if no poorer run waits at
+  that moment (its process is between two slots, or has not yet taken a
+  slot just lent to it), the slot goes back to the run it came from. Sent
+  to the host pool, it would be lent straight back to that run, the one
+  run waiting, and count as taken back (what still took a third slot back
+  on macOS once Return waited a tick). Where it goes then follows
+  from that same count, so a slot taken back always goes to another run.
   Nothing running is interrupted. The margin of two keeps an odd split (3
   and 2) from moving back and forth. Cargo keeps its tokens from one job to
   the next while it has jobs ready (`job_queue`, `spawn_work_if_possible`),

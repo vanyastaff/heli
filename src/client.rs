@@ -59,7 +59,8 @@ use crate::runlog::{self, select::Select};
 use crate::status::{self, Exit, Status};
 use crate::{clock, direct, environment, launch, nesting};
 
-/// How long a daemon may take to answer the handshake.
+/// How long a daemon may take to answer the handshake, and to take the
+/// connection when its endpoint is busy.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Exit code when the connection to the daemon breaks during a run.
@@ -272,12 +273,22 @@ fn query_status() -> Result<Status, String> {
 /// (this client's depth), a daemon is started when none listens; without,
 /// that case is `Ok(None)`. The error is the reason to fall back.
 fn reach(locations: &Locations, start: Option<u32>) -> Result<Option<Stream>, String> {
-    let stream = match ipc::connect(&locations.endpoint) {
+    // A daemon whose endpoint is busy is there: the client waits for it as
+    // long as for its answer.
+    let busy_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+    let stream = match ipc::connect(&locations.endpoint, busy_deadline) {
         Ok(stream) => stream,
         Err(error) if ipc::is_absent(&error) => match start {
             None => return Ok(None),
             Some(depth) => start_daemon(locations, depth)?,
         },
+        Err(error) if ipc::is_busy(&error) => {
+            return Err(format!(
+                "the heli daemon at {} took no connection within {} s",
+                locations.endpoint.display(),
+                HANDSHAKE_TIMEOUT.as_secs()
+            ));
+        }
         Err(error) => return Err(launch::StartError::Unreachable(error).describe(locations)),
     };
     handshake(stream).map(Some)

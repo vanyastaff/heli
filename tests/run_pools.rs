@@ -27,6 +27,19 @@ impl Jobs {
     /// Starts `cargo heli exec -- jobs` with `workers` workers, each holding
     /// a slot for `hold_ms` at a time; `name` tells its files apart.
     fn start(fixture: &Fixture, jobs: &PathBuf, name: &str, workers: u32, hold_ms: u64) -> Self {
+        Self::start_with_gap(fixture, jobs, name, workers, hold_ms, 2)
+    }
+
+    /// [`Jobs::start`], with each worker waiting `gap_ms` between giving a
+    /// slot back and asking for the next.
+    fn start_with_gap(
+        fixture: &Fixture,
+        jobs: &PathBuf,
+        name: &str,
+        workers: u32,
+        hold_ms: u64,
+        gap_ms: u64,
+    ) -> Self {
         let stop = fixture.path(&format!("{name}.stop"));
         let idle = fixture.path(&format!("{name}.idle"));
         let pid = fixture.path(&format!("{name}.pid"));
@@ -35,6 +48,7 @@ impl Jobs {
             .arg(jobs)
             .env("JOBS_WORKERS", workers.to_string())
             .env("JOBS_HOLD_MS", hold_ms.to_string())
+            .env("JOBS_GAP_MS", gap_ms.to_string())
             .env("JOBS_STOP", &stop)
             .env("JOBS_IDLE", &idle)
             .env("JOBS_PID", &pid)
@@ -213,6 +227,41 @@ fn balanced_runs_keep_their_slots() {
     let (first, second) = (loans(&fixture, &a), loans(&fixture, &b));
     assert!(first["taken_back"].as_u64() <= Some(2), "{first}");
     assert_eq!(second["taken_back"], 0, "{second}");
+}
+
+/// A slot is taken back from a run only for another run that waits at
+/// that moment, and goes to it. Taken while the poorer run had just
+/// stopped waiting (its process between two slots, or a slot lent to it
+/// not yet taken), it would be lent straight back to the run it came from:
+/// a take-back that moves nothing, and counts as one. With N = 4: a run
+/// whose three workers keep three slots busy, and a run whose one worker
+/// takes a slot for a moment now and then. Every slot taken back from the
+/// first was lent to the second.
+#[test]
+fn a_slot_taken_back_goes_to_the_run_that_waits() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 4\n");
+    let jobs = fixture.binary("jobs");
+    let busy = Jobs::start(&fixture, &jobs, "busy", 3, 50);
+    let status = fixture.wait_for_status("the first run to use three slots", |status| {
+        runs(status).len() == 1 && runs(status)[0]["slots"] == 3
+    });
+    let a = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    let now_and_then = Jobs::start_with_gap(&fixture, &jobs, "now-and-then", 1, 5, 100);
+    let status = fixture.wait_for_status("the second run", |status| runs(status).len() == 2);
+    let b = runs(&status)
+        .iter()
+        .map(|run| run["id"].as_str().expect("an id").to_owned())
+        .find(|id| *id != a)
+        .expect("the second run");
+    std::thread::sleep(Duration::from_secs(2));
+    busy.stop();
+    now_and_then.stop();
+    let (busy, now_and_then) = (loans(&fixture, &a), loans(&fixture, &b));
+    assert!(
+        busy["taken_back"].as_u64() <= now_and_then["loans"].as_u64(),
+        "taken back from the first: {busy}; lent to the second: {now_and_then}"
+    );
 }
 
 /// A run whose processes stop asking for slots keeps one free in its pool,

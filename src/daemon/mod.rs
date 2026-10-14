@@ -55,7 +55,8 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::num::NonZeroU32;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -82,6 +83,14 @@ use test_run::TestRun;
 /// The daemon's exit code when another daemon already holds the lock: the
 /// client that started it then connects to that one.
 pub const ALREADY_RUNNING: i32 = 3;
+
+/// How long a daemon tries to create its pipe while a predecessor's is
+/// still there ([`bind`]): as long as a client waits for a start.
+const BIND_WAIT: Duration = Duration::from_secs(5);
+
+/// How long a retired daemon tries to wake its own main thread, to exit
+/// there ([`Daemon::exit_if_retired`]), before it exits where it is.
+const WAKE_WAIT: Duration = Duration::from_secs(1);
 
 /// The longest a test run waits for its test slots (DESIGN.md §5, "Where a
 /// run can wait").
@@ -126,19 +135,6 @@ pub fn main() -> ! {
     let events = Arc::new(Events::configured(&locations, &config));
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
-    let mut listener = match ipc::Listener::bind(&locations.endpoint) {
-        Ok(listener) => listener,
-        Err(error) => fail(
-            Some(&log),
-            &format!("cannot listen at {}: {error}", locations.endpoint.display()),
-        ),
-    };
-    log.write(&format!(
-        "started, pid {}, protocol {}, endpoint {}",
-        std::process::id(),
-        protocol::VERSION,
-        locations.endpoint.display()
-    ));
 
     let daemon = Arc::new(Daemon {
         accounts: accounts::Accounts::start(
@@ -162,7 +158,10 @@ pub fn main() -> ! {
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
-        _lock: lock,
+        endpoint: locations.endpoint.clone(),
+        exiting: AtomicBool::new(false),
+        waker: Mutex::new(None),
+        lock,
     });
     {
         let daemon = Arc::clone(&daemon);
@@ -178,8 +177,21 @@ pub fn main() -> ! {
             )
         });
     }
+    // Listening last: a client that finds the endpoint finds the daemon
+    // ready to accept it.
+    let mut listener = bind(&locations, &daemon.log);
+    daemon.log.write(&format!(
+        "started, pid {}, protocol {}, endpoint {}",
+        std::process::id(),
+        protocol::VERSION,
+        locations.endpoint.display()
+    ));
     loop {
-        match listener.accept() {
+        let accepted = listener.accept();
+        if daemon.exiting.load(Ordering::SeqCst) {
+            daemon.exit(listener);
+        }
+        match accepted {
             Ok(stream) => {
                 let daemon = Arc::clone(&daemon);
                 std::thread::spawn(move || daemon.serve(stream));
@@ -188,6 +200,30 @@ pub fn main() -> ! {
                 daemon.log.write(&format!("accept failed: {error}"));
                 std::thread::sleep(Duration::from_millis(100));
             }
+        }
+    }
+}
+
+/// Listens at the endpoint, or exits with failure. This daemon holds the
+/// lock, so a pipe already there on Windows is a predecessor's that has
+/// released the lock but not yet closed its last connections as its process
+/// goes (or someone else's): it tries again for [`BIND_WAIT`].
+fn bind(locations: &Locations, log: &Log) -> ipc::Listener {
+    let deadline = Instant::now() + BIND_WAIT;
+    loop {
+        match ipc::Listener::bind(&locations.endpoint) {
+            Ok(listener) => return listener,
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => fail(
+                Some(log),
+                &format!("cannot listen at {}: {error}", locations.endpoint.display()),
+            ),
         }
     }
 }
@@ -257,9 +293,16 @@ struct Daemon {
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
-    /// Held until the process exits: the operating system releases it even
-    /// when the daemon is killed.
-    _lock: File,
+    endpoint: PathBuf,
+    /// Retired with no run left: the main thread exits ([`Daemon::exit`]).
+    exiting: AtomicBool,
+    /// The connection that wakes the main thread to exit, kept open until it
+    /// does.
+    waker: Mutex<Option<Stream>>,
+    /// Held until the daemon exits: a retired daemon releases it as it
+    /// exits ([`Daemon::exit`]), and the operating system when the process
+    /// is gone, even killed.
+    lock: File,
 }
 
 /// Whether the daemon still takes runs, and how many it is serving.
@@ -444,7 +487,6 @@ impl Daemon {
             "worktree": worktree.to_string_lossy(),
             "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
         });
-        self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself. One that reads it also
         // hears when the command has started (`Spawned`), after the waits
@@ -455,7 +497,11 @@ impl Daemon {
             keyed_in: None,
             spawned_follows: request.reads_spawned,
         };
-        if protocol::write_message(&mut stream, &started).is_err() {
+        let told = protocol::write_message(&mut stream, &started);
+        // Logged once the client is told: the event log's first write
+        // creates it, which can take a while.
+        self.events.admit(id, admission);
+        if told.is_err() {
             self.registry.abandon(id);
             return;
         }
@@ -705,11 +751,34 @@ impl Daemon {
         self.exit_if_retired(&lifecycle);
     }
 
+    /// Once retired with no run left, has the main thread exit: a
+    /// connection of the daemon's own wakes it from its wait for the next
+    /// client. When none can be made, exits here.
     fn exit_if_retired(&self, lifecycle: &Lifecycle) {
-        if lifecycle.retiring && lifecycle.serving == 0 {
+        if lifecycle.retiring
+            && lifecycle.serving == 0
+            && !self.exiting.swap(true, Ordering::SeqCst)
+        {
             self.log.write("retired");
-            std::process::exit(0);
+            match ipc::connect(&self.endpoint, Instant::now() + WAKE_WAIT) {
+                Ok(waker) => {
+                    *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker)
+                }
+                Err(_) => std::process::exit(0),
+            }
         }
+    }
+
+    /// Exits, from the main thread, which owns `listener`. First it stops
+    /// listening, so that no client connects to a daemon that will not
+    /// answer, and releases the lock, so that the next client starts a new
+    /// daemon at once: the process may take a while to be gone, and holds
+    /// its endpoint and the lock until then (seen to take over 10 s on a
+    /// loaded host).
+    fn exit(&self, listener: ipc::Listener) -> ! {
+        drop(listener);
+        let _ = self.lock.unlock();
+        std::process::exit(0)
     }
 
     fn lifecycle(&self) -> MutexGuard<'_, Lifecycle> {
