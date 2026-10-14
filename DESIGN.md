@@ -177,9 +177,9 @@ stderr stream back to the client through the run's record, and the client
 exits with the run's code (on Unix, of its signal). The run belongs to the
 daemon: a client that goes away does not stop it. A run is over when its
 process exits: output still arriving within 500 ms is forwarded, and
-processes it left behind holding its pipes do not hold the client. Once the daemon has told the client that the run
-started, the client never runs the command itself: if the daemon is lost
-mid-run, it exits 1.
+processes it left behind holding its pipes do not hold the client. Once the
+daemon has told the client that the run started, the client never runs the
+command itself: if the daemon is lost mid-run, it exits 1.
 
 ## 4. Host pool
 
