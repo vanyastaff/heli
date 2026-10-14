@@ -18,6 +18,7 @@
 //!   the daemon has said the run started, there is no fallback: the command
 //!   may already have run, so losing the daemon is an error (exit 1).
 //! - **Status.** Ask the daemon, or report that none runs; never start one.
+//! - **Ensure.** Reach the daemon, starting it if need be, and nothing else.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -41,6 +42,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Exit code when the connection to the daemon breaks during a run.
 const LOST: i32 = 1;
 
+/// Exit code of `ensure` when no daemon could be reached.
+const NO_DAEMON: i32 = 1;
 /// Exit code when `log` cannot print the record.
 const FAILED: i32 = 1;
 
@@ -80,6 +83,22 @@ pub fn status(json: bool) -> ! {
         print!("{}", status.to_text(clock::now()));
     }
     std::process::exit(0)
+}
+
+/// `cargo heli ensure`: makes sure a daemon runs, starting one unless one
+/// answers; this process's nesting depth is `depth`. Silent when a daemon
+/// runs, since a harness's session-start hook may show its output to the
+/// agent; and quick when one already did. Exits 1, with one line saying
+/// why, when none could be reached.
+pub fn ensure(depth: u32) -> ! {
+    let reached = Locations::resolve().and_then(|locations| reach(&locations, Some(depth)));
+    match reached {
+        Ok(_daemon) => std::process::exit(0),
+        Err(reason) => {
+            eprintln!("cargo-heli: {reason}");
+            std::process::exit(NO_DAEMON)
+        }
+    }
 }
 
 /// Prints the part of run `run`'s record that `select` picks: stdout on

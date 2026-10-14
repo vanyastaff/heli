@@ -72,6 +72,18 @@ const HELI_VARS: [&str; 5] = [
     "HELI_CONFIG",
 ];
 
+/// Variables that locate the user's own configuration files, which
+/// `cargo heli setup` edits: [`Fixture::setup`] points them at the fixture's
+/// temporary home, or removes them, so that no test edits the real ones.
+const USER_FILE_VARS: [&str; 6] = [
+    "HOME",
+    "USERPROFILE",
+    "CLAUDE_CONFIG_DIR",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "SHELL",
+];
+
 /// A fixture workspace copied into a temporary directory, with a target
 /// directory, a concurrency log and heli's state directory beside it.
 pub struct Fixture {
@@ -260,6 +272,31 @@ impl Fixture {
                 Some(value) => command.env(var, value),
                 None => command.env_remove(var),
             };
+        }
+        command
+    }
+
+    /// `cargo-heli setup` with `args`, run as a user whose home is
+    /// [`Fixture::home`] (`HOME` and `USERPROFILE`; created if missing) and
+    /// whose shell is `shell` (`SHELL`, unset when `None`).
+    /// `CLAUDE_CONFIG_DIR`, `ZDOTDIR` and `XDG_CONFIG_HOME` are unset, so
+    /// every file setup can edit is in that home. The pool it offers is the
+    /// fixture's own.
+    pub fn setup<I, S>(&self, shell: Option<&str>, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let home = self.home();
+        std::fs::create_dir_all(&home).expect("create the temporary home");
+        let mut command = self.heli(["setup"]);
+        command.args(args.into_iter().map(Into::into));
+        for var in USER_FILE_VARS {
+            command.env_remove(var);
+        }
+        command.env("HOME", &home).env("USERPROFILE", &home);
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
         }
         command
     }
