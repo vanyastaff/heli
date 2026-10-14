@@ -15,32 +15,50 @@
 //!   blob id, its size and its modification time. Times are nanoseconds
 //!   since 1970.
 //!
+//! **Clocks.** A file's modification time can be earlier than the moment,
+//! by the clock heli reads (`SystemTime::now()`), at which it was written:
+//! the kernel dates a write by a coarse clock, up to a tick (some
+//! milliseconds) behind, and the file system keeps what its format holds,
+//! whole seconds on HFS+ and two on FAT. So wherever heli compares a file's
+//! time with the clock, it takes a file dated `t` as written as late as `t`
+//! plus a slack ([`written_by`]): 50 ms for a time with a fraction of a
+//! second, which comes from a file system that keeps fractions (10 ms or
+//! finer), and 2.05 s for a whole second, which may come from one that
+//! keeps whole seconds or two.
+//!
 //! **Writing** ([`write`]). Never while a build holds one of cargo's locks
-//! in the build directory. The blob ids come from the snapshot machinery of
-//! the result store (`crate::daemon::key::staged`): `git add -A` into a
-//! scratch copy of the index, here listed with `git ls-files --stage`. The
-//! sizes and times are read from the file system afterwards, so a file
-//! changed meanwhile has a newer time than its blob, and only looks newer
-//! to cargo. Symbolic links and submodules are left out. The file is
-//! replaced whole.
+//! in the build directory. It waits first until every file there is a
+//! slack old, at most 2.05 s, so that the record of a run that just ended
+//! counts (below). The blob ids come from the snapshot machinery of the
+//! result store (`crate::daemon::key::staged`): `git add -A` into a scratch
+//! copy of the index, here listed with `git ls-files --stage`. The sizes and
+//! times are read from the file system afterwards, so a file changed
+//! meanwhile has a newer time than its blob, and only looks newer to cargo.
+//! Symbolic links and submodules are left out. The file is replaced whole.
 //!
 //! **Validity** ([`valid`]). A record counts only if it was taken after the
-//! last build in the directory: `taken_at` is at least the newest
-//! modification time of a file there. heli's own `.heli/` and rustc's
-//! `incremental/` caches (in each profile directory, beside
-//! `.fingerprint/`) are left out: no freshness decision reads them, and a
-//! build that changes what cargo decides writes a fingerprint.
+//! last build in the directory: `taken_at` is no earlier than the time by
+//! which each file there was written, its time plus its slack. heli's own
+//! `.heli/` and rustc's `incremental/` caches (in each profile directory,
+//! beside `.fingerprint/`) are left out: no freshness decision reads them,
+//! and a build that changes what cargo decides writes a fingerprint.
 //!
 //! **Use** ([`stage`], then [`Worktree::settle`]). Each file of the new
 //! worktree whose blob id and size are the record's gets the recorded time,
-//! if it was last written before heli staged the worktree. The size is
-//! checked too because a blob id is of the content after git's filters: two
-//! files that differ only in line endings can share one. Every other file
-//! last written at the donor's last build ([`last_build`]) or before gets
-//! the time now, so that cargo rebuilds what was built from another
-//! content; the rest keep their times, newer than every artifact already.
-//! A worktree with no record to use recycles only when every file of it is
-//! newer than that build already ([`Worktree::newer_than`]).
+//! if it was written before heli began to stage the worktree: its time plus
+//! its slack is no later. A file changed right after git read it, to
+//! content of the same size, may be dated before the staging all the same,
+//! and keeps its time. So that a worktree just made gets the recorded times,
+//! heli stages it again once its files are a slack old, when some were not.
+//! The size is checked too because a blob id is of the content after git's
+//! filters: two files that differ only in line endings can share one. Every
+//! other file last written at the donor's last build ([`last_build`]) or
+//! before gets the time now, and at least its slack after that build, so
+//! that cargo rebuilds what was built from another content (a time cut to
+//! whole seconds stays after the build's); the rest keep their times, newer
+//! than every artifact already. A worktree with no record to use recycles
+//! only when every file of it is newer than that build already
+//! ([`Worktree::newer_than`]).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -77,8 +95,13 @@ pub fn path(build_dir: &Path) -> PathBuf {
 
 /// Writes the record of `build_dir` from `worktree`, asking git through
 /// `probe`; `Ok(false)` when it is not written because a build holds one of
-/// cargo's locks there, or `build_dir` does not exist.
+/// cargo's locks there, or `build_dir` does not exist. It waits first, at
+/// most [`COARSE_SLACK`], until the last build there is a slack old
+/// ([`LastBuild::until`]), so that the record counts.
 pub fn write(build_dir: &Path, worktree: &Path, probe: &Probe) -> Result<bool, String> {
+    if let Ok(last) = last_build(build_dir) {
+        wait_until(last.until);
+    }
     let taken_at = nanos(SystemTime::now()).ok_or("the clock is before 1970")?;
     if !build_dir.is_dir() || super::busy(build_dir) {
         return Ok(false);
@@ -126,30 +149,82 @@ pub fn valid(build_dir: &Path) -> Option<Record> {
     valid_after(build_dir, last_build(build_dir).ok()?)
 }
 
-/// The record of `build_dir`, if it has one taken at `newest` or later:
-/// `newest` is [`last_build`]'s answer.
-pub fn valid_after(build_dir: &Path, newest: u64) -> Option<Record> {
+/// The record of `build_dir`, if it has one taken after `last`, the last
+/// build there ([`last_build`]): at its [`LastBuild::until`] or later.
+pub fn valid_after(build_dir: &Path, last: LastBuild) -> Option<Record> {
     let text = std::fs::read(path(build_dir)).ok()?;
     let record: Record = serde_json::from_slice(&text).ok()?;
-    (record.taken_at >= newest).then_some(record)
+    (record.taken_at >= last.until).then_some(record)
 }
 
-/// When cargo last wrote in `build_dir`: the newest modification time of a
-/// file there, in nanoseconds since 1970, leaving out heli's `.heli/` and
-/// rustc's `incremental/` caches, which no freshness decision reads; 0 for
-/// none. A file of a worktree last written at this time or before looks to
-/// cargo as old as the artifacts built from it, or older.
-pub fn last_build(build_dir: &Path) -> io::Result<u64> {
-    newest(build_dir, true)
+/// A second, in nanoseconds.
+const SECOND: u64 = 1_000_000_000;
+
+/// The slack of a time with a fraction of a second: a file system that
+/// keeps fractions keeps 10 ms or finer, and the kernel's coarse clock is
+/// up to a tick behind the clock, some milliseconds (see the module docs).
+const FINE_SLACK: u64 = 50_000_000;
+
+/// The slack of a time of a whole second, which may come from a file system
+/// that keeps whole seconds (HFS+) or two (FAT); and a tick.
+const COARSE_SLACK: u64 = 2 * SECOND + FINE_SLACK;
+
+/// How much later than its modification time `time` a file may have been
+/// written, by the clock: [`COARSE_SLACK`] for a whole second, else
+/// [`FINE_SLACK`]. Times are nanoseconds since 1970.
+fn slack(time: u64) -> u64 {
+    if time.is_multiple_of(SECOND) {
+        COARSE_SLACK
+    } else {
+        FINE_SLACK
+    }
 }
 
-/// The newest modification time of a file in `dir`, leaving out heli's
-/// `.heli/` at the `top` and the `incremental/` of each profile directory;
-/// 0 for none. Links are not followed. An error, which may hide a newer
+/// The latest time, by the clock, at which a file whose modification time
+/// is `time` may have been written: `time` and its [`slack`].
+fn written_by(time: u64) -> u64 {
+    time.saturating_add(slack(time))
+}
+
+/// Sleeps until the clock reads `until`, in nanoseconds since 1970; not at
+/// all when that is more than [`COARSE_SLACK`] away, as for a file dated
+/// later than a clock set back.
+fn wait_until(until: u64) {
+    let now = nanos(SystemTime::now()).unwrap_or(0);
+    let wait = until.saturating_sub(now);
+    if wait <= COARSE_SLACK {
+        std::thread::sleep(Duration::from_nanos(wait));
+    }
+}
+
+/// When cargo last wrote in a build directory ([`last_build`]). Times are
+/// nanoseconds since 1970.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LastBuild {
+    /// The newest modification time of a file there, 0 for none: a file of
+    /// a worktree last written at this time or before looks to cargo as old
+    /// as the artifacts built from it, or older.
+    pub newest: u64,
+    /// The time, by the clock, by which every file there was written: the
+    /// latest of their times, each with its slack ([`written_by`]). A
+    /// record taken at this time or later was taken after that build.
+    pub until: u64,
+}
+
+/// When cargo last wrote in `build_dir`, leaving out heli's `.heli/` and
+/// rustc's `incremental/` caches, which no freshness decision reads.
+pub fn last_build(build_dir: &Path) -> io::Result<LastBuild> {
+    let mut last = LastBuild::default();
+    newest(build_dir, true, &mut last)?;
+    Ok(last)
+}
+
+/// Takes the modification time of each file in `dir` into `last`, leaving
+/// out heli's `.heli/` at the `top` and the `incremental/` of each profile
+/// directory. Links are not followed. An error, which may hide a newer
 /// file, is one.
-fn newest(dir: &Path, top: bool) -> io::Result<u64> {
+fn newest(dir: &Path, top: bool, last: &mut LastBuild) -> io::Result<()> {
     let profile = dir.join(".fingerprint").is_dir();
-    let mut latest = 0;
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -157,28 +232,63 @@ fn newest(dir: &Path, top: bool) -> io::Result<u64> {
         if kind.is_dir() {
             let skipped = (top && name == ".heli") || (profile && name == "incremental");
             if !skipped {
-                latest = latest.max(newest(&entry.path(), false)?);
+                newest(&entry.path(), false, last)?;
             }
         } else {
-            let modified = entry.metadata()?.modified()?;
-            latest = latest.max(nanos(modified).unwrap_or(0));
+            let modified = nanos(entry.metadata()?.modified()?).unwrap_or(0);
+            last.newest = last.newest.max(modified);
+            last.until = last.until.max(written_by(modified));
         }
     }
-    Ok(latest)
+    Ok(())
 }
 
 /// The files of a worktree as heli staged them (with every change staged,
 /// `key::staged`), and when it did.
 pub struct Worktree {
-    /// Taken before the staging: a file last written at this time or later
-    /// may have changed since it was staged.
+    /// Taken before the staging: a file written at this time or later may
+    /// have changed since it was staged.
     staged_at: SystemTime,
     files: Vec<Staged>,
 }
 
 /// Stages `worktree`, asking git through `probe`; `scratch` holds the
-/// scratch index.
-pub fn stage(worktree: &Path, probe: &Probe, scratch: &Path) -> Result<Worktree, String> {
+/// scratch index. For a worktree whose files a record will `settle`
+/// ([`Worktree::settle`]), which gives a file its recorded time only if it
+/// was written before the staging: when some file may have been written
+/// after the staging began (by its time and slack, as in a worktree just
+/// made), heli waits until none may have been, at most [`COARSE_SLACK`],
+/// and stages the worktree again. A file dated later than that is not
+/// waited for.
+pub fn stage(
+    worktree: &Path,
+    probe: &Probe,
+    scratch: &Path,
+    settle: bool,
+) -> Result<Worktree, String> {
+    let staged = stage_once(worktree, probe, scratch)?;
+    let Some(staged_at) = nanos(staged.staged_at).filter(|_| settle) else {
+        return Ok(staged);
+    };
+    let young = staged
+        .files
+        .iter()
+        .filter_map(|file| std::fs::symlink_metadata(worktree.join(&file.path)).ok())
+        .filter_map(|metadata| metadata.modified().ok().and_then(nanos))
+        .map(written_by)
+        .filter(|by| *by > staged_at && *by - staged_at <= COARSE_SLACK)
+        .max();
+    match young {
+        Some(by) => {
+            wait_until(by);
+            stage_once(worktree, probe, scratch)
+        }
+        None => Ok(staged),
+    }
+}
+
+/// Stages `worktree` once, as [`stage`] does.
+fn stage_once(worktree: &Path, probe: &Probe, scratch: &Path) -> Result<Worktree, String> {
     let staged_at = SystemTime::now();
     let files = staged_files(probe, worktree, scratch)?;
     Ok(Worktree { staged_at, files })
@@ -222,26 +332,27 @@ impl Worktree {
     /// ([`last_build`]), takes nothing built from another content for
     /// theirs:
     ///
-    /// - a file whose blob id and size `record` holds, last written before
-    ///   the staging, gets the time recorded with it: what was built from
-    ///   it is fresh;
+    /// - a file whose blob id and size `record` holds, written before the
+    ///   staging (its time and slack are no later, [`written_by`]), gets the
+    ///   time recorded with it: what was built from it is fresh;
     /// - any other file last written at `newest` or before gets the time
-    ///   now (and never an older one), after every build there: what was
-    ///   built from it is stale;
+    ///   now, and at least its slack after `newest`, so that the time its
+    ///   file system keeps is after every build there: what was built from
+    ///   it is stale;
     /// - any other file keeps its time, newer than every build already.
     ///
     /// A file is changed through a handle that, on Windows, lets nobody
     /// write to it meanwhile.
     pub fn settle(&self, worktree: &Path, record: &Record, newest: u64) -> Settled {
         let mut settled = Settled::default();
-        let after_build = UNIX_EPOCH + Duration::from_nanos(newest.saturating_add(1));
+        let staged_at = nanos(self.staged_at).unwrap_or(0);
         for staged in &self.files {
             let file = worktree.join(&staged.path);
             let recorded = record
                 .files
                 .get(&staged.path)
                 .filter(|recorded| recorded.blob == staged.blob);
-            match settle(&file, recorded, newest, self.staged_at, after_build) {
+            match settle(&file, recorded, newest, staged_at) {
                 Some(true) => settled.restored += 1,
                 Some(false) => {}
                 None => settled.failed += 1,
@@ -252,16 +363,11 @@ impl Worktree {
 }
 
 /// Sets the time of `file` as [`Worktree::settle`] says: `recorded` is
-/// what the record holds for its staged content, if anything. `Some(true)`
-/// when it got the recorded time, `Some(false)` when it needs no other,
-/// `None` when it needed a newer time than `newest` and did not get one.
-fn settle(
-    file: &Path,
-    recorded: Option<&Recorded>,
-    newest: u64,
-    staged_at: SystemTime,
-    after_build: SystemTime,
-) -> Option<bool> {
+/// what the record holds for its staged content, if anything, and
+/// `staged_at` when the staging began. `Some(true)` when it got the
+/// recorded time, `Some(false)` when it needs no other, `None` when it
+/// needed a newer time than `newest` and did not get one.
+fn settle(file: &Path, recorded: Option<&Recorded>, newest: u64, staged_at: u64) -> Option<bool> {
     let older_than_build =
         |modified: Option<u64>| modified.is_none_or(|modified| modified <= newest);
     let Ok(handle) = open_for_times(file) else {
@@ -282,19 +388,24 @@ fn settle(
     if !metadata.is_file() {
         return Some(false);
     }
-    let modified = metadata.modified().ok();
+    let modified = metadata.modified().ok().and_then(nanos);
     if let Some(recorded) = recorded
         && metadata.len() == recorded.size
-        && modified.is_some_and(|modified| modified < staged_at)
+        && modified.is_some_and(|modified| written_by(modified) <= staged_at)
         && handle
             .set_modified(UNIX_EPOCH + Duration::from_nanos(recorded.mtime))
             .is_ok()
     {
         return Some(true);
     }
-    if !older_than_build(modified.and_then(nanos)) {
+    if !older_than_build(modified) {
         return Some(false);
     }
+    // Its file system may keep whole seconds, or two: of a time a moment
+    // after `newest`, it may keep one no later than `newest`, which cargo
+    // takes as fresh.
+    let slack = modified.map_or(COARSE_SLACK, slack);
+    let after_build = UNIX_EPOCH + Duration::from_nanos(newest.saturating_add(slack));
     let now = SystemTime::now().max(after_build);
     handle.set_modified(now).is_ok().then_some(false)
 }
