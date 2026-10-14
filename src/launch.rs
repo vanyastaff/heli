@@ -28,7 +28,13 @@
 //!   daemon then stays in that job, which holds the whole app and is never
 //!   killed as a whole in normal operation (no kill-on-close limit). A job
 //!   that is terminated as a whole still takes the daemon with it; only a
-//!   daemon started outside the job (the logon task) avoids that.
+//!   daemon started outside the job avoids that. So once `setup
+//!   --autostart` has registered the logon task, the client does not start
+//!   the daemon itself: it asks Task Scheduler to (`schtasks /Run`), and
+//!   likewise the systemd user manager or launchd elsewhere
+//!   (`crate::autostart`). It starts the daemon itself only when there is
+//!   no registration for its program and locations, or the service manager
+//!   refuses.
 //! - **The working directory**, which would keep the client's worktree busy
 //!   on Windows: it runs in the state directory.
 //!
@@ -41,7 +47,7 @@ use std::time::{Duration, Instant};
 
 use crate::ipc::{self, Stream};
 use crate::locations::{CONFIG_VAR, ENDPOINT_VAR, Locations, POOL_VAR, STATE_DIR_VAR};
-use crate::{daemon, environment, nesting};
+use crate::{autostart, daemon, environment, nesting};
 
 /// How long a starting daemon may take to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,12 +58,14 @@ const START_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`StartError::TimedOut`], so it reports a timeout either way.
 const DETACH_TIMED_OUT: i32 = 4;
 
-/// A stage of the start this process launched.
+/// A start this process launched: the stage it started, or, when the
+/// autostart registration was asked to start the daemon, nothing it can
+/// watch.
 pub struct Launched {
     #[cfg(unix)]
-    child: std::process::Child,
+    child: Option<std::process::Child>,
     #[cfg(windows)]
-    process: std::os::windows::io::OwnedHandle,
+    process: Option<std::os::windows::io::OwnedHandle>,
 }
 
 /// Why no daemon listens.
@@ -71,18 +79,33 @@ pub enum StartError {
 }
 
 /// Starts a daemon for `locations`, outside this process's tree; `depth` is
-/// this client's. Follow with [`wait`].
+/// this client's. When setup registered the daemon to start at logon for
+/// this program and these locations, the registration starts it
+/// (`crate::autostart`); when there is none, or the service manager
+/// refuses, this process does. Follow with [`wait`].
 pub fn start(locations: &Locations, depth: u32) -> io::Result<Launched> {
+    if autostart::start(locations, depth) {
+        return Ok(Launched {
+            #[cfg(unix)]
+            child: None,
+            #[cfg(windows)]
+            process: None,
+        });
+    }
     spawn_stage(locations, depth, &["daemon", "--detach"])
 }
 
 /// `cargo-heli daemon --detach`: starts the daemon, exits 0 once it listens,
 /// [`DETACH_TIMED_OUT`] when nothing listened in time, or with the code the
-/// daemon exited with, or 1.
+/// daemon exited with, or 1. It creates the state directory, where the
+/// daemon runs, since the logon task may run it before anything else has.
 pub fn detach(depth: u32) -> ! {
     let Ok(locations) = Locations::resolve() else {
         std::process::exit(1)
     };
+    if locations.create_state_dir().is_err() {
+        std::process::exit(1)
+    }
     let Ok(mut daemon) = spawn_stage(&locations, depth, &["daemon"]) else {
         std::process::exit(1)
     };
@@ -97,7 +120,8 @@ pub fn detach(depth: u32) -> ! {
 /// Waits until a daemon listens at the endpoint, while `launched` (the
 /// detaching stage, or the daemon itself) has not failed, and connects.
 /// Exiting with 0 or [`daemon::ALREADY_RUNNING`] is no failure: a daemon
-/// listens, or will.
+/// listens, or will. A daemon the autostart registration starts is not
+/// this process's to watch, so only the deadline ends that wait.
 pub fn wait(locations: &Locations, launched: &mut Launched) -> Result<Stream, StartError> {
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
@@ -152,20 +176,23 @@ fn spawn_stage(locations: &Locations, depth: u32, args: &[&str]) -> io::Result<L
 }
 
 impl Launched {
-    /// The exit code once the process has exited; `None` while it runs.
+    /// The exit code once the process has exited; `None` while it runs, or
+    /// when there is no process to watch.
     #[cfg(unix)]
     pub fn exit_code(&mut self) -> Option<i32> {
         self.child
+            .as_mut()?
             .try_wait()
             .ok()
             .flatten()
             .map(|status| status.code().unwrap_or(1))
     }
 
-    /// The exit code once the process has exited; `None` while it runs.
+    /// The exit code once the process has exited; `None` while it runs, or
+    /// when there is no process to watch.
     #[cfg(windows)]
     pub fn exit_code(&mut self) -> Option<i32> {
-        windows::exit_code(&self.process)
+        windows::exit_code(self.process.as_ref()?)
     }
 }
 
@@ -189,7 +216,7 @@ fn spawn(
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()?;
-    Ok(Launched { child })
+    Ok(Launched { child: Some(child) })
 }
 
 #[cfg(windows)]
@@ -200,7 +227,9 @@ fn spawn(
     env: Vec<(OsString, OsString)>,
 ) -> io::Result<Launched> {
     let process = windows::create_process(program, args, &locations.state_dir, env)?;
-    Ok(Launched { process })
+    Ok(Launched {
+        process: Some(process),
+    })
 }
 
 #[cfg(windows)]

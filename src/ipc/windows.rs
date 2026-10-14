@@ -28,7 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -81,6 +81,27 @@ impl Listener {
 /// was written before (only `DisconnectNamedPipe`, which heli never calls,
 /// would drop it).
 pub struct Stream(File);
+
+impl Stream {
+    /// Whether the other side still has the connection open; asks without
+    /// reading or blocking.
+    pub fn connected(&self) -> bool {
+        let mut available = 0;
+        // SAFETY: a pipe handle; a peek of no bytes only counts them. It
+        // fails (ERROR_BROKEN_PIPE) once the other side has closed.
+        let peeked = unsafe {
+            PeekNamedPipe(
+                self.0.as_raw_handle(),
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        };
+        peeked != 0
+    }
+}
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -299,6 +320,12 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<TokenInformat
         return Err(error);
     }
     Ok(TokenInformation(buffer))
+}
+
+/// The SID of the user this process runs as, `S-1-5-…`: the one user the
+/// endpoint admits, and the one the logon task runs as (`crate::autostart`).
+pub fn user_sid() -> io::Result<String> {
+    sid_string(token_information(TokenUser)?.user())
 }
 
 /// `sid` as `S-1-5-…`.

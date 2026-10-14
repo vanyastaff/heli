@@ -36,10 +36,15 @@
 //!   line;
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
-//!   working directory or its session; waits for a file, leaves an orphan
-//!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
+//!   working directory, its session or its process id; waits for a file,
+//!   leaves an orphan behind, starts a child in a process group of its own,
+//!   counts its starts; exits with `ECHO_EXIT` (see its `main.rs`);
 //! - `chatter`: numbered lines on stdout and stderr, and on request bytes
-//!   that test a run log's fidelity (see its `main.rs`).
+//!   that test a run log's fidelity (see its `main.rs`);
+//! - `linger`: a test that, on request, starts a child in a process group
+//!   of its own and waits for a file with it (see its `lib.rs`);
+//! - `fake-manager`: stands in for `schtasks`, `systemctl` and `launchctl`
+//!   ([`fake_manager`]); no test reaches the real ones.
 //!
 //! After every run the daemon executes, heli prints a footer line on stderr
 //! ([`split_footer`], [`without_footer`]).
@@ -48,6 +53,7 @@
 
 pub mod endpoint;
 pub mod fake_daemon;
+pub mod fake_manager;
 pub mod jobserver;
 pub mod terminal;
 
@@ -491,6 +497,12 @@ impl Fixture {
                 None => command.env_remove(var),
             };
         }
+        // No test reaches the real Task Scheduler, systemd or launchd: heli
+        // finds a program that does not exist unless a test sets the fake
+        // (`fake_manager::FakeManager::apply`).
+        for var in fake_manager::VARS {
+            command.env(var, self.root.path().join("no-service-manager"));
+        }
         command
     }
 
@@ -498,8 +510,9 @@ impl Fixture {
     /// [`Fixture::home`] (`HOME` and `USERPROFILE`; created if missing) and
     /// whose shell is `shell` (`SHELL`, unset when `None`).
     /// `CLAUDE_CONFIG_DIR`, `ZDOTDIR` and `XDG_CONFIG_HOME` are unset, so
-    /// every file setup can edit is in that home. The pool it offers is the
-    /// fixture's own.
+    /// every file setup can edit is in that home; its Cargo home
+    /// (`CARGO_HOME`, which rustup sets for the tests) is `.cargo` there. The
+    /// pool it offers is the fixture's own.
     pub fn setup<I, S>(&self, shell: Option<&str>, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
@@ -512,7 +525,10 @@ impl Fixture {
         for var in USER_FILE_VARS {
             command.env_remove(var);
         }
-        command.env("HOME", &home).env("USERPROFILE", &home);
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CARGO_HOME", home.join(".cargo"));
         if let Some(shell) = shell {
             command.env("SHELL", shell);
         }
@@ -639,8 +655,9 @@ pub fn daemon_pid(status: &Value) -> Option<u32> {
 }
 
 /// Kills process `pid` and its descendants, found by their parent process
-/// (as agent harnesses kill a command), and on Unix its process group: only
-/// for processes the tests started themselves.
+/// (as agent harnesses kill a command), and on Unix its process group and
+/// the sessions its children lead (a daemon's runs): only for processes the
+/// tests started themselves.
 pub fn kill_tree(pid: u32) {
     let pid = pid.to_string();
     let mut commands = Vec::new();
@@ -649,7 +666,20 @@ pub fn kill_tree(pid: u32) {
         taskkill.args(["/F", "/T", "/PID", &pid]);
         commands.push(taskkill);
     } else {
-        // A daemon leads its own process group, which its runs share.
+        // Each run of a daemon leads a session of its own.
+        let children = Command::new("pgrep")
+            .args(["-P", &pid])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        for child in children.split_whitespace() {
+            let mut session = Command::new("pkill");
+            session.args(["-KILL", "-s", child]);
+            commands.push(session);
+        }
+        // A daemon leads its own process group.
         let mut group = Command::new("kill");
         group.args(["-KILL", "--", &format!("-{pid}")]);
         let mut children = Command::new("pkill");

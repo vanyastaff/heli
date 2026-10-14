@@ -27,10 +27,19 @@ pub enum Action {
     /// Start the daemon unless one runs.
     Ensure,
     /// Offer the environment that lets a bare cargo draw from the pool;
-    /// with `print`, only show it.
-    Setup { print: bool },
+    /// with `print`, only show it. `autostart` registers the daemon to start
+    /// at logon (`Some(true)`), removes that registration (`Some(false)`),
+    /// or leaves it as it is (`None`).
+    Setup {
+        print: bool,
+        autostart: Option<bool>,
+    },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
     Log { run: String, select: Select },
+    /// Kill run `run` (`r<number>`) with every process it started.
+    Cancel { run: String },
+    /// List the build store's directories (`dry_run`), as JSON with `json`.
+    Gc { dry_run: bool, json: bool },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
@@ -120,6 +129,14 @@ enum Command {
         /// Only show what would be written; ask nothing, write nothing.
         #[arg(long)]
         print: bool,
+        /// Also register the daemon to start when you log on, in your
+        /// session: a Task Scheduler task, a systemd user unit or a launchd
+        /// agent. Clients then start it through that registration.
+        #[arg(long, conflicts_with = "no_autostart")]
+        autostart: bool,
+        /// Remove the registration `--autostart` made.
+        #[arg(long)]
+        no_autostart: bool,
     },
     /// Print a run's recorded output: stdout on stdout, stderr on stderr.
     Log {
@@ -140,6 +157,24 @@ enum Command {
         /// and name, `my-crate tests::it_works`.
         #[arg(long, value_name = "NAME", group = "select")]
         test: Option<String>,
+    },
+    /// Kill a run in flight with every process it started; its clients
+    /// report it as cancelled.
+    Cancel {
+        /// The run, as the footer after it and `status` name it: `r17` (or
+        /// `17`).
+        #[arg(value_parser = parse_run)]
+        run: String,
+    },
+    /// List every directory of the build store, with its state; nothing is
+    /// deleted yet.
+    Gc {
+        /// Only list what gc would look at, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the versioned JSON document instead of text.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
     },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
@@ -201,7 +236,19 @@ pub fn parse(
         }
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
-        Command::Setup { print } => Action::Setup { print },
+        Command::Gc { dry_run, json } => Action::Gc { dry_run, json },
+        Command::Setup {
+            print,
+            autostart,
+            no_autostart,
+        } => Action::Setup {
+            print,
+            autostart: match (autostart, no_autostart) {
+                (true, _) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
+            },
+        },
         Command::Log {
             run,
             tail,
@@ -218,6 +265,7 @@ pub fn parse(
                 (None, None, None) => Select::All,
             },
         },
+        Command::Cancel { run } => Action::Cancel { run },
         Command::Daemon { warden: true, .. } => Action::Warden,
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => {

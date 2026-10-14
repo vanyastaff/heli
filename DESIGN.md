@@ -114,7 +114,10 @@ owner-only ACL, or a socket with mode 0600) accepts only that user.
 The daemon must run in the user's interactive session, never as a service:
 runs inherit its session, and tests that drive real windows (flui's live
 Win32 tests) need the user's desktop. It is started on demand by a client, or
-by a logon task that runs only while the user is logged on (§10).
+by the logon registration `cargo heli setup --autostart` makes: a task that
+runs only while the user is logged on, or its systemd and launchd
+counterparts (§4, "Autostart"). Once that registration exists, clients start
+the daemon through it too (below).
 
 **One daemon per user**, and on Windows per logon session: a lock in the
 per-user state directory (`%LOCALAPPDATA%\heli`, `$XDG_STATE_HOME/heli` or
@@ -124,7 +127,10 @@ unlike semaphores, so the Windows endpoint carries the session:
 and `HELI_ENDPOINT` override both, and `HELI_POOL` and `HELI_CONFIG` the host
 pool (§4) and the configuration file (§5), which is how tests isolate their
 daemons. A client resolves them, relative paths against its own working
-directory, and passes them to the daemon it starts.
+directory, and passes them to the daemon it starts. `HELI_SCHTASKS`,
+`HELI_SYSTEMCTL` and `HELI_LAUNCHCTL` name the programs heli runs as
+`schtasks`, `systemctl` and `launchctl` (§4, "Autostart"); tests point them
+at a fake, so that none registers anything with the real ones.
 
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
@@ -172,16 +178,31 @@ not start, listen or answer within 5 s.
   command stays in that job and outlives the command. A harness that
   terminated that job as a whole would take the daemon and every run with
   it; only a daemon started outside the job, by the logon task, avoids that
-  (§10).
+  (§10). Hence the next point.
+- **Through the registration.** When `setup --autostart` has registered the
+  daemon for the client's own program and locations (its record in the state
+  directory says which), the client does not start the daemon itself: it asks
+  the service manager to (`schtasks /Run /TN <task>`,
+  `systemctl --user start heli.service`,
+  `launchctl kickstart gui/<uid>/<label>`), with no stdio, and waits for the
+  daemon to listen within the same 5 s. That daemon belongs to the service
+  manager, outside any agent's job, process tree or control group. A client
+  that asked never also starts one: if none listens in time, it runs the
+  command directly. When there is no such record (no registration, another
+  program such as a second install, other locations), or the service manager
+  refuses or does not answer within 5 s (the registration was removed behind
+  heli's back), the client starts the daemon itself, as above.
 
 **A run** is a child of the daemon, started in the client's working
-directory with exactly the client's environment and no stdin. Its stdout and
-stderr stream back to the client, which exits with the run's code (on Unix,
-of its signal). A run is over when its process exits: output still arriving
-within 500 ms is forwarded, and processes it left behind holding its pipes do
-not hold the client. Once the daemon has told the client that the run
-started, the client never runs the command itself: if the daemon is lost
-mid-run, it exits 1.
+directory with exactly the client's environment and no stdin, as the first
+process of a process tree of its own (§5, lifecycle step 4). Its stdout and
+stderr stream back to the client through the run's record, and the client
+exits with the run's code (on Unix, of its signal). The run belongs to the
+daemon: a client that goes away does not stop it. A run is over when its
+process exits: output still arriving within 500 ms is forwarded, and
+processes it left behind holding its pipes do not hold the client. Once the
+daemon has told the client that the run started, the client never runs the
+command itself: if the daemon is lost mid-run, it exits 1.
 
 ## 4. Host pool
 
@@ -406,7 +427,7 @@ Bare cargo, started without heli, still draws from the host pool directly.
   runs as it does today (Lifetime, above). `cargo heli` starts the daemon on
   demand, and so does `cargo heli ensure`, for a harness's session-start
   hook. `cargo heli setup --autostart` can also register it to start at
-  logon (Task Scheduler, systemd `--user`, launchd).
+  logon (Task Scheduler, systemd `--user`, launchd; "Autostart", below).
 
 **`cargo heli setup [--print]`** offers `CARGO_MAKEFLAGS`, with the value
 every run gets for the host pool (`-j --jobserver-auth=<semaphore>`, or
@@ -441,6 +462,81 @@ agent's context. With a daemon running it only connects and exchanges
 versions. When no daemon can be reached, or the one there speaks another
 protocol version (an older one is asked to retire, as for a run), it exits
 1 with one line saying why.
+
+### Autostart
+
+**`cargo heli setup --autostart`** registers the daemon to start when the
+user logs on, in their own session, never as a service and never while they
+are logged off: a daemon there would have no desktop. Clients then start the
+daemon through the registration too (§3, "Starting on demand").
+
+- **Windows**: the Task Scheduler task `heli-daemon-<hash of the state
+  directory>`, in the root folder as other per-user tasks are (OneDrive's).
+  Its definition, `autostart-task.xml` in the state directory (UTF-16, as
+  Task Scheduler exports tasks), is registered with
+  `schtasks /Create /TN <task> /XML <file> /F`.
+  - A logon trigger for the user's SID, and the principal `InteractiveToken`
+    with `LeastPrivilege`: it runs only while the user is logged on, in
+    their interactive session, not elevated, and no password is stored.
+  - It overrides the defaults that would hurt every build: `Priority` 5, a
+    normal priority class (the default 7 is below normal, with low I/O and
+    memory priority, which every run would inherit); `ExecutionTimeLimit`
+    `PT0S` (by default a task is stopped after 72 h); and
+    `DisallowStartIfOnBatteries` and `StopIfGoingOnBatteries` false.
+  - `MultipleInstancesPolicy` `IgnoreNew` and `AllowStartOnDemand`, for
+    `schtasks /Run`.
+  - The action is `cargo-heli daemon --detach`. Task Scheduler gives a
+    console program started in the user's session a console window; the
+    detaching stage holds it only until the daemon listens, and the daemon
+    gets a console without a window, as when a client starts it. The
+    detaching stage creates the state directory if need be.
+- **Linux**: the systemd user unit `heli.service` in
+  `$XDG_CONFIG_HOME/systemd/user` (else `~/.config/systemd/user`), enabled
+  as `systemctl --user enable` would, by the link
+  `default.target.wants/heli.service` beside it, then
+  `systemctl --user daemon-reload`. It runs `cargo-heli daemon` in the
+  foreground (a detaching start would end the unit, and systemd would stop
+  the daemon with it), with `SuccessExitStatus=3`, the exit of a daemon that
+  finds another one running. The user manager lives from the first login to
+  the last logout; heli does not enable lingering.
+- **macOS**: the launchd agent `io.github.vanyastaff.heli`, in
+  `~/Library/LaunchAgents`, loaded at once with
+  `launchctl bootstrap gui/<uid> <file>`: `cargo-heli daemon` in the
+  foreground, `RunAtLoad`, `LimitLoadToSessionType` `Aqua`,
+  `AbandonProcessGroup`, and `ProcessType` `Interactive`: without it launchd
+  throttles an agent's CPU and I/O, and every build's with it. No
+  `KeepAlive`: a daemon that exits stays down until a client starts it.
+
+Rules:
+
+- **Default locations only.** A task cannot hand its program variables, so
+  the registration starts the daemon a plain `cargo heli` finds, and setup
+  refuses to register or unregister (exit 1, one line saying why) while
+  `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or `HELI_CONFIG` is set. The
+  unit and the agent name the locations setup resolved, so that the service
+  manager's environment, which lacks what a shell's profile sets, cannot
+  move them.
+- **The record**, `autostart` in the state directory, names the program and
+  the locations setup registered. A client starts the daemon through the
+  registration only when the record names its own (§3). setup removes the
+  record before it changes anything and writes it once the registration is
+  complete, so no client relies on half of one.
+- **Again.** setup asks the service manager whether the registration is in
+  place with the same definition (`schtasks /Query`, the unit and its link,
+  `launchctl print`) and if so says "registered already" and changes
+  nothing. A registration of another definition (heli installed elsewhere)
+  is replaced; on macOS that unloads the old agent first, which stops a
+  daemon launchd started.
+- **`--no-autostart`** removes the registration, its definition and the
+  record (`schtasks /Delete`; the unit, its link and a reload;
+  `launchctl bootout`, which stops a daemon launchd started), and finds
+  nothing to do the second time.
+- **Consent** is the flag: setup shows the definition and each step, then
+  takes them, and asks nothing. Without `--autostart`, setup registers
+  nothing and does not reach the service manager. `--print` shows the steps
+  of a first registration, or of a removal, and takes none.
+- setup exits 1, with one line naming the command and what it said, when a
+  step fails.
 
 ## 5. Runs: `cargo heli <subcommand> [args...]`
 
@@ -481,11 +577,45 @@ How a command line is read:
 3. **Single-flight.** If a run with the same key is in flight anywhere on the
    machine, the client attaches to it: it streams that run's output and
    returns its exit code.
-4. **Detach.** The daemon spawns the command, inside a Job Object on Windows
-   or a process group on Unix, and the client streams its output.
-   - A killed client leaves the run going, and re-running the same command in
-     the same worktree attaches to it.
-   - `cargo heli cancel <run>` kills the whole process tree.
+4. **Detach.** The daemon spawns the command as the first process of a
+   process tree of its own, and the client follows its output.
+   - **The tree.** On Windows, a Job Object per run: the process starts
+     suspended, joins the job, then runs, so nothing it starts escapes (the
+     job allows no breakaway, and cargo's and nextest's own jobs nest in
+     it). The job does not kill on close, so runs outlive a daemon that
+     dies. On Unix, a session of its own (`setsid`): a process group would
+     not do, since nextest puts each test in a group of its own. Each phase
+     of a test run (step 6) is a tree of its own, and cancel kills the one
+     that runs.
+   - **Following.** The run writes its output only to its record (see
+     "Output" below), and every client follows the record from its first
+     byte, each in a thread of its own. A client that stops reading or is
+     killed holds up nothing; a killed client is noticed within 200 ms, even
+     while the run is silent. Output that cannot be recorded is kept in
+     memory, so clients still get all of it.
+   - **Attach.** Re-running the same command attaches to the run in flight:
+     the client prints one notice line (the run, how long it has been going,
+     and `cargo heli cancel <run>` to run it anew), then the run's output
+     from its first byte, and exits with its code. The same command is the
+     same working directory, argv and environment, apart from what a shell
+     keeps for itself (`PWD`, `OLDPWD`, `SHLVL`, `_`); on Windows variable
+     names ignore case. The environment counts because it holds the target
+     directory, flags and tool settings. A run still waiting for its turn
+     at the worktree lock takes clients too, which hear what it waits for.
+     Every client gets the run's whole story: heli's notes, and its end
+     (its exit, a pass found in the result store meanwhile, or a command
+     that could not start). A retiring daemon starts no run but still
+     attaches. Single-flight (step 3) widens this to the key, across
+     worktrees.
+   - **Cancel.** `cargo heli cancel <run>` kills the whole tree and answers
+     once none of its processes is left. On Windows, `TerminateJobObject`,
+     waiting on the processes themselves too (a job stops counting a
+     process a moment before it has ended). On Unix, SIGTERM to every
+     process of the session, so cargo and nextest can stop their children,
+     then SIGKILL to those left after 2 s. Its clients report the run as
+     cancelled, and it takes no new clients. A run cancelled while it waits
+     for its worktree never starts, and its clients exit 1. A process that
+     starts a session of its own (on Unix) is not the run's any more.
 5. **Compile phase.** The environment gets the run pool (§4) and
    `HELI_RUN=<run id>`. heli sets no `-j`: under a jobserver, cargo ignores it.
 6. **Test phase** (test class only).
@@ -542,11 +672,20 @@ How a command line is read:
    run has a header: its test phase's line (step 6). The footer holds the
    run id, the exit (`exit <code>`, or on Unix `signal <n>`) and the
    duration:
-   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. Peak
-   memory and slots join it once heli measures them. After a quiet run that
-   succeeded, quiet's one line takes its place ("Output" below). A run heli
-   executes directly, without the daemon, has no footer and no record, and
-   its output is the tool's own, untouched.
+   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`, or for
+   a cancelled run `r17 cancelled, exit 1 in …`. Peak memory and slots
+   join it once heli measures them. After a quiet run that succeeded,
+   quiet's one line takes its place ("Output" below); never after a
+   cancelled one. A run heli executes directly, without the daemon, has no
+   footer and no record, and its output is the tool's own, untouched.
+
+**Run ids** are `r<number>`, unique for the life of the state directory:
+records, markers and `cancel` name runs by them, and on Windows every logon
+session has a daemon of its own on the same state directory. Each number is
+read from and advanced in `next-run` in the state directory under a file
+lock (`next-run.lock`), and is never below one past the highest record in
+the run log, so a lost or stale counter costs no record. A number that
+cannot be written back is not given: the client runs the command directly.
 
 **Worktree lock.** heli runs that read a worktree's sources hold its lock
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
@@ -591,7 +730,7 @@ cargo heli exec [heli flags] -- <command…>
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
 cargo heli cancel <run>
-cargo heli gc [--dry-run]
+cargo heli gc [--dry-run [--json]]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli daemon [--detach | --warden]            (internal)
@@ -608,6 +747,12 @@ cargo heli daemon [--detach | --warden]            (internal)
     expression, or two selectors at once.
   - 1 when the daemon is lost during a run (§3), and when `log` has no
     record of the run or cannot read it.
+  - For `cancel`: 0 once the run's processes are gone; 1 when the run is
+    not in flight (it ended, or never was), when no daemon runs (`cancel`
+    starts none), or when the daemon cannot cancel it (too old: it is asked
+    to retire); 2 for a run id that is not one. The client of a cancelled
+    run exits as its process did: on Windows 1, on Unix of SIGTERM (or
+    SIGKILL).
 - **Environment given to runs:**
   - `CARGO_MAKEFLAGS`: the run pool;
   - `HELI_RUN`: the run id, for tools that skip their own host lock under
@@ -625,8 +770,10 @@ cargo heli daemon [--detach | --warden]            (internal)
     §4);
   - the event log's size (`[event_log] max_kb`, §8);
   - disk budget and free-space floor;
-  - the store per volume;
-  - tool-cache patterns (§6.3);
+  - the store per volume (`[store] paths`: absolute paths; on each volume
+    the first one there serves it, §6.1);
+  - tool-cache patterns (`[store] tool_caches`: paths below `target/`, `/`
+    between components, `*` and `?` within one; §6.2, §6.3);
   - eviction ages;
   - the default output mode (`[output] mode`, "Output" below; the client
     reads it too, and ignores a file it cannot use);
@@ -887,7 +1034,35 @@ trybuild, and whatever a project's own tests build there.
 `<store>` must be on the same volume as the worktrees. Cargo hardlinks final
 artifacts out of the build directory, and across volumes it copies them
 instead. The default is `<volume>/.heli/build`, one store per volume that
-holds worktrees.
+holds worktrees. On Unix the root of a volume is rarely writable, so there
+the default is the user's cache, `$XDG_CACHE_HOME/heli/build` (else
+`~/.cache/heli/build`), when it is on the worktree's volume, and
+`<volume>/.heli/build` otherwise. A volume is known by its root:
+`GetVolumePathNameW` on Windows, elsewhere the highest directory above the
+path on the same device.
+
+**Where setup writes it.** Each file is offered with its own question, as
+for the pool's variable (§4, "Reach"):
+
+- **This repository**: `.cargo/config.toml` in the repository's main
+  worktree (the one holding the git common directory). Cargo reads the
+  `.cargo/` of every directory above the one it runs in, so this covers the
+  main worktree and every worktree inside it (Claude Code puts them in
+  `.claude/worktrees/`), and nothing else: not worktrees elsewhere, and not
+  the nested cargos of tests that build projects in temporary directories.
+  Its store is the one on that worktree's volume. If the file is tracked,
+  the line is a local change, this machine's, not to be committed.
+- **Every project**: the user's Cargo configuration (`config.toml` in
+  `CARGO_HOME`, else in `~/.cargo`). One value serves every volume, so its
+  store is the one on the volume setup runs in. Every cargo reads it,
+  nested ones included.
+
+setup adds two lines under the file's `[build]` table (or in a new one at
+its end): a comment that marks them as heli's, and
+`build-dir = "<store>/{workspace-path-hash}"`. It replaces lines an earlier
+setup wrote, and leaves alone, with the reason, a file that is not TOML,
+that sets `build-dir` itself, or whose new content would not parse to the
+same configuration plus `build.build-dir`.
 
 **Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
 move, anything that searches `target/<profile>/deps` for rlibs, test binaries
@@ -906,12 +1081,66 @@ sizes by category (incremental, deps, build scripts, fingerprints, other), for
 build directories and for registered `target/` directories. It rescans a
 directory after cargo releases its lock there.
 
+**Learning a workspace.** heli does not compute `{workspace-path-hash}`
+(cargo's hash of the canonical manifest path, which changes with cargo's
+hasher); cargo names the directories. A run whose program is named `cargo`
+(a cargo subcommand, or an `exec` of cargo) starts, beside it in the
+background, `cargo metadata --format-version 1 --no-deps` as the run would:
+its program, directory and environment. No other program is started with
+those arguments, not even one standing in for cargo under another name. Its
+`workspace_root`,
+`target_directory` and `build_directory` (cargo 1.91 and later) say where
+the run builds. It takes no lock (verified: it answers while a build holds
+the build directory's), and it neither delays nor fails the run.
+
+- The `target/` directory is **registered**, with its workspace, in
+  `store.json` in the state directory, which outlives the daemon.
+- A build directory at `<store>/<2 hex digits>/<hex digits>` in a store
+  heli manages (configured, or its volume's default) gets its manifest,
+  JSON: `{"workspace":…,"repository":…,"created_at":…,"last_run":…}`, times
+  in seconds since 1970, `repository` `null` outside a repository. The
+  daemon rewrites it whole as each run starts, keeping `created_at`.
+
+The stores heli manages are the configured ones and the default store of
+each registered workspace's volume, where it exists.
+
+**Sizes.** A file's category follows from its path in a profile directory
+(`<profile>/`, or `<triple>/<profile>/`, a triple always holding a `-`):
+`incremental/`, `deps/`, `build/` (build scripts) and `.fingerprint/`. In a
+registered `target/` directory, what a `[store] tool_caches` pattern names
+counts as tool caches; nothing is a tool cache by default. The rest is
+other. Sizes are file lengths; links are never followed, and a final
+artifact cargo hardlinked into `target/` counts in both directories. The
+daemon's accountant scans a directory it has no figures for, those a heli
+run built in once the run has ended (cargo has let go of its locks), and any
+whose figures are an hour old, which catches what bare cargo built. It
+never takes cargo's locks; `status` shows its figures, and
+`gc --dry-run` scans afresh.
+
 A build directory is in one of three states:
 
-- **Busy.** `<build-dir>/<profile>/.cargo-build-lock` cannot be locked; cargo
-  holds it exclusively for a build (`src/compiler/layout.rs`).
-- **Live.** Its workspace path exists.
+- **Busy.** One of cargo's locks in a profile directory cannot be locked:
+  `<build-dir>/<profile>/.cargo-build-lock`, which cargo holds for a build
+  (`src/compiler/layout.rs`), or in the artifact directory (`target/`)
+  `.cargo-lock` and `.cargo-artifact-lock`. Where the build directory is the
+  target directory, all three are in one place (verified with cargo 1.99).
+  heli only tries the locks, and lets go at once. A lock it cannot even
+  open, it counts as held.
+- **Live.** Its workspace path exists: its `Cargo.toml`, since a removed
+  worktree can leave files behind.
 - **Orphan.** Its workspace is gone, because the worktree was removed.
+
+A build directory without a manifest, which only bare cargo has built in, is
+**unknown**: heli cannot tell whose it is. Registered `target/` directories
+have the same states, from the same locks and their registered workspace.
+
+`cargo heli gc --dry-run` lists every directory, build and target, with its
+state, size, workspace and repository, and deletes nothing; until eviction
+exists (§6.3), `gc` without `--dry-run` is refused. It reads the store
+itself and needs no daemon. `--json` prints a versioned document
+(`schema`, now 1): `dirs`, one entry per directory, with `kind` (`build` or
+`target`), `path`, `store`, `state`, `workspace`, `repository`,
+`created_at`, `last_run`, `size` and `by_category`.
 
 ### 6.3 Budget and eviction
 
@@ -934,8 +1163,9 @@ evicts down to 85 % of B, cheapest to regenerate first:
 Safety rules:
 
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
-  directory) or `.cargo-lock` (artifact directory) exclusively. If the lock is
-  held, the directory is busy and skipped.
+  directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
+  directory) exclusively. If the lock is held, the directory is busy and
+  skipped.
 - **Rename, then delete.** Under the lock, heli only renames the victim into
   `<store>/.trash/`, which on one volume takes constant time, and releases the
   lock. It deletes the trash in the background at low I/O priority. A cargo
@@ -1125,9 +1355,18 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   need not be whole), `waiting_since` (`null` unless the run waits),
   `waiting_for`
   (the ids of the runs it waits for at the worktree lock),
-  `attached_clients` and `started_at`;
-- `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
-  `by_category`;
+  `attached_clients` (the clients following it now), `started_at`, and
+  once it has ended `ended_at` and `exit` (`code`, `signal` on Unix,
+  `cancelled`), else `null`. The runs in flight are listed, and the last
+  32 runs that ended while no client followed them, as done: nobody else
+  was told how they ended. A run whose clients heard its end leaves the
+  list; a done run holds no worktree lock and counts as no run in flight
+  (for the top-up's quiescence, §4);
+- `disk`: `stores`, one entry per store, with `path`, `budget` (`null` until
+  budgets exist), `used` and `by_category` (`incremental`, `deps`,
+  `build_scripts`, `fingerprints`, `tool_caches`, `other`, in bytes); and
+  `targets`, one entry per registered `target/` directory, with `path`,
+  `used` and `by_category`. `null` when no daemon answers;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,
@@ -1171,9 +1410,12 @@ the one before, and the next event starts a new file.
 | Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
+| A client is killed, or stops reading, during a run | none | The run goes on and its record is complete; `status` lists it as done if no client heard its end; the same command attaches to it while it runs (§5) |
+| Two daemons on one state directory (Windows logon sessions) | They could give the same run id, and write one record over another | Ids come from the state directory's counter under a lock, above every record (§5) |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
-| An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. The logon task starts the daemon outside any agent's job |
-| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon task restricted to the logged-on user |
+| An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. Once `setup --autostart` registered the logon task, the daemon starts outside any agent's job: at logon, and when a client needs one, through `schtasks /Run` (§3) |
+| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart") |
+| The logon registration is gone or stale (removed by hand, heli installed elsewhere, other locations) | A start through it would bring up no daemon, or the wrong one | A client uses it only when the record names its own program and locations; when the service manager refuses the start, the client starts the daemon itself (§3) |
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
 | Run killed while holding slots | none | The run pool's loans go back in full (§4) |

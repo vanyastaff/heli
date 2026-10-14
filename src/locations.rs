@@ -90,15 +90,27 @@ impl Locations {
         self.state_dir.join(session_suffixed("events", ".log"))
     }
 
-    /// The next run number, kept across daemon restarts so run ids stay
-    /// unique.
+    /// The next run number, shared by every daemon of this state directory
+    /// so run ids stay unique (`daemon::registry::RunIds`).
     pub fn run_counter(&self) -> PathBuf {
         self.state_dir.join("next-run")
+    }
+
+    /// The lock held while a run number is taken from [`Self::run_counter`].
+    pub fn run_counter_lock(&self) -> PathBuf {
+        self.state_dir.join("next-run.lock")
     }
 
     /// The run log: one record of output per run (`crate::runlog`).
     pub fn run_logs(&self) -> PathBuf {
         self.state_dir.join("runs")
+    }
+
+    /// The hash of the state directory that names what belongs to it: the
+    /// default endpoint and pool, and the logon task (`crate::autostart`).
+    #[cfg(windows)]
+    pub fn state_dir_hash(&self) -> u64 {
+        path_hash(&self.state_dir)
     }
 
     /// Creates the state directory, owner-only on Unix.

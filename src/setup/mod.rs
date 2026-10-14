@@ -20,26 +20,49 @@
 //!   was told to write cannot be written.
 //! - **`--print`** shows the same and asks nothing, so it writes nothing.
 //!
-//! Another file setup comes to manage (the build store's `build-dir` in the
-//! Cargo configuration) is one more [`Offer`].
+//! **The build store** ([`cargo`]): then setup offers cargo's
+//! `build.build-dir`, pointing at heli's build store, for this repository
+//! and for every project, each file with its own question, as above.
+//!
+//! **`--autostart`** also registers the daemon to start at logon, and
+//! **`--no-autostart`** removes that registration ([`autostart`]); the flag
+//! is the consent. When heli cannot make the registration at all (location
+//! variables are set), setup refuses before it does anything else.
 
+mod autostart;
+mod cargo;
 mod claude;
 mod profile;
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::autostart::Registration;
+use crate::config::Config;
 use crate::locations::Locations;
-use crate::pool;
+use crate::{pool, store};
 
 /// The variable that hands a cargo the host pool.
 pub const VAR: &str = "CARGO_MAKEFLAGS";
 
-/// `cargo heli setup [--print]`.
-pub fn main(print: bool) -> ! {
-    let makeflags = match Locations::resolve()
-        .and_then(|locations| pool::makeflags(&locations.pool).map_err(|error| error.to_string()))
-    {
+/// `cargo heli setup [--print] [--autostart | --no-autostart]`: `autostart`
+/// is `Some(true)` to register the daemon at logon, `Some(false)` to remove
+/// that registration.
+pub fn main(print: bool, autostart: Option<bool>) -> ! {
+    // Checked first, so that a registration heli cannot make changes nothing.
+    let registration = autostart.map(|register| match Registration::new() {
+        Ok(registration) => (register, registration),
+        Err(reason) => {
+            let verb = if register { "register" } else { "remove" };
+            eprintln!("cargo-heli: cannot {verb} autostart: {reason}");
+            std::process::exit(1)
+        }
+    });
+    let locations = Locations::resolve().unwrap_or_else(|reason| {
+        eprintln!("cargo-heli: cannot name the host pool: {reason}");
+        std::process::exit(1)
+    });
+    let makeflags = match pool::makeflags(&locations.pool) {
         Ok(makeflags) => makeflags,
         Err(reason) => {
             eprintln!("cargo-heli: cannot name the host pool: {reason}");
@@ -54,16 +77,19 @@ pub fn main(print: bool) -> ! {
 
     let claude = claude::settings().map(|path| Offer {
         what: "Claude Code settings",
+        sets: VAR,
         edit: claude::edit(&path, &makeflags),
         path,
     });
     let profile = profile::locate()
         .map(|(path, syntax)| Offer {
             what: "Shell profile",
+            sets: VAR,
             edit: profile::edit(&path, syntax, &makeflags),
             path,
         })
         .ok_or_else(|| profile::hint(&makeflags));
+    let (repository, user) = build_store_offers(&locations);
     let mut consent = if print {
         Consent::Never
     } else {
@@ -74,24 +100,95 @@ pub fn main(print: bool) -> ! {
         }
     };
     let mut failed = false;
-    for target in [claude, profile] {
+    let mut present = |target: Result<Offer, String>| {
         println!();
         match target {
             Ok(offer) => failed |= !offer.present(&mut consent),
             Err(note) => println!("{note}"),
         }
+    };
+    present(claude);
+    present(profile);
+    println!(
+        "\nWith {} set, cargo keeps a workspace's intermediates (deps, incremental, \
+         fingerprints, build scripts) in heli's build store on its volume, and its target/ \
+         keeps the final artifacts. Tools that look for intermediates in \
+         target/<profile>/deps no longer find them there.",
+        cargo::SETTING
+    );
+    present(repository);
+    present(user);
+    if let Some((register, registration)) = &registration {
+        println!();
+        failed |= !if *register {
+            autostart::register(registration, print)
+        } else {
+            autostart::unregister(registration, print)
+        };
     }
     println!(
         "\nTo start the daemon as an agent session starts, run `cargo heli ensure` \
          from the harness's session-start hook."
     );
+    if registration.is_none() {
+        println!("To start it when you log on, run `cargo heli setup --autostart`.");
+    }
     std::process::exit(i32::from(failed))
+}
+
+/// The Cargo configurations that would set `build.build-dir`: this
+/// repository's and the user's, or for each why there is none.
+fn build_store_offers(locations: &Locations) -> (Result<Offer, String>, Result<Offer, String>) {
+    let config = match Config::load(&locations.config) {
+        Ok(config) => config,
+        Err(reason) => {
+            let note = format!("Build store: none offered ({reason}).");
+            return (Err(note.clone()), Err(note));
+        }
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            let note = format!("Build store: none offered (no working directory: {error}).");
+            return (Err(note.clone()), Err(note));
+        }
+    };
+    let offer = |what: &'static str, dir: &Path, volume_of: &Path| -> Result<Offer, String> {
+        let path = cargo::file(dir);
+        let store = store::serving(&config.store, volume_of)
+            .map_err(|reason| format!("{what}: none offered ({reason})."))?;
+        let value = store::build_dir(&store);
+        let edit = match value.to_str() {
+            Some(value) => cargo::edit(&path, value),
+            None => Edit::Refused(format!("the store {} is not Unicode", store.display())),
+        };
+        Ok(Offer {
+            what,
+            sets: cargo::SETTING,
+            path,
+            edit,
+        })
+    };
+    let repository = cargo::repository(&cwd).and_then(|main| {
+        offer(
+            "Cargo configuration for this repository",
+            &main.join(".cargo"),
+            &main,
+        )
+    });
+    let user = match cargo::home(&cwd) {
+        Some(home) => offer("Cargo configuration for every project", &home, &cwd),
+        None => Err("Cargo configuration for every project: none (no home directory).".to_owned()),
+    };
+    (repository, user)
 }
 
 /// A file setup offers to edit.
 struct Offer {
     /// What the file is, for people.
     what: &'static str,
+    /// The setting it gets, as people know it.
+    sets: &'static str,
     path: PathBuf,
     edit: Edit,
 }
@@ -149,11 +246,16 @@ impl Offer {
     /// given, and makes it on a yes. False when the file could not be
     /// written.
     fn present(self, consent: &mut Consent) -> bool {
-        let Self { what, path, edit } = self;
+        let Self {
+            what,
+            sets,
+            path,
+            edit,
+        } = self;
         let place = path.display();
         let (content, shown) = match edit {
             Edit::Done => {
-                println!("{what} {place} already sets {VAR} to this.");
+                println!("{what} {place} already sets {sets} to this.");
                 return true;
             }
             Edit::Refused(reason) => {

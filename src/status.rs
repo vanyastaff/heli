@@ -13,10 +13,23 @@
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
 //!           "class":"compile","phase":"running","started_at":1791911112,
-//!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0},
+//!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0,
+//!           "attached_clients":1,"ended_at":null,"exit":null},
 //!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
 //!           "class":"mutate","phase":"running","started_at":1791911120,
-//!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0}]}
+//!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0,
+//!           "attached_clients":2,"ended_at":null,"exit":null},
+//!          {"id":"r16","worktree":"D:\\work\\agent-f1c0","argv":["cargo","test"],
+//!           "class":"test","phase":"done","started_at":1791910990,
+//!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
+//!           "attached_clients":0,"ended_at":1791911050,
+//!           "exit":{"code":101,"signal":null,"cancelled":false}}],
+//!  "disk":{"stores":[{"path":"D:\\.heli\\build","budget":null,"used":1000,
+//!                     "by_category":{"incremental":600,"deps":300,"build_scripts":50,
+//!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
+//!          "targets":[{"path":"D:\\work\\agent-a64b\\target","used":120,
+//!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
+//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]}}
 //! ```
 //!
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
@@ -25,11 +38,20 @@
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
 //! empty. `class` is `null` only from a daemon older than run classes. A
 //! run's `slots` are the host pool's slots it uses, and `share` its share of
-//! them (`crate::pool::broker`).
+//! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
+//! last runs that ended while no client followed them (`daemon::registry`),
+//! so whoever started them can still learn how they ended.
+//!
+//! `disk` is the build store as the daemon last counted it
+//! (`crate::daemon::accounts`): each store's bytes in use, by category
+//! (`crate::store::sizes`), and its `budget` (`null`: no budget yet); and
+//! each registered `target/` directory's. It is `null` when no daemon
+//! answers, or one older than the build store.
 
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::store::sizes::{self, Sizes};
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -45,6 +67,37 @@ pub struct Status {
     #[serde(default)]
     pub memory: Option<Memory>,
     pub runs: Vec<Run>,
+    /// Absent from a daemon older than the build store.
+    #[serde(default)]
+    pub disk: Option<Disk>,
+}
+
+/// The disk the build store takes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Disk {
+    /// One entry per store.
+    pub stores: Vec<StoreUse>,
+    /// One entry per registered `target/` directory.
+    #[serde(default)]
+    pub targets: Vec<TargetUse>,
+}
+
+/// A store's build directories, added up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreUse {
+    pub path: String,
+    /// The bytes the store may take; `None` until budgets exist.
+    pub budget: Option<u64>,
+    pub used: u64,
+    pub by_category: Sizes,
+}
+
+/// A registered `target/` directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetUse {
+    pub path: String,
+    pub used: u64,
+    pub by_category: Sizes,
 }
 
 /// The host pool's slots (`crate::pool`), counted as the status was taken.
@@ -83,10 +136,10 @@ pub struct Daemon {
     pub started_at: u64,
 }
 
-/// A run in flight.
+/// A run in flight, or one that ended while no client followed it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
-    /// `r<number>`, unique on this machine across daemon restarts.
+    /// `r<number>`, unique for the life of the state directory.
     pub id: String,
     /// The worktree the run works in (`crate::worktree`).
     pub worktree: String,
@@ -110,6 +163,44 @@ pub struct Run {
     /// other run waits.
     #[serde(default)]
     pub share: f64,
+    /// The clients following the run now: the call that started it and
+    /// those that attached to it.
+    #[serde(default)]
+    pub attached_clients: u32,
+    /// When it ended; `null` while it runs.
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+    /// How it ended; `null` while it runs.
+    #[serde(default)]
+    pub exit: Option<Exit>,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exit {
+    /// The code its clients exit with: the command's own, or on Unix 128
+    /// plus the signal that killed it.
+    pub code: i32,
+    /// On Unix, the signal that killed it.
+    pub signal: Option<i32>,
+    /// Whether `cargo heli cancel` ended it.
+    pub cancelled: bool,
+}
+
+impl Exit {
+    /// `exit <code>` or `signal <n>`, after `cancelled, ` for a cancelled
+    /// run.
+    pub fn describe(&self) -> String {
+        let ending = match self.signal {
+            Some(signal) => format!("signal {signal}"),
+            None => format!("exit {}", self.code),
+        };
+        if self.cancelled {
+            format!("cancelled, {ending}")
+        } else {
+            ending
+        }
+    }
 }
 
 /// Where a run is in its lifecycle.
@@ -122,6 +213,8 @@ pub enum Phase {
     Building,
     /// A test run waiting for its test slots, then running its tests.
     Testing,
+    /// Ended.
+    Done,
 }
 
 impl Phase {
@@ -131,6 +224,7 @@ impl Phase {
             Self::Running => "running",
             Self::Building => "building",
             Self::Testing => "testing",
+            Self::Done => "done",
         }
     }
 }
@@ -144,6 +238,7 @@ impl Status {
             pool: None,
             memory: None,
             runs: Vec::new(),
+            disk: None,
         }
     }
 
@@ -186,10 +281,16 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
-            let state = if run.waiting_for.is_empty() {
-                run.phase.name().to_owned()
-            } else {
-                format!("waiting for {}", run.waiting_for.join(", "))
+            let state = match &run.exit {
+                Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
+                None if run.waiting_for.is_empty() => {
+                    format!("{}, {} attached", run.phase.name(), run.attached_clients)
+                }
+                None => format!(
+                    "waiting for {}, {} attached",
+                    run.waiting_for.join(", "),
+                    run.attached_clients
+                ),
             };
             text.push_str(&format!(
                 "{label:<6}  {}  {}  {}  {}  {state}  {} slot{}, share {}  {}s\n",
@@ -202,6 +303,25 @@ impl Status {
                 slots(run.share),
                 age(run.started_at)
             ));
+        }
+        if let Some(disk) = &self.disk {
+            let mut label = "disk";
+            for store in &disk.stores {
+                text.push_str(&format!(
+                    "{label:<6}  {}  {}\n",
+                    store.path,
+                    used(store.used, &store.by_category)
+                ));
+                label = "";
+            }
+            for target in &disk.targets {
+                text.push_str(&format!(
+                    "{label:<6}  target {}  {}\n",
+                    target.path,
+                    used(target.used, &target.by_category)
+                ));
+                label = "";
+            }
         }
         text
     }
@@ -219,4 +339,26 @@ pub fn slots(slots: f64) -> String {
 /// `bytes` in gigabytes of 2^30 bytes, to a tenth.
 fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
+}
+
+/// `used` bytes, then the categories that hold any:
+/// `1.2 GiB (incremental 800.0 MiB, deps 400.0 MiB)`.
+fn used(used: u64, by_category: &Sizes) -> String {
+    let parts: Vec<String> = [
+        ("incremental", by_category.incremental),
+        ("deps", by_category.deps),
+        ("build scripts", by_category.build_scripts),
+        ("fingerprints", by_category.fingerprints),
+        ("tool caches", by_category.tool_caches),
+        ("other", by_category.other),
+    ]
+    .into_iter()
+    .filter(|(_, bytes)| *bytes > 0)
+    .map(|(name, bytes)| format!("{name} {}", sizes::human(bytes)))
+    .collect();
+    if parts.is_empty() {
+        sizes::human(used)
+    } else {
+        format!("{} ({})", sizes::human(used), parts.join(", "))
+    }
 }
