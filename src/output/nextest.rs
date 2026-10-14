@@ -101,12 +101,12 @@ fn summary_counts(line: &[u8]) -> Option<String> {
     Some(counts.to_owned())
 }
 
-/// What a status line of nextest's (without its line end) is about: the
-/// test it names, `tests-mixed tests::fails` in `        FAIL [   0.029s]
-/// (1/3) tests-mixed tests::fails`, or for another status line what follows
-/// its time (`2 tests run: …` after `Summary [   0.323s]`). `None` for any
-/// other line. For `cargo heli log --test` (`crate::runlog::select`).
-pub fn status_line(line: &str) -> Option<&str> {
+/// What follows the time on a status line of nextest's (without its line
+/// end): `(1/3) tests-mixed tests::fails` on `        FAIL [   0.029s] (1/3)
+/// tests-mixed tests::fails`, `2 tests run: …` on `     Summary [
+/// 0.323s] 2 tests run: …`. `None` for any other line: a status is words of
+/// letters and digits, and a time digits, spaces, `.`, `>` and `s`.
+fn status_line(line: &str) -> Option<&str> {
     let (status, rest) = line.trim_start().split_once(" [")?;
     let status_word = |c: char| c.is_ascii_alphanumeric() || c == ' ' || c == '/';
     if status.is_empty() || !status.chars().all(status_word) {
@@ -114,18 +114,15 @@ pub fn status_line(line: &str) -> Option<&str> {
     }
     let (time, rest) = rest.split_once("] ")?;
     let time_mark = |c: char| c.is_ascii_digit() || matches!(c, ' ' | '.' | '>' | 's');
-    if !time.chars().all(time_mark) {
-        return None;
-    }
-    let counter = rest
-        .strip_prefix('(')
-        .and_then(|rest| rest.split_once(") "))
-        .filter(|(counter, _)| {
-            counter
-                .split('/')
-                .all(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
-        });
-    Some(counter.map_or(rest, |(_, test)| test))
+    time.chars().all(time_mark).then_some(rest)
+}
+
+/// Whether `line` (without its line end) is a status line of test `name`:
+/// one that ends with the test's path (`tests::it_works`), or its binary and
+/// path (`my-crate tests::it_works`). For `cargo heli log --test`
+/// (`crate::runlog::select`).
+pub fn is_status_of(line: &str, name: &str) -> bool {
+    status_line(line).is_some_and(|test| test == name || test.ends_with(&format!(" {name}")))
 }
 
 /// Whether `line` (without its line end) ends the output nextest prints

@@ -89,7 +89,7 @@ fn a_quiet_green_nextest_run_prints_one_line_with_counts() {
     let fixture = Fixture::new("basic");
     let args: Vec<&str> = ["-q"].into_iter().chain(GREEN_NEXTEST).collect();
     let output = heli(&fixture, &args);
-    quiet_line(&output, &GREEN_NEXTEST.join(" "), "102 passed, 1 skipped, ");
+    quiet_line(&output, &GREEN_NEXTEST.join(" "), "102 passed, 2 skipped, ");
 }
 
 /// In compact mode, a failing nextest test shows its name, its panic message
@@ -276,11 +276,9 @@ fn nextest_output_levels_the_user_set_are_shown() {
     let logged = log(&fixture, &[&footer.run, "--test", "g0::t0"]);
     support::assert_success(&logged, "cargo heli log --test");
     let logged = text(&logged.stderr);
-    let printed = "    output of many_tests::g0::t0\n    NOT [a] status line\n    \
-                   not a: status [   1.000s] line\n";
     assert!(
         logged.trim_start().starts_with("PASS [")
-            && logged.contains(printed)
+            && logged.contains(&printed_by("g0::t0", "    "))
             && logged
                 .lines()
                 .last()
@@ -382,43 +380,133 @@ fn a_green_libtest_run_prints_its_count() {
     let lines: Vec<&str> = stderr.lines().collect();
     assert_eq!(lines.len(), 2, "{stderr}");
     assert!(lines[0].contains(": testing on "), "the header: {stderr}");
-    assert_eq!(lines[1], "tests: 100 passed");
+    assert_eq!(lines[1], "tests: 100 passed, 1 ignored");
 
     let output = heli(&fixture, &["-q", "--no-cache", "test", "-p", "many-tests"]);
-    quiet_line(&output, "test -p many-tests", "100 passed, ");
+    quiet_line(&output, "test -p many-tests", "100 passed, 1 ignored, ");
+}
+
+/// What test `test` of `many-tests` prints, each line after `indent`.
+fn printed_by(test: &str, indent: &str) -> String {
+    [
+        &format!("output of many_tests::{test}"),
+        "NOT [a] status line",
+        "not a: status [   1.000s] line",
+        "... not progress",
+    ]
+    .iter()
+    .map(|line| format!("{indent}{line}\n"))
+    .collect()
+}
+
+/// `cargo heli test <args>` of `many-tests`, which must pass: its stdout,
+/// and its stderr without the footer, whose last line counts the tests.
+fn green_libtest(fixture: &Fixture, args: &[&str], counts: &str) -> (String, String) {
+    let args: Vec<&str> = ["test", "-p", "many-tests"]
+        .iter()
+        .chain(args)
+        .copied()
+        .collect();
+    let output = heli(fixture, &args);
+    support::assert_success(&output, &format!("cargo heli {args:?}"));
+    let (stderr, footer) = support::split_footer(&output.stderr);
+    let stderr = text(&stderr);
+    assert!(
+        stderr.ends_with(&format!("\ntests: {counts}\n")),
+        "{stderr}"
+    );
+    (text(&output.stdout), footer.run)
 }
 
 /// Under `--show-output`, libtest lists what passing tests printed in a
 /// `successes:` section: compact mode keeps it, as plain cargo prints it,
-/// and `log --test` shows a test's part of it. The count names the tests
-/// that libtest's filter left out.
+/// and `log --test` shows one test's part of it, to the next test's or to
+/// the list of names. The count names the tests that libtest's filter left
+/// out, the ignored one among them. On one thread, so that the sections
+/// come in the same order in both runs.
 #[test]
 fn libtest_successes_are_kept_and_filtered_tests_counted() {
     let fixture = Fixture::new("basic");
-    let args = ["test", "-p", "many-tests", "--", "g0::t0", "--show-output"];
+    let args = ["--", "g0::t", "--show-output", "--test-threads=1"];
     let plain = fixture
-        .cargo(args)
+        .cargo(["test", "-p", "many-tests"].iter().chain(&args))
         .env_remove("RUST_TEST_THREADS")
         .output()
         .expect("run cargo");
     support::assert_success(&plain, "cargo test");
     let expected = kept_sections(&text(&plain.stdout));
-    let section = "---- g0::t0 stdout ----\noutput of many_tests::g0::t0\nNOT [a] status line\n\
-                   not a: status [   1.000s] line\n";
-    assert!(expected.contains(section), "plain cargo's: {expected}");
-
-    let output = heli(&fixture, &args);
-    support::assert_success(&output, "cargo heli test");
-    assert_eq!(text(&output.stdout), expected);
-    let (stderr, footer) = support::split_footer(&output.stderr);
-    let stderr = text(&stderr);
+    let section = |test: &str| format!("---- {test} stdout ----\n{}", printed_by(test, ""));
     assert!(
-        stderr.ends_with("\ntests: 1 passed, 99 filtered out\n"),
-        "{stderr}"
+        expected.contains(&section("g0::t0")) && expected.contains(&section("g0::t9")),
+        "plain cargo's: {expected}"
     );
-    let logged = log(&fixture, &[&footer.run, "--test", "g0::t0"]);
-    support::assert_success(&logged, "cargo heli log --test");
-    assert_eq!(text(&logged.stdout), section);
+
+    let (stdout, run) = green_libtest(&fixture, &args, "10 passed, 91 filtered out");
+    assert_eq!(stdout, expected);
+    for test in ["g0::t0", "g0::t9"] {
+        let logged = log(&fixture, &[&run, "--test", test]);
+        support::assert_success(&logged, "cargo heli log --test");
+        assert_eq!(text(&logged.stdout), section(test));
+    }
+}
+
+/// libtest's lines per test are dropped in its pretty format too; what a
+/// test prints itself (`--nocapture`) passes through, though it looks like
+/// libtest's own lines. When the user's arguments choose cargo's output
+/// (`--quiet`), all of libtest's output passes through.
+#[test]
+fn libtest_drops_only_its_lines_per_test() {
+    let fixture = Fixture::new("basic");
+    let (stdout, _) = green_libtest(
+        &fixture,
+        &["--", "g0::", "--format", "pretty"],
+        "10 passed, 91 filtered out",
+    );
+    assert_eq!(stdout, "");
+    let (stdout, _) = green_libtest(
+        &fixture,
+        &["--", "g0::t0", "--nocapture"],
+        "1 passed, 100 filtered out",
+    );
+    assert_eq!(stdout, printed_by("g0::t0", ""));
+
+    let output = heli(&fixture, &["test", "-p", "many-tests", "--quiet"]);
+    support::assert_success(&output, "cargo heli test --quiet");
+    assert!(
+        text(&output.stdout).contains("\nrunning 101 tests\n"),
+        "libtest's own lines: {}",
+        text(&output.stdout)
+    );
+    let stderr = support::without_footer(&output.stderr);
+    assert!(!stderr.contains("tests: "), "no count of heli's: {stderr}");
+}
+
+/// The build phase of a test run shows cargo's diagnostics as a compile run
+/// does, whichever the runner: errors as rustc renders them, on stderr,
+/// and nothing of cargo's JSON; no tests ran, so heli counts none.
+#[test]
+fn a_test_runs_build_errors_show_as_a_compile_runs() {
+    let fixture = Fixture::new("basic");
+    let plain = fixture
+        .cargo(["build", "-p", "broken"])
+        .output()
+        .expect("run cargo");
+    let plain = text(&plain.stderr);
+    let error = plain
+        .split_inclusive('\n')
+        .skip_while(|line| !line.starts_with("error[E0308]"))
+        .take_while(|line| !line.trim().is_empty())
+        .collect::<String>();
+    assert!(error.contains("expected `u32`"), "plain cargo's: {plain}");
+    for runner in [&["test"][..], &["nextest", "run"]] {
+        let args: Vec<&str> = runner.iter().chain(&["-p", "broken"]).copied().collect();
+        let output = heli(&fixture, &args);
+        assert!(!output.status.success(), "{args:?}: {output:?}");
+        assert_eq!(text(&output.stdout), "", "{args:?}");
+        let stderr = support::without_footer(&output.stderr);
+        assert!(stderr.contains(&error), "{args:?}: {stderr}");
+        assert!(!stderr.contains("tests: "), "{args:?}: {stderr}");
+    }
 }
 
 /// `cargo heli log` with `args`.
@@ -494,14 +582,15 @@ fn log_test_shows_one_libtest_tests_output() {
 /// `log <run> --test <name>` prints one test's output from a nextest run's
 /// record, on stderr where nextest wrote it: the test's status line and the
 /// output under it. By the test's name, or by its binary and name. In a
-/// compact run, the output comes once, after the summary; in a full run,
-/// right after the test's line, and a passing test has its line only.
+/// compact run, the output comes once, after the summary; in a full run
+/// (here without nextest's counter of tests, `(1/3)`), right after the
+/// test's line, and a passing test has its line only.
 #[test]
 fn log_test_shows_one_nextest_tests_output() {
     let fixture = Fixture::new("basic");
-    for (mode, name) in [
-        ("compact", "tests::fails"),
-        ("full", "tests-mixed tests::fails"),
+    for (mode, name, progress) in [
+        ("compact", "tests::fails", "counter"),
+        ("full", "tests-mixed tests::fails", "none"),
     ] {
         let (output, run) = failing_run(
             &fixture,
@@ -513,6 +602,8 @@ fn log_test_shows_one_nextest_tests_output() {
                 "-p",
                 "tests-mixed",
                 "--no-fail-fast",
+                "--show-progress",
+                progress,
             ],
         );
         let logged = log(&fixture, &[&run, "--test", name]);
@@ -522,7 +613,7 @@ fn log_test_shows_one_nextest_tests_output() {
         let (status, rest) = stderr.split_once('\n').expect("a status line");
         assert!(
             status.trim_start().starts_with("FAIL [")
-                && status.ends_with("/3) tests-mixed tests::fails"),
+                && status.ends_with(" tests-mixed tests::fails"),
             "{mode}: {stderr}"
         );
         let rest = untimed(rest);

@@ -30,15 +30,10 @@ use super::cargo::{Diagnostics, Warnings};
 use super::{LineBuffer, Render, Sink};
 use crate::protocol::Channel;
 
-/// What libtest's summary lines count, summed.
+/// What libtest's summary lines count, summed: each count by what it
+/// counts (`passed`, `filtered out`), in the order libtest lists them.
 #[derive(Debug, Default)]
-struct Counts {
-    passed: u64,
-    failed: u64,
-    ignored: u64,
-    measured: u64,
-    filtered: u64,
-}
+struct Counts(Vec<(String, u64)>);
 
 impl Counts {
     /// Adds the counts of a summary line, `test result: ok. 2 passed; 0
@@ -54,33 +49,24 @@ impl Counts {
             let Ok(number) = number.parse::<u64>() else {
                 continue;
             };
-            match what {
-                "passed" => self.passed += number,
-                "failed" => self.failed += number,
-                "ignored" => self.ignored += number,
-                "measured" => self.measured += number,
-                "filtered out" => self.filtered += number,
-                _ => {}
+            match self.0.iter_mut().find(|(counted, _)| counted == what) {
+                Some((_, sum)) => *sum += number,
+                None => self.0.push((what.to_owned(), number)),
             }
         }
         Some(verdict != "ok")
     }
 
     /// `812 passed, 1 failed, 3 ignored`: passed always, the others when
-    /// there are some.
-    fn describe(&self) -> String {
-        let mut counts = vec![format!("{} passed", self.passed)];
-        for (count, what) in [
-            (self.failed, "failed"),
-            (self.ignored, "ignored"),
-            (self.measured, "measured"),
-            (self.filtered, "filtered out"),
-        ] {
-            if count > 0 {
-                counts.push(format!("{count} {what}"));
-            }
-        }
-        counts.join(", ")
+    /// there are some; `None` before any summary line.
+    fn describe(&self) -> Option<String> {
+        let counts: Vec<String> = self
+            .0
+            .iter()
+            .filter(|(what, sum)| what == "passed" || *sum > 0)
+            .map(|(what, sum)| format!("{sum} {what}"))
+            .collect();
+        (!self.0.is_empty()).then(|| counts.join(", "))
     }
 }
 
@@ -98,11 +84,13 @@ fn per_test(line: &str) -> bool {
     let pretty = line.starts_with("test ") && line.contains(" ... ");
     // `....... 87/100`: a character per test, then a count at a line's end.
     let (marks, count) = line.split_once(' ').unwrap_or((line, ""));
+    let counted = count.is_empty()
+        || count
+            .split_once('/')
+            .is_some_and(|(done, all)| [done, all].iter().all(|n| n.parse::<u64>().is_ok()));
     let terse = !marks.is_empty()
         && marks.bytes().all(|byte| matches!(byte, b'.' | b'i' | b'F'))
-        && count
-            .split_once('/')
-            .is_none_or(|(done, all)| [done, all].iter().all(|n| n.parse::<u64>().is_ok()));
+        && counted;
     line.is_empty() || running || pretty || terse || line.ends_with(" --- FAILED")
 }
 
@@ -114,13 +102,12 @@ pub fn section_of(line: &str) -> Option<&str> {
 }
 
 /// Whether `line` (without its line end) ends a test's section: the next
-/// section, the list of names that ends the sections, or the binary's
-/// summary.
+/// section, or the list of names that ends the sections (`failures:`,
+/// `successes:`), which libtest prints before the binary's summary.
 pub fn ends_section(line: &str) -> bool {
     (line.starts_with("---- ") && line.ends_with(" ----"))
         || line == "failures:"
         || line == "successes:"
-        || line.starts_with("test result: ")
 }
 
 /// Renders a `cargo test` run (see the module docs).
@@ -130,8 +117,6 @@ pub struct Libtest {
     /// Inside a `failures:` or `successes:` section.
     in_section: bool,
     counts: Counts,
-    /// Whether a summary line was seen.
-    summaries: bool,
 }
 
 impl Libtest {
@@ -141,7 +126,6 @@ impl Libtest {
             stdout: LineBuffer::default(),
             in_section: false,
             counts: Counts::default(),
-            summaries: false,
         }
     }
 
@@ -153,7 +137,6 @@ impl Libtest {
         let text = String::from_utf8_lossy(line);
         let text = text.trim_end_matches(['\n', '\r']);
         if let Some(failed) = self.counts.add(text) {
-            self.summaries = true;
             self.in_section = false;
             if failed {
                 out.write(Channel::Stdout, line);
@@ -185,11 +168,10 @@ impl Render for Libtest {
             self.line(&line, out);
         }
         let warnings = self.diagnostics.finish(run, out);
-        if !self.summaries {
-            return warnings;
-        }
         let counts = self.counts.describe();
-        out.line(&format!("tests: {counts}"));
-        std::iter::once(counts).chain(warnings).collect()
+        if let Some(counts) = &counts {
+            out.line(&format!("tests: {counts}"));
+        }
+        counts.into_iter().chain(warnings).collect()
     }
 }
