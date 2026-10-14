@@ -20,18 +20,36 @@
 //! effort: a key that cannot be computed, or a store that cannot be written,
 //! costs the saving, never the run.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use crate::class::Class;
 use crate::clock;
 use crate::daemon::execute;
 use crate::daemon::key::{self, Key};
 use crate::daemon::registry::RunId;
 use crate::protocol::{Cache, Reply, RunRequest, Text};
 use crate::worktree;
+
+/// How a run of `class`, `cargo <args>`, uses the store: verify and test
+/// runs look it up and are recorded (with `no_cache`, only recorded), the
+/// result-store column of the class table (`crate::class`). A request for
+/// help (`-h` or `--help`, cargo's or, after `--`, the test runner's) is no
+/// verdict, so it does not use it. `exec` is opt-in, and nothing opts in
+/// yet.
+pub fn cache(class: Class, args: &[OsString], no_cache: bool) -> Cache {
+    let help = args.iter().any(|arg| arg == "-h" || arg == "--help");
+    match class {
+        Class::Verify | Class::Test if help => Cache::Off,
+        Class::Verify | Class::Test if no_cache => Cache::Refresh,
+        Class::Verify | Class::Test => Cache::On,
+        Class::Compile | Class::Mutate | Class::Exec => Cache::Off,
+    }
+}
 
 /// The most markers kept.
 pub const CAP: usize = 256;
