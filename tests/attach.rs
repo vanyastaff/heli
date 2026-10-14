@@ -53,6 +53,10 @@ fn split_notice(stderr: &str) -> (&str, &str) {
     (notice, rest)
 }
 
+/// How long a run goes before a client attaches to it, when the test reads
+/// the age in the notice.
+const MEASURABLE_AGE: Duration = Duration::from_millis(200);
+
 /// A second call of the same command attaches to the first one's run: it
 /// prints a notice, then the run's output from its start (written before it
 /// attached), and exits with the run's code; the command started once.
@@ -78,10 +82,15 @@ fn the_same_command_attaches_to_the_run_in_flight() {
     };
     let first = call("1");
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    // The run started before it was listed.
+    let listed = Instant::now();
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
     wait_until("the run's first output", || {
         logged(&fixture, &id) == "arg: \"once\"\n"
     });
+    // The notice gives the age in tenths of a second: the run is old enough
+    // that it shows.
+    std::thread::sleep(MEASURABLE_AGE.saturating_sub(listed.elapsed()));
 
     let second = call("2");
     fixture.wait_for_status("the second client", |status| {
@@ -119,7 +128,10 @@ fn the_same_command_attaches_to_the_run_in_flight() {
         .split_once("the same command started ")
         .and_then(|(_, rest)| rest.split_once(" s ago"))
         .and_then(|(seconds, _)| seconds.parse::<f64>().ok());
-    assert!(age.is_some_and(|age| age > 0.0), "{notice}");
+    assert!(
+        age.is_some_and(|age| age >= MEASURABLE_AGE.as_secs_f64()),
+        "{notice}"
+    );
     assert_eq!(rest, "echo-args: stderr\n");
     let started = std::fs::read_to_string(&starts).expect("read the starts");
     assert_eq!(started.lines().count(), 1, "the command started once");
