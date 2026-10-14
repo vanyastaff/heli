@@ -177,6 +177,27 @@ impl Repo {
         self.git(&self.main(), &["worktree", "remove", "--force", &spelled]);
     }
 
+    /// Removes worktree `removed` and adds worktree `added`, so that the
+    /// first heli run in `added` recycles a build directory for it. The
+    /// daemon's look, which recycles too, as it starts, as runs end and
+    /// every minute (DESIGN.md §6.4), would race that run. So the daemon
+    /// that built in `removed` is stopped, with any look it was about to
+    /// make, and a new one has made its first look before `added` exists
+    /// (each pass of its accountant looks first, then counts the stores
+    /// that `status` shows); its next look is a minute away, or after the
+    /// next run's end.
+    fn replace_worktree(&self, removed: &str, added: &str) -> PathBuf {
+        self.fixture.kill_daemon();
+        self.remove_worktree(removed);
+        let output = self
+            .heli(&self.main(), &["ensure"])
+            .output()
+            .expect("run heli ensure");
+        assert_success(&output, "cargo heli ensure");
+        self.wait_for_first_look();
+        self.add_worktree(added)
+    }
+
     /// `cargo heli <args>` in `dir`, building into its own `target/` and the
     /// store.
     fn heli(&self, dir: &Path, args: &[&str]) -> Command {
@@ -363,9 +384,11 @@ fn a_new_worktree_builds_warm_in_a_removed_ones_build_directory() {
     let (built, _) = repo.build(&a);
     assert_eq!(names(&built, false), ALL_UNITS, "a builds cold: {built:?}");
     let a_dir = repo.build_dir_of(&a);
+    // Stopped first, the daemon cannot write the record again as it sees
+    // the build's lock released.
+    repo.fixture.kill_daemon();
     forget_record(&a_dir);
-    repo.remove_worktree("a");
-    let b = repo.add_worktree("b");
+    let b = repo.replace_worktree("a", "b");
 
     let (built, stderr) = repo.build(&b);
     assert_eq!(
@@ -1427,8 +1450,7 @@ fn recycled_build(in_a: impl FnOnce(&Path), in_b: impl FnOnce(&Repo, &Path)) -> 
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
     assert!(record_file(&a_dir).is_file(), "a's run left a record");
-    repo.remove_worktree("a");
-    let b = repo.add_worktree("b");
+    let b = repo.replace_worktree("a", "b");
     in_b(&repo, &b);
 
     let (built, stderr) = repo.build_like_a_clean_build(&b);
