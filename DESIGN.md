@@ -245,8 +245,11 @@ a name with a space, or a semaphore name that is not ASCII.
 
 The daemon reads the free count with `NtQuerySemaphore` (ntdll; the handle
 needs `SEMAPHORE_QUERY_STATE`, which the one `CreateSemaphoreW` returns has,
-and the ones cargo opens do not) or `FIONREAD` on its own nonblocking file
-description of the FIFO. Counts are snapshots.
+and the ones cargo opens do not) or `FIONREAD` on a nonblocking file
+description of the FIFO open for reading only: on one open for reading and
+writing, macOS answers for the FIFO's write side, which never holds a byte
+(its `fifo_ioctl` asks the read socket, then the write socket, and the last
+answer wins). Counts are snapshots.
 
 **Adoption.** A restarted daemon adopts a pool that some process still holds,
 as it is: the slots that process holds come back to the same pool, so a
