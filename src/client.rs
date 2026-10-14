@@ -54,6 +54,7 @@ use crate::output::{self, Plan, Printer, print};
 use crate::protocol::{
     self, CancelRequest, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text,
 };
+use crate::run_id::RunId;
 use crate::runlog::{self, select::Select};
 use crate::status::{self, Exit, Status};
 use crate::{clock, direct, environment, launch, nesting};
@@ -142,7 +143,7 @@ pub fn ensure(depth: u32) -> ! {
 /// Prints the part of run `run`'s record that `select` picks: stdout on
 /// stdout, stderr on stderr. The daemon sends it; when none answers, this
 /// client reads the record itself (and starts no daemon).
-pub fn log(run: &str, select: &Select) -> ! {
+pub fn log(run: RunId, select: &Select) -> ! {
     let locations = Locations::resolve().unwrap_or_else(|error| {
         eprintln!("cargo-heli: {error}");
         std::process::exit(FAILED)
@@ -177,9 +178,9 @@ pub fn log(run: &str, select: &Select) -> ! {
 
 /// Asks the daemon for the record, prints it as it arrives, and exits.
 /// Returns only when the daemon sent none of it, with the reason.
-fn ask_log(mut stream: Stream, run: &str, select: &Select) -> Result<Infallible, String> {
+fn ask_log(mut stream: Stream, run: RunId, select: &Select) -> Result<Infallible, String> {
     let request = Request::Log(LogRequest {
-        run: run.to_owned(),
+        run: run.to_string(),
         select: select.clone(),
     });
     protocol::write_message(&mut stream, &request)
@@ -223,13 +224,13 @@ fn ask_log(mut stream: Stream, run: &str, select: &Select) -> Result<Infallible,
 
 /// Cancels run `run`: asks the daemon, and starts none. Exits 0 once the
 /// run's processes are gone, else 1 after one line saying why.
-pub fn cancel(run: &str) -> ! {
+pub fn cancel(run: RunId) -> ! {
     let failure = match Locations::resolve().and_then(|locations| reach(&locations, None)) {
         Ok(None) => "no heli daemon is running, so no run is in flight".to_owned(),
         Err(reason) => format!("cannot cancel {run}: {reason}"),
         Ok(Some(mut stream)) => {
             let request = Request::Cancel(CancelRequest {
-                run: run.to_owned(),
+                run: run.to_string(),
             });
             let asked = protocol::write_message(&mut stream, &request)
                 .and_then(|()| protocol::read_message::<Reply>(&mut stream));
@@ -385,14 +386,14 @@ fn submit(
             if let Some(milliseconds) = attached {
                 let running_for = Duration::from_millis(milliseconds);
                 started = started.checked_sub(running_for).unwrap_or(started);
-                printer.note(&attached_notice(&run, running_for, keyed_in.as_ref()));
+                printer.note(&attached_notice(run, running_for, keyed_in.as_ref()));
             }
             // A daemon older than `Spawned` may start the command any time
             // after `Started`.
             let spawned = !spawned_follows;
-            follow(stream, invocation, &run, started, printer, spawned)
+            follow(stream, invocation, run, started, printer, spawned)
         }
-        Ok(Reply::Passed { run, worktree, at }) => already_passed(&run, &worktree, at),
+        Ok(Reply::Passed { run, worktree, at }) => already_passed(run, &worktree, at),
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
@@ -404,7 +405,7 @@ fn submit(
 /// the same command, or with `keyed_in` the same key, of a run in that
 /// worktree. Another client may follow a run of the same key, so the way
 /// to run it anew is `--no-cache`, not cancelling it.
-fn attached_notice(run: &str, running_for: Duration, keyed_in: Option<&Text>) -> String {
+fn attached_notice(run: RunId, running_for: Duration, keyed_in: Option<&Text>) -> String {
     let age = running_for.as_secs_f64();
     match keyed_in {
         None => format!(
@@ -427,7 +428,7 @@ fn attached_notice(run: &str, running_for: Duration, keyed_in: Option<&Text>) ->
 fn follow(
     mut stream: Stream,
     invocation: &Invocation,
-    run: &str,
+    run: RunId,
     started: Instant,
     mut printer: Printer,
     mut spawned: bool,
@@ -459,7 +460,7 @@ fn follow(
                     signal,
                     cancelled,
                 };
-                printer.exited(run, exit, started.elapsed());
+                printer.exited(&run.to_string(), exit, started.elapsed());
                 exit_as(code, signal)
             }
             Ok(Frame::Message(Reply::SpawnFailed { not_found, message })) => {
@@ -471,7 +472,7 @@ fn follow(
                 at,
             })) => {
                 drop(printer);
-                already_passed(&passed, &worktree, at)
+                already_passed(passed, &worktree, at)
             }
             Ok(Frame::Message(other)) => format!("unexpected message {other:?}"),
             Err(error) => error.to_string(),
@@ -480,7 +481,7 @@ fn follow(
             lost(run, &failure, printer)
         }
         // The command never started: running it is no second run.
-        printer.abandon(run);
+        printer.abandon(&run.to_string());
         return Err(format!(
             "lost the heli daemon before {run} started: {failure}"
         ));
@@ -489,7 +490,7 @@ fn follow(
 
 /// Reports a hit of the result store: run `run` in `worktree` passed with
 /// the same key at `at`. Exits 0.
-fn already_passed(run: &str, worktree: &Text, at: u64) -> ! {
+fn already_passed(run: RunId, worktree: &Text, at: u64) -> ! {
     eprintln!(
         "cargo-heli: already passed: {run}, {} ({}); nothing to run",
         ago(clock::now().saturating_sub(at)),
@@ -536,8 +537,8 @@ fn waiting_for(runs: &[status::Run]) -> String {
     )
 }
 
-fn lost(run: &str, error: &str, printer: Printer) -> ! {
-    printer.abandon(run);
+fn lost(run: RunId, error: &str, printer: Printer) -> ! {
+    printer.abandon(&run.to_string());
     eprintln!("cargo-heli: lost the heli daemon during run {run}: {error}");
     std::process::exit(LOST)
 }

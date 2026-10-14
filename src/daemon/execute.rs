@@ -26,9 +26,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::live::Live;
-use super::registry::RunId;
 use super::tree::{self, Tree};
 use crate::protocol::{Channel, RunRequest};
+use crate::run_id::RunId;
 use crate::runlog::Recorder;
 
 /// How long output may still arrive after the run's process has exited.

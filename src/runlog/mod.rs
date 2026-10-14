@@ -45,6 +45,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::config::LogConfig;
 use crate::protocol::Channel;
+use crate::run_id::RunId;
 
 use select::{Out, Select};
 
@@ -100,11 +101,11 @@ impl RunLog {
         }
     }
 
-    /// Keeps the record of `run` (`r<number>`), whether it exists yet or
-    /// not, from being pruned until the pin drops: for a client following
-    /// the run (`daemon::live`).
-    pub fn pin(&self, run: &str) -> Pin<'_> {
-        let number = run_number(run).expect("BUG: run ids are r<number>");
+    /// Keeps the record of `run`, whether it exists yet or not, from being
+    /// pruned until the pin drops: for a client following the run
+    /// (`daemon::live`).
+    pub fn pin(&self, run: RunId) -> Pin<'_> {
+        let number = run.number();
         self.hold(number);
         Pin { log: self, number }
     }
@@ -129,12 +130,12 @@ impl RunLog {
         &self.dir
     }
 
-    /// Starts the record of `run` (`r<number>`), after pruning the oldest
+    /// Starts the record of `run`, after pruning the oldest
     /// records to make room for it (see the module docs). A record that
     /// cannot be written never fails the run: the recorder then drops the
     /// output and keeps the error for the daemon's log.
-    pub fn record(&self, run: &str) -> Recorder<'_> {
-        let number = run_number(run).expect("BUG: run ids are r<number>");
+    pub fn record(&self, run: RunId) -> Recorder<'_> {
+        let number = run.number();
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
         self.prune(&live);
         let file = std::fs::create_dir_all(&self.dir).and_then(|()| {
@@ -168,7 +169,8 @@ impl RunLog {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name();
-                let number = run_number(name.to_str()?.strip_suffix(".log")?)?;
+                let run: RunId = name.to_str()?.strip_suffix(".log")?.parse().ok()?;
+                let number = run.number();
                 Some((number, entry.path(), entry.metadata().ok()?.len()))
             })
             .collect();
@@ -321,16 +323,22 @@ fn read_whole(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<bool> {
 #[derive(Debug)]
 pub enum ReadError {
     /// No record of this run: it never ran, or its record was pruned.
-    Unknown(String),
+    Unknown(RunId),
+    /// Not a run id: no run has a record.
+    NotARun(String),
     /// The file is not a record this heli can read.
-    Foreign(String),
-    Io(String, io::Error),
+    Foreign(RunId),
+    Io(RunId, io::Error),
 }
 
 impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unknown(run) => write!(
+                f,
+                "no run {run} in the run log: no such run, or its record was pruned"
+            ),
+            Self::NotARun(run) => write!(
                 f,
                 "no run {run} in the run log: no such run, or its record was pruned"
             ),
@@ -343,16 +351,13 @@ impl std::fmt::Display for ReadError {
 }
 
 /// Opens the record of `run` in `dir`.
-pub fn open(dir: &Path, run: &str) -> Result<Events, ReadError> {
-    if run_number(run).is_none() {
-        return Err(ReadError::Unknown(run.to_owned()));
-    }
+pub fn open(dir: &Path, run: RunId) -> Result<Events, ReadError> {
     let file = match File::open(record_path(dir, run)) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ReadError::Unknown(run.to_owned()));
+            return Err(ReadError::Unknown(run));
         }
-        Err(error) => return Err(ReadError::Io(run.to_owned(), error)),
+        Err(error) => return Err(ReadError::Io(run, error)),
     };
     let mut reader = BufReader::new(file);
     let mut header = [0u8; 12];
@@ -360,41 +365,32 @@ pub fn open(dir: &Path, run: &str) -> Result<Events, ReadError> {
     expected.extend(VERSION.to_le_bytes());
     let reader = match read_whole(&mut reader, &mut header) {
         Ok(true) if header[..] == expected[..] => Some(reader),
-        Ok(true) => return Err(ReadError::Foreign(run.to_owned())),
+        Ok(true) => return Err(ReadError::Foreign(run)),
         // The run has only just started: nothing recorded yet.
         Ok(false) => None,
-        Err(error) => return Err(ReadError::Io(run.to_owned(), error)),
+        Err(error) => return Err(ReadError::Io(run, error)),
     };
     Ok(Events { reader, next: 0 })
 }
 
 /// Writes the part of `run`'s record in `dir` that `select` picks to `out`,
 /// each piece on the channel it was written to.
-pub fn read(dir: &Path, run: &str, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
+pub fn read(dir: &Path, run: RunId, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
     let events = open(dir, run)?;
-    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
+    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run, error))
 }
 
 /// Writes what `select` picks from a record without output to `out`: that
 /// of a run listed before its record begins (it waits for its turn), which
 /// has printed nothing yet.
-pub fn read_unstarted(run: &str, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
+pub fn read_unstarted(run: RunId, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
     let events = Events {
         reader: None,
         next: 0,
     };
-    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
+    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run, error))
 }
 
-/// The number of run id `run` (`r<number>`).
-pub fn run_number(run: &str) -> Option<u64> {
-    let digits = run.strip_prefix('r')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    digits.parse().ok()
-}
-
-fn record_path(dir: &Path, run: &str) -> PathBuf {
+fn record_path(dir: &Path, run: RunId) -> PathBuf {
     dir.join(format!("{run}.log"))
 }

@@ -72,8 +72,9 @@ use super::live::Live;
 use super::tree::Tree;
 use crate::class::{Access, Class};
 use crate::protocol::{Cache, RunRequest};
+use crate::run_id::RunId;
 use crate::status::{self, Exit, Phase};
-use crate::{clock, environment, runlog};
+use crate::{clock, environment};
 
 /// How many runs that ended while no client followed them stay listed.
 pub const DONE_KEPT: usize = 32;
@@ -82,16 +83,6 @@ pub const DONE_KEPT: usize = 32;
 /// is being told it started waits for that, before it starts a run of its
 /// own.
 const TELLING_WAIT: Duration = Duration::from_secs(10);
-
-/// A run's id, `r<number>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RunId(u64);
-
-impl std::fmt::Display for RunId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "r{}", self.0)
-    }
-}
 
 /// What makes two runs the same command: the working directory (cargo
 /// picks the package from it), argv, and the environment (the target
@@ -274,7 +265,7 @@ impl RunIds {
             .unwrap_or(1);
         let number = stored.max(highest_record(&self.records) + 1);
         write_atomically(&self.counter, &(number + 1).to_string())?;
-        Ok(RunId(number))
+        Ok(RunId::new(number))
     }
 }
 
@@ -286,7 +277,8 @@ fn highest_record(records: &Path) -> u64 {
     entries
         .filter_map(|entry| {
             let name = entry.ok()?.file_name();
-            runlog::run_number(name.to_str()?.strip_suffix(".log")?)
+            let run: RunId = name.to_str()?.strip_suffix(".log")?.parse().ok()?;
+            Some(run.number())
         })
         .max()
         .unwrap_or(0)
@@ -481,12 +473,12 @@ impl Registry {
         !entry.cancelled
     }
 
-    /// Marks run `run` (`r<number>`) as cancelled. Returns its process tree
+    /// Marks run `run` as cancelled. Returns its process tree
     /// to kill, or `None` for a run that has not started (and now never
     /// will); the error says why it cannot be cancelled.
-    pub fn cancel(&self, run: &str) -> Result<Option<Arc<Tree>>, String> {
+    pub fn cancel(&self, run: RunId) -> Result<Option<Arc<Tree>>, String> {
         let mut inner = self.lock();
-        let entry = runlog::run_number(run).and_then(|number| inner.runs.get_mut(&RunId(number)));
+        let entry = inner.runs.get_mut(&run);
         let Some(entry) = entry else {
             return Err(format!("no run {run} is in flight"));
         };
@@ -559,16 +551,19 @@ impl Registry {
             .any(|entry| entry.state.in_flight())
     }
 
-    /// Whether run `run` (`r<number>`) is listed: in flight, or ended
-    /// unfollowed.
-    pub fn lists(&self, run: &str) -> bool {
-        runlog::run_number(run).is_some_and(|number| self.lock().runs.contains_key(&RunId(number)))
+    /// Whether run `run` is listed: in flight, or ended unfollowed.
+    pub fn lists(&self, run: RunId) -> bool {
+        self.lock().runs.contains_key(&run)
     }
 
     /// The runs in flight and those that ended unfollowed, oldest first.
-    pub fn snapshot(&self) -> Vec<status::Run> {
+    pub fn snapshot(&self) -> Vec<(RunId, status::Run)> {
         let inner = self.lock();
-        inner.runs.keys().map(|&id| inner.describe(id)).collect()
+        inner
+            .runs
+            .keys()
+            .map(|&id| (id, inner.describe(id)))
+            .collect()
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {

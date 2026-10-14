@@ -13,7 +13,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use crate::class::Class;
 use crate::output::Mode;
 use crate::protocol::Cache;
-use crate::runlog;
+use crate::run_id::RunId;
 use crate::runlog::select::Select;
 
 /// What heli was asked to do.
@@ -34,9 +34,9 @@ pub enum Action {
         autostart: Option<bool>,
     },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
-    Log { run: String, select: Select },
+    Log { run: RunId, select: Select },
     /// Kill run `run` (`r<number>`) with every process it started.
-    Cancel { run: String },
+    Cancel { run: RunId },
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
@@ -146,7 +146,7 @@ enum Command {
         /// The run, as the footer after it and `status` name it: `r17` (or
         /// `17`).
         #[arg(value_parser = parse_run)]
-        run: String,
+        run: RunId,
         /// Only the last N lines, of both streams together.
         #[arg(long, value_name = "N", group = "select")]
         tail: Option<usize>,
@@ -167,7 +167,7 @@ enum Command {
         /// The run, as the footer after it and `status` name it: `r17` (or
         /// `17`).
         #[arg(value_parser = parse_run)]
-        run: String,
+        run: RunId,
     },
     /// List every directory of the build store, with its state, and evict
     /// what the ladder chooses when the store is over its budget or a
@@ -294,15 +294,15 @@ pub fn parse(
 }
 
 /// A run id as the user gives it, `r17` or `17`, as heli writes it: `r17`.
-fn parse_run(text: &str) -> Result<String, String> {
-    let run = if text.starts_with('r') {
+fn parse_run(text: &str) -> Result<RunId, String> {
+    let spelled = if text.starts_with('r') {
         text.to_owned()
     } else {
         format!("r{text}")
     };
-    runlog::run_number(&run)
-        .map(|number| format!("r{number}"))
-        .ok_or_else(|| "a run id is r<number>, as the footer after a run names it".to_owned())
+    spelled
+        .parse()
+        .map_err(|_| "a run id is r<number>, as the footer after a run names it".to_owned())
 }
 
 /// An output mode, checked here so that a bad one is a usage error.

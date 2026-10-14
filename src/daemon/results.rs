@@ -33,8 +33,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock;
 use crate::daemon::key::{self, Key};
-use crate::daemon::registry::RunId;
 use crate::protocol::{Cache, Reply, RunRequest, Text};
+use crate::run_id::RunId;
 use crate::worktree;
 
 /// The most markers kept.
@@ -43,7 +43,7 @@ pub const CAP: usize = 256;
 /// A pass, as its marker holds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
-    pub run: String,
+    pub run: RunId,
     pub worktree: Text,
     /// Seconds since 1970.
     pub at: u64,
@@ -181,7 +181,7 @@ impl Store {
             }
         }
         let record = Record {
-            run: run.to_string(),
+            run,
             worktree: Text(worktree::of(&request.cwd()).into_os_string()),
             at: clock::now(),
         };

@@ -69,6 +69,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
 use crate::environment;
+use crate::run_id::RunId;
 use crate::runlog::select::Select;
 use crate::status::{self, Status};
 
@@ -128,14 +129,16 @@ pub enum Request {
 /// The run to cancel.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CancelRequest {
-    /// `r<number>`.
+    /// `r<number>`, as the client was given it: the daemon answers one
+    /// that is not a run id as a run it does not know, and never takes it
+    /// for a request it does not know.
     pub run: String,
 }
 
 /// The run whose record to send, and which part of it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogRequest {
-    /// `r<number>`.
+    /// `r<number>`, as for [`CancelRequest::run`].
     pub run: String,
     pub select: Select,
 }
@@ -222,7 +225,7 @@ pub enum Reply {
     /// ends; or, with `attached`, the same run was already in flight as
     /// `run`, and the client follows that run from its start.
     Started {
-        run: String,
+        run: RunId,
         /// For an attached client: how long the run had been going, in
         /// milliseconds.
         #[serde(default)]
@@ -256,7 +259,7 @@ pub enum Reply {
     /// `run` is the run that passed, in `worktree`, at `at` (seconds since
     /// 1970).
     Passed {
-        run: String,
+        run: RunId,
         worktree: Text,
         at: u64,
     },

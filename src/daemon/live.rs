@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use crate::ipc::Stream;
 use crate::protocol::{self, Channel, Reply};
+use crate::run_id::RunId;
 use crate::runlog::{self, Events};
 use crate::status;
 
@@ -35,8 +36,7 @@ const TICK: Duration = Duration::from_millis(200);
 pub struct Live {
     /// The run log's directory.
     dir: PathBuf,
-    /// The run, `r<number>`.
-    run: String,
+    run: RunId,
     journal: Mutex<Journal>,
     changed: Condvar,
 }
@@ -73,7 +73,7 @@ impl Item {
 
 impl Live {
     /// The output of run `run`, recorded in the run log `dir`.
-    pub fn new(dir: PathBuf, run: String) -> Self {
+    pub fn new(dir: PathBuf, run: RunId) -> Self {
         Self {
             dir,
             run,
@@ -191,7 +191,7 @@ pub fn follow(live: &Live, client: &mut Stream, reads: Reads) {
             match item {
                 Item::Recorded(count) => {
                     if record.is_none() {
-                        record = runlog::open(&live.dir, &live.run).ok();
+                        record = runlog::open(&live.dir, live.run).ok();
                     }
                     for _ in 0..count {
                         let event = match record.as_mut().and_then(Iterator::next) {
