@@ -33,26 +33,5 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-      # TEMPORARY (fix/stale-link): the precise look test, over and over,
-      # alone and beside the other recycling tests. Removed before merging.
-      - name: stale-link loop
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          cargo test --locked --test recycle --no-run
-          fails=0
-          for i in $(seq 40); do
-            if ! cargo test --locked --test recycle -- --exact the_look_recycles_precisely_for_an_older_worktree_without_the_donors_code > out.txt 2>&1; then
-              fails=$((fails+1)); echo "=== alone, run $i failed"; sed -n '/panicked/,$p' out.txt
-            fi
-          done
-          for i in $(seq 10); do
-            if ! cargo test --locked --test recycle > out.txt 2>&1; then
-              fails=$((fails+1)); echo "=== with the others, run $i failed"; sed -n '/^failures:/,$p' out.txt
-            fi
-          done
-          echo "failed runs: $fails"
-          test "$fails" -eq 0
       - name: test
-        if: always()
         run: cargo test --locked --no-fail-fast
