@@ -4,8 +4,8 @@
 //!
 //! Each passing test prints its own path (`output of many_tests::g0::t0`),
 //! then lines that look like what a runner prints of its own but are not:
-//! two like nextest's status lines (`PASS [ 0.012s] many-tests g0::t0`), one
-//! like libtest's progress (`...`).
+//! two like nextest's status lines (`PASS [ 0.012s] many-tests g0::t0`), two
+//! like libtest's own lines (`... not progress`, `running two tests`).
 
 /// A passing test per name, printing its own path and the look-alikes.
 #[cfg(test)]
@@ -18,6 +18,7 @@ macro_rules! tests {
                 println!("NOT [a] status line");
                 println!("not a: status [   1.000s] line");
                 println!("... not progress");
+                println!("running two tests");
             }
         )*
     };

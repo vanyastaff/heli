@@ -240,6 +240,86 @@ fn nextest_controls_the_user_set_are_honoured() {
     assert_eq!(printed, expected);
 }
 
+/// nextest's build phase leaves out every flag and variable that only the
+/// tests read, which nextest ignores (with a warning) or refuses under
+/// `--no-run`; the test phase keeps them, the thread count aside, which it
+/// sets. In full mode, so that heli adds nothing.
+#[test]
+fn nextests_build_leaves_out_what_only_the_tests_read() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 2\n");
+    let run_only = [
+        "-j",
+        "2",
+        "--test-threads=2",
+        "--jobs",
+        "2",
+        "--retries",
+        "1",
+        "--flaky-result",
+        "pass",
+        "--no-tests=pass",
+        "--max-fail",
+        "1",
+        "--status-level",
+        "all",
+        "--final-status-level",
+        "all",
+        "--success-output",
+        "never",
+        "--failure-output",
+        "final",
+        "--no-fail-fast",
+        "--fail-fast",
+        "--no-capture",
+        "--nocapture",
+    ];
+    let args: Vec<&str> = ["--output", "full", "nextest", "run"]
+        .iter()
+        .chain(&run_only)
+        .chain(&["-p", "x", "--", "f", "--nocapture", "--no-capture"])
+        .copied()
+        .collect();
+    let mut expected = args_of(&["nextest", "run", "--no-run", "-p", "x", "--", "f"]);
+    let kept: Vec<&str> = ["nextest", "run", "--test-threads", "2"]
+        .iter()
+        .chain(&run_only[5..])
+        .chain(&["-p", "x", "--", "f", "--nocapture", "--no-capture"])
+        .copied()
+        .collect();
+    expected.extend(args_of(&kept));
+    assert_eq!(echoed(&fixture, &args, &[]), expected);
+
+    for var in [
+        "NEXTEST_TEST_THREADS",
+        "NEXTEST_RETRIES",
+        "NEXTEST_FLAKY_RESULT",
+        "NEXTEST_NO_TESTS",
+        "NEXTEST_STATUS_LEVEL",
+        "NEXTEST_FINAL_STATUS_LEVEL",
+        "NEXTEST_SUCCESS_OUTPUT",
+        "NEXTEST_FAILURE_OUTPUT",
+    ] {
+        let printed = echoed(
+            &fixture,
+            &["--output", "full", "nextest", "run"],
+            &[(var, "1"), ("ECHO_ENV", var)],
+        );
+        let env: Vec<&String> = printed
+            .iter()
+            .filter(|line| line.starts_with("env "))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                &format!("env {var}=None"),
+                &format!("env {var}=Some(\"1\")")
+            ],
+            "{var}"
+        );
+    }
+}
+
 /// Output levels the user sets show what they ask for in compact mode:
 /// here every passing test's line and its output.
 #[test]
@@ -393,6 +473,7 @@ fn printed_by(test: &str, indent: &str) -> String {
         "NOT [a] status line",
         "not a: status [   1.000s] line",
         "... not progress",
+        "running two tests",
     ]
     .iter()
     .map(|line| format!("{indent}{line}\n"))
@@ -462,6 +543,8 @@ fn libtest_drops_only_its_lines_per_test() {
         &["--", "g0::", "--format", "pretty"],
         "10 passed, 91 filtered out",
     );
+    assert_eq!(stdout, "");
+    let (stdout, _) = green_libtest(&fixture, &["--", "no::such"], "0 passed, 101 filtered out");
     assert_eq!(stdout, "");
     let (stdout, _) = green_libtest(
         &fixture,
