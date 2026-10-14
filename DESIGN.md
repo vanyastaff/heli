@@ -309,27 +309,52 @@ Bare cargo, started without heli, still draws from the host pool directly.
   Spikes, such as a single rustc at 4.3 GB, are the governor's job.
 - **Memory governor.** The daemon samples available physical memory and, on
   Windows, available commit, because allocations fail at the commit limit
-  before RAM is full.
+  before RAM is full. It samples once a second: Windows
+  `GlobalMemoryStatusEx` and `K32GetPerformanceInfo` (system-wide
+  `CommitLimit − CommitTotal`), Linux `MemAvailable` in `/proc/meminfo`,
+  macOS `host_statistics64`.
   - Below the low watermark (default: 10 % of RAM or 6 GB, whichever is
     larger), it withholds slots: it acquires one per sample from the host pool
-    as they free up, down to 1 slot left.
-  - Above the high watermark (the low one plus 4 GB), it returns them.
+    as they free up, down to 1 slot left. Available commit below the low
+    watermark counts as pressure too.
+  - Above the high watermark (the low one plus 4 GB), it returns them, all
+    at once; available commit, where there is one, must be above it too.
+    Between the two nothing changes, so it never swings back and forth.
   - Jobs already running are never interrupted, so pressure eases as they
     finish.
+  - `[memory] low_watermark_mb` and `high_watermark_mb` in the configuration
+    set the watermarks, in megabytes (2^20 bytes); the high one must be above
+    the low one. `status` shows the last sample, the watermarks and the
+    slots withheld (§8).
 - **Bounded top-up.** Only bare cargo can leak a slot: a process killed while
   holding one, and semaphores and FIFOs have no owner. The host pool's target
   of free slots is `N − withheld − Σ lent`.
-  - The daemon raises the free count to the target only at quiescence: no
-    heli run active, and no rustc and no build script alive for 2 s.
-    Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore`.
-    Unix: `FIONREAD` on the FIFO, then writes.
-  - The pool never grows beyond the target. On Windows the semaphore's
-    maximum count is N, and a surplus release simply fails (the jobserver
-    client ignores the error). A FIFO has no maximum, so on Unix the daemon
-    also drains, at any time, every byte above the target. A token that a
-    cargo still held during a top-up (between taking it and starting the job,
-    or held by a jobserver client the process scan does not see) then comes
-    back as surplus and is removed.
+  - The daemon raises the free count to the target only at quiescence,
+    observed at its samples for 2 s: no heli run active, and either no
+    process but the daemon holds the pool open, or no rustc, rustdoc,
+    clippy-driver or build script is alive. A pool nobody else holds can
+    have no slot that will come back, whatever compiles elsewhere on the
+    machine (other users' pools, other agents' builds without heli); the
+    process scan alone would wait for every compiler in the session.
+    - Who holds the pool: on Windows, the semaphore's handle count
+      (`NtQueryObject`) above the daemon's one; on Linux, a descriptor of
+      the FIFO under `/proc/<pid>/fd` of the user's processes; on macOS, the
+      same through `proc_pidinfo`.
+    - The process scan: on Windows `WTSEnumerateProcessesW`, the processes
+      of the logon session (where the semaphore lives); on Linux
+      `/proc/<pid>/comm` of the user's processes, cut to 15 bytes
+      (`build-script-bu`); on macOS the file name of `proc_pidpath`.
+    - Windows: `NtQuerySemaphore` for the count, then `ReleaseSemaphore`.
+      Unix: `FIONREAD` on the FIFO, then writes.
+  - The pool never grows beyond the target. The daemon drains, at any time,
+    every free slot above the target. A FIFO has no maximum, and a
+    semaphore's maximum count N bounds it only while nothing is withheld or
+    lent. A token that a cargo still held during a top-up (between taking it
+    and starting the job, or held by a jobserver client the process scan
+    does not see) then comes back as surplus and is removed.
+  - A run pool broker counts a loan after taking its slot from the host
+    pool, and stops counting it before giving the slot back, so the free
+    count never stands above the target meanwhile.
 
 ### Reach
 
@@ -524,7 +549,9 @@ cargo heli daemon [--detach | --warden]            (internal)
   commands run directly and the daemon's log says why. Keys it does not know
   are ignored, so a file written for a newer heli still works. It holds:
   - pool slots (`[pool] slots`, §4);
-  - memory watermarks;
+  - memory watermarks (`[memory] low_watermark_mb`, `high_watermark_mb`,
+    §4);
+  - the event log's size (`[event_log] max_kb`, §8);
   - disk budget and free-space floor;
   - the store per volume;
   - tool-cache patterns (§6.3);
@@ -533,6 +560,11 @@ cargo heli daemon [--detach | --warden]            (internal)
   - log retention (`[log] runs`, the records kept, default 200, and
     `[log] bytes`, their total size in bytes, default 2 GiB; "Output"
     below).
+
+  Debug builds also read a `[test]` table, the one seam tests have into the
+  daemon: memory figures (`[test.memory]`) and a clock for the memory
+  governor (`clock_ms`), read again at each of its looks. Release builds
+  ignore it.
 
 ### Output (G7)
 
@@ -886,7 +918,9 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
 - `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
   never below 0), or `null` when no daemon answers;
-- `memory`: `available`, plus `commit_available` on Windows;
+- `memory`: the governor's last sample, in bytes: `total`, `available`,
+  plus `commit_available` on Windows, and the `low_watermark` and
+  `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
   (running for a run of one phase; building, testing, done), `slots`,
@@ -899,6 +933,19 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,
 drains and evictions, and `cargo heli gc --dry-run`.
+
+**The event log** is `events.log` in the state directory
+(`events-<session>.log` on Windows), one JSON object per line, each with `at`
+(seconds since 1970, UTC) and `event`:
+
+- `admit`: `run`, `worktree`, `argv`;
+- `withhold`: `withheld` (after it), `available`, `commit_available` and
+  `low_watermark`;
+- `return`: `slots`, `available`, `commit_available` and `high_watermark`;
+- `top-up` and `drain`: `slots`, `free` (after it) and `target`.
+
+Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
+the one before, and the next event starts a new file.
 
 ## 9. Adoption in flui (worked example)
 
@@ -926,7 +973,7 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
 | Run killed while holding slots | none | The run pool's loans go back in full (§4) |
-| Unix FIFO holds more than the target | Oversubscription | The daemon drains the surplus (§4) |
+| The pool holds more than the target (a FIFO has no maximum; a semaphore's is N, above the target while slots are withheld) | Oversubscription | The daemon drains the surplus at once (§4) |
 | Memory spike | New jobs wait | Slots are withheld; running jobs finish |
 | GC races a build | none | Try-lock, rename to trash, skip busy directories |
 | Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |
