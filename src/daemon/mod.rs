@@ -68,13 +68,14 @@ use crate::pool::{self, Pool};
 use crate::protocol::{self, CancelRequest, Channel, LogRequest, Reply, Request, RunRequest, Text};
 use crate::runlog::{self, Limits, Recorder, RunLog};
 use crate::status::{self, Phase, Status};
-use crate::{clock, nesting, worktree};
+use crate::{clock, nesting, session, worktree};
 
+use crate::run_id::RunId;
 use events::Events;
 use governor::Governor;
 use key::Key;
 use live::Live;
-use registry::{Admission, Attached, Command, Registry, RunId, RunIds, Same};
+use registry::{Admission, Attached, Command, Registry, RunIds, Same};
 use results::{Admitted, Before};
 use test_run::TestRun;
 
@@ -317,13 +318,20 @@ impl Daemon {
     /// Sends the part of a run's record that `request` asks for.
     fn log(&self, mut stream: Stream, request: &LogRequest) {
         let mut out = |channel, bytes: &[u8]| protocol::write_output(&mut stream, channel, bytes);
-        let mut read = runlog::read(self.runlog.dir(), &request.run, &request.select, &mut out);
-        // A run is listed from its admission, but its record begins only as
-        // its command starts, after its turn at the worktree lock: until
-        // then, it has printed nothing.
-        if matches!(read, Err(runlog::ReadError::Unknown(_))) && self.registry.lists(&request.run) {
-            read = runlog::read_unstarted(&request.run, &request.select, &mut out);
-        }
+        let read = match request.run.parse::<RunId>() {
+            Err(_) => Err(runlog::ReadError::NotARun(request.run.clone())),
+            Ok(run) => {
+                let read = runlog::read(self.runlog.dir(), run, &request.select, &mut out);
+                // A run is listed from its admission, but its record begins
+                // only as its command starts, after its turn at the worktree
+                // lock: until then, it has printed nothing.
+                if matches!(read, Err(runlog::ReadError::Unknown(_))) && self.registry.lists(run) {
+                    runlog::read_unstarted(run, &request.select, &mut out)
+                } else {
+                    read
+                }
+            }
+        };
         let reply = match read {
             Ok(()) => Reply::LogEnd,
             Err(error) => Reply::LogFailed {
@@ -339,7 +347,11 @@ impl Daemon {
     /// cancelled.
     fn cancel(&self, mut stream: Stream, request: &CancelRequest) {
         let run = &request.run;
-        let reply = match self.registry.cancel(run) {
+        let cancelled = run
+            .parse::<RunId>()
+            .map_err(|_| format!("no run {run} is in flight"))
+            .and_then(|run| self.registry.cancel(run));
+        let reply = match cancelled {
             Err(message) => Reply::CancelFailed { message },
             Ok(tree) => match tree.map_or(Ok(()), |tree| tree.kill()) {
                 Ok(()) => {
@@ -370,7 +382,7 @@ impl Daemon {
             }
             Before::Miss(key) => key,
         };
-        let worktree = worktree::of(&execute::cwd(&request));
+        let worktree = worktree::of(&request.cwd());
         let admission = self.registry.admit(
             worktree.clone(),
             Command::of(&request),
@@ -402,17 +414,18 @@ impl Daemon {
     /// Follows run `run.id`, already in flight, for the client on `stream`,
     /// which asked for the same run (`request`).
     fn attach(&self, mut stream: Stream, request: &RunRequest, run: Attached) {
-        let _pin = self.runlog.pin(&run.id.to_string());
+        let _pin = self.runlog.pin(run.id);
         let started = Reply::Started {
-            run: run.id.to_string(),
+            run: run.id,
             attached: Some(u64::try_from(run.running_for.as_millis()).unwrap_or(u64::MAX)),
             keyed_in: run.keyed_in.map(|worktree| Text(worktree.into_os_string())),
+            spawned_follows: request.reads_spawned,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.detach(run.id);
             return;
         }
-        self.follow(run.id, &run.live, stream, request.class.is_some());
+        self.follow(run.id, &run.live, stream, reads(request));
     }
 
     /// Starts run `id` of `request` in `worktree`, and follows it for the
@@ -426,18 +439,21 @@ impl Daemon {
         worktree: &Path,
         known: Option<Key>,
     ) {
-        let argv = execute::argv(request);
+        let argv = request.argv();
         let admission = serde_json::json!({
             "worktree": worktree.to_string_lossy(),
             "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
         });
         self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
-        // never hears of it runs the command itself.
+        // never hears of it runs the command itself. One that reads it also
+        // hears when the command has started (`Spawned`), after the waits
+        // below; until then, it too may run the command itself.
         let started = Reply::Started {
-            run: id.to_string(),
+            run: id,
             attached: None,
             keyed_in: None,
+            spawned_follows: request.reads_spawned,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.abandon(id);
@@ -446,13 +462,13 @@ impl Daemon {
         // Kept until the run has ended (the scope below waits for it), when
         // its directories are counted again.
         let learning = self.accounts.learn(request);
-        let _pin = self.runlog.pin(&id.to_string());
-        let live = Arc::new(Live::new(self.runlog.dir().to_path_buf(), id.to_string()));
+        let _pin = self.runlog.pin(id);
+        let live = Arc::new(Live::new(self.runlog.dir().to_path_buf(), id));
         self.registry.told(id, Arc::clone(&live));
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
             scope.spawn(|| self.execute(id, request, &live, known, learning.as_ref()));
-            self.follow(id, &live, stream, request.class.is_some());
+            self.follow(id, &live, stream, reads(request));
         });
     }
 
@@ -505,7 +521,7 @@ impl Daemon {
         if let Some(recycled) = learning.and_then(accounts::Learning::prepared) {
             live.note(&recycled.describe());
         }
-        let mut record = self.runlog.record(&id.to_string());
+        let mut record = self.runlog.record(id);
         let (makeflags, error) = self.broker.open(id);
         if let Some(error) = error {
             self.log.write(&format!(
@@ -520,7 +536,7 @@ impl Daemon {
             record: &mut record,
         };
         let ended = match test_run::plan(request) {
-            None => self.phase(&mut run, &execute::argv(request)),
+            None => self.phase(&mut run, &request.argv()),
             Some(plan) => self.test(&mut run, &plan),
         };
         if let Some(loans) = self.broker.close(id) {
@@ -571,6 +587,8 @@ impl Daemon {
                 }
             })?;
         let tree = Arc::new(tree);
+        // From here on its clients never run the command themselves.
+        run.live.spawned();
         if !self.registry.run(run.id, Arc::clone(&tree))
             && let Err(error) = tree.kill()
         {
@@ -606,7 +624,7 @@ impl Daemon {
                 live: run.live,
                 record: &mut *run.record,
             };
-            let built = self.phase(&mut phase, &execute::argv(&build))?;
+            let built = self.phase(&mut phase, &build.argv())?;
             if built.0 != 0 {
                 return Ok(built);
             }
@@ -626,21 +644,26 @@ impl Daemon {
     }
 
     /// Sends run `id`'s output to the client on `stream`, from its first
-    /// byte, until the run ends or the client goes away; a client that
-    /// `can_wait` also hears what the run waits for.
-    fn follow(&self, id: RunId, live: &Live, mut stream: Stream, can_wait: bool) {
-        live::follow(live, &mut stream, can_wait);
+    /// byte, until the run ends or the client goes away; the client also
+    /// hears what it `reads` of the run's waits and start.
+    fn follow(&self, id: RunId, live: &Live, mut stream: Stream, reads: live::Reads) {
+        live::follow(live, &mut stream, reads);
         drop(stream);
         self.registry.detach(id);
     }
 
     fn status(&self) -> Status {
+        let place = session::here();
         Status {
             schema: status::SCHEMA,
             daemon: Some(status::Daemon {
                 pid: std::process::id(),
                 protocol: protocol::VERSION,
                 started_at: clock::unix_seconds(self.started_at),
+                interactive: place.interactive(),
+                session: place.session,
+                window_station: place.window_station,
+                desktop: place.desktop,
             }),
             pool: Some(self.pool.status()),
             memory: self.governor.memory(),
@@ -654,14 +677,17 @@ impl Daemon {
     /// each uses.
     fn runs(&self) -> Vec<status::Run> {
         let usage = self.broker.usage();
-        let mut runs = self.registry.snapshot();
-        for run in &mut runs {
-            if let Some((_, usage)) = usage.iter().find(|(id, _)| id.to_string() == run.id) {
-                run.slots = usage.slots;
-                run.share = usage.share;
-            }
-        }
-        runs
+        self.registry
+            .snapshot()
+            .into_iter()
+            .map(|(id, mut run)| {
+                if let Some(usage) = usage.get(&id) {
+                    run.slots = usage.slots;
+                    run.share = usage.share;
+                }
+                run
+            })
+            .collect()
     }
 
     /// Counts a client as served until the guard drops; also says whether
@@ -765,15 +791,23 @@ fn loans_event(id: RunId, loans: &Loans) -> serde_json::Value {
     })
 }
 
+/// What the client of `request` reads besides a run's output and end: what
+/// the run waits for, if it knows run classes (a client older than them
+/// sends none), and when its command started, if it says so.
+fn reads(request: &RunRequest) -> live::Reads {
+    live::Reads {
+        waiting: request.class.is_some(),
+        spawned: request.reads_spawned,
+    }
+}
+
 /// Whether `request` comes from inside another heli run: its client runs
 /// under heli, so the run's depth (`HELI_DEPTH`, the client's plus one) is
 /// above 1.
 fn nested(request: &RunRequest) -> bool {
     request
-        .env
-        .iter()
-        .find(|(name, _)| name.0 == nesting::VAR)
-        .and_then(|(_, depth)| depth.0.to_str()?.trim().parse::<u32>().ok())
+        .var(nesting::VAR)
+        .and_then(|depth| depth.to_str()?.trim().parse::<u32>().ok())
         .is_some_and(|depth| depth > 1)
 }
 

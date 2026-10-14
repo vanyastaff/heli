@@ -128,7 +128,9 @@ impl Governor {
                 }
                 quiet_since = quiet(pool, registry).then(|| quiet_since.unwrap_or(now));
                 if quiet_since.is_some_and(|since| now.saturating_sub(since) >= QUIET) {
-                    match pool.top_up(&lent) {
+                    // Quiet again once the free slots are counted: a cargo
+                    // that started since the look above may have taken some.
+                    match pool.top_up(&lent, || quiet(pool, registry)) {
                         Ok(Some(top_up)) => events.record("top-up", adjustment(top_up)),
                         Ok(None) => {}
                         Err(error) => log.write(&format!("cannot top the pool up: {error}")),
@@ -208,8 +210,9 @@ impl Governor {
 }
 
 /// Whether the pool is quiet now: no heli run is in flight, and either no
-/// other process holds the pool open, or none compiles. A slot missing from
-/// a quiet pool can only be one a process took with it when it died.
+/// other process holds the pool open, or none compiles (no compiler, build
+/// script or cargo runs, `crate::processes`). A slot missing from a quiet
+/// pool can only be one a process took with it when it died.
 fn quiet(pool: &Pool, registry: &Registry) -> bool {
     // Cheapest first; a scan that fails counts as compiling.
     !registry.busy() && (!pool.held_by_others() || !processes::compiling().unwrap_or(true))

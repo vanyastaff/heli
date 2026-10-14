@@ -37,6 +37,7 @@ use std::ffi::OsString;
 use serde::Deserialize;
 
 use super::{Render, Sink};
+use crate::class::subcommand;
 use crate::protocol::Channel;
 
 /// Errors shown as rustc renders them.
@@ -100,17 +101,6 @@ pub fn sets_output(args: &[OsString]) -> bool {
                 .strip_prefix('-')
                 .is_some_and(|cluster| cluster.contains(['q', 'v'])),
         })
-}
-
-/// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
-/// rustup's cargo takes it, and as the run classes read it), and the
-/// arguments after it.
-pub(super) fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
-    let args = match args.first() {
-        Some(first) if first.to_string_lossy().starts_with('+') => &args[1..],
-        _ => args,
-    };
-    args.split_first()
 }
 
 /// `args` with `--quiet --message-format json` after the user's own

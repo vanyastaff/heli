@@ -1309,3 +1309,59 @@ fn setup_replaces_only_its_own_build_dir() {
         );
     }
 }
+
+/// The first run from a directory waits for its build directory to be
+/// recycled only while a store holds an orphan of its own repository
+/// (DESIGN.md §5, "Where a run can wait"): an orphan of another repository
+/// keeps no run waiting. Here cargo's answer about the workspace (the fake
+/// cargo's `metadata`) does not come until the gate opens; the run starts
+/// all the same.
+#[test]
+fn an_orphan_of_another_repository_keeps_no_first_run_waiting() {
+    use std::io::BufRead;
+
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let workspace = fixture.workspace();
+    init_repo(&workspace);
+    let orphan = store.join("ab").join("cdef0123456789");
+    std::fs::create_dir_all(orphan.join("debug").join(".fingerprint")).expect("create an orphan");
+    std::fs::create_dir_all(orphan.join(".heli")).expect("create its .heli/");
+    let manifest = json!({
+        "workspace": fixture.path("gone"),
+        "repository": fixture.path("elsewhere.git"),
+        "created_at": 1,
+        "last_run": 1,
+    });
+    std::fs::write(orphan.join(".heli").join("owner"), manifest.to_string())
+        .expect("write its owner manifest");
+    let bin = fixture.path("bin");
+    std::fs::create_dir_all(&bin).expect("create a bin directory");
+    let cargo = bin.join(exe("cargo"));
+    support::copy_program(&fixture.echo_args(), &cargo);
+    let gate = fixture.path("gate");
+
+    let mut command = heli_in(&fixture, &workspace, &["--output", "full", "exec", "--"]);
+    let mut call = command
+        .arg(&cargo)
+        .arg("hello")
+        .env("ECHO_WAIT_FOR", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start heli");
+    let stdout = call.stdout.take().expect("its stdout");
+    let (said, first) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::BufReader::new(stdout).read_line(&mut line);
+        let _ = said.send(line);
+    });
+    let started = first.recv_timeout(Duration::from_secs(10));
+    std::fs::write(&gate, "").expect("open the gate");
+    call.wait().expect("wait for heli");
+    assert_eq!(
+        started.expect("the run started while cargo metadata waited"),
+        "arg: \"hello\"\n"
+    );
+}

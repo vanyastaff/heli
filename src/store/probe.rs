@@ -22,7 +22,7 @@ use std::process::{Command, Stdio};
 use serde::Deserialize;
 
 use crate::protocol::RunRequest;
-use crate::store;
+use crate::{environment, store};
 
 /// A workspace as cargo places it.
 #[derive(Debug, Deserialize)]
@@ -64,7 +64,7 @@ impl Probe {
             return None;
         }
         Some(Self {
-            cwd: PathBuf::from(&request.cwd.0),
+            cwd: request.cwd(),
             cargo: program.clone(),
             env: request
                 .env
@@ -89,16 +89,8 @@ impl Probe {
 
     /// `program args` as the run would start it, its stdout captured.
     fn command(&self, program: &OsString, args: &[&str], dir: &Path) -> Command {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(dir)
-            .env_clear()
-            .envs(self.env.iter().map(|(name, value)| (name, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        command
+        let env = self.env.iter().map(|(name, value)| (name, value));
+        environment::command(program, args, dir, env)
     }
 
     /// git with `args` in `dir`, taking no optional lock.

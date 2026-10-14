@@ -32,6 +32,13 @@ pub enum Answer {
     /// whatever it is, with a message frame holding this JSON: what a daemon
     /// of another build of the same protocol would answer.
     Reply(&'static str),
+    /// `HELI` and [`PROTOCOL`]; then it answers the client's request with a
+    /// message frame for each of these JSON texts, in order, and keeps the
+    /// connection open until the client closes it.
+    Replies(&'static [&'static str]),
+    /// As [`Answer::Replies`], then it hangs up at once: a daemon lost
+    /// there.
+    LostAfter(&'static [&'static str]),
 }
 
 /// The protocol version of this build of heli.
@@ -66,7 +73,10 @@ impl FakeDaemon {
                     let _ = stream.read_to_end(&mut Vec::new());
                     return Vec::new();
                 }
-                Answer::Unsupported | Answer::Reply(_) => {
+                Answer::Unsupported
+                | Answer::Reply(_)
+                | Answer::Replies(_)
+                | Answer::LostAfter(_) => {
                     let mut bytes = *b"HELI\0\0\0\0";
                     bytes[4..].copy_from_slice(&PROTOCOL.to_le_bytes());
                     bytes
@@ -75,12 +85,13 @@ impl FakeDaemon {
             if stream.write_all(&bytes).is_err() {
                 return Vec::new();
             }
-            let reply = match answer {
-                Answer::Unsupported => Some("\"Unsupported\""),
-                Answer::Reply(json) => Some(json),
-                _ => None,
+            let replies: &[&str] = match &answer {
+                Answer::Unsupported => &["\"Unsupported\""],
+                Answer::Reply(json) => std::slice::from_ref(json),
+                Answer::Replies(replies) | Answer::LostAfter(replies) => replies,
+                _ => &[],
             };
-            if let Some(reply) = reply {
+            if !replies.is_empty() {
                 let mut header = [0u8; 5];
                 stream
                     .read_exact(&mut header)
@@ -90,6 +101,8 @@ impl FakeDaemon {
                 stream
                     .read_exact(&mut request)
                     .expect("the client's request");
+            }
+            for reply in replies {
                 let reply = reply.as_bytes();
                 let mut frame = vec![0u8];
                 frame.extend((reply.len() as u32).to_le_bytes());
@@ -97,6 +110,9 @@ impl FakeDaemon {
                 if stream.write_all(&frame).is_err() {
                     return Vec::new();
                 }
+            }
+            if matches!(answer, Answer::LostAfter(_)) {
+                return Vec::new();
             }
             let mut rest = Vec::new();
             let _ = stream.read_to_end(&mut rest);
@@ -130,36 +146,19 @@ fn listen(endpoint: &OsStr) -> impl FnOnce() -> std::os::unix::net::UnixStream +
     move || listener.accept().expect("accept a client").0
 }
 
+/// Starts listening at `endpoint` now (so a client cannot miss it), and
+/// returns how to accept the one client.
+///
+/// On Windows, the pipe is the user's, as a daemon's is: a client trusts
+/// only a pipe its own user owns, and an elevated process (a CI runner's)
+/// would otherwise give it to the Administrators group.
 #[cfg(windows)]
 fn listen(endpoint: &OsStr) -> impl FnOnce() -> std::fs::File + Send + 'static {
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError};
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
 
-    use windows_sys::Win32::Foundation::{
-        ERROR_PIPE_CONNECTED, GetLastError, INVALID_HANDLE_VALUE,
-    };
-    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
-    use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
-    };
-
-    let name: Vec<u16> = endpoint.encode_wide().chain([0]).collect();
-    // SAFETY: `name` is NUL-terminated; default security, no inheritance.
-    let pipe = unsafe {
-        CreateNamedPipeW(
-            name.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,
-            65_536,
-            65_536,
-            0,
-            std::ptr::null(),
-        )
-    };
-    assert_ne!(pipe, INVALID_HANDLE_VALUE, "create the fake daemon's pipe");
-    // SAFETY: a fresh pipe handle this file now owns.
-    let file = unsafe { std::fs::File::from_raw_handle(pipe) };
+    let file = super::endpoint::pipe_owned_by(endpoint, &super::endpoint::current_user_sid())
+        .expect("create the fake daemon's pipe");
     move || {
         use std::os::windows::io::AsRawHandle;
         // SAFETY: the handle is a pipe instance owned by `file`.

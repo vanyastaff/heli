@@ -6,7 +6,8 @@
 //!
 //! ```json
 //! {"schema":1,
-//!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
+//!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980,"session":1,
+//!            "window_station":"WinSta0","desktop":"Default","interactive":true},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "memory":{"total":68719476736,"available":44291850240,
 //!            "commit_available":42521726976,
@@ -161,6 +162,22 @@ pub struct Daemon {
     /// The protocol version it speaks.
     pub protocol: u32,
     pub started_at: u64,
+    /// Its session: on Windows the logon session (Terminal Services
+    /// session id), elsewhere its session (`getsid`). Absent from a daemon
+    /// older than this field, and `null` when it cannot be read.
+    #[serde(default)]
+    pub session: Option<u32>,
+    /// Its window station, on Windows (`WinSta0` is the interactive one).
+    #[serde(default)]
+    pub window_station: Option<String>,
+    /// Its desktop, on Windows (`Default` is the user's).
+    #[serde(default)]
+    pub desktop: Option<String>,
+    /// Whether it runs on the user's interactive desktop: on Windows the
+    /// window station `WinSta0` of a session other than 0. `null` where
+    /// heli cannot tell.
+    #[serde(default)]
+    pub interactive: Option<bool>,
 }
 
 /// A run in flight, or one that ended while no client followed it.
@@ -172,7 +189,9 @@ pub struct Run {
     pub worktree: String,
     /// The command, program first.
     pub argv: Vec<String>,
-    #[serde(default)]
+    /// `None` from a daemon older than run classes, and for a class this
+    /// build does not know (a newer daemon's).
+    #[serde(default, deserialize_with = "known_class")]
     pub class: Option<Class>,
     pub phase: Phase,
     pub started_at: u64,
@@ -230,7 +249,17 @@ impl Exit {
     }
 }
 
-/// Where a run is in its lifecycle.
+/// A run's class as `status` reads it: `None` for a class this build does
+/// not know, which a newer daemon may send.
+fn known_class<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Class>, D::Error> {
+    let class = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(class.and_then(|class| serde_json::from_value(class).ok()))
+}
+
+/// Where a run is in its lifecycle. A newer daemon may add phases, so a
+/// phase this build does not know reads as [`Phase::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -242,6 +271,9 @@ pub enum Phase {
     Testing,
     /// Ended.
     Done,
+    /// A phase of a newer daemon's, which this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Phase {
@@ -252,6 +284,7 @@ impl Phase {
             Self::Building => "building",
             Self::Testing => "testing",
             Self::Done => "done",
+            Self::Unknown => "unknown",
         }
     }
 }
@@ -276,12 +309,26 @@ impl Status {
         let age = |since: u64| now.saturating_sub(since);
         let mut text = match &self.daemon {
             None => "daemon  not running\n".to_owned(),
-            Some(daemon) => format!(
-                "daemon  pid {}, protocol {}, up {}s\n",
-                daemon.pid,
-                daemon.protocol,
-                age(daemon.started_at)
-            ),
+            Some(daemon) => {
+                let mut place = String::new();
+                if let Some(session) = daemon.session {
+                    place.push_str(&format!(", session {session}"));
+                }
+                if let (Some(station), Some(desktop)) = (&daemon.window_station, &daemon.desktop) {
+                    place.push_str(&format!(", {station}\\{desktop}"));
+                }
+                match daemon.interactive {
+                    Some(true) => place.push_str(" (interactive)"),
+                    Some(false) => place.push_str(" (not interactive)"),
+                    None => {}
+                }
+                format!(
+                    "daemon  pid {}, protocol {}{place}, up {}s\n",
+                    daemon.pid,
+                    daemon.protocol,
+                    age(daemon.started_at)
+                )
+            }
         };
         if let Some(pool) = &self.pool {
             text.push_str(&format!(

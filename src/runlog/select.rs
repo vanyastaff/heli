@@ -24,6 +24,7 @@ use super::Event;
 use crate::output::cargo::Message;
 use crate::output::{libtest, nextest};
 use crate::protocol::Channel;
+use crate::run_id::RunId;
 
 /// Which part of a record to print.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +48,7 @@ pub type Out<'a> = dyn FnMut(Channel, &[u8]) -> io::Result<()> + 'a;
 /// picks to `out`.
 pub fn apply(
     select: &Select,
-    run: &str,
+    run: RunId,
     events: impl Iterator<Item = io::Result<Event>>,
     out: &mut Out<'_>,
 ) -> io::Result<()> {

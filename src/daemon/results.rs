@@ -25,36 +25,17 @@
 //! effort: a key that cannot be computed, or a store that cannot be written,
 //! costs the saving, never the run.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::class::Class;
 use crate::clock;
-use crate::daemon::execute;
 use crate::daemon::key::{self, Key};
-use crate::daemon::registry::RunId;
 use crate::protocol::{Cache, Reply, RunRequest, Text};
+use crate::run_id::RunId;
 use crate::worktree;
-
-/// How a run of `class`, `cargo <args>`, uses the store: verify and test
-/// runs look it up and are recorded (with `no_cache`, only recorded), the
-/// result-store column of the class table (`crate::class`). A request for
-/// help (`-h` or `--help`, cargo's or, after `--`, the test runner's) is no
-/// verdict, so it does not use it. `exec` is opt-in, and nothing opts in
-/// yet.
-pub fn cache(class: Class, args: &[OsString], no_cache: bool) -> Cache {
-    let help = args.iter().any(|arg| arg == "-h" || arg == "--help");
-    match class {
-        Class::Verify | Class::Test if help => Cache::Off,
-        Class::Verify | Class::Test if no_cache => Cache::Refresh,
-        Class::Verify | Class::Test => Cache::On,
-        Class::Compile | Class::Mutate | Class::Exec => Cache::Off,
-    }
-}
 
 /// The most markers kept.
 pub const CAP: usize = 256;
@@ -62,7 +43,7 @@ pub const CAP: usize = 256;
 /// A pass, as its marker holds it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
-    pub run: String,
+    pub run: RunId,
     pub worktree: Text,
     /// Seconds since 1970.
     pub at: u64,
@@ -165,9 +146,11 @@ impl Store {
     }
 
     /// After run `run` of `request`, keyed `key`, ended: records it when it
-    /// `passed` on the tree it started on. A run that failed drops the pass
-    /// recorded for its key, which a flaky run may have left. Returns a note
-    /// when it passed but is not recorded.
+    /// `passed` with the inputs it started with, its key computed again
+    /// (the tree, and the configuration and toolchain it read, may have
+    /// changed meanwhile). A run that failed drops the pass recorded for
+    /// its key, which a flaky run may have left. Returns a note when it
+    /// passed but is not recorded.
     pub fn after(
         &self,
         request: &RunRequest,
@@ -179,22 +162,27 @@ impl Store {
             let _ = std::fs::remove_file(self.marker(key));
             return None;
         }
-        match key::snapshot(request, &self.scratch) {
-            Ok(now) if now == key.snapshot => {}
-            Ok(_) => {
+        match key::compute(request, &self.scratch) {
+            Ok(Some(now)) if now.snapshot != key.snapshot => {
                 return Some(
                     "the worktree changed during the run, so it is not recorded".to_owned(),
                 );
             }
+            Ok(Some(now)) if now.digest == key.digest => {}
+            Ok(_) => {
+                return Some(
+                    "the run's inputs changed during the run, so it is not recorded".to_owned(),
+                );
+            }
             Err(error) => {
                 return Some(format!(
-                    "cannot snapshot the worktree, so the run is not recorded: {error}"
+                    "cannot key the run again, so it is not recorded: {error}"
                 ));
             }
         }
         let record = Record {
-            run: run.to_string(),
-            worktree: Text(worktree::of(&execute::cwd(request)).into_os_string()),
+            run,
+            worktree: Text(worktree::of(&request.cwd()).into_os_string()),
             at: clock::now(),
         };
         self.record(key, &record)

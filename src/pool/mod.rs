@@ -195,14 +195,22 @@ impl Pool {
     }
 
     /// Raises the free slots to the [`target`], `lent` telling the slots
-    /// lent to run pools; `None` when they are not below it. Only safe when
-    /// no process holds a slot it will give back (the governor's
-    /// quiescence).
-    pub fn top_up(&self, lent: impl Fn() -> u32) -> io::Result<Option<Adjustment>> {
+    /// lent to run pools; `None` when they are not below it, or when the
+    /// pool is not `quiet` once they are counted. Only safe when no process
+    /// holds a slot it will give back (the governor's quiescence), so
+    /// `quiet` confirms it after the count: a process that takes a slot
+    /// after the count is alive then, and the top-up waits for it; one that
+    /// takes a slot later takes one the count had as free, which the top-up
+    /// does not replace.
+    pub fn top_up(
+        &self,
+        lent: impl Fn() -> u32,
+        quiet: impl FnOnce() -> bool,
+    ) -> io::Result<Option<Adjustment>> {
         let withheld = self.withheld();
         let target = target(self.jobserver.slots(), *withheld, lent());
         let free = self.jobserver.free()?;
-        if free >= target {
+        if free >= target || !quiet() {
             return Ok(None);
         }
         let given = self.jobserver.give(target - free)?;

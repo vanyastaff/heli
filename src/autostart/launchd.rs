@@ -132,12 +132,7 @@ fn service() -> String {
 /// The property list: `program daemon` with the `locations` setup resolved.
 fn definition(locations: &Locations, program: &str) -> Result<String, String> {
     let mut environment = String::new();
-    for (name, value) in [
-        ("HELI_STATE_DIR", locations.state_dir.as_os_str()),
-        ("HELI_ENDPOINT", locations.endpoint.as_os_str()),
-        ("HELI_POOL", locations.pool.as_os_str()),
-        ("HELI_CONFIG", locations.config.as_os_str()),
-    ] {
+    for (name, value) in locations.vars() {
         let value = value
             .to_str()
             .ok_or_else(|| format!("{name} {} is not valid Unicode", value.display()))?;

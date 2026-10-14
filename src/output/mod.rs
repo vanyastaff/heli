@@ -69,7 +69,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::class::Class;
+use crate::class::{self, Class, Runner};
 use crate::cli::Invocation;
 use crate::protocol::Channel;
 use crate::status::Exit;
@@ -157,15 +157,6 @@ enum View {
     Exec,
 }
 
-/// The tool that runs a test run's tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Runner {
-    /// `cargo test`.
-    Libtest,
-    /// `cargo nextest run`.
-    Nextest,
-}
-
 /// The plan for running `invocation` in `mode`.
 pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
     let view = match mode {
@@ -237,14 +228,9 @@ fn view_of(invocation: &Invocation) -> View {
 /// of its controls the user did not set), libtest's unless the user's
 /// arguments choose cargo's output.
 fn tests_view(args: &[OsString]) -> View {
-    let Some((subcommand, rest)) = cargo::subcommand(args) else {
-        return View::PassThrough;
-    };
-    match subcommand.to_str().unwrap_or_default() {
-        "nextest" if rest.first().is_some_and(|run| run == "run" || run == "r") => {
-            View::Tests(Runner::Nextest)
-        }
-        "test" | "t" if !cargo::sets_output(args) => View::Tests(Runner::Libtest),
+    match class::test_runner(args) {
+        Some((Runner::Nextest, _)) => View::Tests(Runner::Nextest),
+        Some((Runner::Libtest, _)) if !cargo::sets_output(args) => View::Tests(Runner::Libtest),
         _ => View::PassThrough,
     }
 }

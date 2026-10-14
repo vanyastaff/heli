@@ -2,8 +2,10 @@
 //! host pool's top-up waits for (DESIGN.md §4, "Bounded top-up").
 //!
 //! The processes that run cargo's jobs, and hold its slots, are `rustc`,
-//! `rustdoc`, `clippy-driver` and build scripts (`build-script-*`), among the
-//! processes that can open the pool:
+//! `rustdoc`, `clippy-driver` and build scripts (`build-script-*`); and
+//! `cargo` itself, which takes a slot before it starts the job it is for, so
+//! may hold one while none of those runs (#26). Among the processes that
+//! can open the pool:
 //!
 //! - **Windows**: those of this logon session, where the pool's semaphore
 //!   lives (`WTSEnumerateProcessesW`: names and sessions in one call).
@@ -24,9 +26,11 @@ pub fn compiling() -> io::Result<bool> {
 pub use platform::pids;
 
 /// Whether a process named `name` (its file name, without `.exe`) runs a
-/// cargo job.
+/// cargo job, or is a cargo, which may hold a slot for one it has not
+/// started yet.
 fn runs_a_job(name: &str) -> bool {
-    matches!(name, "rustc" | "rustdoc" | "clippy-driver") || name.starts_with("build-script-")
+    matches!(name, "rustc" | "rustdoc" | "clippy-driver" | "cargo")
+        || name.starts_with("build-script-")
 }
 
 #[cfg(windows)]

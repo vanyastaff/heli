@@ -135,9 +135,13 @@ at a fake, so that none registers anything with the real ones.
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
 created as the first instance, so the daemon never joins a pipe someone else
-created. A client connects at identification level and talks only to a pipe
-owned by its own user. On Unix, a socket with mode 0600 in the 0700 state
-directory; a client talks only to a socket owned by its uid.
+created. The daemon sets its owner to the user's SID, elevated or not (an
+elevated process would otherwise give it to the Administrators group). A
+client connects at identification level and talks only to a pipe owned by
+its own user's SID, elevated or not: never to one owned by the
+Administrators group, which any administrator's elevated process can
+create. On Unix, a socket with mode 0600 in the 0700 state directory; a
+client talks only to a socket owned by its uid.
 
 **The protocol** starts with a handshake frozen across versions: `HELI` and
 the protocol version, each way. On a mismatch the client runs the command
@@ -153,7 +157,11 @@ line: it runs the command, or reads the run log, itself. Fields added to a
 message are optional, so both sides still read each other's: a run request
 without a class (§5) comes from a client older than run classes, its run
 counts as exec, and the daemon does not send it the "waiting" message, which
-it could not read.
+it could not read. Values added to a set are read as unknown: a run's phase
+or class in `status` that the client does not know shows as `unknown` and
+as no class, and a reply it does not know is skipped while it follows a run
+(elsewhere it is an answer it did not expect). A daemon still sends a new
+reply only to a client whose request says it reads it.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
@@ -201,9 +209,16 @@ stderr stream back to the client through the run's record, and the client
 exits with the run's code (on Unix, of its signal). The run belongs to the
 daemon: a client that goes away does not stop it. A run is over when its
 process exits: output still arriving within 500 ms is forwarded, and
-processes it left behind holding its pipes do not hold the client. Once the
-daemon has told the client that the run started, the client never runs the
-command itself: if the daemon is lost mid-run, it exits 1.
+processes it left behind holding its pipes do not hold the client. The
+daemon tells the client when it accepts the run, and again when the run's
+command has started (its first process, after any wait for the worktree
+lock or for recycling, §5): a client that loses the daemon in between runs
+the command itself, after one warning line, since the command never
+started. Once the daemon has said the command started, the client never
+runs it itself: if the daemon is lost then, it exits 1. A client asks for
+the second message in its run request (protocol version 1 still), and a
+daemon older than it says in its first that none follows: with one, the
+run counts as started once accepted, as before.
 
 ## 4. Host pool
 
@@ -400,10 +415,23 @@ Bare cargo, started without heli, still draws from the host pool directly.
   - The daemon raises the free count to the target only at quiescence,
     observed at its samples for 2 s: no heli run active, and either no
     process but the daemon holds the pool open, or no rustc, rustdoc,
-    clippy-driver or build script is alive. A pool nobody else holds can
-    have no slot that will come back, whatever compiles elsewhere on the
+    clippy-driver, build script or cargo is alive. A pool nobody else holds
+    can have no slot that will come back, whatever compiles elsewhere on the
     machine (other users' pools, other agents' builds without heli); the
-    process scan alone would wait for every compiler in the session.
+    process scan alone would wait for every compiler in the session. A
+    cargo counts because it takes a slot before it starts the job the slot
+    is for: between the two it holds a slot while no compiler runs, and a
+    top-up then would make the pool exceed N once it gives the slot back
+    (#26). The price: while some process holds the pool, any live cargo
+    (`cargo watch`, a `cargo run` of a server) delays the top-up.
+  - The top-up counts the free slots first, and only then confirms the
+    quiescence once more, before it gives any: a cargo that takes a slot
+    after the count is alive at the confirmation, and the top-up waits for
+    it; one that takes a slot later takes one the count had as free, which
+    the top-up does not replace. Looked at the other way round, a cargo
+    that started between the look and the count would have taken slots the
+    top-up then replaced (a stress test of killed cargos on a macOS runner
+    held 6 slots of 3 at once).
     - Who holds the pool: on Windows, the semaphore's handle count
       (`NtQueryObject`) above the daemon's one; on Linux, a descriptor of
       the FIFO under `/proc/<pid>/fd` of the user's processes; on macOS, the
@@ -750,10 +778,14 @@ These are the only waits; nothing else makes a heli run wait for another run.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
 4. **Recycling:** the first run from a directory, while a store holds an
-   orphan, waits until its worktree's build directory has been recycled or
-   will not be (§6.4): for its `cargo metadata`, and with a donor for a scan
-   and a rename, and with a donor's source-state record for setting times
-   in the worktree. At most 30 s; later runs from there never wait for it.
+   orphan of its own repository (the one git names for the directory),
+   waits until its worktree's build directory has been recycled or will
+   not be (§6.4): for its `cargo metadata`, and with a donor for staging the
+   worktree, a scan and a rename, and with a donor's source-state record
+   for setting times in the worktree. At most 30 s; later runs from there
+   never wait for it, and an orphan of another repository keeps no run
+   waiting. While a store holds any orphan, the first run asks git for its
+   repository before it starts.
 5. **The source-state record:** as a run ends, its clients hear the end
    once the record of its build directory is written (§6.4), at most 10 s
    later. This waits for no other run.
@@ -782,8 +814,8 @@ cargo heli recycle                                 (internal: the post-checkout 
     (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. For `log`, also a
     run id that is not `r<number>` (or a bare number), a bad regular
     expression, or two selectors at once.
-  - 1 when the daemon is lost during a run (§3), and when `log` has no
-    record of the run or cannot read it.
+  - 1 when the daemon is lost once a run's command has started (§3), and
+    when `log` has no record of the run or cannot read it.
   - For `cancel`: 0 once the run's processes are gone; 1 when the run is
     not in flight (it ended, or never was), when no daemon runs (`cancel`
     starts none), or when the daemon cannot cancel it (too old: it is asked
@@ -1138,8 +1170,9 @@ those arguments, not even one standing in for cargo under another name. Its
 `target_directory` and `build_directory` (cargo 1.91 and later) say where
 the run builds. It takes no lock (verified: it answers while a build holds
 the build directory's), and it fails no run. It delays none either, but the
-first run from a directory while a store holds an orphan, which waits for
-it in case its worktree gets a recycled build directory (§6.4).
+first run from a directory while a store holds an orphan of its
+repository, which waits for it in case its worktree gets a recycled build
+directory (§6.4).
 
 - The `target/` directory is **registered**, with its workspace, in
   `store.json` in the state directory, which outlives the daemon.
@@ -1311,7 +1344,8 @@ belongs to one live worktree.
   its creation time.
 - **The first run.** The run's own `cargo metadata` (§6.2) names the build
   directory, and recycling happens before the run starts: the first run
-  from a directory waits for it while a store holds an orphan (§5, "Where a
+  from a directory waits for it while a store holds an orphan of its
+  repository (§5, "Where a
   run can wait"). The run's clients get a note:
   `cargo-heli: note: recycled the build directory of <donor>, a removed
   worktree; the path scan invalidated 2 units`, or after `worktree` for
@@ -1335,13 +1369,35 @@ belongs to one live worktree.
 - The hook and the look ask cargo from the top of the worktree, with their
   own environment, and recycle only for a workspace inside it. While no
   store holds an orphan of the repository, they do not ask cargo at all.
-- Each recycling is a `recycle` event in the event log (§8). Two recyclers
-  need no lock between them: a rename never replaces a directory that has
-  files, and each scans the donor under its old name, which a rename by the
-  other takes away. Before each donor, a recycler checks again that the
-  build directory does not exist. Until the other recycler names the new
-  workspace in it, the directory it renamed into place still looks like
-  the donor's orphan, and renaming it onto itself would succeed.
+- Each recycling is a `recycle` event in the event log (§8). One recycler
+  at a time recycles in a store: it holds the store's recycling lock,
+  `<store>/.recycle.lock`, waiting at most 25 s for it (else it recycles
+  nothing), and once it has it, looks again whether the build directory
+  exists, since the hook, the look and a run can race for one worktree. On
+  Windows a directory that another recycler walks (to scan it) cannot be
+  renamed, so two recyclers of one donor could each make the other's
+  rename fail, and cargo would then make an empty build directory. The
+  operating system releases the lock of a recycler that dies. Beside it
+  (an older heli takes none), a rename never replaces a directory that has
+  files, each scans the donor under its old name, which a rename by the
+  other takes away, and before each donor a recycler checks again that the
+  build directory does not exist.
+- **The claim.** Before anything else, a recycler rewrites the donor's
+  owner manifest to name the new workspace (keeping its creation time),
+  then scans and renames it. Its workspace lives, so from then on no other
+  recycler takes the donor for an orphan, under its old name or its new
+  one: a directory at a worktree's place never names a removed worktree,
+  even for the moment between the rename and the manifest. After the
+  rename the manifest is written once more, in case another recycler
+  claimed the same donor after this one. A recycler that gives the donor up
+  (it cannot be moved, its worktree is older than its last build) writes
+  its manifest back, unless another recycler claimed it since or it moved.
+  A donor whose manifest cannot be written is not taken. A recycler that
+  dies between the claim and the rename leaves the donor named after a
+  live workspace, where it is: recycling never takes it, and eviction does
+  (§6.3). Under the store's lock no other recycler of this heli runs
+  meanwhile; the claim also keeps a recycler that takes no lock (an older
+  heli's hook) from taking the directory.
 
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,
@@ -1418,13 +1474,24 @@ and what depends on them. This applies in both modes below.
 
 There are two modes:
 
-- **Conservative**, always available, and what heli does when the donor has
-  no record that counts, or git cannot stage the new worktree. The new
-  worktree's files are newer than every artifact, so every workspace member
-  rebuilds. Third-party packages stay fresh, except those invalidated by the
-  scan above (a crate that compiles an `OUT_DIR` path in, including through
-  `include!`). This is correct by cargo's own rules plus the scan. The cost
-  of the `OUT_DIR` invalidations is to be measured.
+Both start from the donor's **last build**: the newest modification time of
+a file in its build directory, leaving out heli's own `.heli/` and rustc's
+`incremental/` caches (as for the record's validity, below), read before the
+path scan. heli stages the new worktree first (as for the record, below); a
+worktree git cannot stage gets no recycled directory.
+
+- **Conservative**, what heli does when the donor has no record that
+  counts: only for a new worktree whose every file (tracked or untracked,
+  as staged) was last written after the donor's last build, as in a
+  worktree just made. Every workspace member then rebuilds. Third-party
+  packages stay fresh, except those invalidated by the scan above (a crate
+  that compiles an `OUT_DIR` path in, including through `include!`). This
+  is correct by cargo's own rules plus the scan. A worktree with an older
+  file (one made before the donor's last build: the main worktree at its
+  first run, or a worktree the look finds) gets no recycled directory from
+  this donor: cargo would find units built from another content fresh, and
+  link the donor's code. heli tries the next orphan, and else the worktree
+  builds cold. The cost of the `OUT_DIR` invalidations is to be measured.
 - **Precise.** The donor has a *source-state record*: the blob id, size and
   mtime of every tracked or untracked file.
   - The record counts only if it was taken after the donor's last build: its
@@ -1434,10 +1501,14 @@ There are two modes:
     writes a fingerprint). Otherwise heli ignores it. It is read before the
     path scan, which changes the directory.
   - For each file in the new worktree whose blob and size match the record,
-    heli sets the recorded mtime. Every other file keeps the current time.
-    The size counts because a blob id is of the content after git's filters:
-    two files that differ only in line endings share one, and
-    `include_str!` compiles in bytes.
+    heli sets the recorded mtime. Every other file last written at the
+    donor's last build or before gets the time now (a worktree made before
+    that build has such files); any other keeps its time, newer than every
+    artifact already. The size counts because a blob id is of the content
+    after git's filters: two files that differ only in line endings share
+    one, and `include_str!` compiles in bytes. Should a file not get its
+    newer time, heli deletes the fingerprint of every unit, and cargo
+    rebuilds them all.
   - Every file with the donor's content then looks to cargo exactly as it did
     in the donor, and every changed file is newer than any artifact. Only the
     changed crates, their dependents and the units the scan invalidated
@@ -1457,8 +1528,11 @@ There are two modes:
     the daemon did not see. A run the client executes without a daemon
     writes none.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
-    recorded. Cargo rebuilds when one is missing; one that is present keeps
-    the current time and also triggers a rebuild.
+    recorded, and neither mode looks at them. Cargo rebuilds when one is
+    missing; one that is present triggers a rebuild when it was written
+    after the donor's last build, as in a worktree just made. An ignored
+    input of other content, present in a worktree made before that build,
+    is the case recycling does not cover yet.
   - With `-Zchecksum-freshness` (cargo#14136), cargo compares content itself,
     and precise mode becomes unnecessary. The path scan does not.
 
@@ -1505,8 +1579,10 @@ was found by a failing test.
   toolchain answers. A missing tool is keyed as absent.
 - **Cargo configuration.** The content of every `config.toml` and `config` on
   cargo's discovery path: `.cargo/` in the working directory and every
-  directory above it, then the Cargo home. They are keyed in the order cargo
-  reads them, not by path, so worktrees in different places can share a key.
+  directory above it, then the Cargo home (a relative `CARGO_HOME` against
+  the working directory). They are keyed in the order cargo reads them, not
+  by path, so worktrees in different places can share a key. A file that is
+  there but cannot be read is keyed by its error, never as absent.
 - **Argv**, normalized: without the program, which the toolchain stands for,
   and with the working directory relative to the worktree, which selects
   packages and configuration as an argument would. The worktree's own path is
@@ -1515,7 +1591,9 @@ was found by a failing test.
   - Names are case-folded on Windows only.
   - `PATH`, `LD_LIBRARY_PATH` and the `DYLD_*` search paths are keyed without
     their entries inside the worktree, which cargo prepends for the programs
-    it runs; one left without entries counts as unset.
+    it runs; one left without entries counts as unset. An entry is compared
+    with the worktree on Windows without case and with `\` read as `/`;
+    elsewhere `\` is part of a name.
   - Neutral, and so not keyed:
     - job and thread counts holding a value the tool accepts (an invalid one
       fails the run, so it is keyed);
@@ -1540,10 +1618,11 @@ as a run: it takes no run id; a miss goes on to single-flight with that key
 (§5, step 3). The key is computed afresh after a wait, since the runs waited
 for may have changed the tree. A run that waited for nothing keeps the key
 of the first check, taken a moment before, so its clients from other
-worktrees attached to the tree it runs on. That snapshot of the tree, taken
-before the steps, is compared with one taken after them, so a change in
-between counts as one during the run. A marker is written only
-when the run passed and both snapshots match. A run that fails drops the
+worktrees attached to the tree it runs on. After the steps the whole key is
+computed again, every input read anew, and compared with the one taken
+before them, so a change in between (to the tree, the Cargo configuration
+or the toolchain) counts as one during the run. A marker is written only
+when the run passed and both keys match. A run that fails drops the
 marker of its key, so a flaky pass is reused only until a run of the same key
 fails.
 
@@ -1572,7 +1651,15 @@ disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremen
 `cargo heli status --json` has a versioned schema (`schema`, now 1). Times
 are whole seconds since 1970 (UTC); `status` never starts a daemon.
 
-- `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
+- `daemon`: `pid`, `protocol` and `started_at`, and where it runs, so that
+  a user can see it runs in their interactive session (§3): `session` (on
+  Windows the logon session, elsewhere `getsid`), and on Windows
+  `window_station` and `desktop` (`WinSta0` and `Default` for the user's
+  desktop) and `interactive` (the window station `WinSta0` of a session
+  other than 0; `null` elsewhere, where heli cannot tell). The text form
+  says the same on the daemon's line:
+  `daemon  pid 4242, protocol 1, session 1, WinSta0\Default (interactive), up 52s`.
+  `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
   never below 0), or `null` when no daemon answers;
 - `memory`: the governor's last sample, in bytes: `total`, `available`,
@@ -1580,7 +1667,8 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
-  (running for a run of one phase; building, testing, done), `slots` (the
+  (running for a run of one phase; building, testing, done; `unknown` for
+  a newer daemon's phase the client does not know), `slots` (the
   host pool's slots it uses: lent to its run pool and not free there, plus
   its test slots), `share` (its share of the capacity, §4, a number that
   need not be whole), `waiting_since` (`null` unless the run waits),
@@ -1653,12 +1741,13 @@ the one before, and the next event starts a new file.
 | Daemon not running | A bare cargo warns and uses its own pool, as today | The pool goes with its daemon once nobody holds it: a semaphore by itself, a FIFO through the daemon's warden (§4, Lifetime). `cargo heli` or `cargo heli ensure` starts the daemon; logon task or session hook |
 | Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
-| Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
+| Daemon lost while a run waits (worktree lock, recycling) | The command never started | The client runs it directly, after one warning (§3) |
+| Daemon lost once a run's command started | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | A client is killed, or stops reading, during a run | none | The run goes on and its record is complete; `status` lists it as done if no client heard its end; the same command attaches to it while it runs (§5) |
 | Two daemons on one state directory (Windows logon sessions) | They could give the same run id, and write one record over another | Ids come from the state directory's counter under a lock, above every record (§5) |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
 | An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. Once `setup --autostart` registered the logon task, the daemon starts outside any agent's job: at logon, and when a client needs one, through `schtasks /Run` (§3) |
-| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart") |
+| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart"). `status` shows the daemon's session, and on Windows its window station and desktop and whether they are interactive (§8) |
 | The logon registration is gone or stale (removed by hand, heli installed elsewhere, other locations) | A start through it would bring up no daemon, or the wrong one | A client uses it only when the record names its own program and locations; when the service manager refuses the start, the client starts the daemon itself (§3) |
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
@@ -1669,6 +1758,8 @@ the one before, and the next event starts a new file.
 | `gc` or the daemon stopped while deleting the trash | What is left there takes disk | It counts as free for the floor and in no directory's size; the daemon's deleter, at start and every minute, or the next `gc`, deletes it |
 | Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |
 | Recycled directory with a stale record | Could link stale code | A record counts only if it is newer than every file in the build directory; otherwise conservative mode |
+| Recycling into a worktree made before the donor's last build (the main worktree's first run, the look) | Its unchanged-looking files are older than the donor's artifacts: cargo would link the donor's code | Precise mode gives every file not of the recorded content a time after that build; conservative mode does not recycle into such a worktree (§6.4) |
+| A recycler taking a directory another one has just renamed into place | One worktree's build directory moved to another | The donor's manifest names the new workspace before the rename: a claimed donor is no orphan (§6.4, "The claim") |
 | Tools looking in `target/<profile>/deps` | They miss moved intermediates | Validated on a real workspace before phase 2 (§6.1) |
 | False green from the cache | A flaky pass is reused | Printed caveat; `--no-cache` |
 | heli runs itself in a loop | Unbounded processes | `heli` is refused as a subcommand; `HELI_DEPTH` stops at 16 |

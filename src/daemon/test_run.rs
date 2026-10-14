@@ -23,7 +23,8 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::class::Class;
+use crate::class::{self, Class, Runner};
+use crate::environment;
 use crate::protocol::{RunRequest, Text};
 
 /// nextest's flags with a value that only the test phase reads (checked
@@ -63,15 +64,6 @@ const RUN_ONLY_VARS: [&str; 8] = [
     "NEXTEST_FAILURE_OUTPUT",
 ];
 
-/// The tool that runs the tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Runner {
-    /// `cargo test`: libtest, its arguments after `--`.
-    Libtest,
-    /// `cargo nextest run`.
-    Nextest,
-}
-
 /// A test run's two command lines.
 #[derive(Debug)]
 pub struct TestRun {
@@ -90,20 +82,13 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
     if request.class != Some(Class::Test) {
         return None;
     }
-    let argv: Vec<OsString> = request.argv.iter().map(|arg| arg.0.clone()).collect();
+    let argv = request.argv();
     let (runner, at) = runner(&argv)?;
     let (tool, _) = split_at_separator(&argv[at..]);
     if tool.iter().any(|arg| arg == "--no-run") {
         return None;
     }
-    let env = |name: &str| {
-        request
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| same_name(&key.0, name))
-            .and_then(|(_, value)| value.0.to_str().map(str::to_owned))
-    };
+    let env = |name: &str| request.var(name)?.to_str().map(str::to_owned);
     let asked = match runner {
         Runner::Nextest => thread_flags(tool, &["-j", "--test-threads", "--jobs"])
             .last()
@@ -127,24 +112,11 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
 }
 
 /// Where a test run's flags go (right after `test`, or after `nextest
-/// run`) and which tool runs its tests, read as `Class::of_cargo` reads
-/// the subcommand: `test` (`t`) or `nextest run` (`nextest r`), after an
-/// optional `+toolchain`, the program first.
+/// run`) and which tool runs its tests (`crate::class::test_runner`), in
+/// `argv`, the program first.
 fn runner(argv: &[OsString]) -> Option<(Runner, usize)> {
-    let mut at = 1;
-    if argv
-        .get(at)
-        .is_some_and(|arg| arg.to_string_lossy().starts_with('+'))
-    {
-        at += 1;
-    }
-    match argv.get(at)?.to_str()? {
-        "test" | "t" => Some((Runner::Libtest, at + 1)),
-        "nextest" if matches!(argv.get(at + 1)?.to_str()?, "run" | "r") => {
-            Some((Runner::Nextest, at + 2))
-        }
-        _ => None,
-    }
+    let (runner, at) = class::test_runner(argv.get(1..)?)?;
+    Some((runner, at + 1))
 }
 
 impl TestRun {
@@ -172,7 +144,11 @@ impl TestRun {
                     argv.push("--".into());
                     argv.extend(without_switches(test_args, &RUN_ONLY_SWITCHES[2..]));
                 }
-                env.retain(|(name, _)| !RUN_ONLY_VARS.iter().any(|var| same_name(&name.0, var)));
+                env.retain(|(name, _)| {
+                    !RUN_ONLY_VARS
+                        .iter()
+                        .any(|var| environment::same_name(&name.0, var))
+                });
             }
         }
         Some(RunRequest {
@@ -181,6 +157,7 @@ impl TestRun {
             env,
             class: request.class,
             cache: request.cache,
+            reads_spawned: request.reads_spawned,
         })
     }
 
@@ -304,14 +281,4 @@ fn nextest_threads(value: &str) -> Option<u32> {
         }
     };
     u32::try_from(threads.max(1)).ok()
-}
-
-#[cfg(windows)]
-fn same_name(name: &OsStr, other: &str) -> bool {
-    name.eq_ignore_ascii_case(other)
-}
-
-#[cfg(not(windows))]
-fn same_name(name: &OsStr, other: &str) -> bool {
-    name == other
 }

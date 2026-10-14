@@ -19,8 +19,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner,
-    TokenUser,
+    SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -154,7 +153,8 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     }
 }
 
-/// A security descriptor whose DACL allows the current user alone.
+/// A security descriptor owned by the current user, whose DACL allows that
+/// user alone.
 struct OwnerOnly {
     descriptor: PSECURITY_DESCRIPTOR,
 }
@@ -162,9 +162,11 @@ struct OwnerOnly {
 impl OwnerOnly {
     fn new() -> io::Result<Self> {
         let user = sid_string(token_information(TokenUser)?.user())?;
-        // Protected DACL (no inherited entries), one entry: full access for
-        // the user.
-        let sddl = wide(OsStr::new(&format!("D:P(A;;GA;;;{user})")));
+        // The owner is the user's SID, elevated or not: by default an
+        // elevated process gives what it creates to the Administrators
+        // group, which clients do not trust. Protected DACL (no inherited
+        // entries), one entry: full access for the user.
+        let sddl = wide(OsStr::new(&format!("O:{user}D:P(A;;GA;;;{user})")));
         let mut descriptor = null_mut();
         // SAFETY: `sddl` is NUL-terminated; the descriptor is freed on drop.
         let ok = unsafe {
@@ -227,9 +229,10 @@ fn create_instance(name: &[u16], security: &OwnerOnly, first: bool) -> io::Resul
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-/// Fails unless the pipe's owner is this user, or the default owner of the
-/// objects this process creates (the Administrators group when elevated):
-/// nobody else can create a pipe with either owner.
+/// Fails unless the pipe's owner is this user's SID, which only this user
+/// (or a process with the privilege to take ownership) can give a pipe.
+/// Not the Administrators group: any elevated process of any
+/// administrator can create a pipe it owns.
 fn check_owner(pipe: &File) -> io::Result<()> {
     let mut owner: PSID = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -251,11 +254,8 @@ fn check_owner(pipe: &File) -> io::Result<()> {
     }
     let trusted = (|| -> io::Result<bool> {
         let user = token_information(TokenUser)?;
-        let default_owner = token_information(TokenOwner)?;
-        // SAFETY: all three are valid SIDs.
-        Ok(unsafe {
-            EqualSid(owner, user.user()) != 0 || EqualSid(owner, default_owner.owner()) != 0
-        })
+        // SAFETY: both are valid SIDs.
+        Ok(unsafe { EqualSid(owner, user.user()) != 0 })
     })();
     // SAFETY: allocated by GetSecurityInfo.
     unsafe {
@@ -279,12 +279,6 @@ impl TokenInformation {
     fn user(&self) -> PSID {
         // SAFETY: filled by GetTokenInformation(TokenUser), aligned.
         unsafe { (*self.0.as_ptr().cast::<TOKEN_USER>()).User.Sid }
-    }
-
-    /// The SID of a `TokenOwner` buffer.
-    fn owner(&self) -> PSID {
-        // SAFETY: filled by GetTokenInformation(TokenOwner), aligned.
-        unsafe { (*self.0.as_ptr().cast::<TOKEN_OWNER>()).Owner }
     }
 }
 

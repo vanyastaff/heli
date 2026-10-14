@@ -31,13 +31,16 @@
 //! `.fingerprint/`) are left out: no freshness decision reads them, and a
 //! build that changes what cargo decides writes a fingerprint.
 //!
-//! **Use** ([`restore`]). Each file of the new worktree whose blob id and
-//! size are the record's gets the recorded time. The size is checked too
-//! because a blob id is of the content after git's filters: two files that
-//! differ only in line endings can share one. A file is changed only if it
-//! was last written before heli staged the worktree, through a handle that,
-//! on Windows, lets nobody write to it meanwhile; any other file keeps its
-//! time, which is newer than every artifact.
+//! **Use** ([`stage`], then [`Worktree::settle`]). Each file of the new
+//! worktree whose blob id and size are the record's gets the recorded time,
+//! if it was last written before heli staged the worktree. The size is
+//! checked too because a blob id is of the content after git's filters: two
+//! files that differ only in line endings can share one. Every other file
+//! last written at the donor's last build ([`last_build`]) or before gets
+//! the time now, so that cargo rebuilds what was built from another
+//! content; the rest keep their times, newer than every artifact already.
+//! A worktree with no record to use recycles only when every file of it is
+//! newer than that build already ([`Worktree::newer_than`]).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -120,10 +123,24 @@ pub fn write(build_dir: &Path, worktree: &Path, probe: &Probe) -> Result<bool, S
 /// The record of `build_dir`, if it has one that counts: taken after the
 /// last build there.
 pub fn valid(build_dir: &Path) -> Option<Record> {
+    valid_after(build_dir, last_build(build_dir).ok()?)
+}
+
+/// The record of `build_dir`, if it has one taken at `newest` or later:
+/// `newest` is [`last_build`]'s answer.
+pub fn valid_after(build_dir: &Path, newest: u64) -> Option<Record> {
     let text = std::fs::read(path(build_dir)).ok()?;
     let record: Record = serde_json::from_slice(&text).ok()?;
-    let newest = newest(build_dir, true).ok()?;
     (record.taken_at >= newest).then_some(record)
+}
+
+/// When cargo last wrote in `build_dir`: the newest modification time of a
+/// file there, in nanoseconds since 1970, leaving out heli's `.heli/` and
+/// rustc's `incremental/` caches, which no freshness decision reads; 0 for
+/// none. A file of a worktree last written at this time or before looks to
+/// cargo as old as the artifacts built from it, or older.
+pub fn last_build(build_dir: &Path) -> io::Result<u64> {
+    newest(build_dir, true)
 }
 
 /// The newest modification time of a file in `dir`, leaving out heli's
@@ -150,46 +167,136 @@ fn newest(dir: &Path, top: bool) -> io::Result<u64> {
     Ok(latest)
 }
 
-/// Gives each file of `worktree` whose blob id and size `record` holds the
-/// time recorded with it, asking git through `probe`; `scratch` is a
-/// directory for scratch files. Returns how many files got it.
-pub fn restore(
-    record: &Record,
-    worktree: &Path,
-    probe: &Probe,
-    scratch: &Path,
-) -> Result<usize, String> {
-    let staging = SystemTime::now();
-    let mut restored = 0;
-    for staged in staged_files(probe, worktree, scratch)? {
-        let Some(recorded) = record.files.get(&staged.path) else {
-            continue;
-        };
-        if recorded.blob == staged.blob && set_time(&worktree.join(&staged.path), recorded, staging)
-        {
-            restored += 1;
-        }
-    }
-    Ok(restored)
+/// The files of a worktree as heli staged them (with every change staged,
+/// `key::staged`), and when it did.
+pub struct Worktree {
+    /// Taken before the staging: a file last written at this time or later
+    /// may have changed since it was staged.
+    staged_at: SystemTime,
+    files: Vec<Staged>,
 }
 
-/// Sets the modification time of `file` to `recorded`'s, if it has
-/// `recorded`'s size and was last written before `staging`; whether it
-/// did.
-fn set_time(file: &Path, recorded: &Recorded, staging: SystemTime) -> bool {
-    let Ok(file) = open_for_times(file) else {
-        return false;
+/// Stages `worktree`, asking git through `probe`; `scratch` holds the
+/// scratch index.
+pub fn stage(worktree: &Path, probe: &Probe, scratch: &Path) -> Result<Worktree, String> {
+    let staged_at = SystemTime::now();
+    let files = staged_files(probe, worktree, scratch)?;
+    Ok(Worktree { staged_at, files })
+}
+
+/// What [`Worktree::settle`] did to the files of a worktree.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Settled {
+    /// The files that got the time a record holds for them.
+    pub restored: usize,
+    /// The files that needed a time newer than a build and did not get it:
+    /// cargo may take what was built from another content for theirs.
+    pub failed: usize,
+}
+
+impl Worktree {
+    /// Whether every file of `worktree` staged here (and still there) was
+    /// last written after `newest`, the last build of a build directory
+    /// ([`last_build`]): cargo then finds every unit built from one of
+    /// them stale. Links are not followed.
+    pub fn newer_than(&self, worktree: &Path, newest: u64) -> bool {
+        self.files.iter().all(|file| {
+            match std::fs::symlink_metadata(worktree.join(&file.path)) {
+                // Gone: cargo finds a unit built from it stale.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                Err(_) => false,
+                Ok(metadata) => {
+                    !metadata.is_file()
+                        || metadata
+                            .modified()
+                            .ok()
+                            .and_then(nanos)
+                            .is_some_and(|modified| modified > newest)
+                }
+            }
+        })
+    }
+
+    /// Sets the times of the files of `worktree` staged here so that cargo,
+    /// in a build directory whose last build was at `newest`
+    /// ([`last_build`]), takes nothing built from another content for
+    /// theirs:
+    ///
+    /// - a file whose blob id and size `record` holds, last written before
+    ///   the staging, gets the time recorded with it: what was built from
+    ///   it is fresh;
+    /// - any other file last written at `newest` or before gets the time
+    ///   now (and never an older one), after every build there: what was
+    ///   built from it is stale;
+    /// - any other file keeps its time, newer than every build already.
+    ///
+    /// A file is changed through a handle that, on Windows, lets nobody
+    /// write to it meanwhile.
+    pub fn settle(&self, worktree: &Path, record: &Record, newest: u64) -> Settled {
+        let mut settled = Settled::default();
+        let after_build = UNIX_EPOCH + Duration::from_nanos(newest.saturating_add(1));
+        for staged in &self.files {
+            let file = worktree.join(&staged.path);
+            let recorded = record
+                .files
+                .get(&staged.path)
+                .filter(|recorded| recorded.blob == staged.blob);
+            match settle(&file, recorded, newest, self.staged_at, after_build) {
+                Some(true) => settled.restored += 1,
+                Some(false) => {}
+                None => settled.failed += 1,
+            }
+        }
+        settled
+    }
+}
+
+/// Sets the time of `file` as [`Worktree::settle`] says: `recorded` is
+/// what the record holds for its staged content, if anything. `Some(true)`
+/// when it got the recorded time, `Some(false)` when it needs no other,
+/// `None` when it needed a newer time than `newest` and did not get one.
+fn settle(
+    file: &Path,
+    recorded: Option<&Recorded>,
+    newest: u64,
+    staged_at: SystemTime,
+    after_build: SystemTime,
+) -> Option<bool> {
+    let older_than_build =
+        |modified: Option<u64>| modified.is_none_or(|modified| modified <= newest);
+    let Ok(handle) = open_for_times(file) else {
+        // Gone, or not a file: nothing to set. Kept open by a writer: its
+        // time had better be newer than the build already.
+        return match std::fs::symlink_metadata(file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+            Ok(metadata) if !metadata.is_file() => Some(false),
+            Ok(metadata) => {
+                (!older_than_build(metadata.modified().ok().and_then(nanos))).then_some(false)
+            }
+            Err(_) => None,
+        };
     };
-    let Ok(metadata) = file.metadata() else {
-        return false;
+    let Ok(metadata) = handle.metadata() else {
+        return None;
     };
-    let unchanged = metadata.is_file()
+    if !metadata.is_file() {
+        return Some(false);
+    }
+    let modified = metadata.modified().ok();
+    if let Some(recorded) = recorded
         && metadata.len() == recorded.size
-        && metadata.modified().is_ok_and(|modified| modified < staging);
-    unchanged
-        && file
+        && modified.is_some_and(|modified| modified < staged_at)
+        && handle
             .set_modified(UNIX_EPOCH + Duration::from_nanos(recorded.mtime))
             .is_ok()
+    {
+        return Some(true);
+    }
+    if !older_than_build(modified.and_then(nanos)) {
+        return Some(false);
+    }
+    let now = SystemTime::now().max(after_build);
+    handle.set_modified(now).is_ok().then_some(false)
 }
 
 /// `file`, opened to read and set its times: on Windows, so that nobody
@@ -214,6 +321,7 @@ fn open_for_times(file: &Path) -> io::Result<File> {
 
 /// A file in a staged index: its path from the worktree's top, and its
 /// blob id.
+#[derive(Debug)]
 struct Staged {
     path: String,
     blob: String,

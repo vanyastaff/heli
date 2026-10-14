@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::locations::{CONFIG_VAR, ENDPOINT_VAR, Locations, POOL_VAR, STATE_DIR_VAR};
+use crate::locations::{self, Locations};
 use crate::nesting;
 use crate::protocol::Text;
 
@@ -142,7 +142,7 @@ impl Registration {
     /// The registration for this program and the default locations, or why
     /// there can be none.
     pub fn new() -> Result<Self, String> {
-        if let Some(var) = [STATE_DIR_VAR, ENDPOINT_VAR, POOL_VAR, CONFIG_VAR]
+        if let Some(var) = locations::VARS
             .into_iter()
             .find(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
         {

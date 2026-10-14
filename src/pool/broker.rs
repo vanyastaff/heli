@@ -54,7 +54,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{Pool, RunPool, Waiter};
-use crate::daemon::registry::RunId;
+use crate::run_id::RunId;
 
 /// How often the broker looks at the pools.
 pub const TICK: Duration = Duration::from_millis(20);

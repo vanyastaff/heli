@@ -74,6 +74,21 @@ pub fn invalidate(build_dir: &Path, old: &[PathBuf]) -> Vec<PathBuf> {
     deleted
 }
 
+/// Deletes, in the build directory `build_dir`, the fingerprint of every
+/// unit, so that cargo rebuilds them all. Returns the fingerprint
+/// directories it deleted.
+pub fn invalidate_all(build_dir: &Path) -> Vec<PathBuf> {
+    let mut deleted = Vec::new();
+    for profile in profiles(build_dir) {
+        for dir in subdirs(&profile.join(".fingerprint")) {
+            if std::fs::remove_dir_all(&dir).is_ok() {
+                deleted.push(dir);
+            }
+        }
+    }
+    deleted
+}
+
 /// The components of the path `text`, as the platform compares them: on
 /// Windows without case, with either separator, and without `\\?\`.
 fn components(text: &str) -> Vec<String> {

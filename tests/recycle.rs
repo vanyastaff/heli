@@ -609,7 +609,10 @@ impl Repo {
 
     /// A build directory made by hand in the store, at
     /// `<store>/<first 2 of hash>/<the rest>`, holding a file `marker` that
-    /// says `label`, and the owner manifest `owner` if given.
+    /// says `label`, and the owner manifest `owner` if given. Its files are
+    /// dated [`long_ago`], as a removed worktree's last build is older than
+    /// a worktree made since: without a source-state record, recycling
+    /// takes no donor built after a file of the new worktree was written.
     fn craft(&self, hash: &str, label: &str, owner: Option<Value>) -> PathBuf {
         let dir = self.store.join(&hash[..2]).join(&hash[2..]);
         std::fs::create_dir_all(dir.join("debug").join(".fingerprint"))
@@ -620,8 +623,14 @@ impl Repo {
             std::fs::write(dir.join(".heli").join("owner"), owner.to_string())
                 .expect("write the owner manifest");
         }
+        set_mtimes(&dir, long_ago());
         dir
     }
+}
+
+/// A time before any worktree of a test was made.
+fn long_ago() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
 }
 
 /// An owner manifest for `workspace` in `repository`, last run at
@@ -796,6 +805,15 @@ fn an_orphan_that_cannot_be_moved_is_passed_over() {
         "with none left to try, it says why: {stderr}"
     );
     assert_eq!(marker(&latest), "latest");
+    // Given up, it names its removed worktree again: an orphan still, for
+    // a recycler that can move it.
+    assert!(
+        owner(&latest).is_some_and(|owner| owner["workspace"]
+            .as_str()
+            .is_some_and(|path| Path::new(path) == gone("gone-1"))),
+        "{:?}",
+        owner(&latest)
+    );
 }
 
 /// The build directory cargo names for a worktree as heli would find it:
@@ -1073,6 +1091,7 @@ fn the_path_scan_invalidates_exactly_the_units_that_compiled_in_old_paths() {
         invalidated: true,
     };
     in_triple.write(&dir.join("x86_64-unknown-test").join("debug"));
+    set_mtimes(&dir, long_ago());
 
     let output = repo.recycle_in(&b);
     let b_dir = repo.build_dir_of(&b);
@@ -1473,7 +1492,12 @@ impl Repo {
     /// of each unit, and the client's stderr.
     fn build_like_a_clean_build(&self, worktree: &Path) -> (Vec<Unit>, String) {
         let output = self.build_output(worktree);
-        assert_eq!(self.recycled().len(), 1, "the first build recycled");
+        assert_eq!(
+            self.recycled().len(),
+            1,
+            "the first build recycled\n--- the daemon's log\n{}",
+            self.fixture.daemon_log()
+        );
         let recycled = test_outputs(&output.stdout, worktree);
         assert_eq!(recycled, self.clean_test_outputs(worktree));
         (units(&output.stdout), text(&output.stderr))
@@ -1911,4 +1935,317 @@ fn a_record_that_counts_is_not_written_again() {
     repo.fixture
         .wait_for_status("the look after the run", |status| used(status) != before);
     assert_eq!(record(), counting);
+}
+
+impl Repo {
+    /// Builds worktree `a`, changes its `leaf` crate (which nothing the path
+    /// scan invalidates depends on) and builds it again, so that its last
+    /// build is newer than every file of a worktree made before it; then
+    /// stops the daemon (it cannot write a's record again), deletes a's
+    /// source-state record unless `keep_record`, and removes `a`. Returns
+    /// a's build directory, an orphan now.
+    fn build_changed_and_remove(&self, a: &Path, keep_record: bool) -> PathBuf {
+        self.build(a);
+        change(
+            a,
+            "leaf/src/lib.rs",
+            "leaf from the commit",
+            "leaf from a's change",
+        );
+        let output = self.build_output(a);
+        assert_eq!(
+            leaf_says(&output.stdout, a),
+            "leaf: leaf from a's change over root from the commit"
+        );
+        let a_dir = self.build_dir_of(a);
+        self.fixture.kill_daemon();
+        if !keep_record {
+            forget_record(&a_dir);
+        }
+        self.remove_worktree("a");
+        a_dir
+    }
+}
+
+/// What `leaf`'s test prints, of a build whose JSON messages are `stdout`,
+/// run in `dir`.
+fn leaf_says(stdout: &[u8], dir: &Path) -> String {
+    let outputs = test_outputs(stdout, dir);
+    let (_, output) = outputs
+        .iter()
+        .find(|(name, _)| name == "leaf (test)")
+        .unwrap_or_else(|| panic!("no test binary of leaf: {outputs:?}"));
+    output
+        .lines()
+        .find_map(|line| line.find("leaf: ").map(|at| line[at..].to_owned()))
+        .unwrap_or_else(|| panic!("leaf's test printed nothing: {output}"))
+}
+
+/// What `leaf`'s test prints when built from the commit.
+const LEAF_FROM_THE_COMMIT: &str = "leaf: leaf from the commit over root from the commit";
+
+/// A time well before any build of a test.
+fn an_hour_ago() -> std::time::SystemTime {
+    std::time::SystemTime::now() - Duration::from_secs(3600)
+}
+
+/// The main worktree, whose files are older than a's last build, recycles
+/// a's build directory precisely at its first run: `leaf`, which a's
+/// record holds with a's change, is rebuilt from the main worktree's own
+/// source, and never links a's code; the rest stays warm.
+#[test]
+fn a_worktree_older_than_the_donors_build_recycles_precisely_without_its_code() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build_changed_and_remove(&a, true);
+    let main = repo.main();
+    set_mtimes(&main, an_hour_ago());
+
+    let output = repo.build_output(&main);
+    assert_eq!(leaf_says(&output.stdout, &main), LEAF_FROM_THE_COMMIT);
+    let built = units(&output.stdout);
+    assert!(
+        built.iter().any(|unit| unit.name == "root" && unit.fresh),
+        "the build is warm: {built:?}"
+    );
+    let recycled = repo.recycled();
+    assert_eq!(recycled.len(), 1, "{recycled:?}");
+    assert_eq!(recycled[0]["trigger"], "run", "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
+}
+
+/// Without a record of the donor, a worktree whose files are not all newer
+/// than the donor's last build does not recycle at its first run: cargo
+/// would find a's units fresh. It builds cold, from its own sources, and
+/// the orphan stays for another.
+#[test]
+fn a_worktree_older_than_the_donors_build_does_not_recycle_conservatively() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    let a_dir = repo.build_changed_and_remove(&a, false);
+    let main = repo.main();
+    set_mtimes(&main, an_hour_ago());
+
+    let output = repo.build_output(&main);
+    assert_eq!(leaf_says(&output.stdout, &main), LEAF_FROM_THE_COMMIT);
+    let built = units(&output.stdout);
+    assert_eq!(names(&built, false), ALL_UNITS, "cold: {built:?}");
+    assert_eq!(repo.recycled(), Vec::<Value>::new());
+    assert!(a_dir.is_dir(), "the orphan stays");
+}
+
+/// The daemon's look recycles precisely for a worktree made before a's
+/// last build: `leaf` is rebuilt from the worktree's own source at its
+/// first build.
+#[test]
+fn the_look_recycles_precisely_for_an_older_worktree_without_the_donors_code() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    let b = repo.add_worktree("b");
+    repo.build_changed_and_remove(&a, true);
+    set_mtimes(&b, an_hour_ago());
+    let ensure = repo
+        .heli(&repo.main(), &["ensure"])
+        .output()
+        .expect("run heli ensure");
+    assert_success(&ensure, "cargo heli ensure");
+    let recycled = wait_for("the recycle event", || {
+        let recycled = repo.recycled();
+        (!recycled.is_empty()).then_some(recycled)
+    });
+    assert_eq!(recycled[0]["trigger"], "look", "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
+
+    let output = repo.build_output(&b);
+    assert_eq!(
+        leaf_says(&output.stdout, &b),
+        LEAF_FROM_THE_COMMIT,
+        "{}",
+        repo.diagnosis(&b.join("leaf").join("src").join("lib.rs"))
+    );
+}
+
+impl Repo {
+    /// What a failing recycling test shows: the modification time of
+    /// `file`, the recycle events and the daemon's log.
+    fn diagnosis(&self, file: &Path) -> String {
+        let modified = std::fs::metadata(file)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| format!("{modified:?}"))
+            .unwrap_or_else(|error| error.to_string());
+        format!(
+            "{} modified {modified} (now {:?})\n--- recycle events\n{:?}\n--- the daemon's log\n{}",
+            file.display(),
+            std::time::SystemTime::now(),
+            self.recycled(),
+            self.fixture.daemon_log()
+        )
+    }
+}
+
+/// Without a record of the donor, the look does not recycle for a worktree
+/// made before a's last build; its first build is cold, from its own
+/// sources.
+#[test]
+fn the_look_does_not_recycle_conservatively_for_an_older_worktree() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    let b = repo.add_worktree("b");
+    let a_dir = repo.build_changed_and_remove(&a, false);
+    set_mtimes(&b, an_hour_ago());
+    let ensure = repo
+        .heli(&repo.main(), &["ensure"])
+        .output()
+        .expect("run heli ensure");
+    assert_success(&ensure, "cargo heli ensure");
+    repo.wait_for_first_look();
+    assert_eq!(repo.recycled(), Vec::<Value>::new());
+
+    let output = repo.build_output(&b);
+    assert_eq!(leaf_says(&output.stdout, &b), LEAF_FROM_THE_COMMIT);
+    let built = units(&output.stdout);
+    assert_eq!(names(&built, false), ALL_UNITS, "cold: {built:?}");
+    assert_eq!(repo.recycled(), Vec::<Value>::new());
+    assert!(a_dir.is_dir(), "the orphan stays");
+}
+
+/// Keeps anything from being written into the directory `dir` until
+/// dropped (what is in it can still be read): on Windows an entry of its
+/// DACL that denies the user adding files there, elsewhere its mode
+/// read-only.
+struct Unwritable {
+    #[cfg(windows)]
+    _denied: Denied,
+    #[cfg(unix)]
+    dir: PathBuf,
+}
+
+impl Unwritable {
+    fn new(dir: &Path) -> Self {
+        #[cfg(windows)]
+        let denied = Denied::new(dir, "WD,AD");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                .expect("make it read-only");
+        }
+        Self {
+            #[cfg(windows)]
+            _denied: denied,
+            #[cfg(unix)]
+            dir: dir.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unwritable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Denies the user, on Windows, the access rights `rights` (as `icacls`
+/// names them: `WA` to write attributes, `WD,AD` to add files to a
+/// directory) to `path` until dropped, by an entry of its DACL.
+#[cfg(windows)]
+struct Denied {
+    path: PathBuf,
+}
+
+#[cfg(windows)]
+impl Denied {
+    fn new(path: &Path, rights: &str) -> Self {
+        let entry = format!("*{}:({rights})", support::endpoint::current_user_sid());
+        let output = Command::new("icacls")
+            .arg(path)
+            .args(["/deny", &entry])
+            .output()
+            .expect("run icacls");
+        assert_success(&output, "icacls /deny");
+        Self {
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Denied {
+    fn drop(&mut self) {
+        let user = format!("*{}", support::endpoint::current_user_sid());
+        let _ = Command::new("icacls")
+            .arg(&self.path)
+            .args(["/remove:d", &user])
+            .output();
+    }
+}
+
+/// A recycler claims its donor before it moves it: the donor's owner
+/// manifest names the new workspace first, so no directory at a worktree's
+/// place ever names a removed worktree, which another recycler would take
+/// for an orphan and move away. A donor whose manifest no recycler can
+/// write (here, nothing can be written into its `.heli/`) is claimed by
+/// none: it stays where it was, the orphan of its removed worktree, until a
+/// recycler can claim it.
+#[test]
+fn a_donor_is_claimed_before_it_moves() {
+    let repo = Repo::new();
+    let b = repo.add_worktree("b");
+    let c = repo.add_worktree("c");
+    let gone = repo.fixture.workspace().join("gone");
+    let donor = repo.craft(
+        "c0000000000000",
+        "donor",
+        Some(manifest(&gone, Some(&repo.repository()), 1)),
+    );
+    let unwritable = Unwritable::new(&donor.join(".heli"));
+
+    let output = repo.recycle_in(&b);
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("cargo-heli: no build directory recycled: cannot claim "),
+        "{stderr}"
+    );
+    repo.recycle_in(&c);
+    assert_eq!(marker(&donor), "donor", "the donor stays where it was");
+    assert!(!named_build_dir(&repo, &b).exists(), "b got nothing");
+    assert!(!named_build_dir(&repo, &c).exists(), "c got nothing");
+    assert!(
+        owner(&donor).is_some_and(|owner| owner["workspace"]
+            .as_str()
+            .is_some_and(|path| Path::new(path) == gone)),
+        "it names its removed worktree still"
+    );
+
+    drop(unwritable);
+    repo.recycle_in(&c);
+    assert_eq!(marker(&repo.build_dir_of(&c)), "donor");
+    assert!(!named_build_dir(&repo, &b).exists(), "b got nothing");
+}
+
+/// A file of the new worktree that needs a time newer than the donor's last
+/// build and cannot get one (here its DACL denies the user setting its
+/// attributes) makes cargo rebuild every unit: precise recycling never
+/// leaves a file looking older than what was built from another content.
+#[cfg(windows)]
+#[test]
+fn a_file_that_cannot_get_a_newer_time_rebuilds_every_unit() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build_changed_and_remove(&a, true);
+    let main = repo.main();
+    set_mtimes(&main, an_hour_ago());
+    let held = Denied::new(&main.join("leaf").join("src").join("lib.rs"), "WA");
+    repo.recycle_in(&main);
+    drop(held);
+    let recycled = repo.recycled();
+    assert_eq!(recycled.len(), 1, "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
+
+    let output = repo.build_output(&main);
+    assert_eq!(leaf_says(&output.stdout, &main), LEAF_FROM_THE_COMMIT);
+    let built = units(&output.stdout);
+    assert_eq!(names(&built, false), ALL_UNITS, "{built:?}");
 }

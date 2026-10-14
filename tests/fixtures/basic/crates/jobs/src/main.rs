@@ -9,6 +9,10 @@
 //! - `JOBS_IDLE` names a file: once it exists, the workers give their slots
 //!   back and ask for no more, and the process lives on, idle.
 //! - `JOBS_STOP` names a file: it exits once that file exists.
+//! - `JOBS_LOG` names a file: each worker appends a line there as it starts
+//!   to hold a slot, `<pid>.<worker> start <ns>`, and one as it stops,
+//!   `<pid>.<worker> end <ns>` (nanoseconds since 1970), both while it holds
+//!   the slot, in `ConcurrencyLog`'s format (`tests/support`).
 //! - It exits after `JOBS_MAX_MS` (default 120000) in any case, so a test
 //!   that fails never leaves it behind for long.
 //!
@@ -47,17 +51,37 @@ fn main() {
         std::process::exit(2);
     };
     let idle = std::env::var_os("JOBS_IDLE");
-    for _ in 0..workers {
+    let log = std::env::var_os("JOBS_LOG");
+    for worker in 0..workers {
         let slots = Slots::open(&auth);
         let idle = idle.clone();
+        let log = log.clone();
         std::thread::spawn(move || {
             let idle = || idle.as_ref().is_some_and(|idle| Path::new(idle).exists());
+            let note = |event: &str| {
+                if let Some(log) = &log {
+                    use std::io::Write;
+                    let at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("a clock after 1970")
+                        .as_nanos();
+                    let line = format!("{}.{worker} {event} {at}\n", std::process::id());
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(log)
+                        .and_then(|mut file| file.write_all(line.as_bytes()))
+                        .expect("jobs: cannot write JOBS_LOG");
+                }
+            };
             loop {
                 slots.take();
+                note("start");
                 let held = Instant::now();
                 while held.elapsed() < hold && !idle() {
                     std::thread::sleep(hold.min(Duration::from_millis(20)));
                 }
+                note("end");
                 slots.give();
                 if idle() {
                     return;

@@ -359,20 +359,10 @@ mod unix {
     /// reaped).
     #[cfg(target_os = "macos")]
     pub fn members(session: Pid) -> Vec<Pid> {
-        use std::ffi::c_int;
-
         let session = session.as_raw_nonzero().get();
-        // SAFETY: with no buffer, only counts the processes.
-        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-        let Ok(count) = usize::try_from(count) else {
+        let Ok(pids) = crate::processes::pids() else {
             return Vec::new();
         };
-        // Room for processes started since.
-        let mut pids: Vec<libc::pid_t> = vec![0; count + 64];
-        let size = c_int::try_from(size_of_val(pids.as_slice())).unwrap_or(c_int::MAX);
-        // SAFETY: the buffer holds `size` bytes.
-        let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), size) };
-        pids.truncate(usize::try_from(count).unwrap_or(0));
         pids.into_iter()
             // SAFETY: `getsid` only queries.
             .filter(|&pid| pid > 0 && unsafe { libc::getsid(pid) } == session && !zombie(pid))

@@ -37,10 +37,10 @@ use std::sync::{Mutex, PoisonError};
 
 use serde_json::{Map, Value};
 
-use super::registry::RunId;
 use crate::clock;
 use crate::config::Config;
 use crate::locations::Locations;
+use crate::run_id::RunId;
 
 /// The size limit when the configuration sets none: 1 MB.
 pub const DEFAULT_MAX: u64 = 1 << 20;

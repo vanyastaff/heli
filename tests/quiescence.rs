@@ -6,7 +6,9 @@
 //! session), not only this test's: compilers that other tests or programs
 //! run keep the top-up waiting too. So this test has a binary of its own,
 //! which `cargo test` runs alone; where other compilers run meanwhile, it
-//! still passes, but proves less.
+//! still passes, but proves less. A `cargo` counts too, and `cargo test`
+//! itself runs while the tests do: there, only the case of `cargo` tells a
+//! scan that sees it from one that does not.
 
 mod support;
 
@@ -33,9 +35,10 @@ fn sample(fixture: &Fixture, available_mb: u64) -> Value {
 }
 
 /// A slot lost by a process that died stays lost while another process
-/// holds the pool and a `rustc`, `rustdoc`, `clippy-driver` or build script
-/// runs: each may run a job whose slot will come back. Once nothing else
-/// holds the pool, it comes back.
+/// holds the pool and a `rustc`, `rustdoc`, `clippy-driver`, build script or
+/// `cargo` runs: each may run a job whose slot will come back, and a cargo
+/// may hold a slot it took for a job it has not started yet (#26). Once
+/// nothing else holds the pool, it comes back.
 #[test]
 fn a_top_up_waits_while_anything_compiles() {
     let fixture = Fixture::new("basic");
@@ -50,7 +53,13 @@ fn a_top_up_waits_while_anything_compiles() {
     assert_eq!(fixture.status()["pool"], pool(2, 1, 0, 1));
 
     let mut available = 40_000;
-    for name in ["rustc", "rustdoc", "clippy-driver", "build-script-build"] {
+    for name in [
+        "rustc",
+        "rustdoc",
+        "clippy-driver",
+        "build-script-build",
+        "cargo",
+    ] {
         let program = fixture.path(&format!("{name}{}", std::env::consts::EXE_SUFFIX));
         std::fs::copy(&echo, &program).expect("copy echo-args");
         let gate = fixture.path(&format!("{name}.gate"));

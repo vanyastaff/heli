@@ -21,16 +21,16 @@
 //!   `config` cargo reads, by content;
 //! - the environment ([`environment`]): every variable but the neutral ones.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
-use crate::daemon::execute;
 use crate::protocol::RunRequest;
-use crate::worktree;
+use crate::{environment, worktree};
 
 /// Raised when what goes into the key, or how, changes, so that markers of
 /// another composition never match.
@@ -54,7 +54,7 @@ pub struct Key {
 /// repository, where runs are not keyed. `scratch` is a directory for
 /// scratch files.
 pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, String> {
-    let cwd = execute::cwd(request);
+    let cwd = request.cwd();
     let worktree = worktree::of(&cwd);
     if !worktree.join(".git").exists() {
         return Ok(None);
@@ -81,7 +81,7 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
 /// as `git write-tree` names it.
 pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String> {
     let git = |args: &[&str], index: Option<&Path>| git(request, args, index);
-    let tree = staged(&git, &execute::cwd(request), scratch, |index| {
+    let tree = staged(&git, &request.cwd(), scratch, |index| {
         git(&["write-tree"], Some(index))
     })?;
     Ok(Snapshot { tree: trim(tree) })
@@ -185,7 +185,7 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
         .argv
         .first()
         .map_or(OsStr::new("cargo"), |program| &program.0);
-    let rustc = var(request, "RUSTC").unwrap_or(OsStr::new("rustc"));
+    let rustc = request.var("RUSTC").unwrap_or(OsStr::new("rustc"));
     let mut args = request.argv.iter().skip(1).map(|arg| arg.0.as_os_str());
     let mut subcommand = args.next();
     let pinned = subcommand.filter(|first| first.as_encoded_bytes().starts_with(b"+"));
@@ -222,17 +222,27 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
 /// order cargo reads it: `.cargo/config.toml` and `.cargo/config` in the
 /// working directory and every directory above it, nearest first, then in
 /// the Cargo home. Their paths are not keyed, so worktrees in different
-/// places share a key.
+/// places share a key. A file that is there but cannot be read is keyed by
+/// its error, never as absent: cargo may fail on it.
 fn cargo_config(request: &RunRequest, fields: &mut Fields) {
-    let cwd = execute::cwd(request);
+    let cwd = request.cwd();
     let dirs = cwd
         .ancestors()
         .map(|dir| ("cargo-config", dir.join(".cargo")))
         .chain(cargo_home(request, &cwd).map(|home| ("cargo-home-config", home)));
     for (place, dir) in dirs {
         for file in ["config.toml", "config"] {
-            if let Ok(content) = std::fs::read(dir.join(file)) {
-                fields.push(format!("{place} {file}").as_bytes(), &content);
+            match std::fs::read(dir.join(file)) {
+                Ok(content) => fields.push(format!("{place} {file}").as_bytes(), &content),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => fields.push(
+                    format!("unreadable {place} {file}").as_bytes(),
+                    format!("{:?} {:?}", error.kind(), error.raw_os_error()).as_bytes(),
+                ),
             }
         }
     }
@@ -266,13 +276,10 @@ fn environment(request: &RunRequest, worktree: &Path, fields: &mut Fields) {
     }
 }
 
-/// `name` as the key holds it: upper-cased on Windows.
+/// `name` as the key holds it: upper-cased on Windows
+/// (`environment::folded`).
 fn folded(name: &OsStr) -> Vec<u8> {
-    let mut name = name.as_encoded_bytes().to_vec();
-    if cfg!(windows) {
-        name.make_ascii_uppercase();
-    }
-    name
+    environment::folded(name).as_encoded_bytes().to_vec()
 }
 
 /// The program and library search paths.
@@ -305,12 +312,19 @@ fn outside(value: &OsStr, worktree: &Path) -> Vec<u8> {
 }
 
 /// `path` for comparing places: `/` as the separator, no trailing one, and
-/// on Windows without case.
+/// on Windows, where `\` separates too, without case. Elsewhere `\` is a
+/// character of a name like any other.
 fn spelled(path: &OsStr) -> Vec<u8> {
     let mut bytes: Vec<u8> = path
         .as_encoded_bytes()
         .iter()
-        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .map(|&byte| {
+            if cfg!(windows) && byte == b'\\' {
+                b'/'
+            } else {
+                byte
+            }
+        })
         .collect();
     while bytes.len() > 1 && bytes.last() == Some(&b'/') {
         bytes.pop();
@@ -337,7 +351,7 @@ fn spelled(path: &OsStr) -> Vec<u8> {
 /// - locations whose content is keyed elsewhere: `CARGO_HOME` (its
 ///   configuration), `CARGO_TARGET_DIR` (the outputs) and `RUSTUP_*` (the
 ///   toolchain they select, keyed by its versions);
-/// - shell bookkeeping (`PWD`, `OLDPWD`, `SHLVL`, `_`);
+/// - shell bookkeeping (`environment::SHELL_BOOKKEEPING`);
 /// - per-session identifiers of terminals and agent harnesses.
 fn neutral(name: &[u8], value: &OsStr) -> bool {
     let Ok(name) = std::str::from_utf8(name) else {
@@ -346,7 +360,7 @@ fn neutral(name: &[u8], value: &OsStr) -> bool {
     if let Some(valid) = valid_count(name, value) {
         return valid;
     }
-    const NAMES: [&str; 25] = [
+    const NAMES: [&str; 21] = [
         "CARGO_MAKEFLAGS",
         "CARGO",
         "CARGO_MANIFEST_DIR",
@@ -358,10 +372,6 @@ fn neutral(name: &[u8], value: &OsStr) -> bool {
         "CARGO_TARGET_TMPDIR",
         "CARGO_HOME",
         "CARGO_TARGET_DIR",
-        "PWD",
-        "OLDPWD",
-        "SHLVL",
-        "_",
         "WT_SESSION",
         "WT_PROFILE_ID",
         "TERM_SESSION_ID",
@@ -381,7 +391,9 @@ fn neutral(name: &[u8], value: &OsStr) -> bool {
         "RUSTUP_",
         "CLAUDE_",
     ];
-    NAMES.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    NAMES.contains(&name)
+        || environment::SHELL_BOOKKEEPING.contains(&name)
+        || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 
 /// For a job or thread count variable, whether `value` is a count its tool
@@ -408,32 +420,14 @@ fn valid_count(name: &str, value: &OsStr) -> Option<bool> {
 /// The Cargo home as cargo finds it for the run: `CARGO_HOME` (relative to
 /// the working directory), else `.cargo` in the user's home.
 fn cargo_home(request: &RunRequest, cwd: &Path) -> Option<PathBuf> {
-    if let Some(home) = var(request, "CARGO_HOME").filter(|home| !home.is_empty()) {
+    if let Some(home) = request.var("CARGO_HOME").filter(|home| !home.is_empty()) {
         return Some(cwd.join(home));
     }
     let user = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
-    var(request, user)
+    request
+        .var(user)
         .filter(|home| !home.is_empty())
         .map(|home| Path::new(home).join(".cargo"))
-}
-
-/// The client's variable `name` (ignoring case on Windows, as there).
-fn var<'a>(request: &'a RunRequest, name: &str) -> Option<&'a OsStr> {
-    request
-        .env
-        .iter()
-        .find(|(candidate, _)| same_name(&candidate.0, name))
-        .map(|(_, value)| value.0.as_os_str())
-}
-
-#[cfg(windows)]
-fn same_name(name: &OsString, other: &str) -> bool {
-    name.eq_ignore_ascii_case(other)
-}
-
-#[cfg(not(windows))]
-fn same_name(name: &OsString, other: &str) -> bool {
-    name == other
 }
 
 /// `git <args>` as the client would run it, with `index` as the index when
@@ -467,16 +461,8 @@ fn tool<A: AsRef<OsStr>>(
     program: &OsStr,
     args: impl IntoIterator<Item = A>,
 ) -> Command {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(execute::cwd(request))
-        .env_clear()
-        .envs(request.env.iter().map(|(name, value)| (&name.0, &value.0)))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    command
+    let env = request.env.iter().map(|(name, value)| (&name.0, &value.0));
+    environment::command(program, args, &request.cwd(), env)
 }
 
 /// `bytes` without trailing whitespace.

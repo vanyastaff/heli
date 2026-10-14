@@ -49,14 +49,48 @@ pub enum Access {
     Exclusive,
 }
 
+/// The tool that runs a test run's tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runner {
+    /// `cargo test` (`t`): libtest, its arguments after `--`.
+    Libtest,
+    /// `cargo nextest run` (`nextest r`).
+    Nextest,
+}
+
+/// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
+/// rustup's cargo takes it), and the arguments after it.
+pub fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
+    let args = match args.first() {
+        Some(first) if first.to_string_lossy().starts_with('+') => &args[1..],
+        _ => args,
+    };
+    args.split_first()
+}
+
+/// For a test run `cargo <args>`: the tool that runs its tests, and how
+/// many of `args` name the toolchain and the subcommand (`test`, or
+/// `nextest run`), before the tool's own arguments. `None` for any other
+/// command.
+pub fn test_runner(args: &[OsString]) -> Option<(Runner, usize)> {
+    let (subcommand, rest) = subcommand(args)?;
+    let at = args.len() - rest.len();
+    match subcommand.to_str()? {
+        "test" | "t" => Some((Runner::Libtest, at)),
+        "nextest" if rest.first().is_some_and(|run| run == "run" || run == "r") => {
+            Some((Runner::Nextest, at + 1))
+        }
+        _ => None,
+    }
+}
+
 impl Class {
     /// The class of `cargo <args>`, `args` starting with the subcommand.
     pub fn of_cargo(args: &[OsString]) -> Self {
-        let args = match args.first() {
-            Some(first) if first.to_string_lossy().starts_with('+') => &args[1..],
-            _ => args,
-        };
-        let Some((subcommand, rest)) = args.split_first() else {
+        if test_runner(args).is_some() {
+            return Self::Test;
+        }
+        let Some((subcommand, rest)) = subcommand(args) else {
             return Self::Exec;
         };
         let before_separator = || rest.iter().take_while(|arg| *arg != "--");
@@ -67,8 +101,6 @@ impl Class {
             "clippy" => Self::Verify,
             "fmt" if rest.iter().any(|arg| arg == "--check") => Self::Verify,
             "fmt" | "fix" => Self::Mutate,
-            "test" | "t" => Self::Test,
-            "nextest" if rest.first().is_some_and(|run| run == "run" || run == "r") => Self::Test,
             _ => Self::Exec,
         }
     }

@@ -20,10 +20,13 @@
 //! - [`Request::Status`]: one [`Reply::Status`].
 //! - [`Request::Run`]: [`Reply::Refused`] (the client then runs the command
 //!   itself), or [`Reply::Started`], then [`Reply::Waiting`] if the run
-//!   has to wait for its worktree's lock, then output frames in the order
-//!   the run wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`].
-//!   The daemon sends `Started` before it starts anything, so a client that
-//!   never sees it can safely run the command itself. Either before
+//!   has to wait for its worktree's lock, then [`Reply::Spawned`] once its
+//!   command has started (to a client that reads it, and then `Started`
+//!   says it follows), then output frames in the order the run wrote them,
+//!   then [`Reply::Exited`] or [`Reply::SpawnFailed`]. The daemon sends
+//!   `Started` before it starts anything, so a client that never sees it can
+//!   safely run the command itself, and so can one told that `Spawned`
+//!   follows, until it sees that. Either before
 //!   `Started` or in place of the output, [`Reply::Passed`] ends the run
 //!   without starting it: the result store holds a pass for its key. A
 //!   client that sends no [`RunRequest::class`] predates the worktree lock
@@ -47,20 +50,26 @@
 //! **Changes.** The version stays 1 until the first release. Until then a
 //! new request needs no new version: older daemons answer it with
 //! `Unsupported`. Fields are only added, with defaults, so that both sides
-//! read each other's messages. A change that breaks that raises
-//! [`VERSION`].
+//! read each other's messages, and a value a newer side adds to an enum
+//! reads as unknown on an older one: a reply ([`Reply::Unknown`], which a
+//! client following a run skips), a run's phase or class in a status
+//! (`crate::status`). A daemon sends a new reply only to a client that
+//! says it reads it. A change that breaks that raises [`VERSION`].
 //!
 //! JSON (serde, serde_json) keeps messages readable and easy to extend for
 //! the requests later tickets add; output stays raw bytes in frames of its
 //! own, since it need not be UTF-8.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::environment;
+use crate::run_id::RunId;
 use crate::runlog::select::Select;
 use crate::status::{self, Status};
 
@@ -120,14 +129,16 @@ pub enum Request {
 /// The run to cancel.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CancelRequest {
-    /// `r<number>`.
+    /// `r<number>`, as the client was given it: the daemon answers one
+    /// that is not a run id as a run it does not know, and never takes it
+    /// for a request it does not know.
     pub run: String,
 }
 
 /// The run whose record to send, and which part of it.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LogRequest {
-    /// `r<number>`.
+    /// `r<number>`, as for [`CancelRequest::run`].
     pub run: String,
     pub select: Select,
 }
@@ -148,6 +159,32 @@ pub struct RunRequest {
     /// no result store.
     #[serde(default)]
     pub cache: Cache,
+    /// The client reads [`Reply::Spawned`]; absent (false) from a client
+    /// older than it, which is never sent one.
+    #[serde(default)]
+    pub reads_spawned: bool,
+}
+
+impl RunRequest {
+    /// The command line, program first.
+    pub fn argv(&self) -> Vec<OsString> {
+        self.argv.iter().map(|arg| arg.0.clone()).collect()
+    }
+
+    /// The working directory.
+    pub fn cwd(&self) -> PathBuf {
+        PathBuf::from(&self.cwd.0)
+    }
+
+    /// The client's variable `name`, by the platform's rule for names (on
+    /// Windows without case); the last one given, should there be two.
+    pub fn var(&self, name: &str) -> Option<&OsStr> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(candidate, _)| environment::same_name(&candidate.0, name))
+            .map(|(_, value)| value.0.as_os_str())
+    }
 }
 
 /// How a run uses the result store (`crate::daemon::results`).
@@ -163,6 +200,24 @@ pub enum Cache {
     Refresh,
 }
 
+impl Cache {
+    /// How a run of `class`, `cargo <args>`, uses the store, as the client
+    /// decides: verify and test runs look it up and are recorded (with
+    /// `no_cache`, only recorded), the result-store column of the class
+    /// table (`crate::class`). A request for help (`-h` or `--help`,
+    /// cargo's or, after `--`, the test runner's) is no verdict, so it does
+    /// not use it. `exec` is opt-in, and nothing opts in yet.
+    pub fn of(class: Class, args: &[OsString], no_cache: bool) -> Self {
+        let help = args.iter().any(|arg| arg == "-h" || arg == "--help");
+        match class {
+            Class::Verify | Class::Test if help => Self::Off,
+            Class::Verify | Class::Test if no_cache => Self::Refresh,
+            Class::Verify | Class::Test => Self::On,
+            Class::Compile | Class::Mutate | Class::Exec => Self::Off,
+        }
+    }
+}
+
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -170,7 +225,7 @@ pub enum Reply {
     /// ends; or, with `attached`, the same run was already in flight as
     /// `run`, and the client follows that run from its start.
     Started {
-        run: String,
+        run: RunId,
         /// For an attached client: how long the run had been going, in
         /// milliseconds.
         #[serde(default)]
@@ -180,12 +235,22 @@ pub enum Reply {
         /// than the client's.
         #[serde(default)]
         keyed_in: Option<Text>,
+        /// [`Reply::Spawned`] will say when the run's command has started:
+        /// until then, a client that loses the daemon may run the command
+        /// itself. Absent (false) from a daemon older than `Spawned`, and
+        /// for a client that does not read it.
+        #[serde(default)]
+        spawned_follows: bool,
     },
     /// The run waits for these runs, which use its worktree, before it
     /// starts (the worktree lock).
     Waiting {
         runs: Vec<status::Run>,
     },
+    /// The run's command has started (the first process of its first
+    /// phase): from here on its client never runs it itself. Sent only to a
+    /// client whose request [`RunRequest::reads_spawned`].
+    Spawned,
     /// The daemon takes no runs (it is retiring); nothing was started.
     Refused {
         reason: String,
@@ -194,7 +259,7 @@ pub enum Reply {
     /// `run` is the run that passed, in `worktree`, at `at` (seconds since
     /// 1970).
     Passed {
-        run: String,
+        run: RunId,
         worktree: Text,
         at: u64,
     },
@@ -227,6 +292,12 @@ pub enum Reply {
     CancelFailed {
         message: String,
     },
+    /// A message of a newer daemon's that this build does not know (a
+    /// variant it lacks, or one whose fields it cannot read). Never sent.
+    /// A client following a run skips it; elsewhere it is an answer the
+    /// client did not expect.
+    #[serde(untagged, skip_serializing)]
+    Unknown(serde::de::IgnoredAny),
 }
 
 impl Reply {
