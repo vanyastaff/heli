@@ -16,7 +16,9 @@
 //!
 //! Sizes are file lengths. Links are never followed, so a symlink or
 //! junction counts nothing; a hard link counts wherever it is, so a final
-//! artifact cargo hardlinked out of the build directory counts in both.
+//! artifact cargo hardlinked out of the build directory counts in both. A
+//! `target/` directory's trash (`.heli-trash/`, `super::trash`) counts
+//! nothing: it is on its way out.
 
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
@@ -115,6 +117,10 @@ pub fn scan(root: &Path, tool_caches: &[String]) -> Sizes {
             let Ok(kind) = entry.file_type() else {
                 continue;
             };
+            // A `target/` directory's trash is on its way out.
+            if dir == root && entry.file_name() == super::trash::TARGET_TRASH {
+                continue;
+            }
             let place = match &place {
                 Err(category) => Err(*category),
                 Ok(above) => {
@@ -167,7 +173,7 @@ fn category(components: &[String], patterns: &[Vec<&str>]) -> Option<Category> {
 
 /// Whether `text` matches `pattern`: `*` matches any run of characters,
 /// `?` any one.
-fn glob(pattern: &str, text: &str) -> bool {
+pub fn glob(pattern: &str, text: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let text: Vec<char> = text.chars().collect();
     // The positions in `pattern` reachable after each character of `text`.

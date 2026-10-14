@@ -24,12 +24,15 @@
 //!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
 //!           "attached_clients":0,"ended_at":1791911050,
 //!           "exit":{"code":101,"signal":null,"cancelled":false}}],
-//!  "disk":{"stores":[{"path":"D:\\.heli\\build","budget":null,"used":1000,
+//!  "disk":{"stores":[{"path":"D:\\.heli\\build","budget":1200,"used":1000,
 //!                     "by_category":{"incremental":600,"deps":300,"build_scripts":50,
 //!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
 //!          "targets":[{"path":"D:\\work\\agent-a64b\\target","used":120,
 //!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
-//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]}}
+//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]},
+//!  "last_gc":{"at":1791911000,
+//!             "evicted":[{"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
+//!                         "tier":1,"bytes":300}]}}
 //! ```
 //!
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
@@ -44,9 +47,12 @@
 //!
 //! `disk` is the build store as the daemon last counted it
 //! (`crate::daemon::accounts`): each store's bytes in use, by category
-//! (`crate::store::sizes`), and its `budget` (`null`: no budget yet); and
-//! each registered `target/` directory's. It is `null` when no daemon
-//! answers, or one older than the build store.
+//! (`crate::store::sizes`), and the `budget` all of them and the registered
+//! `target/` directories share (`null`: no budget); and each registered
+//! `target/` directory's. It is `null` when no daemon answers, or one older
+//! than the build store. `last_gc` is the daemon's last eviction pass that
+//! evicted anything (DESIGN.md §6.3): when, and each victim's `path`, `tier`
+//! and `bytes`; `null` before the first.
 
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +76,26 @@ pub struct Status {
     /// Absent from a daemon older than the build store.
     #[serde(default)]
     pub disk: Option<Disk>,
+    /// The daemon's last eviction pass that evicted anything; absent from a
+    /// daemon older than eviction.
+    #[serde(default)]
+    pub last_gc: Option<LastGc>,
+}
+
+/// An eviction pass of the daemon's (`crate::store::evict`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LastGc {
+    pub at: u64,
+    pub evicted: Vec<Evicted>,
+}
+
+/// A victim the daemon evicted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Evicted {
+    pub path: String,
+    /// Its rung of the ladder, 1 to 5.
+    pub tier: u8,
+    pub bytes: u64,
 }
 
 /// The disk the build store takes.
@@ -86,7 +112,8 @@ pub struct Disk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoreUse {
     pub path: String,
-    /// The bytes the store may take; `None` until budgets exist.
+    /// B, the budget every store and registered `target/` directory share
+    /// (`[store] budget_mb`), in bytes; `None` without one.
     pub budget: Option<u64>,
     pub used: u64,
     pub by_category: Sizes,
@@ -239,6 +266,7 @@ impl Status {
             memory: None,
             runs: Vec::new(),
             disk: None,
+            last_gc: None,
         }
     }
 
@@ -322,6 +350,15 @@ impl Status {
                 ));
                 label = "";
             }
+        }
+        if let Some(gc) = &self.last_gc {
+            let freed = gc.evicted.iter().map(|evicted| evicted.bytes).sum();
+            text.push_str(&format!(
+                "gc      {}s ago: evicted {}, {}\n",
+                age(gc.at),
+                gc.evicted.len(),
+                sizes::human(freed)
+            ));
         }
         text
     }

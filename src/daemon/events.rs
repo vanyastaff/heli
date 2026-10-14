@@ -1,5 +1,6 @@
-//! The daemon's event log (DESIGN.md §8): what it decided about runs and
-//! the host pool, one JSON object per line, for people and tools.
+//! The daemon's event log (DESIGN.md §8): what it decided about runs, the
+//! host pool and the build store, one JSON object per line, for people and
+//! tools.
 //!
 //! Each event has `at` (seconds since 1970, UTC) and `event`, then fields of
 //! its own:
@@ -19,7 +20,10 @@
 //!   the build directory's path now, `donor` and `from`, the removed
 //!   workspace and the path it had, and `invalidated`, the units whose
 //!   fingerprints the path scan deleted. The hook writes its event itself,
-//!   to the log of its logon session's daemon.
+//!   to the log of its logon session's daemon;
+//! - `evict`: an eviction pass (the daemon's, or `cargo heli gc`'s, which
+//!   writes to the same log) renamed a victim into the trash
+//!   (`crate::store::evict`): `tier`, `path`, `bytes` and `reason`.
 //!
 //! It is `events.log` in the state directory (`events-<session>.log` on
 //! Windows). Past its size limit it rotates: it becomes `<name>.1`, replacing

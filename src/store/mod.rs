@@ -11,13 +11,26 @@
 //! writable, so the default there is the user's cache,
 //! `$XDG_CACHE_HOME/heli/build` (else `~/.cache/heli/build`), when it is on
 //! that volume, and `<volume>/.heli/build` otherwise.
+//!
+//! **Accounting** ([`survey`], [`Dir`], [`owner`], [`registry`], [`sizes`]):
+//! every directory the store accounts for, whose it is, its state and its
+//! sizes by category.
+//!
+//! **Eviction** (DESIGN.md §6.3): the [`ladder`] says what to evict over
+//! the budget or under the floor, an [`evict`] pass renames it into the
+//! [`trash`] under cargo's locks, and the trash is deleted afterwards. An
+//! [`orphan`] counts as unclaimed from the first pass that finds it.
 
+pub mod evict;
+pub mod ladder;
+pub mod orphan;
 pub mod owner;
 pub mod probe;
 pub mod recycle;
 pub mod registry;
 pub mod scan;
 pub mod sizes;
+pub mod trash;
 pub mod volume;
 
 use std::fs::{File, TryLockError};
@@ -99,7 +112,9 @@ impl Dir {
     }
 
     /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
-    /// a removed worktree can leave files behind.
+    /// a removed worktree can leave files behind. (Eviction also counts a
+    /// directory of an unknown lock layout busy while it changed within the
+    /// hour: [`busy_for_eviction`].)
     pub fn state(&self) -> State {
         if busy(&self.path) {
             return State::Busy;
@@ -205,26 +220,84 @@ fn is_real_dir(path: &Path) -> bool {
 /// directories cannot be taken. heli only tries the locks, never waits for
 /// them, and lets go at once.
 pub fn busy(dir: &Path) -> bool {
-    subdirs(dir)
-        .iter()
-        .any(|profile| held(profile) || subdirs(profile).iter().any(|profile| held(profile)))
+    lock_dirs(dir).iter().any(|profile| held(profile))
+}
+
+/// Whether eviction counts `dir` busy at `now` (seconds since 1970): a
+/// cargo builds in it ([`busy`]), or its lock layout is unknown and it
+/// changed within the last [`RECENT`] seconds.
+///
+/// **Unknown layout.** Lock names change between cargo versions. A profile
+/// directory that holds cargo's intermediates (`deps/`, `incremental/`,
+/// `.fingerprint/`, `build/`) but none of the [`LOCKS`] was laid out by a
+/// cargo heli does not know.
+pub fn busy_for_eviction(dir: &Path, now: u64) -> bool {
+    let profiles = lock_dirs(dir);
+    profiles.iter().any(|profile| held(profile))
+        || (unknown_layout(&profiles) && recently_changed(dir, now))
+}
+
+/// Within this many seconds, a change makes a directory of an unknown lock
+/// layout busy for eviction: an hour.
+pub const RECENT: u64 = 3600;
+
+/// Whether anything in `dir` changed within [`RECENT`] seconds of `now`.
+pub fn recently_changed(dir: &Path, now: u64) -> bool {
+    ladder::measure(dir)
+        .newest
+        .is_some_and(|newest| newest.saturating_add(RECENT) > now)
+}
+
+/// Whether one of `profiles` holds intermediates but none of the [`LOCKS`].
+pub fn unknown_layout(profiles: &[PathBuf]) -> bool {
+    const INTERMEDIATES: [&str; 4] = ["deps", "incremental", ".fingerprint", "build"];
+    profiles.iter().any(|profile| {
+        INTERMEDIATES.iter().any(|name| profile.join(name).is_dir())
+            && !LOCKS.iter().any(|name| profile.join(name).is_file())
+    })
+}
+
+/// The directories of `dir` where cargo's [`LOCKS`] can be: its
+/// subdirectories (profile directories), and theirs (a target triple's),
+/// never through a link.
+pub fn lock_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for profile in subdirs(dir) {
+        dirs.extend(subdirs(&profile));
+        dirs.push(profile);
+    }
+    dirs
 }
 
 /// Whether one of the [`LOCKS`] in `profile` is held.
 fn held(profile: &Path) -> bool {
-    LOCKS.iter().any(|name| {
-        let file = match File::open(profile.join(name)) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
-            // A lock heli cannot even open, it cannot prove free.
-            Err(_) => return true,
-        };
-        // Taken, it is let go as `file` closes, at once.
-        match file.try_lock() {
-            Ok(()) => false,
-            Err(TryLockError::WouldBlock | TryLockError::Error(_)) => true,
-        }
-    })
+    LOCKS
+        .iter()
+        .any(|name| matches!(try_lock(&profile.join(name)), Lock::Held))
+}
+
+/// One of cargo's lock files, as heli tried it.
+pub enum Lock {
+    /// There is none.
+    Absent,
+    /// Taken by heli until the file closes.
+    Taken(File),
+    /// Someone holds it, or heli cannot even open it, so it cannot prove it
+    /// free.
+    Held,
+}
+
+/// Tries to take the lock file at `path` exclusively, without waiting.
+pub fn try_lock(path: &Path) -> Lock {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Lock::Absent,
+        Err(_) => return Lock::Held,
+    };
+    match file.try_lock() {
+        Ok(()) => Lock::Taken(file),
+        Err(TryLockError::WouldBlock | TryLockError::Error(_)) => Lock::Held,
+    }
 }
 
 /// The template cargo replaces with a hash of the workspace's manifest path.

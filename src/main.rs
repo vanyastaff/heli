@@ -17,8 +17,9 @@
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
-//! - [`store`]: the build store, [`gc`], which lists its directories, and
-//!   [`recycle`], which git's `post-checkout` hook runs;
+//! - [`store`]: the build store and its eviction ladder, [`gc`], which lists
+//!   its directories and evicts, and [`recycle`], which git's
+//!   `post-checkout` hook runs;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
 //!   draw from the pool, cargo's `build-dir` in the build [`store`], and the
 //!   [`autostart`] registration that starts the daemon at logon;

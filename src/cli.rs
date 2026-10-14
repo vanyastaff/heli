@@ -38,7 +38,8 @@ pub enum Action {
     Log { run: String, select: Select },
     /// Kill run `run` (`r<number>`) with every process it started.
     Cancel { run: String },
-    /// List the build store's directories (`dry_run`), as JSON with `json`.
+    /// List the build store's directories and evict what the ladder says,
+    /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
     /// Give the worktree here a removed worktree's build directory, as
     /// git's `post-checkout` hook asks.
@@ -169,14 +170,16 @@ enum Command {
         #[arg(value_parser = parse_run)]
         run: String,
     },
-    /// List every directory of the build store, with its state; nothing is
-    /// deleted yet.
+    /// List every directory of the build store, with its state, and evict
+    /// what the ladder chooses when the store is over its budget or a
+    /// volume under its floor.
     Gc {
-        /// Only list what gc would look at, and delete nothing.
+        /// Only list the directories and the victims, each with its tier
+        /// and reason, and delete nothing.
         #[arg(long)]
         dry_run: bool,
         /// Print the versioned JSON document instead of text.
-        #[arg(long, requires = "dry_run")]
+        #[arg(long)]
         json: bool,
     },
     /// Give the worktree here the build directory of a removed worktree of
