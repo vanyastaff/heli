@@ -74,10 +74,27 @@ pub fn repository(dir: &Path) -> Result<PathBuf, String> {
     // git writes `/` between components on Windows too.
     let native = |path: &str| Path::new(path).components().collect::<PathBuf>();
     let common = native(common);
-    Ok(match common.parent() {
+    let main = match common.parent() {
         Some(main) if common.file_name().is_some_and(|name| name == ".git") => main.to_path_buf(),
         _ => native(toplevel),
-    })
+    };
+    Ok(spelled_as(&main, dir))
+}
+
+/// `path` as `dir` spells it when `dir` is inside it (git resolves links,
+/// such as macOS's `/var` to `/private/var`, which people do not write).
+fn spelled_as(path: &Path, dir: &Path) -> PathBuf {
+    let (Ok(real_path), Ok(real_dir)) = (std::fs::canonicalize(path), std::fs::canonicalize(dir))
+    else {
+        return path.to_path_buf();
+    };
+    let Ok(below) = real_dir.strip_prefix(&real_path) else {
+        return path.to_path_buf();
+    };
+    let up = below.components().count();
+    dir.ancestors()
+        .nth(up)
+        .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
 }
 
 /// The user's Cargo home: `CARGO_HOME` (relative to `cwd`), else `.cargo`

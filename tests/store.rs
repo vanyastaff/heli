@@ -729,6 +729,43 @@ fn status_shows_disk_use_per_store() {
     );
 }
 
+/// A store that is not an absolute path, or a tool-cache pattern that does
+/// not stay below `target/`, makes the configuration unusable: `gc` says
+/// so, and setup offers no `build-dir`.
+#[test]
+fn a_store_configuration_heli_cannot_use_is_refused() {
+    let fixture = Fixture::new("basic");
+    for (config, says) in [
+        ("[store]\npaths = ['relative/store']\n", "store.paths"),
+        (
+            "[store]\ntool-caches = [\"../outside\"]\n",
+            "store.tool-caches",
+        ),
+        ("[store]\ntool-caches = [\"\"]\n", "store.tool-caches"),
+    ] {
+        fixture.configure(config);
+        let output = fixture
+            .heli(["gc", "--dry-run"])
+            .output()
+            .expect("run heli gc --dry-run");
+        assert_eq!(output.status.code(), Some(1), "{config}: {output:?}");
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains(says), "{config}: {stderr}");
+
+        let output = fixture
+            .setup(None, ["--print"])
+            .output()
+            .expect("run heli setup --print");
+        assert_success(&output, "cargo heli setup --print");
+        let stdout = text(&output.stdout);
+        assert!(
+            stdout.contains("Build store: none offered") && stdout.contains(says),
+            "{config}: {stdout}"
+        );
+        assert!(!stdout.contains("build-dir = "), "{stdout}");
+    }
+}
+
 /// The owner manifest of `workspace`'s build directory in `store`.
 fn find_owner(store: &Path, workspace: &Path) -> Value {
     let workspace = canonical(workspace);
