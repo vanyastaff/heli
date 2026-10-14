@@ -1000,7 +1000,9 @@ selector picks a part of it:
 
 - **The record** is `runs/<run>.log` in the state directory. The daemon
   writes it as the output arrives, whether or not a client still listens,
-  so `log` shows a run in flight up to now. It is a sequence of numbered
+  so `log` shows a run in flight up to now; a run `status` lists before its
+  command starts (waiting for its turn) shows nothing yet, not "no such
+  run". It is a sequence of numbered
   events, each the bytes one read of the run's stdout or stderr returned, in
   the order the daemon received them: exact within each stream, and across
   the two as close as two pipes allow. Selectors work on lines: one stream's

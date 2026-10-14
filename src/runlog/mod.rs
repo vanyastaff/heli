@@ -375,6 +375,17 @@ pub fn read(dir: &Path, run: &str, select: &Select, out: &mut Out<'_>) -> Result
     select::apply(select, run, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
 }
 
+/// Writes what `select` picks from a record without output to `out`: that
+/// of a run listed before its record begins (it waits for its turn), which
+/// has printed nothing yet.
+pub fn read_unstarted(run: &str, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
+    let events = Events {
+        reader: None,
+        next: 0,
+    };
+    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
+}
+
 /// The number of run id `run` (`r<number>`).
 pub fn run_number(run: &str) -> Option<u64> {
     let digits = run.strip_prefix('r')?;
