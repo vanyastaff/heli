@@ -845,6 +845,28 @@ pub fn without_footer(stderr: &[u8]) -> String {
     String::from_utf8_lossy(&split_footer(stderr).0).into_owned()
 }
 
+/// Copies the program at `from` to `to`, to run it from there.
+///
+/// On Unix another process (`cp`) writes the copy. Written here, the copy
+/// would be open for writing in this process for a moment, and a child
+/// that another test's thread forks in that moment holds it open until it
+/// executes its own program: running the copy then fails with "Text file
+/// busy" (`ETXTBSY`).
+pub fn copy_program(from: &Path, to: &Path) {
+    if cfg!(unix) {
+        let copied = Command::new("cp")
+            .arg("--")
+            .arg(from)
+            .arg(to)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run cp");
+        assert_success(&copied, &format!("cp {} {}", from.display(), to.display()));
+    } else {
+        std::fs::copy(from, to).unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
+    }
+}
+
 /// The `cargo-heli` binary under test.
 pub fn heli_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_cargo-heli"))

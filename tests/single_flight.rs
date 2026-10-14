@@ -83,7 +83,7 @@ impl Twins {
         std::fs::create_dir_all(&tools).expect("create the tools");
         let tool = |name: &str| {
             let path = tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-            std::fs::copy(&echo, &path).expect("copy echo-args");
+            support::copy_program(&echo, &path);
             path
         };
         let cargo = tool("fake-cargo");

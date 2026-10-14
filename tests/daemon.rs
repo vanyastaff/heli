@@ -108,7 +108,7 @@ fn a_run_matches_direct_execution() {
     let name = echo.file_name().expect("a file name");
     let dir = fixture.workspace().join("crates");
     std::fs::create_dir_all(dir.join("bin")).expect("create bin");
-    std::fs::copy(&echo, dir.join("bin").join(name)).expect("copy echo-args");
+    support::copy_program(&echo, &dir.join("bin").join(name));
     let relative = std::path::Path::new("bin").join(name);
     let configure = |command: &mut Command| {
         command

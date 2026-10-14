@@ -100,7 +100,7 @@ fn heli_copy(fixture: &Fixture, name: &str) -> PathBuf {
     let dir = fixture.path(name);
     std::fs::create_dir_all(&dir).expect("create the copy's directory");
     let copy = dir.join(heli_binary().file_name().expect("a file name"));
-    std::fs::copy(heli_binary(), &copy).expect("copy cargo-heli");
+    support::copy_program(&heli_binary(), &copy);
     copy
 }
 
