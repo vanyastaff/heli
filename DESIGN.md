@@ -708,6 +708,10 @@ These are the only waits; nothing else makes a heli run wait for another run.
    worktree, and they wait for it, in the order they came.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
+4. **Recycling:** the first run from a directory, while a store holds an
+   orphan, waits until its worktree's build directory has been recycled or
+   will not be (§6.4): for its `cargo metadata`, and with a donor for a scan
+   and a rename. At most 30 s; later runs from there never wait for it.
 
 ### Command line and contracts
 
@@ -721,6 +725,7 @@ cargo heli gc [--dry-run [--json]]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli daemon [--detach | --warden]            (internal)
+cargo heli recycle                                 (internal: the post-checkout hook, §6.4)
 ```
 
 - **Exit codes.**
@@ -988,7 +993,8 @@ its end): a comment that marks them as heli's, and
 `build-dir = "<store>/{workspace-path-hash}"`. It replaces lines an earlier
 setup wrote, and leaves alone, with the reason, a file that is not TOML,
 that sets `build-dir` itself, or whose new content would not parse to the
-same configuration plus `build.build-dir`.
+same configuration plus `build.build-dir`. Then, in a repository, setup
+offers its git `post-checkout` hook, for recycling (§6.4).
 
 **Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
 move, anything that searches `target/<profile>/deps` for rlibs, test binaries
@@ -1017,7 +1023,9 @@ those arguments, not even one standing in for cargo under another name. Its
 `workspace_root`,
 `target_directory` and `build_directory` (cargo 1.91 and later) say where
 the run builds. It takes no lock (verified: it answers while a build holds
-the build directory's), and it neither delays nor fails the run.
+the build directory's), and it fails no run. It delays none either, but the
+first run from a directory while a store holds an orphan, which waits for
+it in case its worktree gets a recycled build directory (§6.4).
 
 - The `target/` directory is **registered**, with its workspace, in
   `store.json` in the state directory, which outlives the daemon.
@@ -1112,6 +1120,47 @@ repository, renamed to the new worktree's `{workspace-path-hash}` path. On one
 volume that is a rename: no copy and no extra disk. One build directory still
 belongs to one live worktree.
 
+- **The donor** is an orphan (§6.2: its workspace's `Cargo.toml` is gone,
+  none of cargo's locks in it held) in the store that holds the new build
+  directory, whose owner manifest names the same repository; of those, the
+  one with the latest last run. Never taken: live, busy and unknown
+  directories, orphans of other repositories or of none, and what eviction
+  moved into `<store>/.trash/` (§6.3). An orphan stays claimable until
+  eviction takes it, which is no earlier than 24 h unclaimed (§6.3, tier 2).
+- **The new build directory** is the one cargo names for the worktree
+  (`build_directory`, §6.2): heli recycles only when it is in a store heli
+  manages and does not exist. An existing one, even empty, is never
+  replaced. Afterwards its owner manifest names the new workspace, keeping
+  its creation time.
+- **The first run.** The run's own `cargo metadata` (§6.2) names the build
+  directory, and recycling happens before the run starts: the first run
+  from a directory waits for it while a store holds an orphan (§5, "Where a
+  run can wait"). The run's clients get a note:
+  `cargo-heli: note: recycled the build directory of <donor>, a removed
+  worktree; the path scan invalidated 2 units`.
+- **The hook.** setup offers the repository's `post-checkout` hook (the file
+  in its hooks directory, as `git rev-parse --git-path hooks` names it, so
+  `core.hooksPath` counts; one file serves every worktree), with its own
+  question, after the Cargo configurations (§6.1). git runs it after every
+  checkout; only for a checkout from the null commit, which is what
+  `git worktree add` does, does it run `cargo heli recycle` in the new
+  worktree, which reads the store itself and needs no daemon. It runs
+  before `git worktree add` returns, says what it recycled on stderr, and
+  never fails the checkout. It names heli by its full path; setup replaces
+  a hook it wrote earlier, and leaves any other one alone, with the reason.
+- **The look.** As the daemon starts, as runs end and every minute, for each
+  repository with an orphan in a store, it lists the worktrees
+  (`git worktree list`). Each linked worktree it has not looked at before
+  gets a build directory recycled, if it has none. The main worktree is
+  never new, and is left to its first run.
+- The hook and the look ask cargo from the top of the worktree, with their
+  own environment, and recycle only for a workspace inside it. While no
+  store holds an orphan of the repository, they do not ask cargo at all.
+- Each recycling is a `recycle` event in the event log (§8). Two recyclers
+  need no lock between them: a rename never replaces a directory that has
+  files, and each scans the donor under its old name, which a rename by the
+  other takes away.
+
 What makes this sound, verified in cargo's source:
 
 - **Paths cargo tracks.** Cargo's own dep-info encodes each input path
@@ -1139,11 +1188,33 @@ keeps the donor's paths compiled in:
 - `env!("OUT_DIR")` points under the old build directory path.
 
 rustc still records these values in its own dep-info (`# env-dep:NAME=value`
-lines in `deps/*.d`, observed on the example host). So right after the
-rename, heli scans the rustc dep-info. It deletes the fingerprint of every
-unit with an `env-dep` value under the donor's workspace or the old build
-directory path, and cargo rebuilds exactly those units. This applies in both
-modes below.
+lines in `deps/*.d`, observed on the example host). So heli scans the rustc
+dep-info of the donor, where it lies, and only then renames it: a cargo that
+starts in the new worktree never sees it half scanned. It deletes the
+fingerprint of every unit with an `env-dep` value under the donor's
+workspace or the old build directory path, and cargo rebuilds those units,
+and what depends on them. This applies in both modes below.
+
+- **Values.** rustc escapes `\`, line feed and carriage return as `\\`, `\n`
+  and `\r` (on Windows, `# env-dep:CARGO_MANIFEST_DIR=E:\\heli`). A value is
+  under a path when its components start with the path's: on Windows
+  without case, with either separator, and without `\\?\`. Each old path
+  counts as given and as it resolves on disk. A value that lists paths
+  (`PATH`-like) is also looked at path by path. Any variable counts, not
+  only cargo's.
+- **Where cargo keeps them** (cargo 1.99, checked by experiment), in each
+  profile directory (`<profile>/` or `<triple>/<profile>/`): rustc's
+  dep-info is `deps/<crate>-<hash>.d`, `examples/<crate>-<hash>.d`, or for a
+  build script `build/<package>-<hash>/build_script_build-<hash>.d`; the
+  unit's fingerprint is `.fingerprint/<package>-<hash>/`, with the same hash
+  (cargo's `-C extra-filename`). A crate's name has `_` where its package's
+  has `-`, so only the hash ties the two. Units whose files have no hash (on
+  Windows MSVC a path package's executables, and dylibs and cdylibs of path
+  packages) write `deps/<crate>.d`; their fingerprint directory still has a
+  hash and holds `dep-<kind>-<target>`, so such a file stands for every
+  fingerprint directory whose `dep-…` file names its target, `-` read as
+  `_`.
+- The number of units it invalidated is in the `recycle` event.
 
 There are two modes:
 
@@ -1311,7 +1382,13 @@ drains and evictions, and `cargo heli gc --dry-run`.
   `taken_back` (slots the broker took back while it had work pending),
   `most` (the most slots it was seen using), `wait_median_ms` and
   `wait_longest_ms` (how long it waited for a lent slot, at most; `null`
-  without loans).
+  without loans);
+- `recycle`, when a worktree got an orphan's build directory (§6.4):
+  `trigger` (`run`, `hook` or `look`), `workspace` and `to` (the new
+  workspace, and the build directory's path now), `donor` and `from` (the
+  removed workspace, and the path the directory had), and `invalidated`
+  (the units whose fingerprints the path scan deleted). The hook writes it
+  itself, to the log of its logon session's daemon.
 
 Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
 the one before, and the next event starts a new file.

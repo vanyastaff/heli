@@ -20,14 +20,20 @@
 //!    the build directory is whole the moment it appears under its new
 //!    name, and a cargo that starts then never sees it half scanned.
 //! 4. The rename. When it fails (another recycler or eviction took the
-//!    donor first) the next orphan is tried, unless the build directory has
-//!    appeared meanwhile.
+//!    donor first, or it cannot be moved now) the next orphan is tried,
+//!    unless the build directory has appeared meanwhile.
 //! 5. The owner manifest now names the new workspace, keeping its creation
-//!    time.
+//!    time. Should that fail, the donor's manifest goes, so that no other
+//!    worktree takes the directory for an orphan.
 //!
 //! Two recyclers need no lock between them: a rename never replaces a
 //! directory that has files, and each scans the donor under its old name,
 //! which a rename by the other takes away.
+//!
+//! [`for_worktree`] is the way in for the `post-checkout` hook
+//! (`crate::recycle`) and the daemon's look at a repository's worktrees
+//! (`crate::daemon::accounts`): it asks cargo where a worktree builds, and
+//! only while an orphan of its repository waits.
 
 use std::path::{Path, PathBuf};
 
@@ -96,6 +102,7 @@ pub fn claim(
     if exists(build_dir) {
         return Ok(None);
     }
+    let mut failure = None;
     for donor in orphans(&store, repository) {
         let Some(owner) = &donor.owner else {
             continue;
@@ -110,17 +117,22 @@ pub fn claim(
             if exists(build_dir) {
                 return Ok(None);
             }
+            // Gone: taken by another recycler, or by eviction. Still there:
+            // it cannot be moved now. Either way, the next one.
             if exists(&donor.path) {
-                return Err(format!(
+                failure = Some(format!(
                     "cannot move {} to {}: {error}",
                     donor.path.display(),
                     build_dir.display()
                 ));
             }
-            // Taken by another recycler, or by eviction: the next one.
             continue;
         }
         if let Err(error) = owner::record_run(build_dir, workspace, Some(repository), at) {
+            // The donor's manifest would make it an orphan still, for
+            // another worktree to take: without one it is never taken, and
+            // the first run here writes it.
+            let _ = std::fs::remove_file(owner::path(build_dir));
             return Err(format!(
                 "recycled {} to {}, but cannot write its owner manifest: {error}",
                 donor.path.display(),
@@ -135,7 +147,7 @@ pub fn claim(
             invalidated,
         }));
     }
-    Ok(None)
+    failure.map_or(Ok(None), Err)
 }
 
 /// Gives the worktree `worktree` a build directory, as [`claim`] does,

@@ -29,6 +29,13 @@
 //! how many units the path scan invalidated, and a note to the run's
 //! clients.
 //!
+//! **The look** (`Accounts::look`). Each pass of the accountant first
+//! lists the worktrees of every repository with an orphan in a store
+//! (`git worktree list`); each linked worktree it has not looked at before
+//! gets a build directory recycled if it has none
+//! (`crate::store::recycle::for_worktree`): one added without the
+//! `post-checkout` hook, or before the daemon started.
+//!
 //! **Sizes** ([`Accounts::disk`]). The accountant, a thread of the daemon's,
 //! keeps the sizes of every directory `crate::store::survey` finds, by
 //! category. It scans a directory it has no figures for, one whose run has

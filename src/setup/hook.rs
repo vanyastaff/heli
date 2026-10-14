@@ -8,8 +8,10 @@
 //! The hook is the file `post-checkout` in the repository's hooks
 //! directory, as git finds it (`git rev-parse --git-path hooks`, which
 //! follows `core.hooksPath`): one for every worktree of the repository. It
-//! names heli by its full path, as the program that wrote it, and never
-//! fails a checkout: it exits 0 whatever heli does. A hook that setup did
+//! names heli by its full path, as the program that wrote it (should heli
+//! move, the shell says it is not found, and setup run again rewrites the
+//! hook), and never fails a checkout: it exits 0 whatever heli does. A hook
+//! that setup did
 //! not write (it lacks heli's marker line) is left as it is, with the
 //! reason; one an earlier setup wrote is replaced when it differs.
 
@@ -82,6 +84,7 @@ pub fn edit(path: &Path, program: &Path) -> Edit {
 
 /// The hook that runs `program`, if its path can be quoted.
 fn script(program: &Path) -> Option<String> {
+    let program = quoted(program)?;
     Some(format!(
         "#!/bin/sh\n\
          {MARKER}\n\
@@ -90,9 +93,8 @@ fn script(program: &Path) -> Option<String> {
          case \"$1\" in\n\
          *[!0]* | \"\") exit 0 ;;\n\
          esac\n\
-         {} recycle </dev/null >/dev/null\n\
-         exit 0\n",
-        quoted(program)?
+         {program} recycle </dev/null >/dev/null\n\
+         exit 0\n"
     ))
 }
 

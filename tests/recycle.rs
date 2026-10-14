@@ -643,6 +643,101 @@ fn only_the_latest_free_orphan_of_the_same_repository_is_claimed() {
     drop(held);
 }
 
+/// Keeps the directory `dir` from being moved until dropped: on Windows a
+/// file in it held open without sharing, elsewhere its parent read-only.
+struct Unmovable {
+    #[cfg(windows)]
+    _file: std::fs::File,
+    #[cfg(unix)]
+    parent: PathBuf,
+}
+
+impl Unmovable {
+    fn new(dir: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .open(dir.join("marker"))
+                .expect("hold a file in it");
+            Self { _file: file }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = dir.parent().expect("a parent").to_path_buf();
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+                .expect("make its parent read-only");
+            Self { parent }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unmovable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.parent, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// An orphan that cannot be moved now is passed over for the next one.
+#[test]
+fn an_orphan_that_cannot_be_moved_is_passed_over() {
+    let repo = Repo::new();
+    let b = repo.add_worktree("b");
+    let ours = repo.repository();
+    let gone = |name: &str| repo.fixture.workspace().join(name);
+    // Not where b's build directory goes, which a read-only parent would
+    // keep from being made.
+    let output = repo
+        .fixture
+        .cargo(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(&b)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run cargo metadata");
+    assert_success(&output, "cargo metadata");
+    let metadata: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    let b_dir = PathBuf::from(
+        metadata["build_directory"]
+            .as_str()
+            .expect("a build directory"),
+    );
+    let b_outer = b_dir
+        .parent()
+        .and_then(Path::file_name)
+        .expect("<store>/<2 hex digits>/");
+    let hash = if b_outer == "d0" {
+        "d2000000000000"
+    } else {
+        "d0000000000000"
+    };
+    let latest = repo.craft(
+        hash,
+        "latest",
+        Some(manifest(&gone("gone-1"), Some(&ours), 200)),
+    );
+    repo.craft(
+        "d1000000000000",
+        "older",
+        Some(manifest(&gone("gone-2"), Some(&ours), 100)),
+    );
+    let unmovable = Unmovable::new(&latest);
+
+    let output = repo.recycle_in(&b);
+    drop(unmovable);
+    assert_eq!(
+        marker(&repo.build_dir_of(&b)),
+        "older",
+        "{}",
+        text(&output.stderr)
+    );
+    assert_eq!(marker(&latest), "latest");
+}
+
 /// The content of rustc's dep-info for a unit that read each of `env`
 /// (`NAME`, or `NAME=value` with the value as rustc escapes it).
 fn dep_info(env: &[String]) -> String {
@@ -1022,6 +1117,41 @@ fn setup_leaves_another_post_checkout_hook_alone() {
         std::fs::read_to_string(repo.hook()).expect("their hook"),
         theirs
     );
+}
+
+/// The hook names the heli that wrote it. When that heli is gone, the
+/// hook still never fails `git worktree add`; setup, run by another heli,
+/// replaces the hook an earlier setup wrote.
+#[test]
+fn a_hook_never_fails_a_checkout_and_follows_heli() {
+    let repo = Repo::new();
+    let moved = repo
+        .fixture
+        .path(&format!("moved-heli{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(support::heli_binary(), &moved).expect("copy heli");
+    let template = repo.fixture.setup(None, Vec::<String>::new());
+    let mut setup = Command::new(&moved);
+    setup.arg("setup").current_dir(repo.main());
+    for (name, value) in template.get_envs() {
+        match value {
+            Some(value) => setup.env(name, value),
+            None => setup.env_remove(name),
+        };
+    }
+    repo.isolate_git(&mut setup);
+    let output = answered(setup, "n\nn\ny\n");
+    assert_success(&output, "setup by a heli that moves away");
+    let hook = std::fs::read_to_string(repo.hook()).expect("the hook");
+    assert!(hook.contains("moved-heli"), "{hook}");
+    std::fs::remove_file(&moved).expect("heli moves away");
+
+    let b = repo.add_worktree("b");
+    assert!(b.join("Cargo.toml").is_file(), "b is checked out");
+
+    let stdout = text(&repo.setup("n\nn\ny\n").stdout);
+    assert_eq!(asked(&stdout).len(), 3, "{stdout}");
+    let hook = std::fs::read_to_string(repo.hook()).expect("the hook");
+    assert!(!hook.contains("moved-heli"), "replaced: {hook}");
 }
 
 /// The daemon looks at the worktrees of every repository with an orphan
