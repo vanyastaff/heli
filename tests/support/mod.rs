@@ -32,6 +32,8 @@
 //! - `many-errors`: 40 compile errors, one per line; `many-warnings`: 60
 //!   warnings from three lints, one per line (see their `lib.rs`);
 //! - `tests-mixed`: passing, failing and slow tests;
+//! - `many-tests`: 100 passing tests, `g0::t0` to `g9::t9`, each printing a
+//!   line;
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
 //!   working directory, its session or its process id; waits for a file,

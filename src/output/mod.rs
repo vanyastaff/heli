@@ -14,12 +14,20 @@
 //!
 //! - **Pass-through**: the output as the tool writes it, byte for byte.
 //!   Every run in full mode; in compact and quiet mode, every run no other
-//!   view takes, and every run whose arguments already choose cargo's output
-//!   (`--message-format`, `-q`, `-v`: [`cargo::sets_output`]).
+//!   view takes (cargo subcommands heli knows nothing of, `run`, `fmt`,
+//!   mutate runs), and every cargo run whose arguments already choose
+//!   cargo's output (`--message-format`, `-q`, `-v`: [`cargo::sets_output`]).
 //! - **Cargo's diagnostics** ([`cargo`]): compile and verify runs
 //!   (`crate::class`) of build, check, clippy and doc, in compact and quiet
 //!   mode. heli adds `--quiet --message-format json` and renders the
 //!   diagnostics from cargo's JSON.
+//! - **Tests**, test runs in compact and quiet mode, both their phases
+//!   (`crate::daemon::test_run`): [`nextest`] for `nextest run`, which adds
+//!   nextest's own controls the user did not set; [`libtest`] for `test`,
+//!   which adds cargo's flags as above and keeps libtest's `failures:`
+//!   sections. Both render cargo's JSON as for a compile run.
+//! - **Head and tail** ([`exec`]): `cargo heli exec` in compact and quiet
+//!   mode. heli adds nothing, and shows the first and the last lines.
 //!
 //! **Quiet mode** holds a rendered view's output back until the run ends,
 //! and heli's own lines about the run with it ([`Printer::note`]): on
@@ -27,7 +35,7 @@
 //! failure, the held output and the footer, as compact mode would have.
 //! Pass-through output is never held.
 //!
-//! **Adding a view** (#11: test runs, exec): a [`View`] variant; its case in
+//! **Adding a view**: a [`View`] variant; its case in
 //! [`view_of`], which decides from the run's class when it applies; what it
 //! adds to the command in [`plan`]; and a [`Render`] that turns the run's
 //! output into what the client prints and returns the facts for quiet
@@ -49,6 +57,9 @@
 //! `NO_COLOR` already.
 
 pub mod cargo;
+pub mod exec;
+pub mod libtest;
+pub mod nextest;
 
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Write};
@@ -142,6 +153,17 @@ pub struct Plan {
 enum View {
     PassThrough,
     Cargo(cargo::Warnings),
+    Tests(Runner),
+    Exec,
+}
+
+/// The tool that runs a test run's tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runner {
+    /// `cargo test`.
+    Libtest,
+    /// `cargo nextest run`.
+    Nextest,
 }
 
 /// The plan for running `invocation` in `mode`.
@@ -152,7 +174,13 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
     };
     let mut env = Vec::new();
     let args = match view {
-        View::Cargo(_) => cargo::with_json_messages(&invocation.args),
+        View::Cargo(_) | View::Tests(Runner::Libtest) => {
+            cargo::with_json_messages(&invocation.args)
+        }
+        View::Tests(Runner::Nextest) => nextest::with_controls(&invocation.args, |name| {
+            std::env::var_os(name).is_some_and(|value| !value.is_empty())
+        }),
+        View::Exec => invocation.args.clone(),
         View::PassThrough => {
             if colours_wanted() {
                 env.push((COLOR_VAR, OsString::from("always")));
@@ -162,7 +190,7 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
     };
     // A cargo subcommand is named as in `cargo heli`, without `cargo`; any
     // other command by its program's name.
-    let program = (invocation.class == Class::Exec).then(|| {
+    let program = invocation.exec.then(|| {
         Path::new(&invocation.program)
             .file_stem()
             .unwrap_or(&invocation.program)
@@ -183,22 +211,41 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
     }
 }
 
-/// The view that shows `invocation`'s output in compact and quiet mode: the
-/// run's class decides how warnings show (compile runs count them, verify
-/// runs list them by lint), when cargo can report its diagnostics as JSON
-/// for the subcommand ([`cargo::reports_json`]) and the user's arguments
-/// leave cargo's output to heli ([`cargo::sets_output`]). Every other run
-/// passes through.
+/// The view that shows `invocation`'s output in compact and quiet mode,
+/// from the run's class. Compile and verify runs show cargo's diagnostics,
+/// their warnings counted or listed by lint, when cargo can report them as
+/// JSON for the subcommand ([`cargo::reports_json`]) and the user's
+/// arguments leave cargo's output to heli ([`cargo::sets_output`]); test
+/// runs show their tests ([`tests_view`]); `cargo heli exec` shows its head
+/// and tail. Every other run passes through.
 fn view_of(invocation: &Invocation) -> View {
     let warnings = match invocation.class {
         Class::Compile => cargo::Warnings::Counts,
         Class::Verify => cargo::Warnings::ByLint,
-        Class::Test | Class::Mutate | Class::Exec => return View::PassThrough,
+        Class::Test => return tests_view(&invocation.args),
+        Class::Exec if invocation.exec => return View::Exec,
+        Class::Mutate | Class::Exec => return View::PassThrough,
     };
     if cargo::reports_json(&invocation.args) && !cargo::sets_output(&invocation.args) {
         View::Cargo(warnings)
     } else {
         View::PassThrough
+    }
+}
+
+/// The view of a test run, `cargo <args>`: nextest's always (heli adds each
+/// of its controls the user did not set), libtest's unless the user's
+/// arguments choose cargo's output.
+fn tests_view(args: &[OsString]) -> View {
+    let Some((subcommand, rest)) = cargo::subcommand(args) else {
+        return View::PassThrough;
+    };
+    match subcommand.to_str().unwrap_or_default() {
+        "nextest" if rest.first().is_some_and(|run| run == "run" || run == "r") => {
+            View::Tests(Runner::Nextest)
+        }
+        "test" | "t" if !cargo::sets_output(args) => View::Tests(Runner::Libtest),
+        _ => View::PassThrough,
     }
 }
 
@@ -217,6 +264,9 @@ impl Plan {
         let render: Box<dyn Render> = match self.view {
             View::PassThrough => Box::new(PassThrough),
             View::Cargo(warnings) => Box::new(cargo::Diagnostics::new(warnings)),
+            View::Tests(Runner::Nextest) => Box::new(nextest::Nextest::new()),
+            View::Tests(Runner::Libtest) => Box::new(libtest::Libtest::new()),
+            View::Exec => Box::new(exec::HeadTail::new()),
         };
         let quiet = self.mode == Mode::Quiet && self.view != View::PassThrough;
         Printer {
@@ -251,6 +301,32 @@ impl Render for PassThrough {
 
     fn finish(&mut self, _run: &str, _out: &mut Sink) -> Vec<String> {
         Vec::new()
+    }
+}
+
+/// One stream's output, cut into lines: each with its line end, the start
+/// of a line waiting for the rest.
+#[derive(Default)]
+struct LineBuffer {
+    pending: Vec<u8>,
+}
+
+impl LineBuffer {
+    /// The lines `bytes` completes, in order.
+    fn push(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        let mut from = self.pending.len();
+        self.pending.extend_from_slice(bytes);
+        while let Some(end) = self.pending[from..].iter().position(|&byte| byte == b'\n') {
+            lines.push(self.pending.drain(..=from + end).collect());
+            from = 0;
+        }
+        lines
+    }
+
+    /// The stream's last bytes, when they do not end a line.
+    fn rest(&mut self) -> Option<Vec<u8>> {
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
 }
 
