@@ -476,6 +476,46 @@ fn log_shows_a_run_in_flight_so_far() {
     support::assert_success(&finish(call), "cargo heli exec");
 }
 
+/// A run is listed from its admission, before its command starts and its
+/// record begins: one waiting for its turn at the worktree lock has printed
+/// nothing yet, and `log` says just that rather than "no such run".
+#[test]
+fn log_of_a_run_that_has_not_started_prints_nothing_yet() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    // `echo-args` stands in for cargo: a build, held by the gate, and a
+    // `fmt`, which waits for the build.
+    let mut build = fixture.heli(["--output", "full", "build"]);
+    build.env("CARGO", &echo).env("ECHO_WAIT_FOR", &gate);
+    let build = start(&mut build);
+    let status = fixture.wait_for_status("the build", |status| runs(status).len() == 1);
+    let build_id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    let mut fmt = fixture.heli(["fmt"]);
+    fmt.env("CARGO", &echo);
+    let fmt = start(&mut fmt);
+    let status = fixture.wait_for_status("fmt to wait", |status| {
+        runs(status).len() == 2 && runs(status)[1]["waiting_for"] == serde_json::json!([build_id])
+    });
+    let fmt_id = runs(&status)[1]["id"].as_str().expect("an id").to_owned();
+
+    for args in [&[][..], &["--tail", "3"], &["--errors"]] {
+        let logged = log(&fixture, &[&[fmt_id.as_str()][..], args].concat());
+        support::assert_success(&logged, "cargo heli log");
+        assert!(
+            logged.stdout.is_empty() && logged.stderr.is_empty(),
+            "{args:?}: {logged:?}"
+        );
+    }
+    assert_eq!(fixture.runs().len(), 2, "fmt still waits");
+    open(&gate);
+    support::assert_success(&finish(build), "the build");
+    support::assert_success(&finish(fmt), "cargo heli fmt");
+    let logged = log(&fixture, &[&fmt_id]);
+    support::assert_success(&logged, "cargo heli log");
+    assert_eq!(text(&logged.stdout), "arg: \"fmt\"\n");
+}
+
 /// Output is recorded whether or not a client listens: a run whose client
 /// was killed early has all of its output in the log, including the many
 /// writes it made after.

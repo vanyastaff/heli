@@ -36,6 +36,19 @@
 //! (`crate::store::recycle::for_worktree`): one added without the
 //! `post-checkout` hook, or before the daemon started.
 //!
+//! **Source-state records** (DESIGN.md §6.4, "Precise";
+//! `crate::store::record`), which make the next recycling of a build
+//! directory precise. A run's build directory in a store heli manages, in a
+//! repository, gets one as the run ends ([`Learning::ended`], which the run
+//! waits for, at most [`RECORD_WAIT`], before its clients hear its end). And
+//! each pass of the accountant writes one for each build directory in which
+//! one of cargo's locks was held at the pass before and none is now
+//! (`Accounts::released`): a build without heli, which the accountant saw.
+//! It leaves alone a build directory where a run in flight will write one
+//! as it ends, and one whose record still counts, so that the worktree is
+//! not read again just after a run. None is written while one of cargo's
+//! locks there is held.
+//!
 //! **Sizes** ([`Accounts::disk`]). The accountant, a thread of the daemon's,
 //! keeps the sizes of every directory `crate::store::survey` finds, by
 //! category. It scans a directory it has no figures for, one whose run has
@@ -74,8 +87,8 @@ use crate::store::probe::Probe;
 use crate::store::recycle::{self, Recycled};
 use crate::store::registry::{Registry, Target};
 use crate::store::sizes::Sizes;
-use crate::store::{self, Kind, State, evict, orphan, owner, trash, volume};
-use crate::{clock, config};
+use crate::store::{self, Dir, Kind, State, evict, orphan, owner, record, trash, volume};
+use crate::{clock, config, worktree};
 
 /// How often the accountant looks for new directories when no run ends.
 const LOOK: Duration = Duration::from_secs(60);
@@ -85,6 +98,10 @@ const STALE: Duration = Duration::from_secs(3600);
 
 /// The longest a run waits for its build directory to be recycled.
 pub const PREPARE_WAIT: Duration = Duration::from_secs(30);
+
+/// The longest a run's end waits for the source-state record of its build
+/// directory, which is written anyway.
+const RECORD_WAIT: Duration = Duration::from_secs(10);
 
 pub struct Accounts {
     config: StoreConfig,
@@ -109,6 +126,10 @@ pub struct Accounts {
     /// The directories a run was learnt from, its build directory recycled
     /// if it could be: later runs from there never wait.
     prepared: Mutex<BTreeSet<PathBuf>>,
+    /// The build directories of the runs in flight that write a
+    /// source-state record as they end, once for each run: the accountant
+    /// writes none there meanwhile.
+    recording: Mutex<Vec<PathBuf>>,
 }
 
 /// What the accountant knows.
@@ -129,12 +150,16 @@ struct Figures {
     scanned: Instant,
 }
 
-/// Kept while a run lasts; dropping it tells the accounts the run ended.
+/// Kept while a run lasts; [`Learning::ended`], or dropping it, tells the
+/// accounts the run ended.
 pub struct Learning {
-    _ended: mpsc::Sender<()>,
+    ended: mpsc::Sender<()>,
     /// Hears what was recycled for the run, once that is settled; `None`
     /// when the run need not wait for it.
     ready: Option<Mutex<mpsc::Receiver<Option<Recycled>>>>,
+    /// Closed once the run's source-state record is written, or will not
+    /// be.
+    recorded: Mutex<mpsc::Receiver<()>>,
 }
 
 impl Learning {
@@ -148,6 +173,25 @@ impl Learning {
             .unwrap_or_else(PoisonError::into_inner);
         ready.recv_timeout(PREPARE_WAIT).ok().flatten()
     }
+
+    /// Tells the accounts the run ended, and waits, at most
+    /// [`RECORD_WAIT`], until the source-state record of its build directory
+    /// is written, or will not be.
+    pub fn ended(&self) {
+        let _ = self.ended.send(());
+        let recorded = self.recorded.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = recorded.recv_timeout(RECORD_WAIT);
+    }
+}
+
+/// Where a run builds, as its learning found it.
+struct Learnt {
+    /// The directories to scan again once it has ended.
+    dirs: Vec<PathBuf>,
+    /// Its build directory and the worktree of its workspace, if the build
+    /// directory is in a store heli manages and the worktree is in a
+    /// repository: what a source-state record is written for.
+    recorded: Option<(PathBuf, PathBuf)>,
 }
 
 impl Accounts {
@@ -174,6 +218,7 @@ impl Accounts {
             log,
             events,
             prepared: Mutex::new(BTreeSet::new()),
+            recording: Mutex::new(Vec::new()),
         });
         let accountant = Arc::clone(&accounts);
         std::thread::spawn(move || accountant.keep());
@@ -199,23 +244,48 @@ impl Accounts {
         let at = clock::now();
         let (ended, end) = mpsc::channel();
         let (prepared, ready) = mpsc::channel();
+        let (recorded, written) = mpsc::channel::<()>();
         let wait = self.may_recycle(&probe.cwd);
         let accounts = Arc::clone(self);
         std::thread::spawn(move || {
-            let Some(dirs) = accounts.discover(&probe, at, prepared) else {
+            let Some(learnt) = accounts.discover(&probe, at, prepared) else {
                 return;
             };
-            // An error: the run has ended.
+            if let Some((build, _)) = &learnt.recorded {
+                accounts.recording().push(build.clone());
+            }
+            // An error: the run has ended too.
             let _ = end.recv();
+            if let Some((build, worktree)) = &learnt.recorded {
+                accounts.record(build, worktree, &probe);
+                let mut recording = accounts.recording();
+                if let Some(index) = recording.iter().position(|dir| dir == build) {
+                    recording.swap_remove(index);
+                }
+            }
+            drop(recorded);
             let mut ledger = accounts.ledger();
-            ledger.dirty.extend(dirs);
+            ledger.dirty.extend(learnt.dirs);
             drop(ledger);
             accounts.wake.notify_all();
         });
         Some(Learning {
-            _ended: ended,
+            ended,
             ready: wait.then(|| Mutex::new(ready)),
+            recorded: Mutex::new(written),
         })
+    }
+
+    /// Writes the source-state record of `build`, the build directory of a
+    /// workspace in `worktree`, asking git through `probe`; unless a build
+    /// holds one of cargo's locks there.
+    fn record(&self, build: &Path, worktree: &Path, probe: &Probe) {
+        if let Err(error) = record::write(build, worktree, probe) {
+            self.log.write(&format!(
+                "cannot write the source-state record of {}: {error}",
+                build.display()
+            ));
+        }
     }
 
     /// Whether the first run from `cwd` must wait for its learning: no run
@@ -276,29 +346,33 @@ impl Accounts {
 
     /// Asks cargo where the workspace of `probe` builds, recycles a build
     /// directory for it if it has none (and tells `prepared` what, or that
-    /// nothing was), and records a run there that started `at`. Returns the
-    /// directories the run builds in.
+    /// nothing was), and records a run there that started `at`. Returns
+    /// where the run builds.
     fn discover(
         &self,
         probe: &Probe,
         at: u64,
         prepared: mpsc::Sender<Option<Recycled>>,
-    ) -> Option<Vec<PathBuf>> {
+    ) -> Option<Learnt> {
         let workspace = probe.workspace()?;
         let build = workspace.build_dir();
+        let mut recorded = None;
         if store::store_of(&self.config, &build).is_some() {
             let repository = probe.repository(&workspace.root);
             let recycled = repository.as_deref().and_then(|repository| {
-                self.recycle(&build, &workspace.root, repository, at, "run")
+                self.recycle(&build, &workspace.root, repository, at, "run", probe)
             });
             self.prepared(&probe.cwd);
             let _ = prepared.send(recycled);
-            let recorded = owner::record_run(&build, &workspace.root, repository.as_deref(), at);
-            if let Err(error) = recorded {
+            let written = owner::record_run(&build, &workspace.root, repository.as_deref(), at);
+            if let Err(error) = written {
                 self.log.write(&format!(
                     "cannot write the owner manifest of {}: {error}",
                     build.display()
                 ));
+            }
+            if repository.is_some() {
+                recorded = Some((build.clone(), worktree::of(&workspace.root)));
             }
         } else {
             self.prepared(&probe.cwd);
@@ -309,11 +383,15 @@ impl Accounts {
             path: workspace.target.clone(),
             workspace: workspace.root.clone(),
         });
-        Some(vec![workspace.target, build])
+        Some(Learnt {
+            dirs: vec![workspace.target, build],
+            recorded,
+        })
     }
 
     /// Recycles an orphan into `build`, the build directory of `workspace`
-    /// in `repository`, if it has none; logs it as set off by `trigger`.
+    /// in `repository`, if it has none, asking git through `probe`; logs it
+    /// as set off by `trigger`.
     fn recycle(
         &self,
         build: &Path,
@@ -321,8 +399,9 @@ impl Accounts {
         repository: &Path,
         at: u64,
         trigger: &str,
+        probe: &Probe,
     ) -> Option<Recycled> {
-        match recycle::claim(&self.config, build, workspace, repository, at) {
+        match recycle::claim(&self.config, build, workspace, repository, at, probe) {
             Ok(Some(recycled)) => {
                 self.recycled(&recycled, trigger);
                 Some(recycled)
@@ -371,6 +450,7 @@ impl Accounts {
     /// and scans what needs it, for ever.
     fn keep(&self) {
         let mut looked = BTreeSet::new();
+        let mut held = BTreeSet::new();
         loop {
             // Each run that ended is in `ended` once: after it ended, the
             // survey below sees every directory it built.
@@ -378,6 +458,7 @@ impl Accounts {
             let registry = Registry::load(&self.state_dir);
             self.look(&registry, &mut looked);
             let dirs = store::survey(&self.config, &registry);
+            self.released(&dirs, &mut held);
             let stores = store::stores(&self.config, &registry);
             for dir in &dirs {
                 let run_ended = ended.iter().any(|path| store::same_path(path, &dir.path));
@@ -420,6 +501,38 @@ impl Accounts {
                     .unwrap_or_else(PoisonError::into_inner);
             }
         }
+    }
+
+    /// Writes the source-state record of each build directory among `dirs`
+    /// in which one of cargo's locks was held at the last look (`held`) and
+    /// none is now, if its workspace exists in a repository. Not where a run
+    /// in flight writes one as it ends, nor where the record still counts:
+    /// nothing was built since. Then `held` becomes those whose locks are
+    /// held now.
+    fn released(&self, dirs: &[Dir], held: &mut BTreeSet<PathBuf>) {
+        let mut now = BTreeSet::new();
+        for dir in dirs.iter().filter(|dir| dir.kind == Kind::Build) {
+            if store::busy(&dir.path) {
+                now.insert(dir.path.clone());
+                continue;
+            }
+            let Some(owner) = dir.owner.as_ref().filter(|_| held.contains(&dir.path)) else {
+                continue;
+            };
+            let recording = self
+                .recording()
+                .iter()
+                .any(|build| store::same_path(build, &dir.path));
+            if recording || record::valid(&dir.path).is_some() {
+                continue;
+            }
+            if owner.repository.is_some() && owner.workspace.join("Cargo.toml").is_file() {
+                let worktree = worktree::of(&owner.workspace);
+                let probe = Probe::here(worktree.clone());
+                self.record(&dir.path, &worktree, &probe);
+            }
+        }
+        *held = now;
     }
 
     /// The time now for the ladder: the test seam's clock, if it has one.
@@ -583,5 +696,11 @@ impl Accounts {
 
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn recording(&self) -> MutexGuard<'_, Vec<PathBuf>> {
+        self.recording
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }

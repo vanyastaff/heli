@@ -313,12 +313,14 @@ impl Daemon {
 
     /// Sends the part of a run's record that `request` asks for.
     fn log(&self, mut stream: Stream, request: &LogRequest) {
-        let read = runlog::read(
-            self.runlog.dir(),
-            &request.run,
-            &request.select,
-            &mut |channel, bytes| protocol::write_output(&mut stream, channel, bytes),
-        );
+        let mut out = |channel, bytes: &[u8]| protocol::write_output(&mut stream, channel, bytes);
+        let mut read = runlog::read(self.runlog.dir(), &request.run, &request.select, &mut out);
+        // A run is listed from its admission, but its record begins only as
+        // its command starts, after its turn at the worktree lock: until
+        // then, it has printed nothing.
+        if matches!(read, Err(runlog::ReadError::Unknown(_))) && self.registry.lists(&request.run) {
+            read = runlog::read_unstarted(&request.run, &request.select, &mut out);
+        }
         let reply = match read {
             Ok(()) => Reply::LogEnd,
             Err(error) => Reply::LogFailed {
@@ -520,6 +522,12 @@ impl Daemon {
         };
         if let Some(loans) = self.broker.close(id) {
             self.events.record("loans", loans_event(id, &loans));
+        }
+        // Its build directory's source-state record (DESIGN.md §6.4), before
+        // its clients hear it ended: a worktree removed right after its last
+        // run leaves a record of it.
+        if let Some(learning) = learning {
+            learning.ended();
         }
         if let Some(error) = record.take_error() {
             self.log.write(&format!("cannot record {id}: {error}"));

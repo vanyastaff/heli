@@ -25,6 +25,14 @@
 //! 5. The owner manifest now names the new workspace, keeping its creation
 //!    time. Should that fail, the donor's manifest goes, so that no other
 //!    worktree takes the directory for an orphan.
+//! 6. **Precise** recycling, when the donor has a source-state record that
+//!    counts (`crate::store::record`; read before the scan, which changes
+//!    the directory): each file of the new worktree with the content the
+//!    record holds gets the recorded time, so that cargo finds fresh what
+//!    it found fresh in the donor. Otherwise recycling is **conservative**:
+//!    every file of the new worktree is newer than every artifact. Only the
+//!    recycler whose rename succeeded touches the worktree's files, with the
+//!    record of the directory it moved.
 //!
 //! Two recyclers need no lock between them: a rename never replaces a
 //! directory that has files, and each scans the donor under its old name,
@@ -41,8 +49,9 @@ use serde_json::json;
 
 use super::probe::Probe;
 use super::registry::Registry;
-use super::{Dir, Kind, State, owner};
+use super::{Dir, Kind, State, owner, record};
 use crate::config::StoreConfig;
+use crate::worktree;
 
 /// A build directory that was recycled.
 #[derive(Debug, Clone)]
@@ -57,6 +66,10 @@ pub struct Recycled {
     pub workspace: PathBuf,
     /// The fingerprints the path scan deleted.
     pub invalidated: usize,
+    /// For precise recycling, the files of the new worktree that got the
+    /// times the donor's source-state record holds; `None` for conservative
+    /// recycling.
+    pub restored: Option<usize>,
 }
 
 impl Recycled {
@@ -71,13 +84,19 @@ impl Recycled {
             "donor": text(&self.donor),
             "from": text(&self.from),
             "invalidated": self.invalidated,
+            "mode": if self.restored.is_some() { "precise" } else { "conservative" },
+            "restored": self.restored,
         })
     }
 
     /// What a person reads of it.
     pub fn describe(&self) -> String {
+        let precisely = match self.restored {
+            Some(restored) => format!(", precisely ({restored} files got their recorded times)"),
+            None => String::new(),
+        };
         format!(
-            "recycled the build directory of {}, a removed worktree; \
+            "recycled the build directory of {}, a removed worktree{precisely}; \
              the path scan invalidated {} units",
             self.donor.display(),
             self.invalidated
@@ -88,13 +107,15 @@ impl Recycled {
 /// Gives the workspace `workspace` of `repository`, whose build directory
 /// cargo names `build_dir`, the most recently used orphan of the same
 /// repository, if `build_dir` does not exist yet and is in a store heli
-/// manages; `at` is the run's start, for the owner manifest.
+/// manages; `at` is the run's start, for the owner manifest. git is asked
+/// about the workspace's worktree through `probe`.
 pub fn claim(
     config: &StoreConfig,
     build_dir: &Path,
     workspace: &Path,
     repository: &Path,
     at: u64,
+    probe: &Probe,
 ) -> Result<Option<Recycled>, String> {
     let Some(store) = super::store_of(config, build_dir) else {
         return Ok(None);
@@ -107,6 +128,7 @@ pub fn claim(
         let Some(owner) = &donor.owner else {
             continue;
         };
+        let record = record::valid(&donor.path);
         let old = [owner.workspace.clone(), donor.path.clone()];
         let invalidated = super::scan::invalidate(&donor.path, &old).len();
         if let Some(parent) = build_dir.parent() {
@@ -139,12 +161,17 @@ pub fn claim(
                 build_dir.display()
             ));
         }
+        let restored = record.and_then(|record| {
+            let scratch = build_dir.join(".heli");
+            record::restore(&record, &worktree::of(workspace), probe, &scratch).ok()
+        });
         return Ok(Some(Recycled {
             from: donor.path,
             donor: owner.workspace.clone(),
             to: build_dir.to_path_buf(),
             workspace: workspace.to_path_buf(),
             invalidated,
+            restored,
         }));
     }
     failure.map_or(Ok(None), Err)
@@ -185,6 +212,7 @@ pub fn for_worktree(
         &workspace.root,
         &repository,
         at,
+        probe,
     )
 }
 

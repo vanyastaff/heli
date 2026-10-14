@@ -114,8 +114,17 @@ impl FakeDaemon {
 
 /// Starts listening at `endpoint` now (so a client cannot miss it), and
 /// returns how to accept the one client.
+///
+/// On Unix, a socket left at `endpoint` (by an earlier fake, or a killed
+/// daemon) is removed first, as the daemon does: a listener leaves its
+/// socket behind.
 #[cfg(unix)]
 fn listen(endpoint: &OsStr) -> impl FnOnce() -> std::os::unix::net::UnixStream + Send + 'static {
+    use std::os::unix::fs::FileTypeExt;
+
+    if std::fs::symlink_metadata(endpoint).is_ok_and(|metadata| metadata.file_type().is_socket()) {
+        std::fs::remove_file(endpoint).expect("remove the socket left at the endpoint");
+    }
     let listener =
         std::os::unix::net::UnixListener::bind(endpoint).expect("bind the fake daemon's socket");
     move || listener.accept().expect("accept a client").0
