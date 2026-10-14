@@ -499,9 +499,9 @@ fn set_mtimes(dir: &Path, time: std::time::SystemTime) {
 /// `manifest-dir`'s test finds its fixture through the path compiled in
 /// with `env!("CARGO_MANIFEST_DIR")`. After recycling it reads the new
 /// worktree's copy, not the one the removed worktree left behind, even when
-/// every source in the new worktree looks as old as the donor's (as precise
-/// recycling will make them look): cargo would find the test fresh, and
-/// only the path scan rebuilds it.
+/// every source in the new worktree looks as old as the donor's (older
+/// still than precise recycling makes them look): cargo would find the test
+/// fresh, and only the path scan rebuilds it.
 #[test]
 fn a_test_reads_its_fixture_from_the_new_worktree() {
     let repo = Repo::new();
