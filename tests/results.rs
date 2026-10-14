@@ -1173,3 +1173,37 @@ fn a_run_whose_configuration_changed_is_not_recorded() {
         "the configuration it started with"
     );
 }
+
+/// A tracked file changed to other content of the same size in the second
+/// in which the index was last written is keyed by its new content. git
+/// trusts a file's times and size against the index unless the entry is
+/// "racily clean": no older than the index itself. Where git ignores
+/// nanoseconds (its Linux builds), times in one second are equal, and only
+/// that check makes git read the file. So the copy of the index heli stages
+/// in must keep the index's own time: a copy dated later would make git
+/// keep the old content, and a pass of the old tree would be a hit.
+#[test]
+fn a_file_changed_in_the_second_of_the_index_is_keyed_by_its_content() {
+    let verifier = Verifier::new();
+    assert_eq!(
+        outcome(&mut verifier.check()),
+        Outcome::Ran,
+        "the first run"
+    );
+    let file = verifier.path("crates/slow-a/src/lib.rs");
+    let original = std::fs::read_to_string(&file).expect("read the source");
+    let changed = format!("//{}", &original[2..]);
+    assert_ne!(changed, original);
+    assert_eq!(changed.len(), original.len());
+    let index = verifier.path(".git/index");
+    support::within_one_second(&[file.clone(), index], || {
+        std::fs::write(&file, &original).expect("write the source");
+        git(&verifier.fixture, &["add", "crates/slow-a/src/lib.rs"]);
+        std::fs::write(&file, &changed).expect("change the source");
+    });
+    assert_eq!(
+        outcome(&mut verifier.check()),
+        Outcome::Ran,
+        "other content is a miss"
+    );
+}

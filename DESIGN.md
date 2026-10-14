@@ -1594,7 +1594,16 @@ was found by a failing test.
   environment values, Cargo configuration files, tool output.
 - **Tree.** The worktree with every change staged: `git add -A` into a
   scratch copy of the index (`GIT_INDEX_FILE`), then `git write-tree`. The real
-  index is never written (`GIT_OPTIONAL_LOCKS=0`).
+  index is never written (`GIT_OPTIONAL_LOCKS=0`). The copy keeps the
+  index's stat cache, so unchanged files are not hashed again, and the
+  index's own time. git takes a file whose times and size match its entry
+  for unchanged unless the entry is racily clean (no older than the index),
+  and where git compares whole seconds (its Linux builds), a file changed
+  to the same size in the second the index was written matches its entry:
+  only that check finds it. A copy dated later (as `std::fs::copy` dates it
+  on Linux) hid such a change, and git kept the old blob: a false hit here,
+  and in the source-state record (§6.4) a stale link, which a recycling
+  test showed on a Linux runner.
 - **Base.** For a command that diffs against a base, the merge base too. No
   verify or test subcommand does; `exec`, which can run such a command, does
   not use the store yet.
