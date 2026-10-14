@@ -1,0 +1,323 @@
+//! The build store (DESIGN.md §6): cargo's intermediates, kept outside the
+//! worktrees in one store per volume.
+//!
+//! **Placement** ([`serving`], [`build_dir`]). `cargo heli setup` sets
+//! cargo's `build.build-dir` to `<store>/{workspace-path-hash}`, so each
+//! workspace gets a build directory of its own in the store, at
+//! `<store>/<2 hex digits>/<14 hex digits>`; `target/` keeps the final
+//! artifacts. The store must be on the worktree's volume ([`volume`]): the
+//! first one configured there (`[store] paths`), else the volume's default,
+//! `<volume>\.heli\build` on Windows. On Unix the volume's root is rarely
+//! writable, so the default there is the user's cache,
+//! `$XDG_CACHE_HOME/heli/build` (else `~/.cache/heli/build`), when it is on
+//! that volume, and `<volume>/.heli/build` otherwise.
+
+pub mod owner;
+pub mod registry;
+pub mod sizes;
+pub mod volume;
+
+use std::fs::{File, TryLockError};
+use std::io;
+use std::path::{Component, Path, PathBuf, Prefix};
+
+use serde::Serialize;
+
+use crate::config::StoreConfig;
+use owner::Owner;
+use registry::Registry;
+use sizes::Sizes;
+
+/// The lock files cargo holds while it builds, in each profile directory
+/// (`<dir>/<profile>/`, or `<dir>/<target triple>/<profile>/`): the build
+/// directory's, and the artifact directory's two. Where the build directory
+/// is the target directory, all three are in one place.
+pub const LOCKS: [&str; 3] = [".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock"];
+
+/// What a directory is to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// A build directory in a store.
+    Build,
+    /// A registered `target/` directory.
+    Target,
+}
+
+/// Whether a directory is in use, and whether its workspace still exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// A cargo builds in it: one of its [`LOCKS`] cannot be taken.
+    Busy,
+    /// Its workspace exists.
+    Live,
+    /// Its workspace is gone: the worktree was removed.
+    Orphan,
+    /// A build directory without an owner manifest, which no heli run has
+    /// built in: whose it is, heli cannot tell.
+    Unknown,
+}
+
+impl State {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Live => "live",
+            Self::Orphan => "orphan",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// A directory the store accounts for.
+#[derive(Debug, Clone)]
+pub struct Dir {
+    pub kind: Kind,
+    pub path: PathBuf,
+    /// The store a build directory is in.
+    pub store: Option<PathBuf>,
+    /// The workspace it belongs to: from a build directory's owner manifest,
+    /// or from the registry for a `target/` directory.
+    pub workspace: Option<PathBuf>,
+    /// A build directory's owner manifest.
+    pub owner: Option<Owner>,
+}
+
+impl Dir {
+    /// The sizes of its files, by category (`sizes`): the configuration's
+    /// tool-cache patterns apply to a `target/` directory.
+    pub fn scan(&self, config: &StoreConfig) -> Sizes {
+        let patterns: &[String] = match self.kind {
+            Kind::Build => &[],
+            Kind::Target => &config.tool_caches,
+        };
+        sizes::scan(&self.path, patterns)
+    }
+
+    /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
+    /// a removed worktree can leave files behind.
+    pub fn state(&self) -> State {
+        if busy(&self.path) {
+            return State::Busy;
+        }
+        match &self.workspace {
+            Some(workspace) if workspace.join("Cargo.toml").is_file() => State::Live,
+            Some(_) => State::Orphan,
+            None => State::Unknown,
+        }
+    }
+}
+
+/// The stores heli manages: the configured ones, then the default store of
+/// the volume of each registered workspace, where it exists.
+pub fn stores(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
+    let mut stores: Vec<PathBuf> = Vec::new();
+    let defaults = registry
+        .targets
+        .iter()
+        .filter_map(|target| serving(config, &target.workspace).ok())
+        .filter(|store| store.is_dir());
+    for store in config.paths.iter().cloned().chain(defaults) {
+        if !stores.iter().any(|known| same_path(known, &store)) {
+            stores.push(store);
+        }
+    }
+    stores
+}
+
+/// Every directory the store accounts for: the build directories in each of
+/// the [`stores`], then the registered `target/` directories that exist.
+pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
+    let mut dirs = Vec::new();
+    for store in stores(config, registry) {
+        for path in build_dirs(&store) {
+            let owner = owner::read(&path);
+            dirs.push(Dir {
+                kind: Kind::Build,
+                workspace: owner.as_ref().map(|owner| owner.workspace.clone()),
+                owner,
+                store: Some(store.clone()),
+                path,
+            });
+        }
+    }
+    for target in &registry.targets {
+        if is_real_dir(&target.path) {
+            dirs.push(Dir {
+                kind: Kind::Target,
+                path: target.path.clone(),
+                store: None,
+                workspace: Some(target.workspace.clone()),
+                owner: None,
+            });
+        }
+    }
+    dirs
+}
+
+/// The build directories in `store`, `<store>/<2 hex digits>/<hex digits>`,
+/// in order.
+pub fn build_dirs(store: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for outer in subdirs(store) {
+        if !is_hex(&outer, Some(2)) {
+            continue;
+        }
+        dirs.extend(subdirs(&outer).into_iter().filter(|dir| is_hex(dir, None)));
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Whether `dir`'s name is hex digits, `length` of them when given.
+fn is_hex(dir: &Path, length: Option<usize>) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            !name.is_empty()
+                && length.is_none_or(|length| name.len() == length)
+                && name.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
+/// The directories in `dir`, never through a symlink or a junction.
+fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Whether `path` is a directory itself, not a link to one.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+/// Whether a cargo builds in `dir`: one of the [`LOCKS`] in its profile
+/// directories cannot be taken. heli only tries the locks, never waits for
+/// them, and lets go at once.
+pub fn busy(dir: &Path) -> bool {
+    subdirs(dir)
+        .iter()
+        .any(|profile| held(profile) || subdirs(profile).iter().any(|profile| held(profile)))
+}
+
+/// Whether one of the [`LOCKS`] in `profile` is held.
+fn held(profile: &Path) -> bool {
+    LOCKS.iter().any(|name| {
+        let file = match File::open(profile.join(name)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return false,
+            // A lock heli cannot even open, it cannot prove free.
+            Err(_) => return true,
+        };
+        // Taken, it is let go as `file` closes, at once.
+        match file.try_lock() {
+            Ok(()) => false,
+            Err(TryLockError::WouldBlock | TryLockError::Error(_)) => true,
+        }
+    })
+}
+
+/// The template cargo replaces with a hash of the workspace's manifest path.
+pub const WORKSPACE_PATH_HASH: &str = "{workspace-path-hash}";
+
+/// The store that holds `build_dir`, if `build_dir` is a build directory in
+/// one heli manages: `<store>/<2 hex digits>/<hex digits>`, where the store
+/// is configured, or the default of its volume.
+pub fn store_of(config: &StoreConfig, build_dir: &Path) -> Option<PathBuf> {
+    let inner = build_dir.parent()?;
+    let store = inner.parent()?;
+    if !is_hex(inner, Some(2)) || !is_hex(build_dir, None) {
+        return None;
+    }
+    let known = config
+        .paths
+        .iter()
+        .cloned()
+        .chain(serving(config, store).ok())
+        .any(|known| same_path(&known, store));
+    known.then(|| store.to_path_buf())
+}
+
+/// Whether `a` and `b` name the same place, as spelled: components compared
+/// one by one, on Windows without case.
+pub fn same_path(a: &Path, b: &Path) -> bool {
+    let spelled = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|component| {
+                let text = component.as_os_str().to_string_lossy();
+                if cfg!(windows) {
+                    text.to_lowercase()
+                } else {
+                    text.into_owned()
+                }
+            })
+            .collect()
+    };
+    spelled(a) == spelled(b)
+}
+
+/// `path` canonical, and on Windows without the `\\?\` prefix where it has
+/// a plain spelling (`C:\…`, `\\server\share\…`): the form people know.
+pub fn simplified(path: &Path) -> PathBuf {
+    let Ok(canonical) = std::fs::canonicalize(path) else {
+        return path.to_path_buf();
+    };
+    let mut components = canonical.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return canonical;
+    };
+    let plain = match prefix.kind() {
+        Prefix::VerbatimDisk(disk) => PathBuf::from(format!("{}:\\", char::from(disk))),
+        Prefix::VerbatimUNC(server, share) => match (server.to_str(), share.to_str()) {
+            (Some(server), Some(share)) => PathBuf::from(format!(r"\\{server}\{share}\")),
+            _ => return canonical,
+        },
+        _ => return canonical,
+    };
+    components
+        .filter(|component| *component != Component::RootDir)
+        .fold(plain, |path, component| path.join(component))
+}
+
+/// The store that serves the volume holding `dir`.
+pub fn serving(config: &StoreConfig, dir: &Path) -> Result<PathBuf, String> {
+    let Some(root) = volume::root(dir) else {
+        return Err(format!("cannot tell the volume of {}", dir.display()));
+    };
+    if let Some(store) = config.paths.iter().find(|store| volume::same(store, &root)) {
+        return Ok(store.clone());
+    }
+    Ok(default_store(&root))
+}
+
+/// The `build.build-dir` that places a workspace's build directory in
+/// `store`.
+pub fn build_dir(store: &Path) -> PathBuf {
+    store.join(WORKSPACE_PATH_HASH)
+}
+
+#[cfg(windows)]
+fn default_store(root: &Path) -> PathBuf {
+    root.join(".heli").join("build")
+}
+
+#[cfg(unix)]
+fn default_store(root: &Path) -> PathBuf {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+    };
+    let cache = var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")));
+    match cache {
+        Some(cache) if volume::same(&cache, root) => cache.join("heli").join("build"),
+        _ => root.join(".heli").join("build"),
+    }
+}

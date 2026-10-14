@@ -19,6 +19,11 @@
 //! [output]
 //! mode = "compact"     # full, compact or quiet; default: full on a
 //!                      # terminal, compact without
+//!
+//! [store]
+//! paths = ['D:\.heli\build']        # build stores, the first on a volume
+//!                                   # serves it; default <volume>/.heli/build
+//! tool_caches = ["tests/trybuild"]  # tool caches inside target/; default none
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -37,7 +42,7 @@
 
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -51,8 +56,20 @@ pub struct Config {
     pub output: OutputConfig,
     pub memory: MemoryConfig,
     pub event_log: EventLogConfig,
+    pub store: StoreConfig,
     #[cfg(debug_assertions)]
     test: Seam,
+}
+
+/// `[store]`: the build store (`crate::store`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct StoreConfig {
+    /// The stores, absolute; on each volume the first one there serves it.
+    pub paths: Vec<PathBuf>,
+    /// The tool caches inside a `target/` directory: patterns of paths
+    /// relative to it, `/` between components, `*` and `?` within one.
+    pub tool_caches: Vec<String>,
 }
 
 /// `[pool]`: the host pool (`crate::pool`).
@@ -129,8 +146,13 @@ impl Config {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
         };
-        toml::from_str(&text)
-            .map_err(|error| format!("invalid configuration {}: {error}", path.display()))
+        let config: Self = toml::from_str(&text)
+            .map_err(|error| format!("invalid configuration {}: {error}", path.display()))?;
+        config
+            .store
+            .check()
+            .map_err(|error| format!("invalid configuration {}: {error}", path.display()))?;
+        Ok(config)
     }
 
     /// The test seam this configuration holds: always none in a release
@@ -140,6 +162,31 @@ impl Config {
         return self.test;
         #[cfg(not(debug_assertions))]
         return Seam::default();
+    }
+}
+
+impl StoreConfig {
+    /// Refuses a store that is not an absolute path, and a tool-cache
+    /// pattern that is not a relative path below `target/`.
+    fn check(&self) -> Result<(), String> {
+        if let Some(store) = self.paths.iter().find(|store| !store.is_absolute()) {
+            return Err(format!(
+                "store.paths: {} is not an absolute path",
+                store.display()
+            ));
+        }
+        let below = |pattern: &str| {
+            !pattern.is_empty()
+                && Path::new(pattern)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_)))
+        };
+        match self.tool_caches.iter().find(|pattern| !below(pattern)) {
+            Some(pattern) => Err(format!(
+                "store.tool_caches: {pattern:?} is not a path below target/"
+            )),
+            None => Ok(()),
+        }
     }
 }
 

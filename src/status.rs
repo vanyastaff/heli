@@ -23,7 +23,13 @@
 //!           "class":"test","phase":"done","started_at":1791910990,
 //!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
 //!           "attached_clients":0,"ended_at":1791911050,
-//!           "exit":{"code":101,"signal":null,"cancelled":false}}]}
+//!           "exit":{"code":101,"signal":null,"cancelled":false}}],
+//!  "disk":{"stores":[{"path":"D:\\.heli\\build","budget":null,"used":1000,
+//!                     "by_category":{"incremental":600,"deps":300,"build_scripts":50,
+//!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
+//!          "targets":[{"path":"D:\\work\\agent-a64b\\target","used":120,
+//!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
+//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]}}
 //! ```
 //!
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
@@ -35,10 +41,17 @@
 //! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
 //! last runs that ended while no client followed them (`daemon::registry`),
 //! so whoever started them can still learn how they ended.
+//!
+//! `disk` is the build store as the daemon last counted it
+//! (`crate::daemon::accounts`): each store's bytes in use, by category
+//! (`crate::store::sizes`), and its `budget` (`null`: no budget yet); and
+//! each registered `target/` directory's. It is `null` when no daemon
+//! answers, or one older than the build store.
 
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::store::sizes::{self, Sizes};
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -54,6 +67,37 @@ pub struct Status {
     #[serde(default)]
     pub memory: Option<Memory>,
     pub runs: Vec<Run>,
+    /// Absent from a daemon older than the build store.
+    #[serde(default)]
+    pub disk: Option<Disk>,
+}
+
+/// The disk the build store takes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Disk {
+    /// One entry per store.
+    pub stores: Vec<StoreUse>,
+    /// One entry per registered `target/` directory.
+    #[serde(default)]
+    pub targets: Vec<TargetUse>,
+}
+
+/// A store's build directories, added up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreUse {
+    pub path: String,
+    /// The bytes the store may take; `None` until budgets exist.
+    pub budget: Option<u64>,
+    pub used: u64,
+    pub by_category: Sizes,
+}
+
+/// A registered `target/` directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetUse {
+    pub path: String,
+    pub used: u64,
+    pub by_category: Sizes,
 }
 
 /// The host pool's slots (`crate::pool`), counted as the status was taken.
@@ -194,6 +238,7 @@ impl Status {
             pool: None,
             memory: None,
             runs: Vec::new(),
+            disk: None,
         }
     }
 
@@ -259,6 +304,25 @@ impl Status {
                 age(run.started_at)
             ));
         }
+        if let Some(disk) = &self.disk {
+            let mut label = "disk";
+            for store in &disk.stores {
+                text.push_str(&format!(
+                    "{label:<6}  {}  {}\n",
+                    store.path,
+                    used(store.used, &store.by_category)
+                ));
+                label = "";
+            }
+            for target in &disk.targets {
+                text.push_str(&format!(
+                    "{label:<6}  target {}  {}\n",
+                    target.path,
+                    used(target.used, &target.by_category)
+                ));
+                label = "";
+            }
+        }
         text
     }
 }
@@ -275,4 +339,26 @@ pub fn slots(slots: f64) -> String {
 /// `bytes` in gigabytes of 2^30 bytes, to a tenth.
 fn gigabytes(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / f64::from(1u32 << 30))
+}
+
+/// `used` bytes, then the categories that hold any:
+/// `1.2 GiB (incremental 800.0 MiB, deps 400.0 MiB)`.
+fn used(used: u64, by_category: &Sizes) -> String {
+    let parts: Vec<String> = [
+        ("incremental", by_category.incremental),
+        ("deps", by_category.deps),
+        ("build scripts", by_category.build_scripts),
+        ("fingerprints", by_category.fingerprints),
+        ("tool caches", by_category.tool_caches),
+        ("other", by_category.other),
+    ]
+    .into_iter()
+    .filter(|(_, bytes)| *bytes > 0)
+    .map(|(name, bytes)| format!("{name} {}", sizes::human(bytes)))
+    .collect();
+    if parts.is_empty() {
+        sizes::human(used)
+    } else {
+        format!("{} ({})", sizes::human(used), parts.join(", "))
+    }
 }

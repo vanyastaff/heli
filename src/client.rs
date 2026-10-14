@@ -257,7 +257,7 @@ fn query_status() -> Result<Status, String> {
     let asked = protocol::write_message(&mut stream, &Request::Status)
         .and_then(|()| protocol::read_message::<Reply>(&mut stream));
     match asked {
-        Ok(Reply::Status(status)) => Ok(status),
+        Ok(Reply::Status(status)) => Ok(*status),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to status")),
         Err(error) => Err(format!("the heli daemon did not answer: {error}")),
     }
