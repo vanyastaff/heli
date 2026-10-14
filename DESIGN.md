@@ -1630,7 +1630,15 @@ disk   D:\.heli\build  148/150 GB (incremental 61, deps 52, ...)  next: incremen
 `cargo heli status --json` has a versioned schema (`schema`, now 1). Times
 are whole seconds since 1970 (UTC); `status` never starts a daemon.
 
-- `daemon`: `pid`, `protocol` and `started_at`, or `null` when none answers;
+- `daemon`: `pid`, `protocol` and `started_at`, and where it runs, so that
+  a user can see it runs in their interactive session (§3): `session` (on
+  Windows the logon session, elsewhere `getsid`), and on Windows
+  `window_station` and `desktop` (`WinSta0` and `Default` for the user's
+  desktop) and `interactive` (the window station `WinSta0` of a session
+  other than 0; `null` elsewhere, where heli cannot tell). The text form
+  says the same on the daemon's line:
+  `daemon  pid 4242, protocol 1, session 1, WinSta0\Default (interactive), up 52s`.
+  `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
   never below 0), or `null` when no daemon answers;
 - `memory`: the governor's last sample, in bytes: `total`, `available`,
@@ -1718,7 +1726,7 @@ the one before, and the next event starts a new file.
 | Two daemons on one state directory (Windows logon sessions) | They could give the same run id, and write one record over another | Ids come from the state directory's counter under a lock, above every record (§5) |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
 | An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. Once `setup --autostart` registered the logon task, the daemon starts outside any agent's job: at logon, and when a client needs one, through `schtasks /Run` (§3) |
-| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart") |
+| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart"). `status` shows the daemon's session, and on Windows its window station and desktop and whether they are interactive (§8) |
 | The logon registration is gone or stale (removed by hand, heli installed elsewhere, other locations) | A start through it would bring up no daemon, or the wrong one | A client uses it only when the record names its own program and locations; when the service manager refuses the start, the client starts the daemon itself (§3) |
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |

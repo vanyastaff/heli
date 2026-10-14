@@ -14,7 +14,8 @@
 //!   Unix, its pool's warden ([`daemon::warden`]);
 //! - [`pool`]: the host pool, the jobserver every run draws from, sized by
 //!   the per-user [`config`];
-//! - [`status`]: the `status --json` schema;
+//! - [`status`]: the `status --json` schema, and where the daemon runs:
+//!   its [`session`];
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
 //! - [`store`]: the build store and its eviction ladder, [`gc`], which lists
@@ -47,6 +48,7 @@ mod processes;
 mod protocol;
 mod recycle;
 mod runlog;
+mod session;
 mod setup;
 mod status;
 mod store;

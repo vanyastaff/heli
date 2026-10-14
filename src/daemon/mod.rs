@@ -68,7 +68,7 @@ use crate::pool::{self, Pool};
 use crate::protocol::{self, CancelRequest, Channel, LogRequest, Reply, Request, RunRequest, Text};
 use crate::runlog::{self, Limits, Recorder, RunLog};
 use crate::status::{self, Phase, Status};
-use crate::{clock, nesting, worktree};
+use crate::{clock, nesting, session, worktree};
 
 use events::Events;
 use governor::Governor;
@@ -638,12 +638,17 @@ impl Daemon {
     }
 
     fn status(&self) -> Status {
+        let place = session::here();
         Status {
             schema: status::SCHEMA,
             daemon: Some(status::Daemon {
                 pid: std::process::id(),
                 protocol: protocol::VERSION,
                 started_at: clock::unix_seconds(self.started_at),
+                interactive: place.interactive(),
+                session: place.session,
+                window_station: place.window_station,
+                desktop: place.desktop,
             }),
             pool: Some(self.pool.status()),
             memory: self.governor.memory(),

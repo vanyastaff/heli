@@ -6,7 +6,8 @@
 //!
 //! ```json
 //! {"schema":1,
-//!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
+//!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980,"session":1,
+//!            "window_station":"WinSta0","desktop":"Default","interactive":true},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "memory":{"total":68719476736,"available":44291850240,
 //!            "commit_available":42521726976,
@@ -161,6 +162,22 @@ pub struct Daemon {
     /// The protocol version it speaks.
     pub protocol: u32,
     pub started_at: u64,
+    /// Its session: on Windows the logon session (Terminal Services
+    /// session id), elsewhere its session (`getsid`). Absent from a daemon
+    /// older than this field, and `null` when it cannot be read.
+    #[serde(default)]
+    pub session: Option<u32>,
+    /// Its window station, on Windows (`WinSta0` is the interactive one).
+    #[serde(default)]
+    pub window_station: Option<String>,
+    /// Its desktop, on Windows (`Default` is the user's).
+    #[serde(default)]
+    pub desktop: Option<String>,
+    /// Whether it runs on the user's interactive desktop: on Windows the
+    /// window station `WinSta0` of a session other than 0. `null` where
+    /// heli cannot tell.
+    #[serde(default)]
+    pub interactive: Option<bool>,
 }
 
 /// A run in flight, or one that ended while no client followed it.
@@ -292,12 +309,26 @@ impl Status {
         let age = |since: u64| now.saturating_sub(since);
         let mut text = match &self.daemon {
             None => "daemon  not running\n".to_owned(),
-            Some(daemon) => format!(
-                "daemon  pid {}, protocol {}, up {}s\n",
-                daemon.pid,
-                daemon.protocol,
-                age(daemon.started_at)
-            ),
+            Some(daemon) => {
+                let mut place = String::new();
+                if let Some(session) = daemon.session {
+                    place.push_str(&format!(", session {session}"));
+                }
+                if let (Some(station), Some(desktop)) = (&daemon.window_station, &daemon.desktop) {
+                    place.push_str(&format!(", {station}\\{desktop}"));
+                }
+                match daemon.interactive {
+                    Some(true) => place.push_str(" (interactive)"),
+                    Some(false) => place.push_str(" (not interactive)"),
+                    None => {}
+                }
+                format!(
+                    "daemon  pid {}, protocol {}{place}, up {}s\n",
+                    daemon.pid,
+                    daemon.protocol,
+                    age(daemon.started_at)
+                )
+            }
         };
         if let Some(pool) = &self.pool {
             text.push_str(&format!(
