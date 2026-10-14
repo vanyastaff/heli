@@ -11,7 +11,6 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::class::Class;
-use crate::daemon::results;
 use crate::output::Mode;
 use crate::protocol::Cache;
 use crate::runlog;
@@ -286,7 +285,7 @@ pub fn parse(
                 program: cargo,
                 class,
                 exec: false,
-                cache: results::cache(class, &args, cli.no_cache),
+                cache: Cache::of(class, &args, cli.no_cache),
                 args,
                 output,
             })

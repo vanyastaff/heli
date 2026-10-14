@@ -197,6 +197,24 @@ pub enum Cache {
     Refresh,
 }
 
+impl Cache {
+    /// How a run of `class`, `cargo <args>`, uses the store, as the client
+    /// decides: verify and test runs look it up and are recorded (with
+    /// `no_cache`, only recorded), the result-store column of the class
+    /// table (`crate::class`). A request for help (`-h` or `--help`,
+    /// cargo's or, after `--`, the test runner's) is no verdict, so it does
+    /// not use it. `exec` is opt-in, and nothing opts in yet.
+    pub fn of(class: Class, args: &[OsString], no_cache: bool) -> Self {
+        let help = args.iter().any(|arg| arg == "-h" || arg == "--help");
+        match class {
+            Class::Verify | Class::Test if help => Self::Off,
+            Class::Verify | Class::Test if no_cache => Self::Refresh,
+            Class::Verify | Class::Test => Self::On,
+            Class::Compile | Class::Mutate | Class::Exec => Self::Off,
+        }
+    }
+}
+
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
