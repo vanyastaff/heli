@@ -155,7 +155,7 @@ impl Libtest {
 impl Render for Libtest {
     fn output(&mut self, channel: Channel, bytes: &[u8], out: &mut Sink) {
         if channel == Channel::Stderr {
-            out.write(channel, bytes);
+            out.pass(bytes);
             return;
         }
         for line in self.stdout.push(bytes) {

@@ -9,6 +9,8 @@
 //!   process's stdout and stderr and waits for that file, and does not wait
 //!   for it;
 //! - `ECHO_PID`: `pid <its process id>`;
+//! - `ECHO_WRITES` names a file: the writes it lists, on stdout or stderr,
+//!   each flushed and paced ([`write_as_told`]);
 //! - `ECHO_TREE` names a directory: starts a copy of itself in a process
 //!   group of its own (as nextest starts each test), with no output, which
 //!   waits for `ECHO_WAIT_FOR` too, and does not wait for it; each of the
@@ -112,6 +114,9 @@ fn main() {
     if std::env::var_os("ECHO_PID").is_some() {
         println!("pid {}", std::process::id());
     }
+    if let Some(writes) = std::env::var_os("ECHO_WRITES") {
+        write_as_told(Path::new(&writes));
+    }
     if let Some(dir) = std::env::var_os("ECHO_TREE") {
         if std::env::var_os("ECHO_TREE_CHILD").is_none() {
             let mut child = std::process::Command::new(std::env::current_exe().expect("own path"));
@@ -155,6 +160,35 @@ fn main() {
         .and_then(|code| code.trim().parse().ok())
         .unwrap_or(0);
     std::process::exit(code);
+}
+
+/// Makes the writes the file `script` lists, one per line: `out <text>` or
+/// `err <text>`, where `\n` in the text stands for a line end. Each is
+/// flushed, then followed by a pause of 100 ms, so that a reader of both
+/// pipes receives the writes in the order they were made.
+fn write_as_told(script: &Path) {
+    use std::io::Write;
+
+    let script = std::fs::read_to_string(script).expect("read ECHO_WRITES");
+    for write in script.lines() {
+        let (stream, text) = write
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("`out <text>` or `err <text>`: {write:?}"));
+        let text = text.replace("\\n", "\n");
+        let written = match stream {
+            "out" => {
+                let mut out = std::io::stdout().lock();
+                out.write_all(text.as_bytes()).and_then(|()| out.flush())
+            }
+            "err" => {
+                let mut err = std::io::stderr().lock();
+                err.write_all(text.as_bytes()).and_then(|()| err.flush())
+            }
+            _ => panic!("a write to `out` or `err`: {write:?}"),
+        };
+        written.expect("write as told");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Waits until `gate` exists, 60 s at most.

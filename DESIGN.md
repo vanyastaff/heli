@@ -972,7 +972,9 @@ log r17 has them all)`. An output of 80 lines or fewer shows whole. Quiet
 mode's fact is the count of lines: `1314 lines`.
 
 Some things never change: the exit code, the stdout/stderr split, and output
-heli does not recognize, which passes through.
+heli does not recognize, which passes through. Beside lines heli renders on
+stderr, the tool's own stderr passes through a whole line at a time, so that
+a line the tool writes in pieces is not cut by one of heli's.
 
 **Colours.** A run writes to pipes, so cargo would print no colours even for
 a client on a terminal. When a run's output passes through to a client whose
