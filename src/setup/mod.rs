@@ -22,21 +22,39 @@
 //!
 //! Another file setup comes to manage (the build store's `build-dir` in the
 //! Cargo configuration) is one more [`Offer`].
+//!
+//! **`--autostart`** also registers the daemon to start at logon, and
+//! **`--no-autostart`** removes that registration ([`autostart`]); the flag
+//! is the consent. When heli cannot make the registration at all (location
+//! variables are set), setup refuses before it does anything else.
 
+mod autostart;
 mod claude;
 mod profile;
 
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
+use crate::autostart::Registration;
 use crate::locations::Locations;
 use crate::pool;
 
 /// The variable that hands a cargo the host pool.
 pub const VAR: &str = "CARGO_MAKEFLAGS";
 
-/// `cargo heli setup [--print]`.
-pub fn main(print: bool) -> ! {
+/// `cargo heli setup [--print] [--autostart | --no-autostart]`: `autostart`
+/// is `Some(true)` to register the daemon at logon, `Some(false)` to remove
+/// that registration.
+pub fn main(print: bool, autostart: Option<bool>) -> ! {
+    // Checked first, so that a registration heli cannot make changes nothing.
+    let registration = autostart.map(|register| match Registration::new() {
+        Ok(registration) => (register, registration),
+        Err(reason) => {
+            let verb = if register { "register" } else { "remove" };
+            eprintln!("cargo-heli: cannot {verb} autostart: {reason}");
+            std::process::exit(1)
+        }
+    });
     let makeflags = match Locations::resolve()
         .and_then(|locations| pool::makeflags(&locations.pool).map_err(|error| error.to_string()))
     {
@@ -81,10 +99,21 @@ pub fn main(print: bool) -> ! {
             Err(note) => println!("{note}"),
         }
     }
+    if let Some((register, registration)) = &registration {
+        println!();
+        failed |= !if *register {
+            autostart::register(registration, print)
+        } else {
+            autostart::unregister(registration, print)
+        };
+    }
     println!(
         "\nTo start the daemon as an agent session starts, run `cargo heli ensure` \
          from the harness's session-start hook."
     );
+    if registration.is_none() {
+        println!("To start it when you log on, run `cargo heli setup --autostart`.");
+    }
     std::process::exit(i32::from(failed))
 }
 

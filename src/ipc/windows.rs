@@ -301,6 +301,12 @@ fn token_information(class: TOKEN_INFORMATION_CLASS) -> io::Result<TokenInformat
     Ok(TokenInformation(buffer))
 }
 
+/// The SID of the user this process runs as, `S-1-5-…`: the one user the
+/// endpoint admits, and the one the logon task runs as (`crate::autostart`).
+pub fn user_sid() -> io::Result<String> {
+    sid_string(token_information(TokenUser)?.user())
+}
+
 /// `sid` as `S-1-5-…`.
 fn sid_string(sid: PSID) -> io::Result<String> {
     let mut text = null_mut();

@@ -26,7 +26,9 @@
 //!   working directory or its session; waits for a file, leaves an orphan
 //!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
 //! - `chatter`: numbered lines on stdout and stderr, and on request bytes
-//!   that test a run log's fidelity (see its `main.rs`).
+//!   that test a run log's fidelity (see its `main.rs`);
+//! - `fake-manager`: stands in for `schtasks`, `systemctl` and `launchctl`
+//!   ([`fake_manager`]); no test reaches the real ones.
 //!
 //! After every run the daemon executes, heli prints a footer line on stderr
 //! ([`split_footer`], [`without_footer`]).
@@ -35,6 +37,7 @@
 
 pub mod endpoint;
 pub mod fake_daemon;
+pub mod fake_manager;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -272,6 +275,12 @@ impl Fixture {
                 Some(value) => command.env(var, value),
                 None => command.env_remove(var),
             };
+        }
+        // No test reaches the real Task Scheduler, systemd or launchd: heli
+        // finds a program that does not exist unless a test sets the fake
+        // (`fake_manager::FakeManager::apply`).
+        for var in fake_manager::VARS {
+            command.env(var, self.root.path().join("no-service-manager"));
         }
         command
     }

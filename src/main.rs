@@ -4,7 +4,8 @@
 //! - [`cli`]: heli's command line, which gives each run its [`class`];
 //! - [`client`]: hands runs to the daemon, or runs them [`direct`]ly when it
 //!   cannot; asks it for its status; makes sure one runs (`ensure`);
-//! - [`launch`]: starts the daemon in the background;
+//! - [`launch`]: starts the daemon in the background, through the
+//!   [`autostart`] registration when setup made one;
 //! - [`protocol`]: the versioned messages between client and daemon, over
 //!   [`ipc`], the owner-only endpoint;
 //! - [`daemon`]: the per-user daemon, its run registry
@@ -16,10 +17,12 @@
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
-//!   draw from the pool;
+//!   draw from the pool, and the [`autostart`] registration that starts the
+//!   daemon at logon;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
+mod autostart;
 mod class;
 mod cli;
 mod client;
@@ -62,7 +65,7 @@ fn main() {
         cli::Action::Run(invocation) => client::run(invocation, depth),
         cli::Action::Status { json } => client::status(json),
         cli::Action::Ensure => client::ensure(depth),
-        cli::Action::Setup { print } => setup::main(print),
+        cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
