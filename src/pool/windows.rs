@@ -13,15 +13,22 @@
 //!   returns has every access right.
 //! - Cargo's jobserver opens the semaphore with `OpenSemaphoreA`, so the
 //!   name must be ASCII.
+//! - Whether another process holds it: the object's handle count
+//!   (`NtQueryObject`, `ObjectBasicInformation`) is above the daemon's one.
+//! - A release past the maximum count is all or nothing, and fails with
+//!   `ERROR_TOO_MANY_POSTS`.
 
 use std::ffi::{OsStr, c_void};
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HANDLE, NTSTATUS, SetLastError,
+    ERROR_ALREADY_EXISTS, ERROR_TOO_MANY_POSTS, GetLastError, HANDLE, NTSTATUS, SetLastError,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::System::Threading::CreateSemaphoreW;
+use windows_sys::Win32::System::Threading::{
+    CreateSemaphoreW, ReleaseSemaphore, WaitForSingleObject,
+};
 
 use super::{Opened, check_name};
 
@@ -44,6 +51,28 @@ windows_link::link!("ntdll.dll" "system" fn NtQuerySemaphore(
     return_length: *mut u32
 ) -> NTSTATUS);
 
+/// `PUBLIC_OBJECT_BASIC_INFORMATION` (winternl.h).
+#[repr(C)]
+#[derive(Default)]
+struct PublicObjectBasicInformation {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+
+/// `ObjectBasicInformation`, the information class.
+const OBJECT_BASIC_INFORMATION: i32 = 0;
+
+windows_link::link!("ntdll.dll" "system" fn NtQueryObject(
+    handle: HANDLE,
+    information_class: i32,
+    information: *mut c_void,
+    information_length: u32,
+    return_length: *mut u32
+) -> NTSTATUS);
+
 pub struct Jobserver {
     semaphore: OwnedHandle,
     name: String,
@@ -52,13 +81,7 @@ pub struct Jobserver {
 
 impl Jobserver {
     pub fn open(name: &OsStr, slots: u32) -> io::Result<(Self, Opened)> {
-        let name = check_name(name)?;
-        if !name.is_ascii() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
-            ));
-        }
+        let name = auth(name)?;
         let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let count = i32::try_from(slots).map_err(io::Error::other)?;
         // SAFETY: `wide` is NUL-terminated; no security attributes, so the
@@ -83,7 +106,7 @@ impl Jobserver {
         let maximum = query(&semaphore)?.maximum_count;
         let jobserver = Self {
             semaphore,
-            name: name.to_owned(),
+            name,
             slots: u32::try_from(maximum).unwrap_or(0),
         };
         Ok((jobserver, opened))
@@ -104,6 +127,86 @@ impl Jobserver {
         let count = query(&self.semaphore)?.current_count;
         Ok(u32::try_from(count).unwrap_or(0))
     }
+
+    /// Takes up to `slots` free slots, never waiting; returns how many.
+    pub fn take(&self, slots: u32) -> io::Result<u32> {
+        let mut taken = 0;
+        while taken < slots {
+            // SAFETY: a semaphore handle with every access; a zero timeout
+            // never waits.
+            match unsafe { WaitForSingleObject(self.semaphore.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => taken += 1,
+                WAIT_TIMEOUT => break,
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
+        Ok(taken)
+    }
+
+    /// Gives `slots` slots to the pool, as many as fit below its maximum;
+    /// returns how many.
+    pub fn give(&self, slots: u32) -> io::Result<u32> {
+        // A release past the maximum changes nothing and fails, so one at a
+        // time: as many as fit.
+        let mut given = 0;
+        while given < slots && self.release_one()? {
+            given += 1;
+        }
+        Ok(given)
+    }
+
+    /// Whether a process other than this one has the semaphore open: it has
+    /// more handles than the daemon's one.
+    pub fn held_by_others(&self) -> io::Result<bool> {
+        let mut information = PublicObjectBasicInformation::default();
+        // SAFETY: a handle, and a buffer of the size given.
+        let status = unsafe {
+            NtQueryObject(
+                self.semaphore.as_raw_handle(),
+                OBJECT_BASIC_INFORMATION,
+                (&raw mut information).cast(),
+                size_of::<PublicObjectBasicInformation>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "NtQueryObject failed: status {:#010x}",
+                status as u32
+            )));
+        }
+        Ok(information.handle_count > 1)
+    }
+
+    /// Releases one slot; `false` when the semaphore is at its maximum.
+    fn release_one(&self) -> io::Result<bool> {
+        // SAFETY: a semaphore handle with every access; the previous count
+        // is not asked for.
+        let released =
+            unsafe { ReleaseSemaphore(self.semaphore.as_raw_handle(), 1, std::ptr::null_mut()) };
+        if released != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_TOO_MANY_POSTS as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+/// What `--jobserver-auth=` names for the semaphore `name`: the name, which
+/// must be ASCII.
+pub fn auth(name: &OsStr) -> io::Result<String> {
+    let name = check_name(name)?;
+    if !name.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 /// The counts of `semaphore`, a handle with `SEMAPHORE_QUERY_STATE`.

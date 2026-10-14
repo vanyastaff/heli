@@ -1,21 +1,26 @@
 //! `cargo heli`: cargo for machines shared by many agents (`DESIGN.md`).
 //!
 //! Modules, from the command line inward:
-//! - [`cli`]: heli's command line;
+//! - [`cli`]: heli's command line, which gives each run its [`class`];
 //! - [`client`]: hands runs to the daemon, or runs them [`direct`]ly when it
-//!   cannot; asks it for its status;
+//!   cannot; asks it for its status; makes sure one runs (`ensure`);
 //! - [`launch`]: starts the daemon in the background;
 //! - [`protocol`]: the versioned messages between client and daemon, over
 //!   [`ipc`], the owner-only endpoint;
 //! - [`daemon`]: the per-user daemon, its run registry
-//!   ([`daemon::registry`]) and run execution ([`daemon::execute`]);
+//!   ([`daemon::registry`]), run execution ([`daemon::execute`]), the
+//!   result store ([`daemon::results`], keyed by [`daemon::key`]) and, on
+//!   Unix, its pool's warden ([`daemon::warden`]);
 //! - [`pool`]: the host pool, the jobserver every run draws from, sized by
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
+//! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
+//!   draw from the pool;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
+mod class;
 mod cli;
 mod client;
 mod clock;
@@ -26,10 +31,13 @@ mod environment;
 mod ipc;
 mod launch;
 mod locations;
+mod memory;
 mod nesting;
 mod pool;
+mod processes;
 mod protocol;
 mod runlog;
+mod setup;
 mod status;
 mod worktree;
 
@@ -55,10 +63,13 @@ fn main() {
     match action {
         cli::Action::Run(invocation) => client::run(invocation, depth),
         cli::Action::Status { json } => client::status(json),
+        cli::Action::Ensure => client::ensure(depth),
+        cli::Action::Setup { print } => setup::main(print),
         cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Cancel { run } => client::cancel(&run),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
+        cli::Action::Warden => daemon::warden::main(),
     }
 }
 
