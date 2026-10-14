@@ -54,10 +54,29 @@ pub fn record_run(
         created_at,
         last_run: at,
     };
-    let text = serde_json::to_vec(&owner).map_err(io::Error::other)?;
+    let dir = path(build_dir);
+    let dir = dir.parent().expect("BUG: the manifest is in .heli/");
+    std::fs::create_dir_all(dir)?;
+    replace(build_dir, &owner)
+}
+
+/// Makes `owner` the manifest of `build_dir`, which must exist: unlike
+/// [`record_run`], it never creates the build directory, so a manifest
+/// written after the directory moved away goes nowhere.
+pub fn write(build_dir: &Path, owner: &Owner) -> io::Result<()> {
+    match std::fs::create_dir(build_dir.join(".heli")) {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    replace(build_dir, owner)
+}
+
+/// Replaces the manifest of `build_dir`, whose `.heli/` exists, with
+/// `owner`, whole.
+fn replace(build_dir: &Path, owner: &Owner) -> io::Result<()> {
+    let text = serde_json::to_vec(owner).map_err(io::Error::other)?;
     let path = path(build_dir);
     let dir = path.parent().expect("BUG: the manifest is in .heli/");
-    std::fs::create_dir_all(dir)?;
     // A name of this write's own, so that two writers never share a file.
     static WRITES: AtomicU64 = AtomicU64::new(0);
     let temporary = dir.join(format!(

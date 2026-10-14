@@ -14,32 +14,49 @@
 //!    the latest last run. Live, busy and unknown directories, orphans of
 //!    other repositories or outside any, and what eviction moved into the
 //!    store's `.trash/` (DESIGN.md §6.3), are never taken.
-//! 3. The path scan runs on the donor where it lies, before the rename
+//! 3. The claim: the donor's owner manifest names the new workspace (which
+//!    lives, so the donor is no orphan any more), keeping its creation
+//!    time, before anything else. From here on no other recycler takes it,
+//!    under its old name or, once renamed, its new one. A recycler that
+//!    gives the donor up (below) gives it its manifest back, unless another
+//!    recycler claimed it since or it moved; one that dies before the
+//!    rename leaves it named after a live workspace, which recycling never
+//!    takes and eviction does (DESIGN.md §6.3), but never a directory that
+//!    names a removed worktree at a live one's place.
+//! 4. What cargo would find: when the donor was last built in
+//!    (`crate::store::record::last_build`), and its source-state record if
+//!    it counts (taken after that build). The new worktree is staged
+//!    (`crate::store::record::stage`); a worktree git cannot stage gets
+//!    nothing. Without a record, recycling is **conservative**, and only
+//!    for a worktree whose every file is newer than that build, as in a
+//!    worktree just made: cargo then rebuilds every unit built from them.
+//!    Otherwise (a worktree older than the build) the next orphan is tried:
+//!    cargo would find units built from another content fresh.
+//! 5. The path scan runs on the donor where it lies, before the rename
 //!    (`crate::store::scan`): every unit that compiled in a path under the
 //!    donor's workspace or the donor's own path loses its fingerprint. So
 //!    the build directory is whole the moment it appears under its new
 //!    name, and a cargo that starts then never sees it half scanned.
-//! 4. The rename. When it fails (another recycler or eviction took the
+//! 6. The rename. When it fails (another recycler or eviction took the
 //!    donor first, or it cannot be moved now) the next orphan is tried,
 //!    unless the build directory has appeared meanwhile.
-//! 5. The owner manifest now names the new workspace, keeping its creation
-//!    time. Should that fail, the donor's manifest goes, so that no other
-//!    worktree takes the directory for an orphan.
-//! 6. **Precise** recycling, when the donor has a source-state record that
-//!    counts (`crate::store::record`; read before the scan, which changes
-//!    the directory): each file of the new worktree with the content the
-//!    record holds gets the recorded time, so that cargo finds fresh what
-//!    it found fresh in the donor. Otherwise recycling is **conservative**:
-//!    every file of the new worktree is newer than every artifact. Only the
-//!    recycler whose rename succeeded touches the worktree's files, with the
-//!    record of the directory it moved.
+//! 7. The owner manifest names the new workspace again, in case another
+//!    recycler claimed the donor too, after this one.
+//! 8. **Precise** recycling, with a record: each file of the new worktree
+//!    with the content the record holds gets the recorded time, so that
+//!    cargo finds fresh what it found fresh in the donor, and each other
+//!    file last written at the donor's last build or before gets the time
+//!    now, so that cargo rebuilds what was built from another content
+//!    (`crate::store::record::Worktree::settle`). Should a file not get its
+//!    newer time, every unit's fingerprint goes. Only the recycler whose
+//!    rename succeeded touches the worktree's files, with the record of the
+//!    directory it moved.
 //!
 //! Two recyclers need no lock between them: a rename never replaces a
-//! directory that has files, and each scans the donor under its old name,
-//! which a rename by the other takes away. Each checks again, before each
-//! donor, that the build directory does not exist: one the other renamed
-//! into place looks like the donor's orphan until step 5, and renaming it
-//! onto itself would succeed.
+//! directory that has files, each scans the donor under its old name,
+//! which a rename by the other takes away, and a claimed donor is no
+//! orphan. Each checks again, before each donor, that the build directory
+//! does not exist.
 //!
 //! [`for_worktree`] is the way in for the `post-checkout` hook
 //! (`crate::recycle`) and the daemon's look at a repository's worktrees
@@ -126,20 +143,46 @@ pub fn claim(
     if exists(build_dir) {
         return Ok(None);
     }
+    let worktree = worktree::of(workspace);
     let mut failure = None;
     for donor in orphans(&store, repository) {
-        // Another recycler may have renamed its donor into place since:
-        // until it names the new workspace in the owner manifest, that
-        // directory still looks like the donor's orphan, here in the list.
+        // Another recycler may have renamed its donor into place since; a
+        // directory that exists is never replaced.
         if exists(build_dir) {
             return Ok(None);
         }
-        let Some(owner) = &donor.owner else {
+        let Some(owner) = donor.owner.clone() else {
             continue;
         };
-        let record = record::valid(&donor.path);
-        let old = [owner.workspace.clone(), donor.path.clone()];
-        let invalidated = super::scan::invalidate(&donor.path, &old).len();
+        // Claimed, the donor names the new workspace, which lives: no other
+        // recycler takes it for an orphan from here on, under its old name
+        // or its new one.
+        let claimed = match Claim::take(&donor.path, owner, workspace, repository, at) {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                failure = Some(format!("cannot claim {}: {error}", donor.path.display()));
+                continue;
+            }
+        };
+        // What cargo would find, read before the scan changes the directory.
+        let Ok(newest) = record::last_build(&donor.path) else {
+            failure = Some(format!(
+                "cannot tell when {} was last built in",
+                donor.path.display()
+            ));
+            continue;
+        };
+        let record = record::valid_after(&donor.path, newest);
+        let files = record::stage(&worktree, probe, &donor.path.join(".heli"))
+            .map_err(|error| format!("cannot stage {}: {error}", worktree.display()))?;
+        // Without a record, the worktree's files must be newer than every
+        // artifact already (as in a worktree just made): nothing tells
+        // which of them the donor built from the same content.
+        if record.is_none() && !files.newer_than(&worktree, newest) {
+            continue;
+        }
+        let old = [claimed.donor().workspace.clone(), donor.path.clone()];
+        let mut invalidated = super::scan::invalidate(&donor.path, &old).len();
         if let Some(parent) = build_dir.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -159,24 +202,29 @@ pub fn claim(
             }
             continue;
         }
+        let donor_workspace = claimed.kept();
+        // Named so already, unless another recycler claimed the donor too
+        // and wrote after this one: the directory then names its workspace,
+        // which lives, until this.
         if let Err(error) = owner::record_run(build_dir, workspace, Some(repository), at) {
-            // The donor's manifest would make it an orphan still, for
-            // another worktree to take: without one it is never taken, and
-            // the first run here writes it.
-            let _ = std::fs::remove_file(owner::path(build_dir));
             return Err(format!(
                 "recycled {} to {}, but cannot write its owner manifest: {error}",
                 donor.path.display(),
                 build_dir.display()
             ));
         }
-        let restored = record.and_then(|record| {
-            let scratch = build_dir.join(".heli");
-            record::restore(&record, &worktree::of(workspace), probe, &scratch).ok()
+        let restored = record.map(|record| {
+            let settled = files.settle(&worktree, &record, newest);
+            if settled.failed > 0 {
+                // Some file still looks older than what was built from
+                // another content: cargo rebuilds every unit instead.
+                invalidated += super::scan::invalidate_all(build_dir).len();
+            }
+            settled.restored
         });
         return Ok(Some(Recycled {
             from: donor.path,
-            donor: owner.workspace.clone(),
+            donor: donor_workspace,
             to: build_dir.to_path_buf(),
             workspace: workspace.to_path_buf(),
             invalidated,
@@ -184,6 +232,65 @@ pub fn claim(
         }));
     }
     failure.map_or(Ok(None), Err)
+}
+
+/// A donor claimed for a new workspace: its owner manifest names that
+/// workspace, which lives, so no other recycler takes it for an orphan.
+/// Dropped before [`Claim::kept`], it gives the donor back its manifest, if
+/// the donor is still where it was and no other recycler claimed it since.
+struct Claim<'a> {
+    path: &'a Path,
+    donor: owner::Owner,
+    claimed_for: &'a Path,
+    kept: bool,
+}
+
+impl<'a> Claim<'a> {
+    /// Claims the donor at `path`, whose manifest is `donor`, for
+    /// `workspace` of `repository`, as a run that started `at`.
+    fn take(
+        path: &'a Path,
+        donor: owner::Owner,
+        workspace: &'a Path,
+        repository: &Path,
+        at: u64,
+    ) -> std::io::Result<Self> {
+        let claimed = owner::Owner {
+            workspace: workspace.to_path_buf(),
+            repository: Some(repository.to_path_buf()),
+            created_at: donor.created_at,
+            last_run: at,
+        };
+        owner::write(path, &claimed)?;
+        Ok(Self {
+            path,
+            donor,
+            claimed_for: workspace,
+            kept: false,
+        })
+    }
+
+    /// The donor's manifest, as it was.
+    fn donor(&self) -> &owner::Owner {
+        &self.donor
+    }
+
+    /// Keeps the claim: the donor was renamed into place. Returns the
+    /// donor's workspace.
+    fn kept(mut self) -> PathBuf {
+        self.kept = true;
+        self.donor.workspace.clone()
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let still_ours = owner::read(self.path)
+            .is_some_and(|owner| super::same_path(&owner.workspace, self.claimed_for));
+        if !self.kept && still_ours {
+            let _ = owner::write(self.path, &self.donor);
+        }
+    }
 }
 
 /// Gives the worktree `worktree` a build directory, as [`claim`] does,

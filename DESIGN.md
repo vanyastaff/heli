@@ -1344,9 +1344,21 @@ belongs to one live worktree.
   need no lock between them: a rename never replaces a directory that has
   files, and each scans the donor under its old name, which a rename by the
   other takes away. Before each donor, a recycler checks again that the
-  build directory does not exist. Until the other recycler names the new
-  workspace in it, the directory it renamed into place still looks like
-  the donor's orphan, and renaming it onto itself would succeed.
+  build directory does not exist.
+- **The claim.** Before anything else, a recycler rewrites the donor's
+  owner manifest to name the new workspace (keeping its creation time),
+  then scans and renames it. Its workspace lives, so from then on no other
+  recycler takes the donor for an orphan, under its old name or its new
+  one: a directory at a worktree's place never names a removed worktree,
+  even for the moment between the rename and the manifest. After the
+  rename the manifest is written once more, in case another recycler
+  claimed the same donor after this one. A recycler that gives the donor up
+  (it cannot be moved, its worktree is older than its last build) writes
+  its manifest back, unless another recycler claimed it since or it moved.
+  A donor whose manifest cannot be written is not taken. A recycler that
+  dies between the claim and the rename leaves the donor named after a
+  live workspace, where it is: recycling never takes it, and eviction does
+  (§6.3).
 
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,
@@ -1423,13 +1435,24 @@ and what depends on them. This applies in both modes below.
 
 There are two modes:
 
-- **Conservative**, always available, and what heli does when the donor has
-  no record that counts, or git cannot stage the new worktree. The new
-  worktree's files are newer than every artifact, so every workspace member
-  rebuilds. Third-party packages stay fresh, except those invalidated by the
-  scan above (a crate that compiles an `OUT_DIR` path in, including through
-  `include!`). This is correct by cargo's own rules plus the scan. The cost
-  of the `OUT_DIR` invalidations is to be measured.
+Both start from the donor's **last build**: the newest modification time of
+a file in its build directory, leaving out heli's own `.heli/` and rustc's
+`incremental/` caches (as for the record's validity, below), read before the
+path scan. heli stages the new worktree first (as for the record, below); a
+worktree git cannot stage gets no recycled directory.
+
+- **Conservative**, what heli does when the donor has no record that
+  counts: only for a new worktree whose every file (tracked or untracked,
+  as staged) was last written after the donor's last build, as in a
+  worktree just made. Every workspace member then rebuilds. Third-party
+  packages stay fresh, except those invalidated by the scan above (a crate
+  that compiles an `OUT_DIR` path in, including through `include!`). This
+  is correct by cargo's own rules plus the scan. A worktree with an older
+  file (one made before the donor's last build: the main worktree at its
+  first run, or a worktree the look finds) gets no recycled directory from
+  this donor: cargo would find units built from another content fresh, and
+  link the donor's code. heli tries the next orphan, and else the worktree
+  builds cold. The cost of the `OUT_DIR` invalidations is to be measured.
 - **Precise.** The donor has a *source-state record*: the blob id, size and
   mtime of every tracked or untracked file.
   - The record counts only if it was taken after the donor's last build: its
@@ -1439,10 +1462,14 @@ There are two modes:
     writes a fingerprint). Otherwise heli ignores it. It is read before the
     path scan, which changes the directory.
   - For each file in the new worktree whose blob and size match the record,
-    heli sets the recorded mtime. Every other file keeps the current time.
-    The size counts because a blob id is of the content after git's filters:
-    two files that differ only in line endings share one, and
-    `include_str!` compiles in bytes.
+    heli sets the recorded mtime. Every other file last written at the
+    donor's last build or before gets the time now (a worktree made before
+    that build has such files); any other keeps its time, newer than every
+    artifact already. The size counts because a blob id is of the content
+    after git's filters: two files that differ only in line endings share
+    one, and `include_str!` compiles in bytes. Should a file not get its
+    newer time, heli deletes the fingerprint of every unit, and cargo
+    rebuilds them all.
   - Every file with the donor's content then looks to cargo exactly as it did
     in the donor, and every changed file is newer than any artifact. Only the
     changed crates, their dependents and the units the scan invalidated
@@ -1462,8 +1489,11 @@ There are two modes:
     the daemon did not see. A run the client executes without a daemon
     writes none.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
-    recorded. Cargo rebuilds when one is missing; one that is present keeps
-    the current time and also triggers a rebuild.
+    recorded, and neither mode looks at them. Cargo rebuilds when one is
+    missing; one that is present triggers a rebuild when it was written
+    after the donor's last build, as in a worktree just made. An ignored
+    input of other content, present in a worktree made before that build,
+    is the case recycling does not cover yet.
   - With `-Zchecksum-freshness` (cargo#14136), cargo compares content itself,
     and precise mode becomes unnecessary. The path scan does not.
 
@@ -1680,6 +1710,8 @@ the one before, and the next event starts a new file.
 | `gc` or the daemon stopped while deleting the trash | What is left there takes disk | It counts as free for the floor and in no directory's size; the daemon's deleter, at start and every minute, or the next `gc`, deletes it |
 | Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |
 | Recycled directory with a stale record | Could link stale code | A record counts only if it is newer than every file in the build directory; otherwise conservative mode |
+| Recycling into a worktree made before the donor's last build (the main worktree's first run, the look) | Its unchanged-looking files are older than the donor's artifacts: cargo would link the donor's code | Precise mode gives every file not of the recorded content a time after that build; conservative mode does not recycle into such a worktree (§6.4) |
+| A recycler taking a directory another one has just renamed into place | One worktree's build directory moved to another | The donor's manifest names the new workspace before the rename: a claimed donor is no orphan (§6.4, "The claim") |
 | Tools looking in `target/<profile>/deps` | They miss moved intermediates | Validated on a real workspace before phase 2 (§6.1) |
 | False green from the cache | A flaky pass is reused | Printed caveat; `--no-cache` |
 | heli runs itself in a loop | Unbounded processes | `heli` is refused as a subcommand; `HELI_DEPTH` stops at 16 |
