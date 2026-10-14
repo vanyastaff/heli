@@ -23,7 +23,7 @@
 
 use std::ffi::{OsStr, OsString};
 
-use crate::class::Class;
+use crate::class::{self, Class, Runner};
 use crate::protocol::{RunRequest, Text};
 
 /// nextest's flags with a value that only the test phase reads (checked
@@ -62,15 +62,6 @@ const RUN_ONLY_VARS: [&str; 8] = [
     "NEXTEST_SUCCESS_OUTPUT",
     "NEXTEST_FAILURE_OUTPUT",
 ];
-
-/// The tool that runs the tests.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Runner {
-    /// `cargo test`: libtest, its arguments after `--`.
-    Libtest,
-    /// `cargo nextest run`.
-    Nextest,
-}
 
 /// A test run's two command lines.
 #[derive(Debug)]
@@ -127,24 +118,11 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
 }
 
 /// Where a test run's flags go (right after `test`, or after `nextest
-/// run`) and which tool runs its tests, read as `Class::of_cargo` reads
-/// the subcommand: `test` (`t`) or `nextest run` (`nextest r`), after an
-/// optional `+toolchain`, the program first.
+/// run`) and which tool runs its tests (`crate::class::test_runner`), in
+/// `argv`, the program first.
 fn runner(argv: &[OsString]) -> Option<(Runner, usize)> {
-    let mut at = 1;
-    if argv
-        .get(at)
-        .is_some_and(|arg| arg.to_string_lossy().starts_with('+'))
-    {
-        at += 1;
-    }
-    match argv.get(at)?.to_str()? {
-        "test" | "t" => Some((Runner::Libtest, at + 1)),
-        "nextest" if matches!(argv.get(at + 1)?.to_str()?, "run" | "r") => {
-            Some((Runner::Nextest, at + 2))
-        }
-        _ => None,
-    }
+    let (runner, at) = class::test_runner(argv.get(1..)?)?;
+    Some((runner, at + 1))
 }
 
 impl TestRun {
