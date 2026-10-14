@@ -7,11 +7,14 @@
 //! (`crate::store::probe`):
 //!
 //! 1. The build directory must be in a store heli manages, and must not
-//!    exist: an existing one, even empty, is never replaced. While another
-//!    recycler has a donor claimed for the same workspace (step 3), this
-//!    one waits, at most [`CLAIM_WAIT`], for it to rename it into place or
-//!    give it up: otherwise cargo would make an empty build directory
-//!    first, and that rename would fail.
+//!    exist: an existing one, even empty, is never replaced. One recycler
+//!    at a time recycles in a store: each holds the store's recycling lock
+//!    ([`lock`], waiting at most [`LOCK_WAIT`] for it), and looks again
+//!    once it has it, since the one before may have recycled for the same
+//!    worktree (the hook, the look and a run can race for one). Without
+//!    it, on Windows, a directory another recycler walks (to scan it)
+//!    cannot be renamed, so two recyclers of one donor could each make the
+//!    other's rename fail, and cargo then makes an empty build directory.
 //! 2. The donor is the orphan in that store (`crate::store::State::Orphan`:
 //!    its workspace's `Cargo.toml` is gone, and none of cargo's locks in it
 //!    is held) whose owner manifest names the same repository, the one with
@@ -56,17 +59,18 @@
 //!    rename succeeded touches the worktree's files, with the record of the
 //!    directory it moved.
 //!
-//! Two recyclers need no lock between them: a rename never replaces a
-//! directory that has files, each scans the donor under its old name,
-//! which a rename by the other takes away, and a claimed donor is no
-//! orphan. Each checks again, before each donor, that the build directory
-//! does not exist.
+//! Beside the lock, which an older heli does not take, a rename never
+//! replaces a directory that has files, each recycler scans the donor
+//! under its old name, which a rename by another takes away, and a claimed
+//! donor is no orphan. Each checks again, before each donor, that the
+//! build directory does not exist.
 //!
 //! [`for_worktree`] is the way in for the `post-checkout` hook
 //! (`crate::recycle`) and the daemon's look at a repository's worktrees
 //! (`crate::daemon::accounts`): it asks cargo where a worktree builds, and
 //! only while an orphan of its repository waits.
 
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -148,17 +152,12 @@ pub fn claim(
     if exists(build_dir) {
         return Ok(None);
     }
-    // Another recycler for the same workspace (the hook, the look, a run)
-    // may have claimed a donor already: it gives the build directory one
-    // soon, or gives the donor up. Without the wait, cargo would make an
-    // empty build directory first, and that recycler's rename would fail.
-    let waiting = Instant::now();
-    while claimed_elsewhere(&store, build_dir, workspace) && waiting.elapsed() < CLAIM_WAIT {
-        if exists(build_dir) {
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // One recycler at a time in a store: another one may be recycling for
+    // the same worktree (the hook, the look, a run), and it gives the build
+    // directory one, or gives its donor up, before this one looks.
+    let Some(_recycling) = lock(&store)? else {
+        return Ok(None);
+    };
     if exists(build_dir) {
         return Ok(None);
     }
@@ -253,28 +252,45 @@ pub fn claim(
     failure.map_or(Ok(None), Err)
 }
 
-/// The longest a recycler waits for another one, which claimed a donor for
-/// the same workspace, to rename it into place or give it up.
-const CLAIM_WAIT: Duration = Duration::from_secs(25);
+/// The longest a recycler waits for the store's recycling lock.
+const LOCK_WAIT: Duration = Duration::from_secs(25);
 
-/// How long after its claim a donor counts as being recycled by another
-/// recycler. One older than that was left by a recycler that died, and
-/// keeps nobody waiting.
-const CLAIM_FRESH: u64 = 60;
-
-/// Whether a build directory in `store` other than `build_dir` is claimed
-/// for `workspace` (its manifest says so, from a claim made within
-/// [`CLAIM_FRESH`]): another recycler's donor, on its way to `build_dir`.
-fn claimed_elsewhere(store: &Path, build_dir: &Path, workspace: &Path) -> bool {
-    let now = crate::clock::now();
-    super::build_dirs(store).iter().any(|dir| {
-        !super::same_path(dir, build_dir)
-            && owner::read(dir).is_some_and(|owner| {
-                owner.claimed
-                    && super::same_path(&owner.workspace, workspace)
-                    && owner.last_run.saturating_add(CLAIM_FRESH) >= now
-            })
-    })
+/// The recycling lock of `store`, `.recycle.lock` in it, taken within
+/// [`LOCK_WAIT`]: held while a recycler recycles, released when the file
+/// closes (also when its process dies). `None` for a store that does not
+/// exist, which holds no orphan; an error when another recycler held the
+/// lock all that time, or it cannot be taken.
+fn lock(store: &Path) -> Result<Option<File>, String> {
+    let path = store.join(".recycle.lock");
+    let file = match File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(_) if !store.is_dir() => return Ok(None),
+        Err(error) => return Err(format!("cannot open {}: {error}", path.display())),
+    };
+    let waiting = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(TryLockError::WouldBlock) if waiting.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "another recycler held {} for {} s",
+                    path.display(),
+                    LOCK_WAIT.as_secs()
+                ));
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(format!("cannot lock {}: {error}", path.display()));
+            }
+        }
+    }
 }
 
 /// A donor claimed for a new workspace: its owner manifest names that
@@ -303,7 +319,6 @@ impl<'a> Claim<'a> {
             repository: Some(repository.to_path_buf()),
             created_at: donor.created_at,
             last_run: at,
-            claimed: true,
         };
         owner::write(path, &claimed)?;
         Ok(Self {

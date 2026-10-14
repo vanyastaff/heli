@@ -1492,7 +1492,12 @@ impl Repo {
     /// of each unit, and the client's stderr.
     fn build_like_a_clean_build(&self, worktree: &Path) -> (Vec<Unit>, String) {
         let output = self.build_output(worktree);
-        assert_eq!(self.recycled().len(), 1, "the first build recycled");
+        assert_eq!(
+            self.recycled().len(),
+            1,
+            "the first build recycled\n--- the daemon's log\n{}",
+            self.fixture.daemon_log()
+        );
         let recycled = test_outputs(&output.stdout, worktree);
         assert_eq!(recycled, self.clean_test_outputs(worktree));
         (units(&output.stdout), text(&output.stderr))
@@ -2052,7 +2057,30 @@ fn the_look_recycles_precisely_for_an_older_worktree_without_the_donors_code() {
     assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
 
     let output = repo.build_output(&b);
-    assert_eq!(leaf_says(&output.stdout, &b), LEAF_FROM_THE_COMMIT);
+    assert_eq!(
+        leaf_says(&output.stdout, &b),
+        LEAF_FROM_THE_COMMIT,
+        "{}",
+        repo.diagnosis(&b.join("leaf").join("src").join("lib.rs"))
+    );
+}
+
+impl Repo {
+    /// What a failing recycling test shows: the modification time of
+    /// `file`, the recycle events and the daemon's log.
+    fn diagnosis(&self, file: &Path) -> String {
+        let modified = std::fs::metadata(file)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| format!("{modified:?}"))
+            .unwrap_or_else(|error| error.to_string());
+        format!(
+            "{} modified {modified} (now {:?})\n--- recycle events\n{:?}\n--- the daemon's log\n{}",
+            file.display(),
+            std::time::SystemTime::now(),
+            self.recycled(),
+            self.fixture.daemon_log()
+        )
+    }
 }
 
 /// Without a record of the donor, the look does not recycle for a worktree

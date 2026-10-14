@@ -1358,10 +1358,18 @@ belongs to one live worktree.
 - The hook and the look ask cargo from the top of the worktree, with their
   own environment, and recycle only for a workspace inside it. While no
   store holds an orphan of the repository, they do not ask cargo at all.
-- Each recycling is a `recycle` event in the event log (§8). Two recyclers
-  need no lock between them: a rename never replaces a directory that has
-  files, and each scans the donor under its old name, which a rename by the
-  other takes away. Before each donor, a recycler checks again that the
+- Each recycling is a `recycle` event in the event log (§8). One recycler
+  at a time recycles in a store: it holds the store's recycling lock,
+  `<store>/.recycle.lock`, waiting at most 25 s for it (else it recycles
+  nothing), and once it has it, looks again whether the build directory
+  exists, since the hook, the look and a run can race for one worktree. On
+  Windows a directory that another recycler walks (to scan it) cannot be
+  renamed, so two recyclers of one donor could each make the other's
+  rename fail, and cargo would then make an empty build directory. The
+  operating system releases the lock of a recycler that dies. Beside it
+  (an older heli takes none), a rename never replaces a directory that has
+  files, each scans the donor under its old name, which a rename by the
+  other takes away, and before each donor a recycler checks again that the
   build directory does not exist.
 - **The claim.** Before anything else, a recycler rewrites the donor's
   owner manifest to name the new workspace (keeping its creation time),
@@ -1373,15 +1381,12 @@ belongs to one live worktree.
   claimed the same donor after this one. A recycler that gives the donor up
   (it cannot be moved, its worktree is older than its last build) writes
   its manifest back, unless another recycler claimed it since or it moved.
-  A donor whose manifest cannot be written is not taken. The claim marks
-  the manifest (`"claimed":true`, which the rewrite after the rename
-  drops): a recycler that finds a donor claimed for its own workspace in
-  the last minute (the run's and the look's, or the hook's, racing for one
-  worktree) waits, at most 25 s, until the build directory appears or the
-  claim is given up, so that cargo does not make an empty build directory
-  first. A recycler that dies between the claim and the rename leaves the
-  donor named after a live workspace, where it is: recycling never takes
-  it, and eviction does (§6.3).
+  A donor whose manifest cannot be written is not taken. A recycler that
+  dies between the claim and the rename leaves the donor named after a
+  live workspace, where it is: recycling never takes it, and eviction does
+  (§6.3). Under the store's lock no other recycler of this heli runs
+  meanwhile; the claim also keeps a recycler that takes no lock (an older
+  heli's hook) from taking the directory.
 
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,
