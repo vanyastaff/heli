@@ -28,7 +28,9 @@
 //! `-V`, `-vV` or `--version` as its last argument, it only prints the file
 //! in that directory named after the request (its own name, then the
 //! arguments before the flag, joined by spaces: `cargo`, `cargo clippy`,
-//! `rustc`) and exits 0, or exits 1 when there is no such file.
+//! `rustc`) and exits 0, or exits 1 when there is no such file. With
+//! `ECHO_VERSION_LOG` naming a file, it first appends the request there as a
+//! line, so a test can count how often a tool was asked.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -48,6 +50,15 @@ fn main() {
         for arg in before {
             request.push(' ');
             request.push_str(&arg.to_string_lossy());
+        }
+        if let Some(log) = std::env::var_os("ECHO_VERSION_LOG") {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .and_then(|mut file| writeln!(file, "{request}"))
+                .expect("append to ECHO_VERSION_LOG");
         }
         match std::fs::read(Path::new(&versions).join(request)) {
             Ok(text) => {

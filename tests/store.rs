@@ -205,7 +205,9 @@ fn a_repository_set_up_builds_into_the_store() {
     let repository_config = workspace.join(".cargo").join("config.toml");
     let user_config = fixture.home().join(".cargo").join("config.toml");
     let asked = asked(&stdout);
-    assert_eq!(asked.len(), 2, "two questions: {stdout}");
+    // The third is the repository's `post-checkout` hook (tests/recycle.rs),
+    // declined by the end of input.
+    assert_eq!(asked.len(), 3, "three questions: {stdout}");
     assert_eq!(asked[1], user_config, "{stdout}");
     assert_eq!(
         std::fs::read_to_string(&repository_config).expect("the repository's configuration"),

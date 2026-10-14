@@ -44,7 +44,7 @@ use std::fs::File;
 use serde::Serialize;
 
 use crate::config::{Config, StoreConfig};
-use crate::daemon::events::{self, Events};
+use crate::daemon::events::Events;
 use crate::locations::Locations;
 use crate::store::evict::{self, Pass, Volume};
 use crate::store::ladder::{self, Victim};
@@ -134,13 +134,7 @@ pub fn main(dry_run: bool, json: bool) -> ! {
         .collect();
     if !dry_run {
         evict::execute(&mut pass, now);
-        let events = Events::new(
-            locations.event_log(),
-            config
-                .event_log
-                .max_kb
-                .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
-        );
+        let events = Events::configured(&locations, &config);
         for victim in &pass.victims {
             events.record("evict", evict::event(victim));
         }

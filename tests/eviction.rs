@@ -1046,6 +1046,9 @@ fn the_daemon_finds_orphans() {
     use_store(&fixture, &main);
     let linked = add_worktree(&main, "linked");
     let orphan = build_in(&fixture, &linked, "echo-args");
+    // The main worktree has a build directory of its own, so that its runs
+    // below recycle nothing (DESIGN.md §6.4).
+    build_in(&fixture, &main, "echo-args");
     git(
         &main,
         &["worktree", "remove", "--force", &linked.to_string_lossy()],

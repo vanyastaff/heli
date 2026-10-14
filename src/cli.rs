@@ -41,6 +41,9 @@ pub enum Action {
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
+    /// Give the worktree here a removed worktree's build directory, as
+    /// git's `post-checkout` hook asks.
+    Recycle,
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
@@ -54,6 +57,8 @@ pub struct Invocation {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub class: Class,
+    /// Whether `cargo heli exec` runs it; else it is a cargo subcommand.
+    pub exec: bool,
     /// How the run uses the result store.
     pub cache: Cache,
     /// The output mode heli's flags chose, if they chose one.
@@ -152,6 +157,10 @@ enum Command {
         /// Only the errors, as the compiler rendered them, all of them.
         #[arg(long, group = "select")]
         errors: bool,
+        /// Only one test's output: `tests::it_works`, or nextest's binary
+        /// and name, `my-crate tests::it_works`.
+        #[arg(long, value_name = "NAME", group = "select")]
+        test: Option<String>,
     },
     /// Kill a run in flight with every process it started; its clients
     /// report it as cancelled.
@@ -173,6 +182,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Give the worktree here the build directory of a removed worktree of
+    /// its repository, if it has none (run by the `post-checkout` hook
+    /// `cargo heli setup` installs).
+    #[command(hide = true)]
+    Recycle,
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -226,6 +240,7 @@ pub fn parse(
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
                 class: Class::Exec,
+                exec: true,
                 cache: Cache::Off,
                 output: own.mode().or(output),
             })
@@ -250,16 +265,19 @@ pub fn parse(
             tail,
             grep,
             errors,
+            test,
         } => Action::Log {
             run,
-            select: match (tail, grep) {
-                (Some(count), _) => Select::Tail(count),
-                (None, Some(pattern)) => Select::Grep(pattern),
-                (None, None) if errors => Select::Errors,
-                (None, None) => Select::All,
+            select: match (tail, grep, test) {
+                (Some(count), ..) => Select::Tail(count),
+                (None, Some(pattern), _) => Select::Grep(pattern),
+                (None, None, Some(name)) => Select::Test(name),
+                (None, None, None) if errors => Select::Errors,
+                (None, None, None) => Select::All,
             },
         },
         Command::Cancel { run } => Action::Cancel { run },
+        Command::Recycle => Action::Recycle,
         Command::Daemon { warden: true, .. } => Action::Warden,
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => {
@@ -267,6 +285,7 @@ pub fn parse(
             Action::Run(Invocation {
                 program: cargo,
                 class,
+                exec: false,
                 cache: results::cache(class, &args, cli.no_cache),
                 args,
                 output,

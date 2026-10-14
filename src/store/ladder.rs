@@ -204,7 +204,11 @@ impl Surveyed {
     /// `dir` as it is at `now`; `orphaned_since` says since when an orphan
     /// is unclaimed.
     pub fn of(dir: Dir, now: u64, orphaned_since: impl FnOnce(&Dir) -> Option<u64>) -> Self {
-        let state = dir.state(now);
+        let state = if super::busy_for_eviction(&dir.path, now) {
+            State::Busy
+        } else {
+            dir.state()
+        };
         let measure = measure_root(&dir);
         let last_run = dir.owner.as_ref().map(|owner| owner.last_run);
         let last_use = measure.newest.max(last_run).unwrap_or(0);

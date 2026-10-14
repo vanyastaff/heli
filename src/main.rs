@@ -17,8 +17,9 @@
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
-//! - [`store`]: the build store and its eviction ladder, and [`gc`], which
-//!   lists its directories and evicts;
+//! - [`store`]: the build store and its eviction ladder, [`gc`], which lists
+//!   its directories and evicts, and [`recycle`], which git's
+//!   `post-checkout` hook runs;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
 //!   draw from the pool, cargo's `build-dir` in the build [`store`], and the
 //!   [`autostart`] registration that starts the daemon at logon;
@@ -44,6 +45,7 @@ mod output;
 mod pool;
 mod processes;
 mod protocol;
+mod recycle;
 mod runlog;
 mod setup;
 mod status;
@@ -77,6 +79,7 @@ fn main() {
         cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Cancel { run } => client::cancel(&run),
         cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
+        cli::Action::Recycle => recycle::main(),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),

@@ -575,8 +575,20 @@ How a command line is read:
 2. **Result store.** On a hit, heli prints "already passed: <run>, <when>"
    and exits 0 (§7).
 3. **Single-flight.** If a run with the same key is in flight anywhere on the
-   machine, the client attaches to it: it streams that run's output and
-   returns its exit code.
+   machine, the client attaches to it (step 4, "Attach"): it streams that
+   run's output and returns its exit code. The key leaves the worktree's
+   path out, so the run may be another worktree's; the notice names its
+   worktree, and says that `--no-cache` runs it anew.
+   - The key is the one the result store's first lookup computed, so a
+     miss costs no snapshot of its own.
+   - A run takes the clients of its key from other worktrees only once it
+     has the key it runs on. A run that waits at its worktree lock is keyed
+     again after the wait (§7), since the runs it waits for (a `fmt`) may
+     change its tree; until then it takes clients from its own worktree
+     only, whose tree such a change reaches too. A run that waits for
+     nothing keeps its key.
+   - A `--no-cache` run attaches to no run, and is keyed only once
+     admitted; from then on others attach to it.
 4. **Detach.** The daemon spawns the command as the first process of a
    process tree of its own, and the client follows its output.
    - **The tree.** On Windows, a Job Object per run: the process starts
@@ -605,8 +617,14 @@ How a command line is read:
      Every client gets the run's whole story: heli's notes, and its end
      (its exit, a pass found in the result store meanwhile, or a command
      that could not start). A retiring daemon starts no run but still
-     attaches. Single-flight (step 3) widens this to the key, across
-     worktrees.
+     attaches.
+     - This holds for runs without a key: compile, mutate and exec runs,
+       and requests for help. The same command may have started before the
+       agent's last edit; the notice's age tells.
+     - A verify or test run attaches by key instead (single-flight, step
+       3): the same tree too, and from any worktree. The same command after
+       an edit is a run of its own. One without a key (outside git,
+       `--no-cache`, a key that cannot be computed) attaches to no run.
    - **Cancel.** `cargo heli cancel <run>` kills the whole tree and answers
      once none of its processes is left. On Windows, `TerminateJobObject`,
      waiting on the processes themselves too (a job stops counting a
@@ -625,6 +643,19 @@ How a command line is read:
      the run with its exit code. `cargo test --doc`, which cargo cannot build
      apart, goes straight to its test slots, and a command that has
      `--no-run` already is a build, run once.
+   - nextest's build leaves out what only the tests read: under `--no-run`
+     nextest ignores it with a warning (`ignoring --status-level because
+     --no-run is specified`), or refuses it (`--no-fail-fast`, `--fail-fast`,
+     `--max-fail`). That is the thread count (`-j`, `--test-threads`,
+     `--jobs`), `--retries`, `--flaky-result`, `--no-tests`, `--max-fail`,
+     the reporter's `--status-level`, `--final-status-level`,
+     `--success-output` and `--failure-output`, the switches
+     `--no-fail-fast`, `--fail-fast` and `--no-capture` (`--nocapture`, also
+     after `--`), and the variables that set them
+     (`NEXTEST_TEST_THREADS`, `NEXTEST_RETRIES`, `NEXTEST_FLAKY_RESULT`,
+     `NEXTEST_NO_TESTS` and the reporter's four). Checked against nextest
+     0.9.146; `--cargo-quiet` and `--cargo-message-format` stay, and work in
+     both phases.
    - It then takes K slots for the test threads (`status`: `testing`). K is
      the smallest of the thread count asked for, the run's share (whole
      slots, at least one), and the slots it gets within 5 s; it stops waiting
@@ -708,6 +739,10 @@ These are the only waits; nothing else makes a heli run wait for another run.
    worktree, and they wait for it, in the order they came.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
+4. **Recycling:** the first run from a directory, while a store holds an
+   orphan, waits until its worktree's build directory has been recycled or
+   will not be (§6.4): for its `cargo metadata`, and with a donor for a scan
+   and a rename. At most 30 s; later runs from there never wait for it.
 
 ### Command line and contracts
 
@@ -721,6 +756,7 @@ cargo heli gc [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli daemon [--detach | --warden]            (internal)
+cargo heli recycle                                 (internal: the post-checkout hook, §6.4)
 ```
 
 - **Exit codes.**
@@ -814,18 +850,24 @@ their own. Full mode passes every run through. In compact and quiet mode:
 
 - build, check, clippy and doc (and cargo's aliases `b`, `c`, `d`; after a
   `+toolchain` too) show cargo's diagnostics (below);
-- test and nextest runs, and `exec`, get the views below once they exist
-  (#11);
+- `nextest run` (`nextest r`) shows nextest's output under its own controls,
+  and `test` (`t`) libtest's failures, both phases of the run, with cargo's
+  diagnostics as for a compile run ("Test runs" below);
+- `cargo heli exec` shows the head and the tail of the command's output,
+  and adds nothing to the command, which runs as given, even
+  `exec -- cargo …` ("exec" below);
 - anything else passes through untouched, with the footer, in every mode:
   `run`, whose output is the program's; `clippy --fix`, `fix` and `fmt`,
-  which say what they rewrote in lines `--quiet` drops; subcommands heli
-  knows nothing of; and `exec -- cargo …`, which runs the command as given.
-- So does every run whose arguments already choose cargo's output:
-  `--message-format`, `--quiet` or `-q`, `--verbose` or `-v`, also in a
-  cluster of short flags such as `-vv` or `-rq`, before any `--`. heli must
-  not add its own there: cargo refuses a second `--quiet` or
+  which say what they rewrote in lines `--quiet` drops; and cargo
+  subcommands heli knows nothing of (`cargo heli tree`).
+- So does every cargo run (nextest's aside) whose arguments already choose
+  cargo's output: `--message-format`, `--quiet` or `-q`, `--verbose` or
+  `-v`, also in a cluster of short flags such as `-vv` or `-rq`, before any
+  `--`. heli must not add its own there: cargo refuses a second `--quiet` or
   `--message-format`. A cluster counts even when the letter is in a value
-  (`-pserver`), which costs compactness, never the run.
+  (`-pserver`), which costs compactness, never the run. nextest's flags
+  are its own (`-v` is nextest's verbosity, cargo's is `--cargo-verbose`):
+  heli adds each of its controls the user did not set (below).
 
 The run's class (§5, "Classes") decides how warnings show: counted for
 compile runs, by lint for verify runs. Within those classes, `run` and
@@ -837,15 +879,28 @@ compile runs, by lint for verify runs. Within those classes, `run` and
    be misreported.
    - cargo: `--quiet` drops the `Compiling …` line per unit (442 of them in a
      cold build of the example workspace).
+   - cargo under `cargo test`: `--quiet` also has libtest print one
+     character per test in place of a line.
    - nextest: `--cargo-quiet`, `--status-level fail`,
      `--final-status-level fail`, `--success-output never` and
-     `--failure-output final`. All five exist in nextest 0.9.146 (`--help`),
-     and each has an environment variable.
+     `--failure-output final`. All five exist in nextest 0.9.146 (`--help`).
+     A failing test's output (its stdout, and its stderr with the panic
+     message) then comes once, under its name, after nextest's summary.
 
-   heli adds a flag only when the user's argv does not already set it. It
-   adds its flags after the user's arguments, so that cargo reports a
-   mistake in them exactly as without heli, and before any `--`, after
-   which the arguments are another program's.
+   heli adds a flag only when the user did not set it: for cargo, in the
+   argv; for nextest, in the argv or in the variable nextest reads for it
+   (`NEXTEST_STATUS_LEVEL`, `NEXTEST_FINAL_STATUS_LEVEL`,
+   `NEXTEST_SUCCESS_OUTPUT`, `NEXTEST_FAILURE_OUTPUT`). `--cargo-quiet` is
+   not added beside the user's `--cargo-quiet` (twice silences cargo's
+   errors too) or `--cargo-verbose`. Where nextest would ignore a flag with
+   a warning, heli does not add it: none of the reporter's four to a
+   command that only builds (`--no-run`), and neither output level to one
+   that does not capture (`--no-capture`, `--nocapture`, also after `--`).
+   A nextest profile's settings for the same four give way to heli's flags
+   in compact and quiet mode; full mode keeps them. heli adds its flags
+   after the user's arguments, so that cargo reports a mistake in them
+   exactly as without heli, and before any `--`, after which the arguments
+   are another program's.
 2. **Structured messages.** For compile phases heli passes
    `--message-format json` to cargo and `--cargo-message-format json` to
    nextest, and renders diagnostics from the JSON fields (level, code, primary
@@ -873,6 +928,35 @@ compile runs, by lint for verify runs. Within those classes, `run` and
    commands, where compact means the first 20 and last 60 lines around a cut
    marker.
 
+**Test runs.** Both phases of a test run (§5, lifecycle step 6) write to one
+view, so a diagnostic that the build and the tests' own cargo both report
+shows once, and heli's header line passes through between them.
+
+- **nextest.** nextest's own output, on stderr, passes through under heli's
+  controls: its header, a line per failing test, the summary, then each
+  failing test's output. So does a line on stdout that is not cargo's JSON
+  (a test's output under `--no-capture`). Quiet mode's facts are the counts
+  of nextest's summary line as nextest words them (`812 passed, 3
+  skipped`), then the warnings.
+- **libtest.** Of libtest's text on stdout, heli keeps each `failures:` (or,
+  under `--show-output`, `successes:`) section up to the binary's
+  `test result:` line, with each test's captured output and panic message,
+  and the `test result:` line of a binary whose tests failed. It drops what
+  libtest prints per test (`running 3 tests`, `test x ... ok`, progress
+  dots, `x --- FAILED`), the blank lines between, and the `test result:`
+  line of a binary whose tests passed. Any other line passes through. Once
+  the run is over, a line on stderr sums the `test result:` lines of every
+  binary: `tests: 812 passed, 1 failed, 3 ignored` (passed always, the
+  other counts when there are some). Quiet mode's facts are the same
+  counts, then the warnings.
+
+**exec.** heli counts lines over both streams together, in the order they
+came, as `log --tail` does, and prints each on its own stream: the first 20
+as they come; once the run is over, the last 60, after a line on stderr
+when lines were cut between them: `cargo-heli: 1234 lines cut (cargo heli
+log r17 has them all)`. An output of 80 lines or fewer shows whole. Quiet
+mode's fact is the count of lines: `1314 lines`.
+
 Some things never change: the exit code, the stdout/stderr split, and output
 heli does not recognize, which passes through.
 
@@ -897,7 +981,20 @@ selector picks a part of it:
   reported it; from text otherwise, each from a line that starts with
   `error:` or `error[` to the blank line after it, the next warning, or the
   end;
-- `--test <name>`: one test's output;
+- `--test <name>`: one test's output, as its runner wrote it. `<name>` is
+  the test's path (`tests::it_works`), or nextest's binary and path
+  (`my-crate tests::it_works`). Under libtest, the test's section of a
+  `failures:` or `successes:` list on stdout, from `---- <name> stdout ----`
+  to the next section or the list of names that ends them. Under nextest,
+  on stderr, the test's status line and the output under it, to the next
+  status line or line of nextest's own (a separator, `warning: …`: lines
+  indented less than the output's 4 spaces). Blank lines that end it are
+  left out. nextest prints a status line twice when the output comes at
+  the end (`--failure-output final`): outputs with more than their status
+  line come first, else the status lines alone. With none, one line says
+  so:
+  ``cargo-heli: no output of test `<name>` in r17`` (a compact run holds no
+  passing test's output);
 - `--tail N`: the last N lines;
 - `--grep <re>`: matching lines, each matched without its line end.
 
@@ -992,7 +1089,8 @@ its end): a comment that marks them as heli's, and
 `build-dir = "<store>/{workspace-path-hash}"`. It replaces lines an earlier
 setup wrote, and leaves alone, with the reason, a file that is not TOML,
 that sets `build-dir` itself, or whose new content would not parse to the
-same configuration plus `build.build-dir`.
+same configuration plus `build.build-dir`. Then, in a repository, setup
+offers its git `post-checkout` hook, for recycling (§6.4).
 
 **Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
 move, anything that searches `target/<profile>/deps` for rlibs, test binaries
@@ -1021,7 +1119,9 @@ those arguments, not even one standing in for cargo under another name. Its
 `workspace_root`,
 `target_directory` and `build_directory` (cargo 1.91 and later) say where
 the run builds. It takes no lock (verified: it answers while a build holds
-the build directory's), and it neither delays nor fails the run.
+the build directory's), and it fails no run. It delays none either, but the
+first run from a directory while a store holds an orphan, which waits for
+it in case its worktree gets a recycled build directory (§6.4).
 
 - The `target/` directory is **registered**, with its workspace, in
   `store.json` in the state directory, which outlives the daemon.
@@ -1155,8 +1255,8 @@ Safety rules:
 - **Unknown layout.** Lock names change between cargo versions. A profile
   directory with cargo's intermediates (`deps/`, `incremental/`,
   `.fingerprint/`, `build/`) and none of the three lock files has a layout
-  heli does not know. Then heli treats its directory as busy when anything
-  in it changed within the last hour.
+  heli does not know. Then eviction treats its directory as busy when
+  anything in it changed within the last hour, and `gc` lists it so.
 
 **Passes.** `cargo heli gc` makes an eviction pass: it plans the victims,
 evicts them, logs each eviction in the event log (§8), and deletes the
@@ -1179,6 +1279,47 @@ repository, renamed to the new worktree's `{workspace-path-hash}` path. On one
 volume that is a rename: no copy and no extra disk. One build directory still
 belongs to one live worktree.
 
+- **The donor** is an orphan (§6.2: its workspace's `Cargo.toml` is gone,
+  none of cargo's locks in it held) in the store that holds the new build
+  directory, whose owner manifest names the same repository; of those, the
+  one with the latest last run. Never taken: live, busy and unknown
+  directories, orphans of other repositories or of none, and what eviction
+  moved into `<store>/.trash/` (§6.3). An orphan stays claimable until
+  eviction takes it, which is no earlier than 24 h unclaimed (§6.3, tier 2).
+- **The new build directory** is the one cargo names for the worktree
+  (`build_directory`, §6.2): heli recycles only when it is in a store heli
+  manages and does not exist. An existing one, even empty, is never
+  replaced. Afterwards its owner manifest names the new workspace, keeping
+  its creation time.
+- **The first run.** The run's own `cargo metadata` (§6.2) names the build
+  directory, and recycling happens before the run starts: the first run
+  from a directory waits for it while a store holds an orphan (§5, "Where a
+  run can wait"). The run's clients get a note:
+  `cargo-heli: note: recycled the build directory of <donor>, a removed
+  worktree; the path scan invalidated 2 units`.
+- **The hook.** setup offers the repository's `post-checkout` hook (the file
+  in its hooks directory, as `git rev-parse --git-path hooks` names it, so
+  `core.hooksPath` counts; one file serves every worktree), with its own
+  question, after the Cargo configurations (§6.1). git runs it after every
+  checkout; only for a checkout from the null commit, which is what
+  `git worktree add` does, does it run `cargo heli recycle` in the new
+  worktree, which reads the store itself and needs no daemon. It runs
+  before `git worktree add` returns, says what it recycled on stderr, and
+  never fails the checkout. It names heli by its full path; setup replaces
+  a hook it wrote earlier, and leaves any other one alone, with the reason.
+- **The look.** As the daemon starts, as runs end and every minute, for each
+  repository with an orphan in a store, it lists the worktrees
+  (`git worktree list`). Each linked worktree it has not looked at before
+  gets a build directory recycled, if it has none. The main worktree is
+  never new, and is left to its first run.
+- The hook and the look ask cargo from the top of the worktree, with their
+  own environment, and recycle only for a workspace inside it. While no
+  store holds an orphan of the repository, they do not ask cargo at all.
+- Each recycling is a `recycle` event in the event log (§8). Two recyclers
+  need no lock between them: a rename never replaces a directory that has
+  files, and each scans the donor under its old name, which a rename by the
+  other takes away.
+
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,
 every minute while a budget or a floor is set, or `gc`'s. That pass writes
@@ -1190,7 +1331,9 @@ deletes it whole, so recycling has at least that long to claim it. A
 recycled directory names its new workspace, so its old note no longer
 counts. Recycling never takes a directory that is already in the trash:
 `<store>/.trash/` is not a build directory (`<2 hex digits>/<hex digits>`),
-and an eviction renames its victim there before deleting anything.
+and an eviction renames its victim there before deleting anything. Either
+rename of an orphan, by eviction or by recycling, fails once the other has
+moved it, and the loser goes on without it.
 
 What makes this sound, verified in cargo's source:
 
@@ -1219,11 +1362,36 @@ keeps the donor's paths compiled in:
 - `env!("OUT_DIR")` points under the old build directory path.
 
 rustc still records these values in its own dep-info (`# env-dep:NAME=value`
-lines in `deps/*.d`, observed on the example host). So right after the
-rename, heli scans the rustc dep-info. It deletes the fingerprint of every
-unit with an `env-dep` value under the donor's workspace or the old build
-directory path, and cargo rebuilds exactly those units. This applies in both
-modes below.
+lines in `deps/*.d`, observed on the example host). So heli scans the rustc
+dep-info of the donor, where it lies, and only then renames it: a cargo that
+starts in the new worktree never sees it half scanned. It deletes the
+fingerprint of every unit with an `env-dep` value under the donor's
+workspace or the old build directory path, and cargo rebuilds those units,
+and what depends on them. This applies in both modes below.
+
+- **Values.** rustc escapes `\`, line feed and carriage return as `\\`, `\n`
+  and `\r` (on Windows, `# env-dep:CARGO_MANIFEST_DIR=E:\\heli`). A value is
+  under a path when its components start with the path's: on Windows
+  without case, with either separator, and without `\\?\`. The old paths
+  are spelled as cargo spelled them: the workspace as `cargo metadata`
+  named it (the owner manifest), and the build directory as cargo's
+  `build-dir` places it in a store heli manages. A value that lists paths
+  (`PATH`-like) is also looked at path by path. Any variable counts, not
+  only cargo's.
+- **Where cargo keeps them** (cargo 1.99, checked by experiment), in each
+  profile directory (`<profile>/` or `<triple>/<profile>/`): rustc's
+  dep-info is `deps/<crate>-<hash>.d`, `examples/<crate>-<hash>.d`, or for a
+  build script `build/<package>-<hash>/build_script_build-<hash>.d`; the
+  unit's fingerprint is `.fingerprint/<package>-<hash>/`, with the same hash
+  (cargo's `-C extra-filename`). A crate's name has `_` where its package's
+  has `-`, so only the hash ties the two. Units whose files have no hash (on
+  Windows MSVC a path package's executables, and dylibs and cdylibs of path
+  packages) write `deps/<crate>.d`; their fingerprint directory still has a
+  hash, and its files are named after the target (`dep-<kind>-<target>`,
+  `<kind>-<target>`), so such a file stands for every fingerprint directory
+  with a file whose name ends in its crate's name, `-` read as `_`.
+  Invalidating a unit too many costs only its rebuild.
+- The number of units it invalidated is in the `recycle` event.
 
 There are two modes:
 
@@ -1316,16 +1484,21 @@ was found by a failing test.
 **When the key is computed.** It is checked twice: before the run waits for
 anything, and again once admitted and past the worktree lock, because another
 run may have recorded it meanwhile. A hit before the wait is never admitted
-as a run: it takes no run id. The key is computed afresh after the wait, and
-that snapshot of the tree, taken before the steps, is compared with one taken
-after them. A marker is written only
+as a run: it takes no run id; a miss goes on to single-flight with that key
+(§5, step 3). The key is computed afresh after a wait, since the runs waited
+for may have changed the tree. A run that waited for nothing keeps the key
+of the first check, taken a moment before, so its clients from other
+worktrees attached to the tree it runs on. That snapshot of the tree, taken
+before the steps, is compared with one taken after them, so a change in
+between counts as one during the run. A marker is written only
 when the run passed and both snapshots match. A run that fails drops the
 marker of its key, so a flaky pass is reused only until a run of the same key
 fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key. `--no-cache` skips both lookups, not the recording.
+the key. `--no-cache` skips both lookups, not the recording, and attaches to
+no run in flight (§5, step 3).
 
 Compile runs are never recorded, because their product is the artifact, not
 the verdict; nor is a request for help (`-h` or `--help`, also the test
@@ -1395,6 +1568,12 @@ drains and evictions, and `cargo heli gc --dry-run`.
   `most` (the most slots it was seen using), `wait_median_ms` and
   `wait_longest_ms` (how long it waited for a lent slot, at most; `null`
   without loans);
+- `recycle`, when a worktree got an orphan's build directory (§6.4):
+  `trigger` (`run`, `hook` or `look`), `workspace` and `to` (the new
+  workspace, and the build directory's path now), `donor` and `from` (the
+  removed workspace, and the path the directory had), and `invalidated`
+  (the units whose fingerprints the path scan deleted). The hook writes it
+  itself, to the log of its logon session's daemon;
 - `evict`, for each victim an eviction pass of the daemon's or of `gc`
   renamed into the trash (§6.3): `tier`, `path`, `bytes` and `reason`.
 

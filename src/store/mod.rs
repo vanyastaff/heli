@@ -25,7 +25,10 @@ pub mod evict;
 pub mod ladder;
 pub mod orphan;
 pub mod owner;
+pub mod probe;
+pub mod recycle;
 pub mod registry;
+pub mod scan;
 pub mod sizes;
 pub mod trash;
 pub mod volume;
@@ -108,11 +111,12 @@ impl Dir {
         sizes::scan(&self.path, patterns)
     }
 
-    /// Its state at `now` (seconds since 1970, `ladder::now`). A workspace
-    /// exists while its `Cargo.toml` does: a removed worktree can leave
-    /// files behind.
-    pub fn state(&self, now: u64) -> State {
-        if busy(&self.path, now) {
+    /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
+    /// a removed worktree can leave files behind. (Eviction also counts a
+    /// directory of an unknown lock layout busy while it changed within the
+    /// hour: [`busy_for_eviction`].)
+    pub fn state(&self) -> State {
+        if busy(&self.path) {
             return State::Busy;
         }
         match &self.workspace {
@@ -212,25 +216,29 @@ fn is_real_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
-/// Whether a cargo builds in `dir` at `now` (seconds since 1970): one of
-/// the [`LOCKS`] in its profile directories cannot be taken. heli only
-/// tries the locks, never waits for them, and lets go at once.
+/// Whether a cargo builds in `dir`: one of the [`LOCKS`] in its profile
+/// directories cannot be taken. heli only tries the locks, never waits for
+/// them, and lets go at once.
+pub fn busy(dir: &Path) -> bool {
+    lock_dirs(dir).iter().any(|profile| held(profile))
+}
+
+/// Whether eviction counts `dir` busy at `now` (seconds since 1970): a
+/// cargo builds in it ([`busy`]), or its lock layout is unknown and it
+/// changed within the last [`RECENT`] seconds.
 ///
 /// **Unknown layout.** Lock names change between cargo versions. A profile
 /// directory that holds cargo's intermediates (`deps/`, `incremental/`,
 /// `.fingerprint/`, `build/`) but none of the [`LOCKS`] was laid out by a
-/// cargo heli does not know; then `dir` is busy while anything in it
-/// changed within the last [`RECENT`] seconds.
-pub fn busy(dir: &Path, now: u64) -> bool {
+/// cargo heli does not know.
+pub fn busy_for_eviction(dir: &Path, now: u64) -> bool {
     let profiles = lock_dirs(dir);
-    if profiles.iter().any(|profile| held(profile)) {
-        return true;
-    }
-    unknown_layout(&profiles) && recently_changed(dir, now)
+    profiles.iter().any(|profile| held(profile))
+        || (unknown_layout(&profiles) && recently_changed(dir, now))
 }
 
 /// Within this many seconds, a change makes a directory of an unknown lock
-/// layout busy: an hour.
+/// layout busy for eviction: an hour.
 pub const RECENT: u64 = 3600;
 
 /// Whether anything in `dir` changed within [`RECENT`] seconds of `now`.

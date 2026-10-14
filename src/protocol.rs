@@ -28,9 +28,11 @@
 //!   without starting it: the result store holds a pass for its key. A
 //!   client that sends no [`RunRequest::class`] predates the worktree lock
 //!   and is never sent `Waiting`, which it could not read. When the same
-//!   command is already in flight, the client attaches to it instead
-//!   (`Started` says so): the output frames then hold the run's output from
-//!   its first byte, and the end is the run's.
+//!   run is already in flight (the same command, or for a verify or test
+//!   run the same key, in any worktree), the client attaches to it instead
+//!   (`Started` says so, and for a key names the run's worktree): the
+//!   output frames then hold the run's output from its first byte, and the
+//!   end is the run's.
 //! - [`Request::Cancel`]: [`Reply::Cancelled`] once every process of the run
 //!   is gone, or [`Reply::CancelFailed`].
 //! - [`Request::Log`]: output frames holding the part of the run's record
@@ -165,7 +167,7 @@ pub enum Cache {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
     /// The daemon accepted the run, and starts it now or once its wait
-    /// ends; or, with `attached`, the same command was already in flight as
+    /// ends; or, with `attached`, the same run was already in flight as
     /// `run`, and the client follows that run from its start.
     Started {
         run: String,
@@ -173,6 +175,11 @@ pub enum Reply {
         /// milliseconds.
         #[serde(default)]
         attached: Option<u64>,
+        /// For a client attached by key (a verify or test run of the same
+        /// key, single-flight): the run's worktree, which may be another
+        /// than the client's.
+        #[serde(default)]
+        keyed_in: Option<Text>,
     },
     /// The run waits for these runs, which use its worktree, before it
     /// starts (the worktree lock).
