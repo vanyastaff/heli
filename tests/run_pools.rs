@@ -265,6 +265,28 @@ fn a_spare_slot_goes_to_a_run_that_waits() {
     asker.stop();
 }
 
+/// The host pool's drain counts the broker's loans: with N = 4 and a run
+/// holding 2 slots and keeping a third free, a slot given to the host pool
+/// beyond its target (N less the 3 lent) is a surplus, and is drained.
+#[test]
+fn a_surplus_beside_loans_is_drained() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 4\n");
+    let jobs = fixture.binary("jobs");
+    let holding = Jobs::start(&fixture, &jobs, "holding", 2, 600_000);
+    fixture.wait_for_status("2 slots held and 1 kept", |status| {
+        runs(status).len() == 1 && runs(status)[0]["slots"] == 2 && status["pool"]["free"] == 1
+    });
+    support::jobserver::Client::open(&fixture.pool()).give(1);
+    let status = fixture.wait_for_status("the surplus drained", |status| {
+        !fixture.events_named("drain").is_empty() && status["pool"]["free"] == 1
+    });
+    assert_eq!(runs(&status)[0]["slots"], 2, "{status}");
+    let drains = fixture.events_named("drain");
+    assert_eq!(drains[0]["target"], 1, "{drains:?}");
+    holding.stop();
+}
+
 /// A run killed while its processes hold every slot gives them all back at
 /// once: the first `status` without the run shows every slot free, without
 /// waiting for the pool to be quiet.
