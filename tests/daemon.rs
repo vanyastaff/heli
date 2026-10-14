@@ -813,15 +813,30 @@ fn a_daemon_lost_during_a_run_is_an_error() {
     let echo = fixture.echo_args();
     let gate = fixture.path("gate");
     let mut call = fixture.heli(["exec", "--"]);
-    call.arg(&echo).arg("once").env("ECHO_WAIT_FOR", &gate);
+    call.arg(&echo)
+        .arg("once")
+        .env("ECHO_WAIT_FOR", &gate)
+        .env("ECHO_PID", "1");
     let mut call = start(&mut call);
-    // Once the client has printed the run's first line, the run is under
+    // Once the client has printed the run's first lines, the run is under
     // way.
     let mut stdout = std::io::BufReader::new(call.stdout.take().expect("a stdout"));
     let mut first = String::new();
     std::io::BufRead::read_line(&mut stdout, &mut first).expect("read the client's stdout");
     assert_eq!(first, "arg: \"once\"\n", "what the run printed before");
-    support::kill_tree(fixture.daemon_pid().expect("a daemon"));
+    let mut pid = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut pid).expect("read the client's stdout");
+    let run: u32 = pid
+        .strip_prefix("pid ")
+        .and_then(|pid| pid.trim_end().parse().ok())
+        .unwrap_or_else(|| panic!("the run's process id: {pid:?}"));
+    // The daemon alone, as a crash ends it: its run lives on. Were the run
+    // killed first, the daemon could still tell the client how it ended
+    // (and on Unix the client then ends as the run did, of SIGKILL).
+    support::kill_process(fixture.daemon_pid().expect("a daemon"));
+    fixture.wait_for_status("the daemon to be gone", |status| status["daemon"].is_null());
+    // Nobody can hear of the orphaned run any more.
+    support::kill_tree(run);
     let mut rest = String::new();
     stdout
         .read_to_string(&mut rest)
