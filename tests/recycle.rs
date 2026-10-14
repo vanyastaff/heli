@@ -55,24 +55,24 @@ fn same_place(a: impl AsRef<Path>, b: impl AsRef<Path>) -> bool {
     }
 }
 
-/// Whether two spellings of a path that may no longer exist name the same
-/// place: compared by their components, on Windows without case and with
-/// either separator.
-fn same_spelling(a: &str, b: &Path) -> bool {
-    let spelled = |path: &str| -> Vec<String> {
-        let path = if cfg!(windows) {
-            path.replace('/', "\\").to_lowercase()
+/// Whether `a` and `b`, which no longer exist, named the same place: their
+/// parents are the same existing place (resolved, as on macOS
+/// `/private/var` for `/var`), and their names the same, on Windows
+/// without case.
+fn same_gone_place(a: &str, b: &Path) -> bool {
+    let a = Path::new(a);
+    let name = |path: &Path| {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if cfg!(windows) {
+            name.to_lowercase()
         } else {
-            path.to_owned()
-        };
-        let separator = if cfg!(windows) { '\\' } else { '/' };
-        path.trim_start_matches(r"\\?\")
-            .split(separator)
-            .filter(|part| !part.is_empty())
-            .map(str::to_owned)
-            .collect()
+            name.into_owned()
+        }
     };
-    spelled(a) == spelled(&b.to_string_lossy())
+    match (a.parent(), b.parent()) {
+        (Some(parent_a), Some(parent_b)) => same_place(parent_a, parent_b) && name(a) == name(b),
+        _ => false,
+    }
 }
 
 /// A fixture repository, its worktrees beside it, and the build store they
@@ -373,9 +373,9 @@ fn a_new_worktree_builds_warm_in_a_removed_ones_build_directory() {
             .as_str()
             .unwrap_or_else(|| panic!("{field}: {event}"))
     };
-    assert!(same_spelling(path("from"), &a_dir), "{event}");
+    assert!(same_gone_place(path("from"), &a_dir), "{event}");
     assert!(same_place(path("to"), &b_dir), "{event}");
-    assert!(same_spelling(path("donor"), &a), "{event}");
+    assert!(same_gone_place(path("donor"), &a), "{event}");
     assert!(same_place(path("workspace"), &b), "{event}");
     let note = stderr
         .lines()
