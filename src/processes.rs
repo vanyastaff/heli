@@ -29,7 +29,7 @@ pub use platform::pids;
 /// cargo job, or is a cargo, which may hold a slot for one it has not
 /// started yet.
 fn runs_a_job(name: &str) -> bool {
-    matches!(name, "rustc" | "rustdoc" | "clippy-driver")
+    matches!(name, "rustc" | "rustdoc" | "clippy-driver" | "cargo")
         || name.starts_with("build-script-")
 }
 
