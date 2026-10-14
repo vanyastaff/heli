@@ -471,11 +471,14 @@ How a command line is read:
    output in the chosen output mode (see "Output" below), then a footer line
    (duration, peak memory of the process tree, slots held, and the run id for
    `cargo heli log`). Header and footer go to stderr, so stdout stays the
-   tool's own, and the footer starts a line of its own. So far the footer
-   holds the run id, the exit (`exit <code>`, or on Unix `signal <n>`) and
-   the duration:
-   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. A run
-   heli executes directly, without the daemon, has no footer and no record.
+   tool's own, and the footer starts a line of its own. So far there is no
+   header, and the footer holds the run id, the exit (`exit <code>`, or on
+   Unix `signal <n>`) and the duration:
+   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. Peak
+   memory and slots join it once heli measures them. After a quiet run that
+   succeeded, quiet's one line takes its place ("Output" below). A run heli
+   executes directly, without the daemon, has no footer and no record, and
+   its output is the tool's own, untouched.
 
 **Worktree lock.** heli runs that read a worktree's sources hold its lock
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
@@ -531,9 +534,10 @@ cargo heli daemon [--detach | --warden]            (internal)
   - 127 when the command does not exist, 126 when it cannot be started.
   - 2 for heli's usage errors and refusals: `heli` given as its own
     subcommand, or nesting deeper than 16 (`HELI_DEPTH`). The daemon and its
-    detaching starter count as levels too. For `log`, also a run id that is
-    not `r<number>` (or a bare number), a bad regular expression, or two
-    selectors at once.
+    detaching starter count as levels too. An output mode that is not one
+    (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. For `log`, also a
+    run id that is not `r<number>` (or a bare number), a bad regular
+    expression, or two selectors at once.
   - 1 when the daemon is lost during a run (§3), and when `log` has no
     record of the run or cannot read it.
 - **Environment given to runs:**
@@ -556,7 +560,8 @@ cargo heli daemon [--detach | --warden]            (internal)
   - the store per volume;
   - tool-cache patterns (§6.3);
   - eviction ages;
-  - the default output mode;
+  - the default output mode (`[output] mode`, "Output" below; the client
+    reads it too, and ignores a file it cannot use);
   - log retention (`[log] runs`, the records kept, default 200, and
     `[log] bytes`, their total size in bytes, default 2 GiB; "Output"
     below).
@@ -577,16 +582,48 @@ rtk passes `cargo heli …` through untouched. heli must keep its own output
 small, and output is never filtered twice.
 
 **Modes**, chosen by `--output=full|compact|quiet` or `-q` before the
-subcommand, by `HELI_OUTPUT`, or by configuration. Flags before the
-subcommand belong to heli; flags after it belong to the tool.
+subcommand (or after `exec`), else by `HELI_OUTPUT`, else by `[output] mode`
+in the configuration, else by whether the client's stdout is a terminal.
+Flags before the subcommand belong to heli; flags after it belong to the
+tool.
 
 - **full**: the tool's output as it streams, plus heli's header and footer.
   This is the default on a terminal.
 - **compact**: the default when stdout is not a terminal, which covers every
   agent tool call.
-- **quiet**: one line on success, for example
-  `ok  nextest run -p my-crate: 812 passed, 3 skipped, 41 s  [r17]`, and the
-  compact output on failure.
+- **quiet**: one line on success, and the compact output on failure. The
+  line goes to stderr in place of the footer: the verdict, the command as
+  given, what the view counted, the duration and the run, for example
+  `ok  clippy --all-targets: 3 warnings, 41.2 s  [r17]` or
+  `ok  nextest run -p my-crate: 812 passed, 3 skipped, 41.0 s  [r17]`. The
+  client holds the rendered output back until the run ends, and on failure
+  prints it, then the footer.
+
+**Views.** Before a run starts, the client picks the view that shows its
+output, from the command line and the mode, and adds to the command what
+the view needs. The daemon runs and records the command so changed,
+`status` and the worktree lock's waiting line show it so, and the result
+store keys it so (§7): a compact and a full run of one command have keys of
+their own. Full mode passes every run through. In compact and quiet mode:
+
+- build, check, clippy and doc (and cargo's aliases `b`, `c`, `d`; after a
+  `+toolchain` too) show cargo's diagnostics (below);
+- test and nextest runs, and `exec`, get the views below once they exist
+  (#11);
+- anything else passes through untouched, with the footer, in every mode:
+  `run`, whose output is the program's; `clippy --fix`, `fix` and `fmt`,
+  which say what they rewrote in lines `--quiet` drops; subcommands heli
+  knows nothing of; and `exec -- cargo …`, which runs the command as given.
+- So does every run whose arguments already choose cargo's output:
+  `--message-format`, `--quiet` or `-q`, `--verbose` or `-v`, also in a
+  cluster of short flags such as `-vv` or `-rq`, before any `--`. heli must
+  not add its own there: cargo refuses a second `--quiet` or
+  `--message-format`. A cluster counts even when the letter is in a value
+  (`-pserver`), which costs compactness, never the run.
+
+The run's class (§5, "Classes") decides how warnings show: counted for
+compile runs, by lint for verify runs. Within those classes, `run` and
+`fmt --check` pass through: their output is not cargo's diagnostics.
 
 **How compact output is produced**, most robust source first:
 
@@ -599,17 +636,32 @@ subcommand belong to heli; flags after it belong to the tool.
      `--failure-output final`. All five exist in nextest 0.9.146 (`--help`),
      and each has an environment variable.
 
-   heli adds a flag only when the user's argv does not already set it.
+   heli adds a flag only when the user's argv does not already set it. It
+   adds its flags after the user's arguments, so that cargo reports a
+   mistake in them exactly as without heli, and before any `--`, after
+   which the arguments are another program's.
 2. **Structured messages.** For compile phases heli passes
    `--message-format json` to cargo and `--cargo-message-format json` to
    nextest, and renders diagnostics from the JSON fields (level, code, primary
-   span, message, rendered):
-   - Errors: the first 3 in rustc's full rendering, the rest as one short line
-     each (`path:line:col error[E0308] message`), 30 at most.
-   - Warnings, for `clippy` and `check`, where the findings are the point:
-     short lines grouped by lint, 50 at most.
-   - Warnings, for `build` and `test`: counts per lint, for example
+   span, message, rendered), on stderr, where cargo prints them:
+   - Errors, as they arrive: the first 3 in rustc's full rendering, the next
+     30 as one short line each (`path:line:col error[E0308] message`), then,
+     when there are more, `N more: cargo heli log <run> --errors`.
+   - Warnings, once the run is over. For `clippy` and `check`, where the
+     findings are the point: grouped by lint, a line per lint with its count
+     and where its warnings point,
+     `  dead_code (3): src/a.rs:4:5, src/b.rs:9:1, 1 more`, under a
+     `12 warnings:` line. 50 locations at most, shared out one per lint in
+     turn, so that every lint shows some.
+   - Warnings, for `build`, `doc` and `test`: counts per lint, for example
      `12 warnings: 9 unused_imports, 3 dead_code`.
+   - Lints with the most warnings come first, then by name; a warning of no
+     lint is known by its message. A diagnostic that several targets report
+     (a library and its unit tests) is shown once, as cargo's human output
+     does. Notes ("for more information about this error") are dropped, and
+     so are cargo's other messages (artifacts, build scripts, the build's
+     end). A line on stdout that is not cargo's JSON, and cargo's own stderr,
+     pass through.
 3. **Text**, only where no structure exists: libtest's own output under
    `cargo test` (its `failures:` blocks), and `cargo heli exec` of arbitrary
    commands, where compact means the first 20 and last 60 lines around a cut
@@ -618,6 +670,15 @@ subcommand belong to heli; flags after it belong to the tool.
 Some things never change: the exit code, the stdout/stderr split, and output
 heli does not recognize, which passes through.
 
+**Colours.** A run writes to pipes, so cargo would print no colours even for
+a client on a terminal. When a run's output passes through to a client whose
+stdout and stderr are both terminals, heli sets `CARGO_TERM_COLOR=always` in
+the run's environment, unless the client's environment sets
+`CARGO_TERM_COLOR` or `NO_COLOR`. A variable rather than `--color`: it
+reaches nextest and every cargo the run starts, including under `exec`, and
+needs no knowledge of where a flag may go (`cargo run -- …`). It is neutral
+for the result store (§7). Rendered compact output has no colours.
+
 **Nothing is lost.** The daemon records each run's complete output, for
 `cargo heli log` and so that clients can attach to it (lifecycle step 4).
 The output modes only change what the client prints, and the footer names
@@ -625,7 +686,11 @@ the run. `cargo heli log <run>` prints the record by run id, without
 re-running: stdout on stdout and stderr on stderr, byte for byte. At most one
 selector picks a part of it:
 
-- `--errors`: errors only;
+- `--errors`: every error, as rustc rendered it, on stderr. From cargo's
+  JSON in the record of a compact or quiet run, once however many targets
+  reported it; from text otherwise, each from a line that starts with
+  `error:` or `error[` to the blank line after it, the next warning, or the
+  end;
 - `--test <name>`: one test's output;
 - `--tail N`: the last N lines;
 - `--grep <re>`: matching lines, each matched without its line end.
@@ -641,10 +706,12 @@ selector picks a part of it:
 - **Reading.** `log` asks the daemon; when none answers, the client reads
   the record itself, and starts no daemon. Records outlive the daemon.
 - **Retention.** The record holds what the tools printed in the chosen mode,
-  so the dropped per-unit and per-passing-test lines are not in it. heli
-  keeps the last 200 run logs or 2 GB, whichever limit is hit first: when a
-  run starts, the oldest records (lowest run number) are deleted first. The
-  record of a run in flight is never deleted.
+  so the dropped per-unit and per-passing-test lines are not in it (of a
+  compact build, check, clippy or doc, it holds cargo's JSON messages, which
+  `log` prints as they are). heli keeps the last 200 run logs or 2 GB,
+  whichever limit is hit first: when a run starts, the oldest records
+  (lowest run number) are deleted first. The record of a run in flight is
+  never deleted.
 
 **With rtk installed.** A bare `cargo test` that rtk rewrites to
 `rtk cargo test` still draws from the heli pool: rtk passes the environment

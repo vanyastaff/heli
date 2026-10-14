@@ -813,9 +813,12 @@ fn an_ignored_file_is_not_part_of_the_key() {
 fn the_same_inputs_give_a_hit() {
     let fixture = Fixture::new("basic");
     init_repo(&fixture);
+    // Full output, so that cargo's `Finished` line shows that it ran
+    // (compact output drops it).
     let check = || {
         fixture
             .heli(["check", "-p", "slow-a"])
+            .env("HELI_OUTPUT", "full")
             .output()
             .expect("run heli")
     };
@@ -896,8 +899,11 @@ fn builds_are_never_cached() {
         &["exec", "--", "cargo", "check", "-p", "slow-a"][..],
     ] {
         for attempt in ["first", "second"] {
+            // Full output, so that cargo's `Finished` line shows that it ran
+            // (compact output drops it).
             let output = fixture
                 .heli(args.iter().copied())
+                .env("HELI_OUTPUT", "full")
                 .output()
                 .expect("run heli");
             assert_success(&output, &format!("the {attempt} {args:?}"));

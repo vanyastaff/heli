@@ -1,0 +1,43 @@
+//! Does not compile: 40 errors, one per line: 34 mismatched types (E0308),
+//! then 6 unresolved names (E0425).
+
+pub fn number_01() -> u32 { "01" }
+pub fn number_02() -> u32 { "02" }
+pub fn number_03() -> u32 { "03" }
+pub fn number_04() -> u32 { "04" }
+pub fn number_05() -> u32 { "05" }
+pub fn number_06() -> u32 { "06" }
+pub fn number_07() -> u32 { "07" }
+pub fn number_08() -> u32 { "08" }
+pub fn number_09() -> u32 { "09" }
+pub fn number_10() -> u32 { "10" }
+pub fn number_11() -> u32 { "11" }
+pub fn number_12() -> u32 { "12" }
+pub fn number_13() -> u32 { "13" }
+pub fn number_14() -> u32 { "14" }
+pub fn number_15() -> u32 { "15" }
+pub fn number_16() -> u32 { "16" }
+pub fn number_17() -> u32 { "17" }
+pub fn number_18() -> u32 { "18" }
+pub fn number_19() -> u32 { "19" }
+pub fn number_20() -> u32 { "20" }
+pub fn number_21() -> u32 { "21" }
+pub fn number_22() -> u32 { "22" }
+pub fn number_23() -> u32 { "23" }
+pub fn number_24() -> u32 { "24" }
+pub fn number_25() -> u32 { "25" }
+pub fn number_26() -> u32 { "26" }
+pub fn number_27() -> u32 { "27" }
+pub fn number_28() -> u32 { "28" }
+pub fn number_29() -> u32 { "29" }
+pub fn number_30() -> u32 { "30" }
+pub fn number_31() -> u32 { "31" }
+pub fn number_32() -> u32 { "32" }
+pub fn number_33() -> u32 { "33" }
+pub fn number_34() -> u32 { "34" }
+pub fn missing_01() -> u32 { not_defined_01 }
+pub fn missing_02() -> u32 { not_defined_02 }
+pub fn missing_03() -> u32 { not_defined_03 }
+pub fn missing_04() -> u32 { not_defined_04 }
+pub fn missing_05() -> u32 { not_defined_05 }
+pub fn missing_06() -> u32 { not_defined_06 }

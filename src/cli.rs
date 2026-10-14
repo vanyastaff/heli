@@ -1,15 +1,18 @@
 //! The command line: heli's own flags come before the subcommand, and
 //! everything after it belongs to the tool, passed through verbatim. The
 //! subcommand and its arguments also give the run its class
-//! (`crate::class`).
+//! (`crate::class`). heli's flags choose the output mode (`crate::output`):
+//! `--output <mode>` or `-q`, before a cargo subcommand, or before or after
+//! `exec`; and `--no-cache`, before a cargo subcommand.
 
 use std::ffi::OsString;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::class::Class;
 use crate::daemon::results;
+use crate::output::Mode;
 use crate::protocol::Cache;
 use crate::runlog;
 use crate::runlog::select::Select;
@@ -34,7 +37,8 @@ pub enum Action {
     Warden,
 }
 
-/// The program heli runs, its arguments, and the class of the run.
+/// The program heli runs, its arguments, the class of the run, and how to
+/// show its output.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub program: OsString,
@@ -42,6 +46,8 @@ pub struct Invocation {
     pub class: Class,
     /// How the run uses the result store.
     pub cache: Cache,
+    /// The output mode heli's flags chose, if they chose one.
+    pub output: Option<Mode>,
 }
 
 #[derive(Debug, Parser)]
@@ -54,6 +60,8 @@ pub struct Invocation {
     arg_required_else_help = true
 )]
 struct Cli {
+    #[command(flatten)]
+    output: OutputFlags,
     /// Run even when the same inputs already passed; the run is recorded
     /// when it passes.
     #[arg(long)]
@@ -62,10 +70,36 @@ struct Cli {
     command: Command,
 }
 
+/// The flags that choose the output mode.
+#[derive(Debug, Args)]
+struct OutputFlags {
+    /// How much of the tool's output to print: full (as the tool prints
+    /// it), compact (what an agent needs), or quiet (one line on success).
+    /// Default: `HELI_OUTPUT`, the configuration, else full on a terminal and
+    /// compact without.
+    #[arg(long, value_name = "MODE", value_parser = parse_mode)]
+    output: Option<Mode>,
+    /// Quiet output: `--output quiet`.
+    #[arg(short = 'q', conflicts_with = "output")]
+    quiet: bool,
+}
+
+impl OutputFlags {
+    fn mode(&self) -> Option<Mode> {
+        if self.quiet {
+            Some(Mode::Quiet)
+        } else {
+            self.output
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Run any command: `cargo heli exec -- <command> [args...]`.
     Exec {
+        #[command(flatten)]
+        output: OutputFlags,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
@@ -97,6 +131,9 @@ enum Command {
         /// Only the lines that match this regular expression.
         #[arg(long, value_name = "RE", group = "select", value_parser = parse_pattern)]
         grep: Option<String>,
+        /// Only the errors, as the compiler rendered them, all of them.
+        #[arg(long, group = "select")]
+        errors: bool,
     },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
@@ -140,24 +177,35 @@ pub fn parse(
             "`heli` is heli itself: `cargo heli heli …` would run heli again",
         ));
     }
+    let output = cli.output.mode();
     Ok(match cli.command {
-        Command::Exec { command } => {
+        Command::Exec {
+            output: own,
+            command,
+        } => {
             let mut command = command.into_iter();
             Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
                 class: Class::Exec,
                 cache: Cache::Off,
+                output: own.mode().or(output),
             })
         }
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
         Command::Setup { print } => Action::Setup { print },
-        Command::Log { run, tail, grep } => Action::Log {
+        Command::Log {
+            run,
+            tail,
+            grep,
+            errors,
+        } => Action::Log {
             run,
             select: match (tail, grep) {
                 (Some(count), _) => Select::Tail(count),
                 (None, Some(pattern)) => Select::Grep(pattern),
+                (None, None) if errors => Select::Errors,
                 (None, None) => Select::All,
             },
         },
@@ -170,6 +218,7 @@ pub fn parse(
                 class,
                 cache: results::cache(class, &args, cli.no_cache),
                 args,
+                output,
             })
         }
     })
@@ -185,6 +234,11 @@ fn parse_run(text: &str) -> Result<String, String> {
     runlog::run_number(&run)
         .map(|number| format!("r{number}"))
         .ok_or_else(|| "a run id is r<number>, as the footer after a run names it".to_owned())
+}
+
+/// An output mode, checked here so that a bad one is a usage error.
+fn parse_mode(text: &str) -> Result<Mode, String> {
+    text.parse()
 }
 
 /// A regular expression, checked here so that a bad one is a usage error.
