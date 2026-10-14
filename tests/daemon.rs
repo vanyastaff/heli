@@ -827,7 +827,7 @@ fn a_daemon_lost_during_a_run_is_an_error() {
         .read_to_string(&mut rest)
         .expect("read the client's stdout");
     let output = finish(call);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(rest, "", "no second run");
     let stderr = lines(&output.stderr);
     assert_eq!(stderr.len(), 1, "{stderr:?}");
