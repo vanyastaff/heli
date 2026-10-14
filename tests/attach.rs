@@ -183,6 +183,56 @@ fn variable_names_ignore_case_on_windows() {
     }
 }
 
+/// A run waiting for its worktree lock takes clients of the same command
+/// too: an attached client hears what it waits for, then gets its output
+/// once it has run, and the command runs once.
+#[test]
+fn a_run_waiting_for_its_worktree_takes_clients() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    let starts = fixture.path("starts");
+    // `echo-args` stands in for cargo: a build, held by the gate, and a
+    // `fmt`, which waits for the build.
+    let mut build = fixture.heli(["build"]);
+    build.env("CARGO", &echo).env("ECHO_WAIT_FOR", &gate);
+    let build = start(&mut build);
+    let status = fixture.wait_for_status("the build", |status| runs(status).len() == 1);
+    let build_id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    let fmt = || {
+        let mut fmt = fixture.heli(["fmt"]);
+        fmt.env("CARGO", &echo).env("ECHO_STARTS", &starts);
+        start(&mut fmt)
+    };
+    let first = fmt();
+    let status = fixture.wait_for_status("fmt to wait", |status| {
+        runs(status).len() == 2 && runs(status)[1]["waiting_for"] == serde_json::json!([build_id])
+    });
+    let fmt_id = runs(&status)[1]["id"].as_str().expect("an id").to_owned();
+    let second = fmt();
+    fixture.wait_for_status("the second client", |status| {
+        runs(status).len() == 2 && runs(status)[1]["attached_clients"] == 2
+    });
+
+    std::fs::write(&gate, "").expect("open the gate");
+    assert_success(&finish(build), "the build");
+    let first = finish(first);
+    let second = finish(second);
+    for output in [&first, &second] {
+        assert_success(output, "cargo heli fmt");
+        assert_eq!(text(&output.stdout), "arg: \"fmt\"\n");
+        assert_eq!(support::split_footer(&output.stderr).1.run, fmt_id);
+    }
+    let stderr = support::without_footer(&second.stderr);
+    let (notice, rest) = split_notice(&stderr);
+    assert!(notice.contains(&fmt_id), "{notice}");
+    let waiting = format!("cargo-heli: waiting for {build_id} (echo-args build) to finish");
+    assert!(rest.starts_with(&waiting), "{stderr}");
+    assert!(rest.ends_with("echo-args: stderr\n"), "{stderr}");
+    let started = std::fs::read_to_string(&starts).expect("read the starts");
+    assert_eq!(started.lines().count(), 1, "fmt ran once");
+}
+
 /// An agent whose call was killed mid-build calls the same command again:
 /// it attaches to the build still going, and gets its whole output (from
 /// before it attached too) and its exit code; no second build runs.

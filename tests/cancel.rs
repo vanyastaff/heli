@@ -250,6 +250,48 @@ fn a_cancelled_run_is_listed_as_cancelled() {
     );
 }
 
+/// A run cancelled while it waits for its worktree lock stops waiting and
+/// never starts: its client reports it cancelled and exits 1, and the run
+/// it waited for goes on.
+#[test]
+fn a_run_cancelled_while_it_waits_never_starts() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let _gate = Gate(fixture.path("gate"));
+    let starts = fixture.path("starts");
+    // `echo-args` stands in for cargo: a build, held by the gate, and a
+    // `fmt`, which waits for the build.
+    let mut build = fixture.heli(["build"]);
+    build
+        .env("CARGO", &echo)
+        .env("ECHO_WAIT_FOR", fixture.path("gate"));
+    let build = start(&mut build);
+    fixture.wait_for_status("the build", |status| runs(status).len() == 1);
+    let mut fmt = fixture.heli(["fmt"]);
+    fmt.env("CARGO", &echo).env("ECHO_STARTS", &starts);
+    let fmt = start(&mut fmt);
+    let status = fixture.wait_for_status("fmt to wait", |status| {
+        runs(status).len() == 2 && runs(status)[1]["waiting_since"].is_u64()
+    });
+    let id = runs(&status)[1]["id"].as_str().expect("an id").to_owned();
+
+    assert_success(&cancel(&fixture, &id), "cargo heli cancel");
+    let output = finish(fmt);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let (_, footer) = support::split_footer(&output.stderr);
+    assert!(
+        footer.line.contains(&format!("{id} cancelled, exit 1 ")),
+        "{}",
+        footer.line
+    );
+    assert!(!starts.exists(), "fmt never started");
+    let status = fixture.status();
+    assert_eq!(runs(&status).len(), 1, "the build goes on: {status}");
+    drop(_gate);
+    assert_success(&finish(build), "the build");
+}
+
 /// Without a daemon there is nothing to cancel: `cancel` says so, fails,
 /// and starts no daemon. A run id that is not one is a usage error.
 #[test]

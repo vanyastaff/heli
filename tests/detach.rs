@@ -270,3 +270,84 @@ fn status_lists_the_last_32_runs_nobody_followed_to_the_end() {
         .collect();
     assert_eq!(listed, ids[1..], "{status}");
 }
+
+/// Starts `echo-args` through heli (as `cargo heli <args>` with it standing
+/// in for cargo, or with no `args` as `exec`), waiting for a gate; kills its
+/// client once the run is listed, opens the gate once `status` shows no
+/// client attached, and returns the run once it is listed as done.
+fn run_nobody_follows(fixture: &Fixture, args: &[&str]) -> String {
+    let echo = fixture.echo_args();
+    let gate = fixture.path("unfollowed.gate");
+    let mut call = if args.is_empty() {
+        let mut call = fixture.heli(["exec", "--"]);
+        call.arg(&echo);
+        call
+    } else {
+        let mut call = fixture.heli(args.iter().copied());
+        call.env("CARGO", &echo);
+        call
+    };
+    call.env("ECHO_WAIT_FOR", &gate);
+    let call = start(&mut call);
+    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    support::kill_tree(call.id());
+    let _ = finish(call);
+    fixture.wait_for_status("its client to be gone", |status| {
+        listed(status, &id).is_some_and(|run| run["attached_clients"] == 0)
+    });
+    std::fs::write(&gate, "").expect("open the gate");
+    fixture.wait_for_status("the run to end", |status| {
+        listed(status, &id).is_some_and(|run| run["phase"] == "done")
+    });
+    id
+}
+
+/// A run listed as done is no run in flight: it does not keep a lost slot
+/// from coming back once the pool is quiet (the top-up waits only for runs
+/// in flight).
+#[test]
+fn a_run_listed_as_done_does_not_hold_up_a_top_up() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 2\n");
+    fixture.set_clock(0);
+    fixture.start_daemon();
+    run_nobody_follows(&fixture, &[]);
+    let lost = support::jobserver::Client::open(&fixture.pool());
+    lost.take();
+    drop(lost);
+    let full = json!({"slots": 2, "free": 2, "withheld": 0, "in_use": 0});
+    for available_mb in 40_000..40_010 {
+        fixture.inject_memory(support::Memory::available(available_mb));
+        fixture.advance_clock(1000);
+        let status = fixture.wait_for_status("a sample", |status| {
+            status["memory"]["available"] == available_mb << 20
+        });
+        if status["pool"] == full {
+            assert_eq!(runs(&status).len(), 1, "the run is still listed: {status}");
+            return;
+        }
+    }
+    panic!("the lost slot never came back: {}", fixture.status());
+}
+
+/// A run listed as done holds no worktree lock: a `fmt` of its worktree
+/// does not wait for it.
+#[test]
+fn a_run_listed_as_done_holds_no_worktree_lock() {
+    let fixture = Fixture::new("basic");
+    run_nobody_follows(&fixture, &["build"]);
+    let echo = fixture.echo_args();
+    let fmt = start(fixture.heli(["fmt"]).env("CARGO", &echo));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(finish(fmt)));
+    let output = receiver
+        .recv_timeout(Duration::from_secs(30))
+        .expect("fmt waited for a run that had ended");
+    assert_success(&output, "cargo heli fmt");
+    assert!(
+        !text(&output.stderr).contains("waiting for"),
+        "{}",
+        text(&output.stderr)
+    );
+}
