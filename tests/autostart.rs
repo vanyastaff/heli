@@ -198,6 +198,10 @@ mod platform {
     pub const START_VERB: &str = "/Run";
     /// What the registration runs: heli's arguments.
     pub const START_ARGS: &str = "daemon --detach";
+    /// The depth of a client from which a start through the registration
+    /// brings up no daemon: the service manager runs `daemon --detach` one
+    /// level deeper, and the daemon is one more, at the limit of 16.
+    pub const TOO_DEEP: &str = "14";
 
     /// The file that holds the registration's definition.
     pub fn definition(home: &Path) -> PathBuf {
@@ -220,10 +224,17 @@ mod platform {
 
     /// The definition of the task that starts `program` at the logon of
     /// the user running the tests: in their session, only while they are
-    /// logged on, never stopped, on battery too, at normal priority.
+    /// logged on, never stopped, on battery too, at normal priority. A
+    /// program whose path has a space is quoted, as Task Scheduler's own
+    /// editor writes it.
     pub fn expected(program: &Path, _home: &Path) -> String {
         let sid = user_sid();
-        let program = program.display();
+        let program = program.display().to_string();
+        let program = if program.contains(' ') {
+            format!("\"{program}\"")
+        } else {
+            program
+        };
         format!(
             r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -336,6 +347,9 @@ mod platform {
     pub const REGISTER_VERB: &str = "daemon-reload";
     pub const START_VERB: &str = "start";
     pub const START_ARGS: &str = "daemon";
+    /// The service manager runs the daemon one level deeper than the
+    /// client, at the limit of 16.
+    pub const TOO_DEEP: &str = "15";
 
     /// The registration as calls name it: always `heli.service`.
     pub struct Names;
@@ -485,6 +499,9 @@ mod platform {
     pub const REGISTER_VERB: &str = "bootstrap";
     pub const START_VERB: &str = "kickstart";
     pub const START_ARGS: &str = "daemon";
+    /// The service manager runs the daemon one level deeper than the
+    /// client, at the limit of 16.
+    pub const TOO_DEEP: &str = "15";
 
     const LABEL: &str = "io.github.vanyastaff.heli";
 
@@ -733,18 +750,30 @@ fn setup_no_autostart_removes_the_registration() {
     assert!(stdout.contains(" is not registered."), "{stdout}");
     assert!(!stdout.contains("Removed."), "{stdout}");
     assert_eq!(user.manager.calls(), names.absent());
+    user.manager.clear_calls();
+
+    // Clients start the daemon themselves again.
+    let output = user.heli(&["ensure"]).output().expect("run heli ensure");
+    assert_success(&output, "cargo heli ensure");
+    assert_eq!(user.manager.calls(), Vec::<Vec<String>>::new());
+    assert!(user.fixture.daemon_pid().is_some(), "a daemon runs");
 }
 
-/// A registration made for another program (heli installed elsewhere) is
-/// replaced by one for this program.
+/// A registration made for another program (heli installed elsewhere, here
+/// in a directory whose name has a space) is replaced by one for this
+/// program.
 #[test]
 fn setup_replaces_a_registration_of_another_program() {
     let user = User::new();
-    let elsewhere = heli_copy(&user.fixture, "elsewhere");
+    let elsewhere = heli_copy(&user.fixture, "else where");
     let output = with_program(&user.setup_command(&["--autostart"]), &elsewhere)
         .output()
         .expect("run the other heli's setup");
     assert_success(&output, "the other heli's setup --autostart");
+    assert_eq!(
+        platform::read(&platform::definition(&user.home())),
+        platform::expected(&elsewhere, &user.home())
+    );
     let names = platform::Names::from(&user.manager.calls());
     user.manager.clear_calls();
 
@@ -849,6 +878,26 @@ fn setup_refuses_autostart_for_other_locations() {
             )
         );
     }
+    assert_eq!(user.manager.calls(), Vec::<Vec<String>>::new());
+}
+
+/// When the service manager refuses to replace a registration, clients no
+/// longer start the daemon through it: setup dropped its record before it
+/// began.
+#[test]
+fn a_failed_registration_is_not_used() {
+    let (user, _names) = User::registered();
+    let elsewhere = heli_copy(&user.fixture, "elsewhere");
+    let mut setup = with_program(&user.setup_command(&["--autostart"]), &elsewhere);
+    let output = setup
+        .env("FAKE_MANAGER_FAIL", platform::REGISTER_VERB)
+        .output()
+        .expect("run the other heli's setup");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    user.manager.clear_calls();
+
+    let output = user.heli(&["ensure"]).output().expect("run heli ensure");
+    assert_success(&output, "cargo heli ensure");
     assert_eq!(user.manager.calls(), Vec::<Vec<String>>::new());
 }
 
@@ -963,6 +1012,45 @@ fn a_refused_start_means_the_client_starts_the_daemon_itself() {
     );
     assert_eq!(user.manager.calls(), vec![names.start()]);
     assert!(user.fixture.daemon_pid().is_some(), "a daemon runs");
+}
+
+/// A service manager that does not answer within 5 s counts as a refusal:
+/// the client gives up on it and starts the daemon itself.
+#[test]
+fn a_service_manager_that_does_not_answer_counts_as_a_refusal() {
+    let (user, names) = User::registered();
+    let echo = user.builder.echo_args();
+    let output = user
+        .heli(&["exec", "--"])
+        .arg(&echo)
+        .env("FAKE_MANAGER_SLEEP_MS", "60000")
+        .output()
+        .expect("run heli exec");
+    assert_success(&output, "cargo heli exec");
+    assert_eq!(
+        support::without_footer(&output.stderr),
+        "echo-args: stderr\n"
+    );
+    assert_eq!(user.manager.calls(), vec![names.start()]);
+}
+
+/// A start through the registration counts toward the nesting limit as a
+/// start by the client does: the service manager is one level deeper than
+/// the client, so from a client deep enough the daemon would be nested too
+/// deep, and none comes up.
+#[test]
+fn the_nesting_limit_bounds_a_start_through_the_registration() {
+    let (user, names) = User::registered();
+    let mut ensure = user.heli(&["ensure"]);
+    user.manager
+        .apply_starting(&mut ensure, heli_binary(), platform::START_ARGS);
+    let output = ensure
+        .env("HELI_DEPTH", platform::TOO_DEEP)
+        .output()
+        .expect("run heli ensure");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(user.manager.calls(), vec![names.start()]);
+    assert_eq!(user.fixture.daemon_pid(), None);
 }
 
 /// The registration starts the program setup registered, at the default

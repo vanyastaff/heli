@@ -401,12 +401,11 @@ fn link(_path: &Path, _target: &Path) -> io::Result<()> {
     ))
 }
 
-/// `text` with the characters XML gives a meaning escaped.
+/// `text` as the content of an XML element: the characters markup gives a
+/// meaning there escaped.
 #[cfg(any(windows, target_os = "macos"))]
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }

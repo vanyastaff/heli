@@ -114,7 +114,10 @@ owner-only ACL, or a socket with mode 0600) accepts only that user.
 The daemon must run in the user's interactive session, never as a service:
 runs inherit its session, and tests that drive real windows (flui's live
 Win32 tests) need the user's desktop. It is started on demand by a client, or
-by a logon task that runs only while the user is logged on (§10).
+by the logon registration `cargo heli setup --autostart` makes: a task that
+runs only while the user is logged on, or its systemd and launchd
+counterparts (§4, "Autostart"). Once that registration exists, clients start
+the daemon through it too (below).
 
 **One daemon per user**, and on Windows per logon session: a lock in the
 per-user state directory (`%LOCALAPPDATA%\heli`, `$XDG_STATE_HOME/heli` or
@@ -124,7 +127,10 @@ unlike semaphores, so the Windows endpoint carries the session:
 and `HELI_ENDPOINT` override both, and `HELI_POOL` and `HELI_CONFIG` the host
 pool (§4) and the configuration file (§5), which is how tests isolate their
 daemons. A client resolves them, relative paths against its own working
-directory, and passes them to the daemon it starts.
+directory, and passes them to the daemon it starts. `HELI_SCHTASKS`,
+`HELI_SYSTEMCTL` and `HELI_LAUNCHCTL` name the programs heli runs as
+`schtasks`, `systemctl` and `launchctl` (§4, "Autostart"); tests point them
+at a fake, so that none registers anything with the real ones.
 
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
@@ -172,7 +178,20 @@ not start, listen or answer within 5 s.
   command stays in that job and outlives the command. A harness that
   terminated that job as a whole would take the daemon and every run with
   it; only a daemon started outside the job, by the logon task, avoids that
-  (§10).
+  (§10). Hence the next point.
+- **Through the registration.** When `setup --autostart` has registered the
+  daemon for the client's own program and locations (its record in the state
+  directory says which), the client does not start the daemon itself: it asks
+  the service manager to (`schtasks /Run /TN <task>`,
+  `systemctl --user start heli.service`,
+  `launchctl kickstart gui/<uid>/<label>`), with no stdio, and waits for the
+  daemon to listen within the same 5 s. That daemon belongs to the service
+  manager, outside any agent's job, process tree or control group. A client
+  that asked never also starts one: if none listens in time, it runs the
+  command directly. When there is no such record (no registration, another
+  program such as a second install, other locations), or the service manager
+  refuses or does not answer within 5 s (the registration was removed behind
+  heli's back), the client starts the daemon itself, as above.
 
 **A run** is a child of the daemon, started in the client's working
 directory with exactly the client's environment and no stdin. Its stdout and
@@ -342,7 +361,7 @@ Bare cargo, started without heli, still draws from the host pool directly.
   runs as it does today (Lifetime, above). `cargo heli` starts the daemon on
   demand, and so does `cargo heli ensure`, for a harness's session-start
   hook. `cargo heli setup --autostart` can also register it to start at
-  logon (Task Scheduler, systemd `--user`, launchd).
+  logon (Task Scheduler, systemd `--user`, launchd; "Autostart", below).
 
 **`cargo heli setup [--print]`** offers `CARGO_MAKEFLAGS`, with the value
 every run gets for the host pool (`-j --jobserver-auth=<semaphore>`, or
@@ -377,6 +396,81 @@ agent's context. With a daemon running it only connects and exchanges
 versions. When no daemon can be reached, or the one there speaks another
 protocol version (an older one is asked to retire, as for a run), it exits
 1 with one line saying why.
+
+### Autostart
+
+**`cargo heli setup --autostart`** registers the daemon to start when the
+user logs on, in their own session, never as a service and never while they
+are logged off: a daemon there would have no desktop. Clients then start the
+daemon through the registration too (§3, "Starting on demand").
+
+- **Windows**: the Task Scheduler task `heli-daemon-<hash of the state
+  directory>`, in the root folder as other per-user tasks are (OneDrive's).
+  Its definition, `autostart-task.xml` in the state directory (UTF-16, as
+  Task Scheduler exports tasks), is registered with
+  `schtasks /Create /TN <task> /XML <file> /F`.
+  - A logon trigger for the user's SID, and the principal `InteractiveToken`
+    with `LeastPrivilege`: it runs only while the user is logged on, in
+    their interactive session, not elevated, and no password is stored.
+  - It overrides the defaults that would hurt every build: `Priority` 5, a
+    normal priority class (the default 7 is below normal, with low I/O and
+    memory priority, which every run would inherit); `ExecutionTimeLimit`
+    `PT0S` (by default a task is stopped after 72 h); and
+    `DisallowStartIfOnBatteries` and `StopIfGoingOnBatteries` false.
+  - `MultipleInstancesPolicy` `IgnoreNew` and `AllowStartOnDemand`, for
+    `schtasks /Run`.
+  - The action is `cargo-heli daemon --detach`. Task Scheduler gives a
+    console program started in the user's session a console window; the
+    detaching stage holds it only until the daemon listens, and the daemon
+    gets a console without a window, as when a client starts it. The
+    detaching stage creates the state directory if need be.
+- **Linux**: the systemd user unit `heli.service` in
+  `$XDG_CONFIG_HOME/systemd/user` (else `~/.config/systemd/user`), enabled
+  as `systemctl --user enable` would, by the link
+  `default.target.wants/heli.service` beside it, then
+  `systemctl --user daemon-reload`. It runs `cargo-heli daemon` in the
+  foreground (a detaching start would end the unit, and systemd would stop
+  the daemon with it), with `SuccessExitStatus=3`, the exit of a daemon that
+  finds another one running. The user manager lives from the first login to
+  the last logout; heli does not enable lingering.
+- **macOS**: the launchd agent `io.github.vanyastaff.heli`, in
+  `~/Library/LaunchAgents`, loaded at once with
+  `launchctl bootstrap gui/<uid> <file>`: `cargo-heli daemon` in the
+  foreground, `RunAtLoad`, `LimitLoadToSessionType` `Aqua`,
+  `AbandonProcessGroup`, and `ProcessType` `Interactive`: without it launchd
+  throttles an agent's CPU and I/O, and every build's with it. No
+  `KeepAlive`: a daemon that exits stays down until a client starts it.
+
+Rules:
+
+- **Default locations only.** A task cannot hand its program variables, so
+  the registration starts the daemon a plain `cargo heli` finds, and setup
+  refuses to register or unregister (exit 1, one line saying why) while
+  `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or `HELI_CONFIG` is set. The
+  unit and the agent name the locations setup resolved, so that the service
+  manager's environment, which lacks what a shell's profile sets, cannot
+  move them.
+- **The record**, `autostart` in the state directory, names the program and
+  the locations setup registered. A client starts the daemon through the
+  registration only when the record names its own (§3). setup removes the
+  record before it changes anything and writes it once the registration is
+  complete, so no client relies on half of one.
+- **Again.** setup asks the service manager whether the registration is in
+  place with the same definition (`schtasks /Query`, the unit and its link,
+  `launchctl print`) and if so says "registered already" and changes
+  nothing. A registration of another definition (heli installed elsewhere)
+  is replaced; on macOS that unloads the old agent first, which stops a
+  daemon launchd started.
+- **`--no-autostart`** removes the registration, its definition and the
+  record (`schtasks /Delete`; the unit, its link and a reload;
+  `launchctl bootout`, which stops a daemon launchd started), and finds
+  nothing to do the second time.
+- **Consent** is the flag: setup shows the definition and each step, then
+  takes them, and asks nothing. Without `--autostart`, setup registers
+  nothing and does not reach the service manager. `--print` shows the steps
+  of a first registration, or of a removal, and takes none.
+- setup exits 1, with one line naming the command and what it said, when a
+  step fails.
 
 ## 5. Runs: `cargo heli <subcommand> [args...]`
 
@@ -919,8 +1013,9 @@ drains and evictions, and `cargo heli gc --dry-run`.
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
-| An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. The logon task starts the daemon outside any agent's job |
-| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon task restricted to the logged-on user |
+| An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. Once `setup --autostart` registered the logon task, the daemon starts outside any agent's job: at logon, and when a client needs one, through `schtasks /Run` (§3) |
+| Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart") |
+| The logon registration is gone or stale (removed by hand, heli installed elsewhere, other locations) | A start through it would bring up no daemon, or the wrong one | A client uses it only when the record names its own program and locations; when the service manager refuses the start, the client starts the daemon itself (§3) |
 | Daemon crashes mid-build | Running cargos keep their handles: a Windows semaphore lives while any handle is open, and a FIFO keeps its bytes while any process holds it open (its path persists either way) | The restarted daemon adopts a pool still held, as it is; a FIFO that nobody held has lost its bytes, and the daemon fills it again (§4) |
 | Slot leak by bare cargo | The host pool shrinks | Top-up at quiescence, bounded by the target (§4) |
 | Run killed while holding slots | none | The run pool's loans go back in full (§4) |

@@ -22,6 +22,8 @@
 //!   what they did.
 //! - The verb `FAKE_MANAGER_FAIL` names fails instead: it prints
 //!   `fake-manager: <verb> failed` on stderr and exits 1.
+//! - With `FAKE_MANAGER_SLEEP_MS`, it first sleeps that long, as a service
+//!   manager that does not answer.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -40,6 +42,12 @@ fn main() {
             .expect("open the fake manager's log");
         file.write_all(format!("{}\n", args.join("\t")).as_bytes())
             .expect("write the fake manager's log");
+    }
+    if let Some(sleep) = std::env::var("FAKE_MANAGER_SLEEP_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(sleep));
     }
     let verb = args
         .iter()
