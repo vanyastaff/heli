@@ -9,10 +9,27 @@
 //! since nobody was told; the oldest of those go once there are more than
 //! [`DONE_KEPT`]. A done run holds no lock and counts as no run in flight.
 //!
-//! **Attaching.** A client asking for the same [`Command`] as a run that is
-//! starting or running attaches to that run instead of starting another.
+//! **Attaching.** A client asking for the same run as one that is starting
+//! or running attaches to that run instead of starting another ([`Same`]).
 //! One that comes while the run's own client is being told waits for that
 //! (an instant).
+//!
+//! - A run without a key (compile, mutate, exec, a request for help) is the
+//!   same as another when its [`Command`] is.
+//! - A verify or test run is the same as another when its key is, which
+//!   holds the tree: the same command after an edit is another run. This
+//!   is single-flight: the key leaves the worktree's path out, so the run
+//!   may be in any worktree. Until a run has the key it runs on, it takes
+//!   such clients from its own worktree only: a run that waits at its
+//!   worktree lock is keyed again after the wait ([`Registry::keyed`]),
+//!   since the runs it waits for (a `fmt`) may change its tree, which
+//!   changes the tree of every client in that worktree alike, but not that
+//!   of another worktree. A run that waits for nothing has its key from the
+//!   start.
+//! - A verify or test run without a key as it asks (`--no-cache`, outside
+//!   git, a key that cannot be computed) attaches to no run. One keyed
+//!   once admitted (`--no-cache`) takes the clients of its key from then
+//!   on.
 //!
 //! **Cancelling** marks a run cancelled: it takes no new clients, ends as
 //! cancelled, and stops waiting for its turn. A run that runs hands out its
@@ -50,10 +67,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use super::key::Key;
 use super::live::Live;
 use super::tree::Tree;
 use crate::class::{Access, Class};
-use crate::protocol::RunRequest;
+use crate::protocol::{Cache, RunRequest};
 use crate::status::{self, Exit, Phase};
 use crate::{clock, runlog};
 
@@ -117,6 +135,30 @@ impl Command {
     }
 }
 
+/// What makes a run the same as another, for attaching (see the module
+/// docs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Same {
+    /// A run without a key: the same [`Command`].
+    Command,
+    /// A verify or test run: the same key, by its digest.
+    Key(String),
+    /// A verify or test run without a key: no other run.
+    Nothing,
+}
+
+impl Same {
+    /// What `request` is the same as: its `key` (`None` when it has none)
+    /// when it uses the result store, its command when it does not.
+    pub fn of(request: &RunRequest, key: Option<&Key>) -> Self {
+        match (request.cache, key) {
+            (Cache::Off, _) => Self::Command,
+            (Cache::On | Cache::Refresh, Some(key)) => Self::Key(key.digest.clone()),
+            (Cache::On | Cache::Refresh, None) => Self::Nothing,
+        }
+    }
+}
+
 /// What the registry knows of a run.
 struct Entry {
     worktree: PathBuf,
@@ -125,6 +167,11 @@ struct Entry {
     /// Asked for from inside another heli run: it does not wait.
     nested: bool,
     command: Command,
+    /// Which clients it takes.
+    same: Same,
+    /// Its key is the one it runs on: it takes the clients of that key from
+    /// any worktree, and not only from its own.
+    settled: bool,
     class: Class,
     /// Its phase while in flight; once it has ended, it is done.
     phase: Phase,
@@ -154,11 +201,30 @@ impl State {
     }
 }
 
+impl Entry {
+    /// Whether it takes a client asking for `command`, which is the same as
+    /// runs as `same` says, from the worktree whose lock is `lock`.
+    fn takes(&self, command: &Command, same: &Same, lock: &Path) -> bool {
+        if !self.state.in_flight() || self.cancelled {
+            return false;
+        }
+        match (same, &self.same) {
+            (Same::Command, Same::Command) => self.command == *command,
+            (Same::Key(asked), Same::Key(key)) => {
+                asked == key && (self.settled || self.lock == lock)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// How a client's run request is met.
 pub enum Admission {
-    /// A new run, admitted: tell the client, then start it.
-    New(RunId),
-    /// The same command is in flight: follow it.
+    /// A new run, admitted: tell the client, then start it. It `waits`
+    /// for runs at its worktree lock, which may change its tree before it
+    /// starts.
+    New { id: RunId, waits: bool },
+    /// The same run is in flight: follow it.
     Attached(Attached),
     /// Neither; the reason.
     Refused(String),
@@ -170,6 +236,9 @@ pub struct Attached {
     pub live: Arc<Live>,
     /// How long it has been going.
     pub running_for: Duration,
+    /// For a client attached by key: the run's worktree, which may be
+    /// another than the client's.
+    pub keyed_in: Option<PathBuf>,
 }
 
 /// Numbers runs for every daemon of one state directory.
@@ -254,29 +323,29 @@ impl Registry {
         }
     }
 
-    /// Attaches a client to the run of `command` in flight, if there is
-    /// one; else admits a new run of it, of `class`, in `worktree`, unless
-    /// the daemon is `retiring`. A `nested` run was asked for from inside
-    /// another heli run.
+    /// Attaches a client to a run in flight that is the same as `same`
+    /// says, if there is one; else admits a new run of `command`, of
+    /// `class`, in `worktree`, unless the daemon is `retiring`. A `nested`
+    /// run was asked for from inside another heli run.
     pub fn admit(
         &self,
         worktree: PathBuf,
         command: Command,
+        same: Same,
         class: Class,
         nested: bool,
         retiring: bool,
     ) -> Admission {
+        let lock = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
         let deadline = Instant::now() + TELLING_WAIT;
         let mut inner = self.lock();
         loop {
-            let same = inner
+            let found = inner
                 .runs
                 .iter()
-                .find(|(_, entry)| {
-                    entry.command == command && entry.state.in_flight() && !entry.cancelled
-                })
+                .find(|(_, entry)| entry.takes(&command, &same, &lock))
                 .map(|(&id, entry)| (id, matches!(entry.state, State::Telling)));
-            match same {
+            match found {
                 Some((id, false)) => {
                     if let Some(entry) = inner.runs.get_mut(&id)
                         && let State::Starting { live } | State::Running { live, .. } = &entry.state
@@ -287,6 +356,7 @@ impl Registry {
                             id,
                             live,
                             running_for: entry.started_at.elapsed().unwrap_or_default(),
+                            keyed_in: matches!(same, Same::Key(_)).then(|| entry.worktree.clone()),
                         });
                     }
                     break;
@@ -313,7 +383,6 @@ impl Registry {
                 ));
             }
         };
-        let lock = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
         inner.runs.insert(
             id,
             Entry {
@@ -321,6 +390,8 @@ impl Registry {
                 lock,
                 nested,
                 command,
+                same,
+                settled: false,
                 class,
                 phase: Phase::Running,
                 started_at: SystemTime::now(),
@@ -330,7 +401,25 @@ impl Registry {
                 state: State::Telling,
             },
         );
-        Admission::New(id)
+        // The runs it waits for are admitted before it, so they only ever
+        // leave: one that waits for none now never will, and keeps its key.
+        let waits = !inner.blockers(id).is_empty();
+        if let Some(entry) = inner.runs.get_mut(&id) {
+            entry.settled = !waits;
+        }
+        Admission::New { id, waits }
+    }
+
+    /// Run `id`, admitted and done waiting, was keyed again: `key` is the
+    /// key it runs on (`None`: it has none). It now takes the clients of
+    /// that key from any worktree. A run without a key is left as it is.
+    pub fn keyed(&self, id: RunId, key: Option<&Key>) {
+        if let Some(entry) = self.lock().runs.get_mut(&id)
+            && entry.same != Same::Command
+        {
+            entry.same = key.map_or(Same::Nothing, |key| Same::Key(key.digest.clone()));
+            entry.settled = true;
+        }
     }
 
     /// Run `id`'s client knows it started; its clients follow `live`.

@@ -8,11 +8,16 @@
 //!
 //! A run's part, in the daemon's run sequence:
 //!
-//! 1. [`Store::before`]: before the run waits for anything, its key is looked
-//!    up; a hit ends it.
-//! 2. [`Store::admitted`]: once admitted, the key is computed again and
-//!    looked up again (another run may have recorded it meanwhile). This
-//!    snapshot of the tree is the one taken before the run's steps.
+//! 1. [`Store::before`]: before the run waits for anything, its key is
+//!    computed and looked up; a hit ends it. On a miss the key goes on to
+//!    single-flight (`super::registry`), so that matching runs in flight
+//!    costs no snapshot of its own.
+//! 2. [`Store::admitted`]: once admitted, the key is looked up again
+//!    (another run may have recorded it meanwhile). After a wait at the
+//!    worktree lock it is computed again first, since the runs waited for
+//!    may have changed the tree; a run that waited for nothing keeps the
+//!    key of step 1, taken a moment before. This snapshot of the tree is
+//!    the one taken before the run's steps.
 //! 3. [`Store::after`]: a run that passed is recorded when the tree, taken
 //!    again after its steps, is the snapshot of step 2.
 //!
@@ -74,6 +79,15 @@ impl Record {
     }
 }
 
+/// What the result store finds before a run waits for anything.
+pub enum Before {
+    /// The key already passed: nothing runs.
+    Passed(Record),
+    /// No pass is recorded: the run goes on, with its key when it has one
+    /// (it looks the store up, in a git worktree).
+    Miss(Option<Key>),
+}
+
 /// What the result store decides once a run is admitted.
 pub enum Admitted {
     /// The key already passed: nothing runs.
@@ -102,35 +116,45 @@ impl Store {
         }
     }
 
-    /// Before `request` waits for anything: the pass of its key, if one is
-    /// recorded and the run looks the store up.
-    pub fn before(&self, request: &RunRequest) -> Option<Record> {
+    /// Before `request` waits for anything: its key, and the pass of that
+    /// key if one is recorded. Only a run that looks the store up is keyed
+    /// here; one that does not (`--no-cache`, or no verdict) is not.
+    pub fn before(&self, request: &RunRequest) -> Before {
         if request.cache != Cache::On {
-            return None;
+            return Before::Miss(None);
         }
-        let key = key::compute(request, &self.scratch).ok().flatten()?;
-        self.lookup(&key)
+        let Some(key) = key::compute(request, &self.scratch).ok().flatten() else {
+            return Before::Miss(None);
+        };
+        match self.lookup(&key) {
+            Some(record) => Before::Passed(record),
+            None => Before::Miss(Some(key)),
+        }
     }
 
-    /// Once `request` is admitted: its key, read again, and its pass if one
-    /// is recorded now.
-    pub fn admitted(&self, request: &RunRequest) -> Admitted {
+    /// Once `request` is admitted: its key, and its pass if one is recorded
+    /// now. The key is `known` when given (the key of [`Store::before`], for
+    /// a run that waited for nothing), else computed again.
+    pub fn admitted(&self, request: &RunRequest, known: Option<Key>) -> Admitted {
         if request.cache == Cache::Off {
             return Admitted::Run {
                 key: None,
                 note: None,
             };
         }
-        let key = match key::compute(request, &self.scratch) {
-            Ok(key) => key,
-            Err(error) => {
-                return Admitted::Run {
-                    key: None,
-                    note: Some(format!(
-                        "cannot key this run, so it is not recorded: {error}"
-                    )),
-                };
-            }
+        let key = match known {
+            Some(known) => Some(known),
+            None => match key::compute(request, &self.scratch) {
+                Ok(key) => key,
+                Err(error) => {
+                    return Admitted::Run {
+                        key: None,
+                        note: Some(format!(
+                            "cannot key this run, so it is not recorded: {error}"
+                        )),
+                    };
+                }
+            },
         };
         if request.cache == Cache::On
             && let Some(record) = key.as_ref().and_then(|key| self.lookup(key))

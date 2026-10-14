@@ -1,0 +1,624 @@
+//! Single-flight (DESIGN.md §5, lifecycle step 3): a verify or test run
+//! whose key matches a run in flight anywhere on the machine attaches to
+//! that run, from any worktree, instead of starting another. Its client gets
+//! the run's output from its first byte and its exit code.
+
+mod support;
+
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
+
+use serde_json::Value;
+use support::{Fixture, assert_success, runs};
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// `git <args>` in `dir`; panics unless it succeeds.
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git");
+    assert_success(&output, &format!("git {}", args.join(" ")));
+}
+
+/// A fixture repository with a second worktree of the same commit, and a
+/// fake toolchain outside both, so that the same check in either has the
+/// same key. Its `cargo` is a copy of `echo-args` (it prints its arguments,
+/// counts its starts, waits for the gate, and exits 0 unless told
+/// otherwise), and so is its `rustc`; both answer version requests as
+/// [`Twins::set_version`] sets them.
+struct Twins {
+    fixture: Fixture,
+    /// The second worktree.
+    other: PathBuf,
+    cargo: PathBuf,
+    /// The search path, the fake `rustc` first.
+    path: OsString,
+}
+
+impl Twins {
+    fn new() -> Self {
+        let fixture = Fixture::new("basic");
+        let echo = fixture.echo_args();
+        let workspace = fixture.workspace();
+        git(&workspace, &["init", "--quiet"]);
+        git(&workspace, &["add", "-A"]);
+        git(
+            &workspace,
+            &[
+                "-c",
+                "user.name=heli",
+                "-c",
+                "user.email=heli@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                "fixture",
+            ],
+        );
+        let other = fixture.path("other");
+        git(
+            &workspace,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                other.to_str().expect("a UTF-8 path"),
+                "HEAD",
+            ],
+        );
+        let tools = fixture.path("tools");
+        std::fs::create_dir_all(&tools).expect("create the tools");
+        let tool = |name: &str| {
+            let path = tools.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+            std::fs::copy(&echo, &path).expect("copy echo-args");
+            path
+        };
+        let cargo = tool("cargo");
+        tool("rustc");
+        let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        )))
+        .expect("a search path");
+        std::fs::create_dir_all(fixture.path("versions")).expect("create the versions");
+        std::fs::create_dir_all(fixture.path("cargo-home")).expect("create the Cargo home");
+        let twins = Self {
+            fixture,
+            other,
+            cargo,
+            path,
+        };
+        twins.set_version("cargo", "cargo 1.0.0");
+        twins.set_version("rustc", "rustc 1.0.0");
+        twins
+    }
+
+    /// The first worktree.
+    fn workspace(&self) -> PathBuf {
+        self.fixture.workspace()
+    }
+
+    /// Sets the version the fake tools report for `request` (`cargo`,
+    /// `rustc`).
+    fn set_version(&self, request: &str, version: &str) {
+        std::fs::write(self.fixture.path("versions").join(request), version)
+            .expect("write a version");
+    }
+
+    /// `cargo heli <args>` in `dir`, with the fake toolchain; the command
+    /// waits for the gate.
+    fn heli(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut command = self.fixture.heli(args.iter().copied());
+        command
+            .current_dir(dir)
+            .env("CARGO", &self.cargo)
+            .env("CARGO_HOME", self.fixture.path("cargo-home"))
+            .env("ECHO_VERSION", self.fixture.path("versions"))
+            .env("PATH", &self.path)
+            .env("ECHO_WAIT_FOR", self.fixture.path("gate"))
+            .env("ECHO_STARTS", self.fixture.path("starts"));
+        command
+    }
+
+    /// `cargo heli check` in `dir`.
+    fn check(&self, dir: &Path) -> Command {
+        self.heli(dir, &["check"])
+    }
+
+    fn open_gate(&self) {
+        std::fs::write(self.fixture.path("gate"), "").expect("open the gate");
+    }
+
+    /// How many times the fake cargo has run a command.
+    fn starts(&self) -> usize {
+        std::fs::read_to_string(self.fixture.path("starts"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+}
+
+/// Starts `command` with its output captured.
+fn start(command: &mut Command) -> Child {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start heli")
+}
+
+/// Waits for `child` to exit, at most a minute: a wait that is never
+/// released fails the test instead of hanging it.
+fn finish(child: Child) -> Output {
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    match receiver.recv_timeout(Duration::from_secs(60)) {
+        Ok(output) => output.expect("wait for heli"),
+        Err(_) => {
+            support::kill_tree(pid);
+            panic!("heli (pid {pid}) did not finish within a minute");
+        }
+    }
+}
+
+/// The notice line an attached client prints first on stderr, if any.
+fn notice(output: &Output) -> Option<String> {
+    let stderr = support::without_footer(&output.stderr);
+    let first = stderr.lines().next()?;
+    first
+        .starts_with("cargo-heli: attached to ")
+        .then(|| first.to_owned())
+}
+
+/// The run `status` lists as `run`.
+fn id(run: &Value) -> String {
+    run["id"].as_str().expect("an id").to_owned()
+}
+
+/// The run a client followed: the one its footer names.
+fn run_of(output: &Output) -> String {
+    support::split_footer(&output.stderr).1.run
+}
+
+/// Waits until `status` lists `count` runs, and returns them, oldest first.
+fn wait_for_runs(fixture: &Fixture, count: usize) -> Vec<Value> {
+    let status = fixture.wait_for_status(&format!("{count} runs"), |status| {
+        runs(status).len() == count
+    });
+    runs(&status)
+}
+
+/// Waits until run `run` has `count` clients.
+fn wait_for_clients(fixture: &Fixture, run: &str, count: u32) {
+    fixture.wait_for_status(&format!("{count} clients of {run}"), |status| {
+        runs(status)
+            .iter()
+            .any(|listed| listed["id"] == run && listed["attached_clients"] == count)
+    });
+}
+
+/// Waits until run `run` has printed something: its command has started.
+fn wait_for_output(fixture: &Fixture, run: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let output = fixture.heli(["log", run]).output().expect("run heli log");
+        if !output.stdout.is_empty() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the output of {run}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A file tracked in both worktrees.
+fn library(worktree: &Path) -> PathBuf {
+    worktree
+        .join("crates")
+        .join("slow-a")
+        .join("src")
+        .join("lib.rs")
+}
+
+/// Edits [`library`] in `worktree` as the fake `fmt` of
+/// [`a_run_waiting_for_its_worktree_is_keyed_again`] does: one more line.
+fn edit(worktree: &Path) {
+    let mut text = std::fs::read(library(worktree)).expect("read the library");
+    text.extend_from_slice(b"started\n");
+    std::fs::write(library(worktree), text).expect("edit the library");
+}
+
+/// A run whose key differs in any keyed input starts on its own: the
+/// arguments, the directory within the worktree, a variable, the Cargo
+/// configuration, the toolchain or the tree. One that differs only in what
+/// the key leaves out (here the target directory, from another worktree) is
+/// the same run, and attaches.
+#[test]
+fn a_run_whose_key_differs_starts_on_its_own() {
+    let twins = Twins::new();
+    let other = &twins.other;
+    let first = start(&mut twins.check(&twins.workspace()));
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    let mut same = twins.check(other);
+    same.env("CARGO_TARGET_DIR", twins.fixture.path("other-target"));
+    let same = start(&mut same);
+    wait_for_clients(&twins.fixture, &first_run, 2);
+
+    let other_home = twins.fixture.path("other-cargo-home");
+    std::fs::create_dir_all(&other_home).expect("create a Cargo home");
+    std::fs::write(
+        other_home.join("config.toml"),
+        "[build]\nincremental = false\n",
+    )
+    .expect("write a Cargo configuration");
+    let mut variable = twins.check(other);
+    variable.env("SINGLE_FLIGHT_TEST", "1");
+    let mut configuration = twins.check(other);
+    configuration.env("CARGO_HOME", &other_home);
+    let mut differing = Vec::new();
+    for (input, mut command) in [
+        (
+            "the arguments",
+            twins.heli(other, &["check", "--all-targets"]),
+        ),
+        ("the directory", twins.check(&other.join("crates"))),
+        ("a variable", variable),
+        ("the Cargo configuration", configuration),
+    ] {
+        differing.push((input, start(&mut command)));
+        wait_for_runs(&twins.fixture, differing.len() + 1);
+    }
+    // The first run was keyed with rustc 1.0.0.
+    twins.set_version("rustc", "rustc 2.0.0");
+    differing.push(("the toolchain", start(&mut twins.check(other))));
+    wait_for_runs(&twins.fixture, differing.len() + 1);
+    twins.set_version("rustc", "rustc 1.0.0");
+    edit(other);
+    differing.push(("the tree", start(&mut twins.check(other))));
+    let listed = wait_for_runs(&twins.fixture, differing.len() + 1);
+    assert_eq!(listed[0]["attached_clients"], 2, "{listed:?}");
+
+    twins.open_gate();
+    let first = finish(first);
+    assert_success(&first, "the first check");
+    assert_eq!(run_of(&first), first_run);
+    let same = finish(same);
+    assert_success(&same, "the same check");
+    assert_eq!(run_of(&same), first_run);
+    assert!(notice(&same).is_some_and(|notice| notice.contains(&first_run)));
+    let mut runs = vec![first_run];
+    for (input, call) in differing {
+        let output = finish(call);
+        assert_success(&output, input);
+        assert_eq!(notice(&output), None, "{input}");
+        runs.push(run_of(&output));
+    }
+    runs.sort();
+    runs.dedup();
+    assert_eq!(
+        runs.len(),
+        7,
+        "each differing check ran on its own: {runs:?}"
+    );
+    assert_eq!(twins.starts(), 7);
+}
+
+/// The same command in the same worktree is not the same run once the tree
+/// has changed: called again after an edit, it starts a run of its own
+/// rather than attach to one that started on the tree before the edit.
+/// Called again before the edit, it attaches.
+#[test]
+fn the_same_check_after_an_edit_runs_anew() {
+    let twins = Twins::new();
+    let workspace = twins.workspace();
+    let first = start(&mut twins.check(&workspace));
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    let again = start(&mut twins.check(&workspace));
+    wait_for_clients(&twins.fixture, &first_run, 2);
+    edit(&workspace);
+    let edited = start(&mut twins.check(&workspace));
+    let listed = wait_for_runs(&twins.fixture, 2);
+    assert_eq!(listed[1]["attached_clients"], 1, "{listed:?}");
+
+    twins.open_gate();
+    let (first, again, edited) = (finish(first), finish(again), finish(edited));
+    for (output, what) in [(&first, "first"), (&again, "again"), (&edited, "edited")] {
+        assert_success(output, what);
+    }
+    assert_eq!(run_of(&again), first_run);
+    assert!(notice(&again).is_some_and(|notice| notice.contains(&first_run)));
+    assert_ne!(run_of(&edited), first_run);
+    assert_eq!(notice(&edited), None);
+    assert_eq!(twins.starts(), 2);
+}
+
+/// The markers in the fixture's result store.
+fn markers(fixture: &Fixture) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(fixture.state_dir().join("verified")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.expect("an entry").path())
+        .collect()
+}
+
+/// When the run fails, every client attached to it gets the failure (the
+/// run's output and its exit code), and nothing is recorded: the same check
+/// runs again.
+#[test]
+fn a_failure_reaches_every_client_and_is_not_recorded() {
+    let twins = Twins::new();
+    let failing = |dir: &Path| {
+        let mut command = twins.check(dir);
+        command.env("ECHO_EXIT", "1");
+        command
+    };
+    let first = start(&mut failing(&twins.workspace()));
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    let second = start(&mut failing(&twins.other));
+    wait_for_clients(&twins.fixture, &run, 2);
+
+    twins.open_gate();
+    let (first, second) = (finish(first), finish(second));
+    for output in [&first, &second] {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert!(
+            text(&output.stdout).starts_with("arg: \"check\"\n"),
+            "{output:?}"
+        );
+        assert!(
+            support::without_footer(&output.stderr).ends_with("echo-args: stderr\n"),
+            "{output:?}"
+        );
+        assert_eq!(run_of(output), run);
+    }
+    assert_eq!(first.stdout, second.stdout);
+    assert_eq!(markers(&twins.fixture), Vec::<PathBuf>::new());
+    let again = failing(&twins.other).output().expect("run heli");
+    assert_eq!(again.status.code(), Some(1), "it runs again: {again:?}");
+    assert_eq!(twins.starts(), 2);
+}
+
+/// Killing a client (as an agent harness stops a command) stops that client
+/// only: the run goes on for the others, even when the one killed started
+/// it, and they get its whole output and its exit code.
+#[test]
+fn killing_one_client_leaves_the_run_to_the_others() {
+    let twins = Twins::new();
+    let starter = start(&mut twins.check(&twins.workspace()));
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    let others = [
+        start(&mut twins.check(&twins.other)),
+        start(&mut twins.check(&twins.other)),
+    ];
+    wait_for_clients(&twins.fixture, &run, 3);
+    support::kill_tree(starter.id());
+    let _ = finish(starter);
+    wait_for_clients(&twins.fixture, &run, 2);
+
+    twins.open_gate();
+    for other in others {
+        let output = finish(other);
+        assert_success(&output, "an attached check");
+        assert!(
+            text(&output.stdout).starts_with("arg: \"check\"\n"),
+            "{output:?}"
+        );
+        assert_eq!(run_of(&output), run);
+    }
+    assert_eq!(twins.starts(), 1, "the check ran once");
+}
+
+/// A run that waits at its worktree lock is keyed again once its wait is
+/// over, since the runs it waited for may have changed its tree (a `fmt`).
+/// Until then it takes the clients of its key from its own worktree only,
+/// where such a change reaches the clients' tree too; a client in another
+/// worktree runs on its own rather than get the verdict of a tree it does
+/// not have. After the wait, the run takes the clients of the key it has
+/// then, from any worktree.
+#[test]
+fn a_run_waiting_for_its_worktree_is_keyed_again() {
+    let twins = Twins::new();
+    let workspace = twins.workspace();
+    let build_gate = twins.fixture.path("build-gate");
+    let mut build = twins.heli(&workspace, &["build"]);
+    build.env("ECHO_WAIT_FOR", &build_gate);
+    let build = start(&mut build);
+    wait_for_runs(&twins.fixture, 1);
+    // `fmt` waits for the build, then edits the library: the fake cargo
+    // appends a line to its `ECHO_STARTS`.
+    let mut fmt = twins.heli(&workspace, &["fmt"]);
+    fmt.env("ECHO_STARTS", library(&workspace))
+        .env_remove("ECHO_WAIT_FOR");
+    let fmt = start(&mut fmt);
+    wait_for_runs(&twins.fixture, 2);
+    let check = start(&mut twins.check(&workspace));
+    let listed = wait_for_runs(&twins.fixture, 3);
+    assert!(listed[2]["waiting_since"].is_u64(), "{listed:?}");
+    let check_run = id(&listed[2]);
+
+    let here = start(&mut twins.check(&workspace));
+    wait_for_clients(&twins.fixture, &check_run, 2);
+    let there = start(&mut twins.check(&twins.other));
+    wait_for_runs(&twins.fixture, 4);
+
+    std::fs::write(&build_gate, "").expect("open the build's gate");
+    wait_for_output(&twins.fixture, &check_run);
+    edit(&twins.other);
+    let changed = start(&mut twins.check(&twins.other));
+    wait_for_clients(&twins.fixture, &check_run, 3);
+
+    twins.open_gate();
+    assert_success(&finish(build), "the build");
+    assert_success(&finish(fmt), "fmt");
+    let check = finish(check);
+    assert_success(&check, "the check");
+    assert_eq!(run_of(&check), check_run);
+    let here = finish(here);
+    assert_success(&here, "the check in the same worktree");
+    assert_eq!(run_of(&here), check_run);
+    let there = finish(there);
+    assert_success(&there, "the check in the other worktree");
+    assert_ne!(run_of(&there), check_run);
+    assert_eq!(notice(&there), None);
+    let changed = finish(changed);
+    assert_success(&changed, "the check in the other worktree, changed alike");
+    assert_eq!(run_of(&changed), check_run);
+    let notice = notice(&changed).expect("a notice");
+    assert!(notice.contains(&check_run), "{notice}");
+    // The build, the check and the check in the other worktree.
+    assert_eq!(twins.starts(), 3);
+}
+
+/// `--no-cache` runs a check anew: it attaches to no run of its key in
+/// flight. A run so forced still takes the clients of its key, once it has
+/// one.
+#[test]
+fn no_cache_runs_anew() {
+    let twins = Twins::new();
+    let forced = || twins.heli(&twins.workspace(), &["--no-cache", "check"]);
+    let first = start(&mut forced());
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &first_run);
+    let check = start(&mut twins.check(&twins.other));
+    wait_for_clients(&twins.fixture, &first_run, 2);
+    let again = start(&mut forced());
+    wait_for_runs(&twins.fixture, 2);
+
+    twins.open_gate();
+    let (first, check, again) = (finish(first), finish(check), finish(again));
+    for (output, what) in [(&first, "first"), (&check, "check"), (&again, "again")] {
+        assert_success(output, what);
+    }
+    assert_eq!(run_of(&check), first_run);
+    assert!(notice(&check).is_some_and(|notice| notice.contains(&first_run)));
+    assert_ne!(run_of(&again), first_run);
+    assert_eq!(notice(&again), None);
+    assert_eq!(twins.starts(), 2);
+}
+
+/// Outside a git repository a check has no key: nothing tells whether its
+/// tree is the same as a run's in flight, so it attaches to none.
+#[test]
+fn a_check_without_a_key_attaches_to_no_run() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let check = || {
+        let mut check = fixture.heli(["check"]);
+        check
+            .env("CARGO", &echo)
+            .env("ECHO_WAIT_FOR", fixture.path("gate"))
+            .env("ECHO_STARTS", fixture.path("starts"));
+        start(&mut check)
+    };
+    let first = check();
+    wait_for_runs(&fixture, 1);
+    let second = check();
+    let listed = wait_for_runs(&fixture, 2);
+    assert_eq!(listed[0]["attached_clients"], 1, "{listed:?}");
+
+    std::fs::write(fixture.path("gate"), "").expect("open the gate");
+    let (first, second) = (finish(first), finish(second));
+    for output in [&first, &second] {
+        assert_success(output, "cargo heli check");
+        assert_eq!(notice(output), None);
+    }
+    assert_ne!(run_of(&first), run_of(&second));
+}
+
+/// The same check started at the same moment in two worktrees with the same
+/// tree runs once: one client starts the run, the other attaches to it
+/// (one notice line naming the run and its worktree), and both get the
+/// run's whole output and its exit code.
+#[test]
+fn the_same_check_in_two_worktrees_runs_once() {
+    let twins = Twins::new();
+    let first = start(&mut twins.check(&twins.workspace()));
+    let second = start(&mut twins.check(&twins.other));
+    let status = twins
+        .fixture
+        .wait_for_status("one run with two clients", |status| {
+            let runs = runs(status);
+            runs.len() == 1 && runs[0]["attached_clients"] == 2
+        });
+    let run = runs(&status)[0].clone();
+
+    twins.open_gate();
+    let outputs = [finish(first), finish(second)];
+    for output in &outputs {
+        assert_success(output, "cargo heli check");
+        assert!(
+            text(&output.stdout).starts_with("arg: \"check\"\n"),
+            "{output:?}"
+        );
+        assert_eq!(output.stdout, outputs[0].stdout);
+        assert_eq!(support::split_footer(&output.stderr).1.run, id(&run));
+    }
+    let notices: Vec<String> = outputs.iter().filter_map(notice).collect();
+    let [notice] = &notices[..] else {
+        panic!("one client attached: {notices:?}");
+    };
+    assert!(notice.contains(&id(&run)), "{notice}");
+    let worktree = run["worktree"].as_str().expect("a worktree");
+    assert!(notice.contains(worktree), "names {worktree}: {notice}");
+    assert_eq!(twins.starts(), 1, "the check ran once");
+}
+
+/// How many times the fake `rustc` was asked its version, as logged in
+/// `log`: once each time a run's key was computed.
+fn keyings(log: &Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == "rustc")
+        .count()
+}
+
+/// Single-flight matches the key the result store's first lookup computed,
+/// so a miss costs no key of its own; and a run that waits for nothing
+/// keeps that key, the one its clients matched, rather than compute it
+/// again once admitted. A run that waits at its worktree lock is keyed
+/// again after the wait.
+#[test]
+fn a_run_that_waits_for_nothing_is_keyed_once() {
+    let twins = Twins::new();
+    let workspace = twins.workspace();
+    let log = twins.fixture.path("asked");
+    let check = || {
+        let mut check = twins.check(&workspace);
+        check.env("ECHO_VERSION_LOG", &log);
+        check
+    };
+    twins.open_gate();
+    assert_success(&check().output().expect("run heli"), "the check");
+    assert_eq!(keyings(&log), 1, "a check that waits for nothing");
+
+    std::fs::remove_file(&log).expect("clear the log");
+    edit(&workspace);
+    let fmt_gate = twins.fixture.path("fmt-gate");
+    let mut fmt = twins.heli(&workspace, &["fmt"]);
+    fmt.env("ECHO_WAIT_FOR", &fmt_gate);
+    let fmt = start(&mut fmt);
+    wait_for_runs(&twins.fixture, 1);
+    let waiting = start(&mut check());
+    let listed = wait_for_runs(&twins.fixture, 2);
+    assert!(listed[1]["waiting_since"].is_u64(), "{listed:?}");
+    std::fs::write(&fmt_gate, "").expect("open fmt's gate");
+    assert_success(&finish(fmt), "fmt");
+    assert_success(&finish(waiting), "the check that waited");
+    assert_eq!(keyings(&log), 2, "a check that waited for fmt");
+}

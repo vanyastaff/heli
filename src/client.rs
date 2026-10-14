@@ -13,10 +13,12 @@
 //!   is reported as direct execution reports it (exit 127 or 126). A run
 //!   that waits for its worktree's lock says so first, on stderr: "waiting
 //!   for …", naming the runs it waits for (through the printer, so quiet
-//!   mode holds it back with the rest). When the same command is already
-//!   in flight, the daemon attaches this client to it: one notice line on
-//!   stderr (through the printer too), then the same as for a run of its
-//!   own, from the run's first byte.
+//!   mode holds it back with the rest). When the same run is already in
+//!   flight (the same command, or for a verify or test run the same key,
+//!   in any worktree), the daemon attaches this client to it: one notice
+//!   line on stderr (through the printer too) naming the run and how long
+//!   it has been going, then the same as for a run of its own, from the
+//!   run's first byte.
 //! - **A hit.** When the daemon answers that the run's key already passed
 //!   (`crate::daemon::results`), say which run passed and when, with the
 //!   caveats of reusing a verdict, and exit 0 without running anything.
@@ -367,17 +369,17 @@ fn submit(
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
     match protocol::read_message::<Reply>(&mut stream) {
-        Ok(Reply::Started { run, attached }) => {
+        Ok(Reply::Started {
+            run,
+            attached,
+            keyed_in,
+        }) => {
             let mut printer = plan.printer();
             let mut started = Instant::now();
             if let Some(milliseconds) = attached {
                 let running_for = Duration::from_millis(milliseconds);
                 started = started.checked_sub(running_for).unwrap_or(started);
-                printer.note(&format!(
-                    "cargo-heli: attached to {run}, the same command started {:.1} s ago; \
-                     to run it anew, cargo heli cancel {run} first",
-                    running_for.as_secs_f64()
-                ));
+                printer.note(&attached_notice(&run, running_for, keyed_in.as_ref()));
             }
             follow(stream, invocation, &run, started, printer)
         }
@@ -386,6 +388,25 @@ fn submit(
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
         Err(error) => Err(format!("the heli daemon did not take the run: {error}")),
+    }
+}
+
+/// The notice of a client attached to run `run`, going for `running_for`:
+/// the same command, or with `keyed_in` the same key, of a run in that
+/// worktree. Another client may follow a run of the same key, so the way
+/// to run it anew is `--no-cache`, not cancelling it.
+fn attached_notice(run: &str, running_for: Duration, keyed_in: Option<&Text>) -> String {
+    let age = running_for.as_secs_f64();
+    match keyed_in {
+        None => format!(
+            "cargo-heli: attached to {run}, the same command started {age:.1} s ago; \
+             to run it anew, cargo heli cancel {run} first"
+        ),
+        Some(worktree) => format!(
+            "cargo-heli: attached to {run}, the same run on the same tree started {age:.1} s \
+             ago in {}; to run it anew, give --no-cache",
+            worktree.0.to_string_lossy()
+        ),
     }
 }
 

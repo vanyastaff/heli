@@ -575,8 +575,20 @@ How a command line is read:
 2. **Result store.** On a hit, heli prints "already passed: <run>, <when>"
    and exits 0 (§7).
 3. **Single-flight.** If a run with the same key is in flight anywhere on the
-   machine, the client attaches to it: it streams that run's output and
-   returns its exit code.
+   machine, the client attaches to it (step 4, "Attach"): it streams that
+   run's output and returns its exit code. The key leaves the worktree's
+   path out, so the run may be another worktree's; the notice names its
+   worktree, and says that `--no-cache` runs it anew.
+   - The key is the one the result store's first lookup computed, so a
+     miss costs no snapshot of its own.
+   - A run takes the clients of its key from other worktrees only once it
+     has the key it runs on. A run that waits at its worktree lock is keyed
+     again after the wait (§7), since the runs it waits for (a `fmt`) may
+     change its tree; until then it takes clients from its own worktree
+     only, whose tree such a change reaches too. A run that waits for
+     nothing keeps its key.
+   - A `--no-cache` run attaches to no run, and is keyed only once
+     admitted; from then on others attach to it.
 4. **Detach.** The daemon spawns the command as the first process of a
    process tree of its own, and the client follows its output.
    - **The tree.** On Windows, a Job Object per run: the process starts
@@ -605,8 +617,14 @@ How a command line is read:
      Every client gets the run's whole story: heli's notes, and its end
      (its exit, a pass found in the result store meanwhile, or a command
      that could not start). A retiring daemon starts no run but still
-     attaches. Single-flight (step 3) widens this to the key, across
-     worktrees.
+     attaches.
+     - This holds for runs without a key: compile, mutate and exec runs,
+       and requests for help. The same command may have started before the
+       agent's last edit; the notice's age tells.
+     - A verify or test run attaches by key instead (single-flight, step
+       3): the same tree too, and from any worktree. The same command after
+       an edit is a run of its own. One without a key (outside git,
+       `--no-cache`, a key that cannot be computed) attaches to no run.
    - **Cancel.** `cargo heli cancel <run>` kills the whole tree and answers
      once none of its processes is left. On Windows, `TerminateJobObject`,
      waiting on the processes themselves too (a job stops counting a
@@ -1151,16 +1169,21 @@ was found by a failing test.
 **When the key is computed.** It is checked twice: before the run waits for
 anything, and again once admitted and past the worktree lock, because another
 run may have recorded it meanwhile. A hit before the wait is never admitted
-as a run: it takes no run id. The key is computed afresh after the wait, and
-that snapshot of the tree, taken before the steps, is compared with one taken
-after them. A marker is written only
+as a run: it takes no run id; a miss goes on to single-flight with that key
+(§5, step 3). The key is computed afresh after a wait, since the runs waited
+for may have changed the tree. A run that waited for nothing keeps the key
+of the first check, taken a moment before, so its clients from other
+worktrees attached to the tree it runs on. That snapshot of the tree, taken
+before the steps, is compared with one taken after them, so a change in
+between counts as one during the run. A marker is written only
 when the run passed and both snapshots match. A run that fails drops the
 marker of its key, so a flaky pass is reused only until a run of the same key
 fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key. `--no-cache` skips both lookups, not the recording.
+the key. `--no-cache` skips both lookups, not the recording, and attaches to
+no run in flight (§5, step 3).
 
 Compile runs are never recorded, because their product is the artifact, not
 the verdict; nor is a request for help (`-h` or `--help`, also the test
