@@ -284,7 +284,7 @@ fn status_lists_the_last_32_runs_nobody_followed_to_the_end() {
 
 /// Starts `echo-args` through heli (as `cargo heli <args>` with it standing
 /// in for cargo, or with no `args` as `exec`), waiting for a gate; kills its
-/// client once the run is listed, opens the gate once `status` shows no
+/// client once the run has started, opens the gate once `status` shows no
 /// client attached, and returns the run once it is listed as done.
 fn run_nobody_follows(fixture: &Fixture, args: &[&str]) -> String {
     let echo = fixture.echo_args();
@@ -298,10 +298,12 @@ fn run_nobody_follows(fixture: &Fixture, args: &[&str]) -> String {
         call.env("CARGO", &echo);
         call
     };
-    call.env("ECHO_WAIT_FOR", &gate);
+    // It prints its process id before it waits: the sign it has started.
+    call.env("ECHO_WAIT_FOR", &gate).env("ECHO_PID", "1");
     let call = start(&mut call);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    fixture.wait_for_run_output(&id);
     support::kill_tree(call.id());
     let _ = finish(call);
     fixture.wait_for_status("its client to be gone", |status| {

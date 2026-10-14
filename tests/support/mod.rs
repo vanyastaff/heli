@@ -570,6 +570,27 @@ impl Fixture {
         }
     }
 
+    /// Waits until run `run` has printed something, as `cargo heli log`
+    /// shows: its command has started, so its client heard that it started.
+    /// A run is listed from its admission, a moment before its client is
+    /// told; a client gone in that moment means the run never starts (it is
+    /// the client's to run). Panics after 60 s.
+    pub fn wait_for_run_output(&self, run: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logged = self.heli(["log", run]).output().expect("run heli log");
+            assert_success(&logged, "cargo heli log");
+            if !logged.stdout.is_empty() || !logged.stderr.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the output of {run}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The runs `status --json` lists.
     pub fn runs(&self) -> Vec<Value> {
         runs(&self.status())
