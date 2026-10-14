@@ -455,58 +455,28 @@ fn open_lock(path: &Path, create: bool) -> io::Result<File> {
 /// [`WARDEN_POLL`] while one does. Returns without removing it once a daemon
 /// owns the pool again, or when the FIFO is gone or not this user's.
 pub fn remove_when_released(path: &Path) {
-    // TEMPORARY (fix/after-stale-link): why the warden leaves, in
-    // `warden.trace` in its working directory, the state directory.
-    let trace = |what: &str| {
-        let at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_micros());
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("warden.trace")
-            .and_then(|mut file| writeln!(file, "{at} {} {what}", std::process::id()));
-    };
-    trace("the daemon is gone");
-    let mut waiting = false;
     loop {
         // The daemon made the lock. Without it there is nothing to remove,
         // and a warden never creates files.
         let Ok(lock) = open_lock(path, false) else {
-            trace("no lock: leaving");
             return;
         };
         if lock.try_lock().is_err() {
-            trace("the lock is held: leaving");
             return;
         }
         match fs::symlink_metadata(path) {
             Ok(metadata)
                 if metadata.file_type().is_fifo()
                     && metadata.uid() == rustix::process::geteuid().as_raw() => {}
-            _ => {
-                trace("no FIFO: leaving");
-                return;
-            }
+            _ => return,
         }
         match is_held(path) {
-            Ok(true) => {
-                if !waiting {
-                    trace("held: waiting");
-                    waiting = true;
-                }
-            }
+            Ok(true) => {}
             Ok(false) => {
-                let removed = fs::remove_file(path);
-                trace(&format!("released: removed it ({removed:?})"));
+                let _ = fs::remove_file(path);
                 return;
             }
-            Err(error) => {
-                trace(&format!(
-                    "cannot tell whether it is held ({error}): leaving"
-                ));
-                return;
-            }
+            Err(_) => return,
         }
         drop(lock);
         std::thread::sleep(WARDEN_POLL);

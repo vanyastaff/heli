@@ -359,29 +359,7 @@ fn a_held_pool_outlives_its_daemon_until_released() {
     assert_eq!(warnings(&output), [IN_THE_POOL]);
 
     drop(holder);
-    // TEMPORARY (fix/after-stale-link): the warden's trace, and who holds
-    // the pool, should it stay.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pool_exists(&pool) {
-        if Instant::now() >= deadline {
-            let trace = std::fs::read_to_string(fixture.state_dir().join("warden.trace"))
-                .unwrap_or_else(|error| format!("no trace: {error}"));
-            let holders = Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "ls -l /proc/[0-9]*/fd 2>/dev/null | grep -F '{}'; ps -eo pid,ppid,pgid,stat,args",
-                    pool.to_string_lossy()
-                ))
-                .output()
-                .map(|output| text(&output.stdout))
-                .unwrap_or_default();
-            panic!(
-                "timed out waiting for the pool to be gone\n--- the warden's trace\n{trace}\n\
-                 --- holders and processes\n{holders}"
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_until("the pool to be gone", || !pool_exists(&pool));
     let log = fixture.concurrency_log_named("released");
     let output = bare_build(&fixture, &makeflags, "target-released", &log, 0)
         .output()

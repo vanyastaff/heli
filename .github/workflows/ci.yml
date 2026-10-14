@@ -33,32 +33,5 @@ jobs:
         run: cargo fmt --check
       - name: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
-      # TEMPORARY (fix/after-stale-link): three test binaries with rare
-      # failures, over and over, side by side. Removed before merging.
-      - name: flake loop
-        if: matrix.os == 'ubuntu-latest'
-        shell: bash
-        run: |
-          cargo test --locked --test bare_cargo --test governor --test recycle --no-run --message-format=json > build.json
-          binary() {
-            jq -r "select(.reason == \"compiler-artifact\" and .target.name == \"$1\" and .executable != null) | .executable" build.json | tail -n 1
-          }
-          repeat() {
-            local name=$1 runs=$2 fails=0 exe
-            exe=$(binary "$name")
-            for i in $(seq "$runs"); do
-              if ! "$exe" > "out-$name.txt" 2>&1; then
-                fails=$((fails + 1))
-                { echo "=== $name, run $i failed"; sed -n '/^failures:/,$p' "out-$name.txt"; } >> "fails-$name.txt"
-              fi
-            done
-            echo "$name: $fails of $runs runs failed" >> "fails-$name.txt"
-          }
-          repeat bare_cargo 25 &
-          repeat governor 20 &
-          repeat recycle 12 &
-          wait
-          cat fails-*.txt
       - name: test
-        if: always()
         run: cargo test --locked --no-fail-fast
