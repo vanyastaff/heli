@@ -7,7 +7,8 @@
 //! `crate::protocol`:
 //!
 //! - **run**: look its key up in the result store ([`results`], keyed by
-//!   [`key`]), admit it to the registry ([`registry`]), tell the client it
+//!   [`key`]), admit it to the registry ([`registry`]) and the event log
+//!   ([`events`]), tell the client it
 //!   started, look its key up again, start its record in the run log
 //!   (`crate::runlog`), wait for its turn at the worktree lock (telling the
 //!   client for which runs), execute it ([`execute`]), record it in the
@@ -22,13 +23,16 @@
 //!   the runs in flight have reported their exits.
 //!
 //! What the daemon owns for its whole life (the lock, then the host pool,
-//! `crate::pool`, and the run log, `crate::runlog`, both as configured,
-//! and on Unix the pool's [`warden`]) is set up in [`main`]. The daemon
+//! `crate::pool`, its memory [`governor`], the event log and the run log,
+//! `crate::runlog`, all as configured, and on Unix the pool's [`warden`])
+//! is set up in [`main`]. The daemon
 //! runs until it is killed or retired. Its own log (start, end, errors)
 //! is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
+pub mod events;
 pub mod execute;
+pub mod governor;
 pub mod key;
 pub mod registry;
 pub mod results;
@@ -50,6 +54,8 @@ use crate::runlog::{self, Limits, RunLog};
 use crate::status::{self, Status};
 use crate::{clock, nesting, worktree};
 
+use events::Events;
+use governor::Governor;
 use registry::Registry;
 use results::Admitted;
 
@@ -88,6 +94,15 @@ pub fn main() -> ! {
     }
     let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
     let pool = open_pool(&locations, &config, &log);
+    let governor = Governor::new(&config, locations.config.clone())
+        .unwrap_or_else(|error| fail(Some(&log), &error));
+    let events = Events::new(
+        locations.event_log(),
+        config
+            .event_log
+            .max_kb
+            .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
+    );
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
@@ -107,6 +122,8 @@ pub fn main() -> ! {
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
         pool,
+        governor,
+        events,
         runlog: RunLog::new(locations.run_logs(), Limits::configured(&config.log)),
         results: results::Store::new(&locations.state_dir),
         lifecycle: Mutex::new(Lifecycle::default()),
@@ -114,6 +131,20 @@ pub fn main() -> ! {
         log,
         _lock: lock,
     });
+    {
+        let daemon = Arc::clone(&daemon);
+        // No slot is lent to a run pool: runs draw from the host pool.
+        let lent = || 0;
+        std::thread::spawn(move || {
+            daemon.governor.run(
+                &daemon.pool,
+                &daemon.registry,
+                &daemon.events,
+                &daemon.log,
+                lent,
+            )
+        });
+    }
     loop {
         match listener.accept() {
             Ok(stream) => {
@@ -181,6 +212,8 @@ fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter>
 struct Daemon {
     registry: Registry,
     pool: Pool,
+    governor: Governor,
+    events: Events,
     runlog: RunLog,
     results: results::Store,
     lifecycle: Mutex<Lifecycle>,
@@ -271,12 +304,19 @@ impl Daemon {
             let _ = protocol::write_message(&mut stream, &passed.reply());
             return;
         }
+        let worktree = worktree::of(&execute::cwd(&request));
+        let argv = execute::argv(&request);
+        let admission = serde_json::json!({
+            "worktree": worktree.to_string_lossy(),
+            "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+        });
         let id = self.registry.admit(
-            worktree::of(&execute::cwd(&request)),
-            execute::argv(&request),
+            worktree,
+            argv,
             request.class.unwrap_or(Class::Exec),
             nested(&request),
         );
+        self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
         let started = Reply::Started {
@@ -365,6 +405,7 @@ impl Daemon {
                 started_at: clock::unix_seconds(self.started_at),
             }),
             pool: Some(self.pool.status()),
+            memory: self.governor.memory(),
             runs: self.registry.snapshot(),
         }
     }
