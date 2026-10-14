@@ -566,18 +566,25 @@ impl Daemon {
         })
     }
 
-    /// Runs test run `run` in its two phases (`test_run`): the build, then,
-    /// if it passed, the tests on as many threads as it got test slots. A
-    /// header line on its stderr says how many, its share, and how long it
-    /// waited for them.
+    /// Runs test run `run` in its two phases (`test_run`): the build (a
+    /// request of its own), then, if it passed, the tests on as many
+    /// threads as it got test slots. A header line on its stderr says how
+    /// many, its share, and how long it waited for them.
     fn test(
         &self,
         run: &mut Execution<'_, '_>,
         plan: &TestRun,
     ) -> Result<(i32, Option<i32>), Reply> {
-        if let Some(build) = plan.build() {
+        if let Some(build) = plan.build(run.request) {
             self.registry.set_phase(run.id, Phase::Building);
-            let built = self.phase(run, &build)?;
+            let mut phase = Execution {
+                request: &build,
+                id: run.id,
+                makeflags: run.makeflags,
+                live: run.live,
+                record: &mut *run.record,
+            };
+            let built = self.phase(&mut phase, &execute::argv(&build))?;
             if built.0 != 0 {
                 return Ok(built);
             }

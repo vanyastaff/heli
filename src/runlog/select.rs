@@ -3,7 +3,7 @@
 //! Without one, `log` prints every output event as it was recorded, each on
 //! its own stream, so stdout and stderr come out byte for byte.
 //!
-//! **Adding a selector** (`--test <name>`):
+//! **Adding a selector**:
 //!
 //! 1. A variant of [`Select`]. It travels in the `log` request
 //!    (`crate::protocol`); a daemon that does not know it answers that it
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use super::Event;
 use crate::output::cargo::Message;
+use crate::output::{libtest, nextest};
 use crate::protocol::Channel;
 
 /// Which part of a record to print.
@@ -35,14 +36,18 @@ pub enum Select {
     Grep(String),
     /// The errors, as the compiler rendered them ([`errors`]).
     Errors,
+    /// The output of the test of this name ([`test`]).
+    Test(String),
 }
 
 /// Where a selector writes: bytes, and the stream they go to.
 pub type Out<'a> = dyn FnMut(Channel, &[u8]) -> io::Result<()> + 'a;
 
-/// Writes the part of `events` that `select` picks to `out`.
+/// Writes the part of `events`, the record of run `run`, that `select`
+/// picks to `out`.
 pub fn apply(
     select: &Select,
+    run: &str,
     events: impl Iterator<Item = io::Result<Event>>,
     out: &mut Out<'_>,
 ) -> io::Result<()> {
@@ -62,7 +67,83 @@ pub fn apply(
             grep(&pattern, Lines::new(events), out)
         }
         Select::Errors => errors(Lines::new(events), out),
+        Select::Test(name) => {
+            if !test(name, Lines::new(events), out)? {
+                let note = format!("cargo-heli: no output of test `{name}` in {run}\n");
+                out(Channel::Stderr, note.as_bytes())?;
+            }
+            Ok(())
+        }
     }
+}
+
+/// The output of test `name` in a record, as its runner wrote it: under
+/// libtest, on stdout, its section, from `---- <name> stdout ----` to the
+/// next section or the end of the list (`crate::output::libtest`); under
+/// nextest, on stderr, its status line and the output under it, to the
+/// next status line or line of nextest's own (`crate::output::nextest`).
+/// `name` is the test's path (`tests::it_works`), or for nextest also its
+/// binary and path (`my-crate tests::it_works`). Blank lines that end an
+/// output are left out.
+///
+/// nextest may print a test's status line twice, once without its output
+/// (with `--failure-output final`, the output comes after the summary):
+/// outputs with more than their status line come first, and when there is
+/// none, the status lines are the output. Returns whether there was any.
+fn test(
+    name: &str,
+    lines: impl Iterator<Item = io::Result<Line>>,
+    out: &mut Out<'_>,
+) -> io::Result<bool> {
+    let mut outputs: Vec<Vec<Line>> = Vec::new();
+    // The output being read, per stream: libtest's on stdout, nextest's on
+    // stderr.
+    let mut open: [Option<Vec<Line>>; 2] = [None, None];
+    for line in lines {
+        let line = line?;
+        let text = String::from_utf8_lossy(&line.bytes);
+        let text = text.trim_end_matches(['\n', '\r']);
+        let (starts, ends) = match line.channel {
+            Channel::Stdout => (
+                libtest::section_of(text) == Some(name),
+                libtest::ends_section(text),
+            ),
+            Channel::Stderr => (
+                nextest::is_status_of(text, name),
+                nextest::ends_output(text),
+            ),
+        };
+        let current = &mut open[slot(line.channel)];
+        if let Some(output) = current
+            && !ends
+        {
+            output.push(line);
+            continue;
+        }
+        outputs.extend(current.take());
+        if starts {
+            *current = Some(vec![line]);
+        }
+    }
+    outputs.extend(open.into_iter().flatten());
+    for output in &mut outputs {
+        while output
+            .last()
+            .is_some_and(|line| line.bytes.trim_ascii().is_empty())
+        {
+            output.pop();
+        }
+    }
+    let full: Vec<&Vec<Line>> = outputs.iter().filter(|output| output.len() > 1).collect();
+    let shown = if full.is_empty() {
+        outputs.iter().collect()
+    } else {
+        full
+    };
+    for line in shown.iter().flat_map(|output| output.iter()) {
+        out(line.channel, &line.bytes)?;
+    }
+    Ok(!shown.is_empty())
 }
 
 /// The errors in a record, on stderr, where cargo prints them:

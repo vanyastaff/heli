@@ -643,6 +643,19 @@ How a command line is read:
      the run with its exit code. `cargo test --doc`, which cargo cannot build
      apart, goes straight to its test slots, and a command that has
      `--no-run` already is a build, run once.
+   - nextest's build leaves out what only the tests read: under `--no-run`
+     nextest ignores it with a warning (`ignoring --status-level because
+     --no-run is specified`), or refuses it (`--no-fail-fast`, `--fail-fast`,
+     `--max-fail`). That is the thread count (`-j`, `--test-threads`,
+     `--jobs`), `--retries`, `--flaky-result`, `--no-tests`, `--max-fail`,
+     the reporter's `--status-level`, `--final-status-level`,
+     `--success-output` and `--failure-output`, the switches
+     `--no-fail-fast`, `--fail-fast` and `--no-capture` (`--nocapture`, also
+     after `--`), and the variables that set them
+     (`NEXTEST_TEST_THREADS`, `NEXTEST_RETRIES`, `NEXTEST_FLAKY_RESULT`,
+     `NEXTEST_NO_TESTS` and the reporter's four). Checked against nextest
+     0.9.146; `--cargo-quiet` and `--cargo-message-format` stay, and work in
+     both phases.
    - It then takes K slots for the test threads (`status`: `testing`). K is
      the smallest of the thread count asked for, the run's share (whole
      slots, at least one), and the slots it gets within 5 s; it stops waiting
@@ -828,18 +841,24 @@ their own. Full mode passes every run through. In compact and quiet mode:
 
 - build, check, clippy and doc (and cargo's aliases `b`, `c`, `d`; after a
   `+toolchain` too) show cargo's diagnostics (below);
-- test and nextest runs, and `exec`, get the views below once they exist
-  (#11);
+- `nextest run` (`nextest r`) shows nextest's output under its own controls,
+  and `test` (`t`) libtest's failures, both phases of the run, with cargo's
+  diagnostics as for a compile run ("Test runs" below);
+- `cargo heli exec` shows the head and the tail of the command's output,
+  and adds nothing to the command, which runs as given, even
+  `exec -- cargo …` ("exec" below);
 - anything else passes through untouched, with the footer, in every mode:
   `run`, whose output is the program's; `clippy --fix`, `fix` and `fmt`,
-  which say what they rewrote in lines `--quiet` drops; subcommands heli
-  knows nothing of; and `exec -- cargo …`, which runs the command as given.
-- So does every run whose arguments already choose cargo's output:
-  `--message-format`, `--quiet` or `-q`, `--verbose` or `-v`, also in a
-  cluster of short flags such as `-vv` or `-rq`, before any `--`. heli must
-  not add its own there: cargo refuses a second `--quiet` or
+  which say what they rewrote in lines `--quiet` drops; and cargo
+  subcommands heli knows nothing of (`cargo heli tree`).
+- So does every cargo run (nextest's aside) whose arguments already choose
+  cargo's output: `--message-format`, `--quiet` or `-q`, `--verbose` or
+  `-v`, also in a cluster of short flags such as `-vv` or `-rq`, before any
+  `--`. heli must not add its own there: cargo refuses a second `--quiet` or
   `--message-format`. A cluster counts even when the letter is in a value
-  (`-pserver`), which costs compactness, never the run.
+  (`-pserver`), which costs compactness, never the run. nextest's flags
+  are its own (`-v` is nextest's verbosity, cargo's is `--cargo-verbose`):
+  heli adds each of its controls the user did not set (below).
 
 The run's class (§5, "Classes") decides how warnings show: counted for
 compile runs, by lint for verify runs. Within those classes, `run` and
@@ -851,15 +870,28 @@ compile runs, by lint for verify runs. Within those classes, `run` and
    be misreported.
    - cargo: `--quiet` drops the `Compiling …` line per unit (442 of them in a
      cold build of the example workspace).
+   - cargo under `cargo test`: `--quiet` also has libtest print one
+     character per test in place of a line.
    - nextest: `--cargo-quiet`, `--status-level fail`,
      `--final-status-level fail`, `--success-output never` and
-     `--failure-output final`. All five exist in nextest 0.9.146 (`--help`),
-     and each has an environment variable.
+     `--failure-output final`. All five exist in nextest 0.9.146 (`--help`).
+     A failing test's output (its stdout, and its stderr with the panic
+     message) then comes once, under its name, after nextest's summary.
 
-   heli adds a flag only when the user's argv does not already set it. It
-   adds its flags after the user's arguments, so that cargo reports a
-   mistake in them exactly as without heli, and before any `--`, after
-   which the arguments are another program's.
+   heli adds a flag only when the user did not set it: for cargo, in the
+   argv; for nextest, in the argv or in the variable nextest reads for it
+   (`NEXTEST_STATUS_LEVEL`, `NEXTEST_FINAL_STATUS_LEVEL`,
+   `NEXTEST_SUCCESS_OUTPUT`, `NEXTEST_FAILURE_OUTPUT`). `--cargo-quiet` is
+   not added beside the user's `--cargo-quiet` (twice silences cargo's
+   errors too) or `--cargo-verbose`. Where nextest would ignore a flag with
+   a warning, heli does not add it: none of the reporter's four to a
+   command that only builds (`--no-run`), and neither output level to one
+   that does not capture (`--no-capture`, `--nocapture`, also after `--`).
+   A nextest profile's settings for the same four give way to heli's flags
+   in compact and quiet mode; full mode keeps them. heli adds its flags
+   after the user's arguments, so that cargo reports a mistake in them
+   exactly as without heli, and before any `--`, after which the arguments
+   are another program's.
 2. **Structured messages.** For compile phases heli passes
    `--message-format json` to cargo and `--cargo-message-format json` to
    nextest, and renders diagnostics from the JSON fields (level, code, primary
@@ -887,6 +919,35 @@ compile runs, by lint for verify runs. Within those classes, `run` and
    commands, where compact means the first 20 and last 60 lines around a cut
    marker.
 
+**Test runs.** Both phases of a test run (§5, lifecycle step 6) write to one
+view, so a diagnostic that the build and the tests' own cargo both report
+shows once, and heli's header line passes through between them.
+
+- **nextest.** nextest's own output, on stderr, passes through under heli's
+  controls: its header, a line per failing test, the summary, then each
+  failing test's output. So does a line on stdout that is not cargo's JSON
+  (a test's output under `--no-capture`). Quiet mode's facts are the counts
+  of nextest's summary line as nextest words them (`812 passed, 3
+  skipped`), then the warnings.
+- **libtest.** Of libtest's text on stdout, heli keeps each `failures:` (or,
+  under `--show-output`, `successes:`) section up to the binary's
+  `test result:` line, with each test's captured output and panic message,
+  and the `test result:` line of a binary whose tests failed. It drops what
+  libtest prints per test (`running 3 tests`, `test x ... ok`, progress
+  dots, `x --- FAILED`), the blank lines between, and the `test result:`
+  line of a binary whose tests passed. Any other line passes through. Once
+  the run is over, a line on stderr sums the `test result:` lines of every
+  binary: `tests: 812 passed, 1 failed, 3 ignored` (passed always, the
+  other counts when there are some). Quiet mode's facts are the same
+  counts, then the warnings.
+
+**exec.** heli counts lines over both streams together, in the order they
+came, as `log --tail` does, and prints each on its own stream: the first 20
+as they come; once the run is over, the last 60, after a line on stderr
+when lines were cut between them: `cargo-heli: 1234 lines cut (cargo heli
+log r17 has them all)`. An output of 80 lines or fewer shows whole. Quiet
+mode's fact is the count of lines: `1314 lines`.
+
 Some things never change: the exit code, the stdout/stderr split, and output
 heli does not recognize, which passes through.
 
@@ -911,7 +972,20 @@ selector picks a part of it:
   reported it; from text otherwise, each from a line that starts with
   `error:` or `error[` to the blank line after it, the next warning, or the
   end;
-- `--test <name>`: one test's output;
+- `--test <name>`: one test's output, as its runner wrote it. `<name>` is
+  the test's path (`tests::it_works`), or nextest's binary and path
+  (`my-crate tests::it_works`). Under libtest, the test's section of a
+  `failures:` or `successes:` list on stdout, from `---- <name> stdout ----`
+  to the next section or the list of names that ends them. Under nextest,
+  on stderr, the test's status line and the output under it, to the next
+  status line or line of nextest's own (a separator, `warning: …`: lines
+  indented less than the output's 4 spaces). Blank lines that end it are
+  left out. nextest prints a status line twice when the output comes at
+  the end (`--failure-output final`): outputs with more than their status
+  line come first, else the status lines alone. With none, one line says
+  so:
+  ``cargo-heli: no output of test `<name>` in r17`` (a compact run holds no
+  passing test's output);
 - `--tail N`: the last N lines;
 - `--grep <re>`: matching lines, each matched without its line end.
 
