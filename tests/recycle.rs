@@ -692,20 +692,7 @@ fn an_orphan_that_cannot_be_moved_is_passed_over() {
     let gone = |name: &str| repo.fixture.workspace().join(name);
     // Not where b's build directory goes, which a read-only parent would
     // keep from being made.
-    let output = repo
-        .fixture
-        .cargo(["metadata", "--format-version", "1", "--no-deps"])
-        .current_dir(&b)
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .expect("run cargo metadata");
-    assert_success(&output, "cargo metadata");
-    let metadata: Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    let b_dir = PathBuf::from(
-        metadata["build_directory"]
-            .as_str()
-            .expect("a build directory"),
-    );
+    let b_dir = named_build_dir(&repo, &b);
     let b_outer = b_dir
         .parent()
         .and_then(Path::file_name)
@@ -728,14 +715,96 @@ fn an_orphan_that_cannot_be_moved_is_passed_over() {
     let unmovable = Unmovable::new(&latest);
 
     let output = repo.recycle_in(&b);
-    drop(unmovable);
     assert_eq!(
         marker(&repo.build_dir_of(&b)),
         "older",
         "{}",
         text(&output.stderr)
     );
+    let c = repo.add_worktree("c");
+    let output = repo.recycle_in(&c);
+    drop(unmovable);
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.starts_with("cargo-heli: no build directory recycled: cannot move "),
+        "with none left to try, it says why: {stderr}"
+    );
     assert_eq!(marker(&latest), "latest");
+}
+
+/// The build directory cargo names for a worktree as heli would find it:
+/// `build_directory` in `cargo metadata`, run in `dir`.
+fn named_build_dir(repo: &Repo, dir: &Path) -> PathBuf {
+    let output = repo
+        .fixture
+        .cargo(["metadata", "--format-version", "1", "--no-deps"])
+        .current_dir(dir)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run cargo metadata");
+    assert_success(&output, "cargo metadata");
+    let metadata: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    PathBuf::from(
+        metadata["build_directory"]
+            .as_str()
+            .expect("a build directory"),
+    )
+}
+
+/// A build directory that exists is never replaced, even an empty one.
+#[test]
+fn an_existing_build_directory_is_kept() {
+    let repo = Repo::new();
+    let b = repo.add_worktree("b");
+    let gone = repo.fixture.workspace().join("gone");
+    let orphan = repo.craft(
+        "e0000000000000",
+        "orphan",
+        Some(manifest(&gone, Some(&repo.repository()), 1)),
+    );
+    let b_dir = named_build_dir(&repo, &b);
+    std::fs::create_dir_all(&b_dir).expect("create b's build directory");
+
+    repo.recycle_in(&b);
+    assert_eq!(
+        std::fs::read_dir(&b_dir)
+            .expect("b's build directory")
+            .count(),
+        0,
+        "still empty"
+    );
+    assert_eq!(marker(&orphan), "orphan");
+    assert_eq!(repo.recycled(), Vec::<Value>::new());
+}
+
+/// The hook and the look recycle only for a workspace inside the worktree:
+/// a worktree without a `Cargo.toml` at its top, inside another
+/// workspace, gives that workspace no build directory.
+#[test]
+fn only_a_workspace_inside_the_worktree_gets_one() {
+    let repo = Repo::new();
+    // Another repository, without a workspace, inside one of repo's
+    // packages: cargo, asked there, names repo's workspace.
+    let other = repo.main().join("app").join("other");
+    std::fs::create_dir_all(&other).expect("create another repository");
+    std::fs::write(other.join("README"), "no workspace here\n").expect("fill it");
+    repo.git(&other, &["init", "--quiet"]);
+    repo.git(&other, &["add", "-A"]);
+    repo.commit(&other, "another");
+    let gone = repo.fixture.workspace().join("gone");
+    let orphan = repo.craft(
+        "f0000000000000",
+        "orphan",
+        Some(manifest(&gone, Some(&plain(&other.join(".git"))), 1)),
+    );
+
+    repo.recycle_in(&other);
+    assert_eq!(marker(&orphan), "orphan");
+    assert!(
+        !named_build_dir(&repo, &repo.main()).exists(),
+        "repo's workspace got nothing"
+    );
+    assert_eq!(repo.recycled(), Vec::<Value>::new());
 }
 
 /// The content of rustc's dep-info for a unit that read each of `env`
@@ -913,6 +982,20 @@ fn the_path_scan_invalidates_exactly_the_units_that_compiled_in_old_paths() {
             invalidated: false,
         },
     ];
+    let mut units = Vec::from(units);
+    if cfg!(windows) {
+        // The verbatim spelling of the same path.
+        units.push(CraftedUnit {
+            dep_info: "deps/pkg_j-cccccccccccccccc.d",
+            env: vec![format!(
+                "CARGO_MANIFEST_DIR=\\\\?\\{}",
+                donor.join("pkg-j").to_string_lossy()
+            )],
+            fingerprint: "pkg-j-cccccccccccccccc",
+            dep: "dep-lib-pkg_j",
+            invalidated: true,
+        });
+    }
     for unit in &units {
         unit.write(&debug);
     }
@@ -943,13 +1026,14 @@ fn the_path_scan_invalidates_exactly_the_units_that_compiled_in_old_paths() {
         &b_dir.join("x86_64-unknown-test").join("debug"),
         &in_triple
     ));
+    let invalidated = 1 + units.iter().filter(|unit| unit.invalidated).count();
     let recycled = repo.recycled();
     assert_eq!(recycled.len(), 1, "{recycled:?}");
-    assert_eq!(recycled[0]["invalidated"], 8, "{recycled:?}");
+    assert_eq!(recycled[0]["invalidated"], invalidated, "{recycled:?}");
     let stderr = text(&output.stderr);
     assert!(
         stderr.contains("cargo-heli: recycled the build directory of ")
-            && stderr.contains("the path scan invalidated 8 units"),
+            && stderr.contains(&format!("the path scan invalidated {invalidated} units")),
         "{stderr}"
     );
 }

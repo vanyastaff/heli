@@ -23,16 +23,18 @@
 //!   executables of path packages (cargo leaves the hash out so the PDB's
 //!   path stays put), and the dylibs and cdylibs of path packages
 //!   everywhere: `deps/<crate>.d`. Their fingerprint directory still has a
-//!   hash, and holds `dep-<kind>-<target name>`; such a dep-info file stands
-//!   for every fingerprint directory with a `dep-…-<target name>` whose name
-//!   is its crate's, `-` read as `_`. Invalidating one unit too many costs
-//!   only its rebuild.
+//!   hash, and its files are named after the target (`dep-<kind>-<target>`,
+//!   `<kind>-<target>`); such a dep-info file stands for every fingerprint
+//!   directory with a file whose name ends in its crate's, `-` read as `_`.
+//!   Invalidating one unit too many costs only its rebuild.
 //!
 //! A value is under a path when its components start with the path's, as
 //! the platform compares them: on Windows without case, either separator,
-//! and without the `\\?\` prefix. Each old path counts as given and as it
-//! resolves on disk, where that can still be told. A value that holds a
-//! list of paths (`PATH`-like) is looked at path by path too.
+//! and without the `\\?\` prefix. The old paths are spelled as cargo spelled
+//! them (the workspace as `cargo metadata` named it, the build directory in
+//! a store as cargo's `build-dir` names it, or heli would not manage it),
+//! so they need no resolving. A value that holds a list of paths
+//! (`PATH`-like) is looked at path by path too.
 //!
 //! Nothing here follows a link out of the build directory.
 
@@ -46,9 +48,7 @@ use std::path::{Path, PathBuf};
 pub fn invalidate(build_dir: &Path, old: &[PathBuf]) -> Vec<PathBuf> {
     let prefixes: Vec<Vec<String>> = old
         .iter()
-        .flat_map(|path| spellings(path))
         .map(|path| components(&path.to_string_lossy()))
-        .filter(|prefix| !prefix.is_empty())
         .collect();
     let mut deleted = Vec::new();
     for profile in profiles(build_dir) {
@@ -74,47 +74,20 @@ pub fn invalidate(build_dir: &Path, old: &[PathBuf]) -> Vec<PathBuf> {
     deleted
 }
 
-/// The ways `path` may be spelled in a value: as given, and as it resolves
-/// on disk (its nearest existing ancestor resolved, the rest appended).
-fn spellings(path: &Path) -> Vec<PathBuf> {
-    let mut spellings = vec![path.to_path_buf()];
-    let mut rest = Vec::new();
-    for ancestor in path.ancestors() {
-        if let Ok(resolved) = std::fs::canonicalize(ancestor) {
-            let resolved = rest
-                .iter()
-                .rev()
-                .fold(resolved, |path: PathBuf, part: &&OsStr| path.join(part));
-            spellings.push(resolved);
-            break;
-        }
-        match ancestor.file_name() {
-            Some(name) => rest.push(name),
-            None => break,
-        }
-    }
-    spellings
-}
-
-/// The components of the path `text`, as the platform compares them.
+/// The components of the path `text`, as the platform compares them: on
+/// Windows without case, with either separator, and without `\\?\`.
 fn components(text: &str) -> Vec<String> {
-    if cfg!(windows) {
-        let text = text.replace('/', "\\");
-        let text = match text.strip_prefix(r"\\?\UNC\") {
-            Some(rest) => format!(r"\\{rest}"),
-            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned(),
-        };
-        text.to_lowercase()
-            .split('\\')
-            .filter(|part| !part.is_empty() && *part != ".")
-            .map(str::to_owned)
-            .collect()
+    let (text, separator) = if cfg!(windows) {
+        let text = text.replace('/', "\\").to_lowercase();
+        let plain = text.strip_prefix(r"\\?\").unwrap_or(&text).to_owned();
+        (plain, '\\')
     } else {
-        text.split('/')
-            .filter(|part| !part.is_empty() && *part != ".")
-            .map(str::to_owned)
-            .collect()
-    }
+        (text.to_owned(), '/')
+    };
+    text.split(separator)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The profile directories of `build_dir`: those holding `.fingerprint/`,
@@ -192,14 +165,11 @@ fn fingerprint_dirs(fingerprints: &Path) -> BTreeMap<String, Vec<String>> {
 }
 
 /// The fingerprint directories, among `units`, of the unit whose dep-info
-/// file is `<stem>.d`.
+/// file is `<stem>.d`. A crate's name has no `-`, so one in `stem` is
+/// where its hash starts.
 fn units_of<'a>(stem: &str, units: &'a BTreeMap<String, Vec<String>>) -> Vec<&'a str> {
-    let hash = stem
-        .rsplit_once('-')
-        .map(|(_, hash)| hash)
-        .filter(|hash| hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()));
-    match hash {
-        Some(hash) => units
+    match stem.rsplit_once('-') {
+        Some((_, hash)) => units
             .keys()
             .filter(|name| {
                 name.rsplit_once('-')
@@ -212,9 +182,9 @@ fn units_of<'a>(stem: &str, units: &'a BTreeMap<String, Vec<String>>) -> Vec<&'a
             units
                 .iter()
                 .filter(|(_, files)| {
-                    files.iter().any(|file| {
-                        file.starts_with("dep-") && file.replace('-', "_").ends_with(&target)
-                    })
+                    files
+                        .iter()
+                        .any(|file| file.replace('-', "_").ends_with(&target))
                 })
                 .map(|(name, _)| name.as_str())
                 .collect()
