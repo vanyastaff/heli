@@ -257,6 +257,14 @@ impl Jobserver {
                         wanted,
                     )
                 };
+                // A descriptor closed meanwhile has no information; one of
+                // another size means this layout is not the system's, and
+                // who holds the pool is not known.
+                if filled > 0 && filled != wanted {
+                    return Err(io::Error::other(format!(
+                        "proc_pidfdinfo gave {filled} bytes for a vnode, not {wanted}"
+                    )));
+                }
                 if filled == wanted
                     && info.vnode.vi_stat.vst_dev == fifo.dev() as u32
                     && info.vnode.vi_stat.vst_ino == fifo.ino()
