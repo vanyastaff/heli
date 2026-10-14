@@ -649,6 +649,62 @@ fn a_hit_is_not_a_run() {
     );
 }
 
+/// Within the worktree, the directory a run starts in is keyed, as an
+/// argument would be: it selects the packages.
+#[test]
+fn the_directory_within_the_worktree_is_keyed() {
+    let verifier = Verifier::new();
+    let check_in = |dir: &str| {
+        let mut command = verifier.check();
+        command.current_dir(verifier.path(dir));
+        outcome(&mut command)
+    };
+    assert_eq!(check_in("crates/slow-a"), Outcome::Ran);
+    assert_eq!(check_in("crates/slow-a"), Outcome::Hit);
+    assert_eq!(check_in("crates/slow-b"), Outcome::Ran);
+}
+
+/// The worktree's own path is not keyed: a pass in one worktree is a hit in
+/// another with the same content, wherever it lies.
+#[test]
+fn a_pass_in_one_worktree_is_a_hit_in_another() {
+    let verifier = Verifier::new();
+    // A fake rustc outside both worktrees, so the search path keys the same
+    // in each.
+    let bin = verifier.fixture.path("shared-bin");
+    verifier.tool(&bin, "rustc");
+    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .expect("a search path");
+    let other = verifier.fixture.path("nested").join("other");
+    git(
+        &verifier.fixture,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            other.to_str().expect("UTF-8"),
+            "HEAD",
+        ],
+    );
+    let check_in = |dir: &std::path::Path| {
+        verifier
+            .check()
+            .env("PATH", &path)
+            .current_dir(dir)
+            .output()
+            .expect("run heli")
+    };
+    let first = check_in(&verifier.fixture.workspace());
+    assert_success(&first, "the first worktree");
+    assert!(hit_line(&first).is_none(), "{}", text(&first.stderr));
+    let second = check_in(&other);
+    let hit = hit_line(&second).unwrap_or_else(|| panic!("not a hit: {}", text(&second.stderr)));
+    assert!(hit.contains("already passed: r1, "), "{hit}");
+}
+
 /// Ignored files are not part of the key (one of the caveats a hit states).
 #[test]
 fn an_ignored_file_is_not_part_of_the_key() {

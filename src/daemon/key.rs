@@ -187,20 +187,21 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
     }
 }
 
-/// Keys the Cargo configuration cargo reads for the run, by content and
-/// place: `.cargo/config.toml` and `.cargo/config` in the working directory
-/// and every directory above it (by how far above), then in the Cargo home.
+/// Keys the Cargo configuration cargo reads for the run, by content, in the
+/// order cargo reads it: `.cargo/config.toml` and `.cargo/config` in the
+/// working directory and every directory above it, nearest first, then in
+/// the Cargo home. Their paths are not keyed, so worktrees in different
+/// places share a key.
 fn cargo_config(request: &RunRequest, fields: &mut Fields) {
     let cwd = execute::cwd(request);
     let dirs = cwd
         .ancestors()
-        .enumerate()
-        .map(|(up, dir)| (up.to_string(), dir.join(".cargo")))
-        .chain(cargo_home(request, &cwd).map(|home| ("home".to_owned(), home)));
+        .map(|dir| ("cargo-config", dir.join(".cargo")))
+        .chain(cargo_home(request, &cwd).map(|home| ("cargo-home-config", home)));
     for (place, dir) in dirs {
         for file in ["config.toml", "config"] {
             if let Ok(content) = std::fs::read(dir.join(file)) {
-                fields.push(format!("cargo-config {place}/{file}").as_bytes(), &content);
+                fields.push(format!("{place} {file}").as_bytes(), &content);
             }
         }
     }
