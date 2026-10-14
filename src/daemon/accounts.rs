@@ -245,7 +245,7 @@ impl Accounts {
         let (ended, end) = mpsc::channel();
         let (prepared, ready) = mpsc::channel();
         let (recorded, written) = mpsc::channel::<()>();
-        let wait = self.may_recycle(&probe.cwd);
+        let wait = self.may_recycle(&probe);
         let accounts = Arc::clone(self);
         std::thread::spawn(move || {
             let Some(learnt) = accounts.discover(&probe, at, prepared) else {
@@ -288,23 +288,29 @@ impl Accounts {
         }
     }
 
-    /// Whether the first run from `cwd` must wait for its learning: no run
-    /// from there was learnt yet, and a store holds an orphan of some
-    /// repository, which its worktree may get.
-    fn may_recycle(&self, cwd: &Path) -> bool {
+    /// Whether the first run of `probe` must wait for its learning: no run
+    /// from its directory was learnt yet, and a store holds an orphan of its
+    /// own repository, which its worktree may get. git is asked for the
+    /// repository only while a store holds an orphan of any.
+    fn may_recycle(&self, probe: &Probe) -> bool {
         let prepared = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
-        if prepared.contains(cwd) {
+        if prepared.contains(&probe.cwd) {
             return false;
         }
         drop(prepared);
         let registry = Registry::load(&self.state_dir);
-        store::survey(&self.config, &registry).iter().any(|dir| {
-            dir.kind == Kind::Build
-                && dir
-                    .owner
-                    .as_ref()
-                    .is_some_and(|owner| owner.repository.is_some())
-                && dir.state() == State::Orphan
+        let repositories: Vec<PathBuf> = store::survey(&self.config, &registry)
+            .into_iter()
+            .filter(|dir| dir.kind == Kind::Build && dir.state() == State::Orphan)
+            .filter_map(|dir| dir.owner?.repository)
+            .collect();
+        if repositories.is_empty() {
+            return false;
+        }
+        probe.repository(&probe.cwd).is_some_and(|ours| {
+            repositories
+                .iter()
+                .any(|theirs| store::same_path(theirs, &ours))
         })
     }
 
