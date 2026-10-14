@@ -362,6 +362,14 @@ fn the_tiers_come_in_order_oldest_first() {
         !victims(&early).iter().any(|(tier, _)| *tier == 2),
         "unclaimed for 23 hours, an orphan is no victim: {early}"
     );
+    // Idle for 1 and 5 hours, the young ones keep their incremental/ and
+    // their tool caches.
+    assert!(
+        victims(&early)
+            .iter()
+            .all(|(tier, _)| [1, 5].contains(tier)),
+        "{early}"
+    );
 
     set_clock(&fixture, clock);
     let unit = |build: &Path| {
@@ -666,13 +674,27 @@ fn an_unknown_lock_layout_is_busy_for_an_hour_after_a_change() {
     std::fs::write(profile.join("deps").join("libx.rlib"), [0u8; 100]).expect("a unit");
     std::fs::write(profile.join(".cargo-future-lock"), "").expect("an unknown lock");
     let unit = fake_unit(&profile.join("incremental"), "x-1", 1000, now() - 40 * HOUR);
-    // The rlib was written now.
+    // The same, with cargo's lock, free.
+    let known = store(&fixture).join("cd").join("0123456789abcd");
+    let known_profile = known.join("debug");
+    std::fs::create_dir_all(known_profile.join("deps")).expect("create deps/");
+    std::fs::write(known_profile.join("deps").join("libx.rlib"), [0u8; 100]).expect("a unit");
+    std::fs::write(known_profile.join(".cargo-build-lock"), "").expect("cargo's lock");
+    let known_unit = fake_unit(
+        &known_profile.join("incremental"),
+        "x-1",
+        1000,
+        now() - 40 * HOUR,
+    );
+    // The rlibs were written now.
     set_clock(&fixture, now() + 59 * 60);
     let listing = gc(&fixture, &["gc", "--dry-run"]);
     assert_eq!(listed(&listing, &build)["state"], "busy", "{listing}");
-    assert_eq!(victims(&listing), [], "{listing}");
+    assert_eq!(listed(&listing, &known)["state"], "unknown", "{listing}");
+    assert_eq!(victims(&listing), [(1, spelled(&known_unit))], "{listing}");
     gc(&fixture, &["gc"]);
     assert!(unit.is_dir(), "a busy directory's unit stays");
+    assert!(!known_unit.exists());
 
     set_clock(&fixture, now() + 61 * 60);
     let listing = gc(&fixture, &["gc", "--dry-run"]);
