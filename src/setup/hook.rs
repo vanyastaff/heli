@@ -63,10 +63,7 @@ pub fn edit(path: &Path, program: &Path) -> Edit {
     let content = match script(program) {
         Some(content) => content,
         None => {
-            return Edit::Refused(format!(
-                "heli's path {} cannot be written in a shell script",
-                program.display()
-            ));
+            return Edit::Refused(format!("heli's path {} is not Unicode", program.display()));
         }
     };
     match std::fs::read_to_string(path) {
@@ -98,17 +95,9 @@ fn script(program: &Path) -> Option<String> {
     ))
 }
 
-/// `program` as a word of a shell script: in single quotes, and on
-/// Windows with `/` between components, which Git for Windows' shell reads.
+/// `program` as a word of a shell script, in single quotes (Git for
+/// Windows' shell reads a Windows path so too), if it is Unicode.
 fn quoted(program: &Path) -> Option<String> {
     let text = program.to_str()?;
-    let text = if cfg!(windows) {
-        text.replace('\\', "/")
-    } else {
-        text.to_owned()
-    };
-    if text.contains('\n') {
-        return None;
-    }
     Some(format!("'{}'", text.replace('\'', r"'\''")))
 }

@@ -1203,16 +1203,23 @@ fn setup_leaves_another_post_checkout_hook_alone() {
     );
 }
 
-/// The hook names the heli that wrote it. When that heli is gone, the
-/// hook still never fails `git worktree add`; setup, run by another heli,
-/// replaces the hook an earlier setup wrote.
+/// The hook names the heli that wrote it, wherever it is, a `'` and a
+/// space in its path included. When that heli is gone, the hook still
+/// never fails `git worktree add`; setup, run by another heli, replaces
+/// the hook an earlier setup wrote.
 #[test]
 fn a_hook_never_fails_a_checkout_and_follows_heli() {
     let repo = Repo::new();
-    let moved = repo
-        .fixture
-        .path(&format!("moved-heli{}", std::env::consts::EXE_SUFFIX));
+    let place = repo.fixture.path("it's elsewhere");
+    std::fs::create_dir_all(&place).expect("create heli's other place");
+    let moved = place.join(format!("moved-heli{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(support::heli_binary(), &moved).expect("copy heli");
+    let gone = repo.fixture.workspace().join("gone");
+    repo.craft(
+        "c0000000000000",
+        "orphan",
+        Some(manifest(&gone, Some(&repo.repository()), 1)),
+    );
     let template = repo.fixture.setup(None, Vec::<String>::new());
     let mut setup = Command::new(&moved);
     setup.arg("setup").current_dir(repo.main());
@@ -1227,10 +1234,12 @@ fn a_hook_never_fails_a_checkout_and_follows_heli() {
     assert_success(&output, "setup by a heli that moves away");
     let hook = std::fs::read_to_string(repo.hook()).expect("the hook");
     assert!(hook.contains("moved-heli"), "{hook}");
+    let b = repo.add_worktree("b");
+    assert_eq!(marker(&repo.build_dir_of(&b)), "orphan", "that heli ran");
     std::fs::remove_file(&moved).expect("heli moves away");
 
-    let b = repo.add_worktree("b");
-    assert!(b.join("Cargo.toml").is_file(), "b is checked out");
+    let c = repo.add_worktree("c");
+    assert!(c.join("Cargo.toml").is_file(), "c is checked out");
 
     let stdout = text(&repo.setup("n\nn\ny\n").stdout);
     assert_eq!(asked(&stdout).len(), 3, "{stdout}");
