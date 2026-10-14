@@ -414,10 +414,15 @@ Bare cargo, started without heli, still draws from the host pool directly.
   - The daemon raises the free count to the target only at quiescence,
     observed at its samples for 2 s: no heli run active, and either no
     process but the daemon holds the pool open, or no rustc, rustdoc,
-    clippy-driver or build script is alive. A pool nobody else holds can
-    have no slot that will come back, whatever compiles elsewhere on the
+    clippy-driver, build script or cargo is alive. A pool nobody else holds
+    can have no slot that will come back, whatever compiles elsewhere on the
     machine (other users' pools, other agents' builds without heli); the
-    process scan alone would wait for every compiler in the session.
+    process scan alone would wait for every compiler in the session. A
+    cargo counts because it takes a slot before it starts the job the slot
+    is for: between the two it holds a slot while no compiler runs, and a
+    top-up then would make the pool exceed N once it gives the slot back
+    (#26). The price: while some process holds the pool, any live cargo
+    (`cargo watch`, a `cargo run` of a server) delays the top-up.
     - Who holds the pool: on Windows, the semaphore's handle count
       (`NtQueryObject`) above the daemon's one; on Linux, a descriptor of
       the FIFO under `/proc/<pid>/fd` of the user's processes; on macOS, the

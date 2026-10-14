@@ -208,8 +208,9 @@ impl Governor {
 }
 
 /// Whether the pool is quiet now: no heli run is in flight, and either no
-/// other process holds the pool open, or none compiles. A slot missing from
-/// a quiet pool can only be one a process took with it when it died.
+/// other process holds the pool open, or none compiles (no compiler, build
+/// script or cargo runs, `crate::processes`). A slot missing from a quiet
+/// pool can only be one a process took with it when it died.
 fn quiet(pool: &Pool, registry: &Registry) -> bool {
     // Cheapest first; a scan that fails counts as compiling.
     !registry.busy() && (!pool.held_by_others() || !processes::compiling().unwrap_or(true))
