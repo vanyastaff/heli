@@ -332,6 +332,10 @@ fn the_tiers_come_in_order_oldest_first() {
     let [young, younger_idle, orphan, old, older] = &builds[..] else {
         unreachable!()
     };
+    // Something young in the orphan's incremental/, which goes with it.
+    let loose = incremental(&orphan.1).join("loose.bin");
+    std::fs::write(&loose, [0u8; 100]).expect("a loose file");
+    set_times(&loose, clock - 10 * HOUR);
     git(
         &main,
         &["worktree", "remove", "--force", &orphan.0.to_string_lossy()],
@@ -373,7 +377,10 @@ fn the_tiers_come_in_order_oldest_first() {
 
     set_clock(&fixture, clock);
     let unit = |build: &Path| {
-        let units = units(build);
+        let units: Vec<PathBuf> = units(build)
+            .into_iter()
+            .filter(|unit| unit.is_dir())
+            .collect();
         assert_eq!(units.len(), 1, "{units:?}");
         units[0].clone()
     };
@@ -466,12 +473,17 @@ fn eviction_stops_at_85_percent_of_the_budget() {
     assert_eq!(victims(&within), [], "within budget, no victims: {within}");
     let before = used(&within);
 
-    // Two units freed bring it to 85 % of the budget; one does not.
+    // One unit freed brings it under the budget, but not to 85 % of it;
+    // two do.
     let unit = 16 * MB;
-    let budget_mb = (before - 2 * unit) * 100 / 85 / MB + 1;
-    let target = budget_mb * MB * 85 / 100;
+    let budget_mb = (before - unit).div_ceil(MB);
+    let budget = budget_mb * MB;
+    let target = budget * 85 / 100;
     assert!(
-        before > budget_mb * MB && before - unit > target && before - 2 * unit <= target,
+        before > budget
+            && before - unit <= budget
+            && before - unit > target
+            && before - 2 * unit <= target,
         "the fixture does not fit: used {before}, budget {budget_mb} MB"
     );
     configure(&fixture, &format!("budget_mb = {budget_mb}\n{ages}"));
@@ -502,12 +514,35 @@ fn the_floor_starts_eviction_within_the_budget() {
         MB as usize,
         clock - HOUR,
     );
+    // A target triple's profile holds units too; a directory without a
+    // `-` is no triple.
+    let build = units[0]
+        .ancestors()
+        .nth(3)
+        .expect("a build directory")
+        .to_path_buf();
+    let triple = build.join("x86_64-unknown-test").join("debug");
+    let triple_unit = fake_unit(
+        &triple.join("incremental"),
+        "fake-95h",
+        MB as usize,
+        clock - 95 * HOUR,
+    );
+    let not_triple = build.join("notriple").join("debug");
+    let not_a_unit = fake_unit(
+        &not_triple.join("incremental"),
+        "fake-95h",
+        MB as usize,
+        clock - 95 * HOUR,
+    );
     set_clock(&fixture, clock);
     // More than any disk holds free.
     configure(&fixture, "budget_mb = 1000000\nfloor_mb = 1099511627776\n");
     let planned = gc(&fixture, &["gc", "--dry-run"]);
-    let expected: Vec<(u64, PathBuf)> = units.iter().map(|unit| (1, spelled(unit))).collect();
+    let mut expected: Vec<(u64, PathBuf)> = units.iter().map(|unit| (1, spelled(unit))).collect();
+    expected.insert(1, (1, spelled(&triple_unit)));
     assert_eq!(victims(&planned), expected, "{planned}");
+    assert!(not_a_unit.is_dir());
     let volumes = planned["volumes"].as_array().expect("volumes");
     assert!(
         volumes
@@ -849,8 +884,14 @@ fn deleting_a_large_victim_does_not_hold_up_cargo() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("start heli gc");
+    // It leaves whole, never seen half deleted.
     let deadline = Instant::now() + Duration::from_secs(120);
     while large.exists() {
+        let partial = (0..20).any(|part| !large.join(format!("s-{part}")).exists());
+        assert!(
+            !(partial && large.exists()),
+            "the victim is deleted in place"
+        );
         assert!(Instant::now() < deadline, "the victim never left");
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -932,10 +973,62 @@ fn the_daemon_evicts_when_over_budget() {
     assert!(status["last_gc"]["at"].as_u64().is_some(), "{status}");
     let stores = status["disk"]["stores"].as_array().expect("stores");
     assert!(stores.iter().all(|store| store["budget"] == 0), "{status}");
+    let output = fixture.heli(["status"]).output().expect("run heli status");
+    assert_success(&output, "cargo heli status");
+    let stdout = text(&output.stdout);
+    let line = "gc      ";
+    assert!(
+        stdout
+            .lines()
+            .any(|shown| shown.starts_with(line)
+                && shown.contains(&format!("evicted {}", logged.len()))),
+        "{stdout}"
+    );
     assert!(build.join("debug").join("deps").is_dir(), "deps/ stays");
     wait_for("the daemon to empty the trash", || {
         trash_left(&fixture).is_empty().then_some(())
     });
+}
+
+/// A trash that is a link is never used: nothing is renamed into it, and
+/// nothing it points to is deleted. The victim is skipped, and says why.
+#[test]
+fn a_trash_that_is_a_link_is_never_used() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let workspace = fixture.workspace();
+    use_store(&fixture, &workspace);
+    let build = build_in(&fixture, &workspace, "echo-args");
+    let clock = now() + 100 * HOUR;
+    set_times(&build, clock - HOUR);
+    let old = fake_unit(&incremental(&build), "old-1a2b3c", 1000, clock - 30 * HOUR);
+    let elsewhere = outside(&fixture, "outside-trash");
+    link_dir(&elsewhere, &store(&fixture).join(".trash"));
+    set_clock(&fixture, clock);
+    configure(&fixture, "budget_mb = 0\n");
+
+    let done = gc(&fixture, &["gc"]);
+    assert_eq!(victims(&done), [], "{done}");
+    let skipped = done["skipped"].as_array().expect("skipped");
+    assert_eq!(skipped.len(), 1, "{done}");
+    assert_eq!(
+        spelled(Path::new(skipped[0]["path"].as_str().expect("a path"))),
+        spelled(&old)
+    );
+    assert!(
+        skipped[0]["why"]
+            .as_str()
+            .is_some_and(|why| why.contains("trash")),
+        "{done}"
+    );
+    assert!(old.is_dir(), "the victim stays where it was");
+    assert_eq!(
+        std::fs::read_to_string(elsewhere.join("keep.txt"))
+            .ok()
+            .as_deref(),
+        Some("keep")
+    );
+    assert!(elsewhere.join("fake-unit").join("data.bin").is_file());
 }
 
 /// With a budget or a floor, the daemon notes an orphan when it first
@@ -1133,14 +1226,20 @@ fn a_target_directory_loses_only_its_incremental_caches() {
     set_clock(&fixture, now() + 300 * HOUR);
     configure(&fixture, "budget_mb = 0\n");
 
-    let done = gc(&fixture, &["gc"]);
     let mut expected: Vec<(u64, PathBuf)> = units.iter().map(|unit| (1, spelled(unit))).collect();
     expected.sort_by(|a, b| a.1.cmp(&b.1));
-    let mut evicted = victims(&done);
-    let last = evicted.pop();
-    evicted.sort_by(|a, b| a.1.cmp(&b.1));
-    assert_eq!(evicted, expected, "{done}");
-    assert_eq!(last, Some((3, spelled(&incremental(&target)))), "{done}");
+    expected.push((3, spelled(&incremental(&target))));
+    let in_order = |document: &Value| {
+        let mut victims = victims(document);
+        let units = victims.len().saturating_sub(1);
+        victims[..units].sort_by(|a, b| a.1.cmp(&b.1));
+        victims
+    };
+    let planned = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(in_order(&planned), expected, "{planned}");
+    let done = gc(&fixture, &["gc"]);
+    assert_eq!(in_order(&done), expected, "{done}");
+    assert_eq!(done["skipped"], serde_json::json!([]), "{done}");
     assert!(target.join("debug").join("deps").is_dir(), "deps/ stays");
     assert!(
         !target.join(".heli-trash").exists(),
