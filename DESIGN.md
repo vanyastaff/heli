@@ -811,13 +811,14 @@ selector picks a part of it:
   the test's path (`tests::it_works`), or nextest's binary and path
   (`my-crate tests::it_works`). Under libtest, the test's section of a
   `failures:` or `successes:` list on stdout, from `---- <name> stdout ----`
-  to the next section or the list's end. Under nextest, on stderr, the
-  test's status line and the output under it, to the next status line,
-  separator, or line of nextest's own (indented less than the output's 4
-  spaces). Blank lines that end it are left out. nextest prints a status
-  line twice when the output comes at the end (`--failure-output final`):
-  outputs with more than their status line come first, else the status
-  lines alone. With none, one line says so:
+  to the next section or the list of names that ends them. Under nextest,
+  on stderr, the test's status line and the output under it, to the next
+  status line or line of nextest's own (a separator, `warning: …`: lines
+  indented less than the output's 4 spaces). Blank lines that end it are
+  left out. nextest prints a status line twice when the output comes at
+  the end (`--failure-output final`): outputs with more than their status
+  line come first, else the status lines alone. With none, one line says
+  so:
   ``cargo-heli: no output of test `<name>` in r17`` (a compact run holds no
   passing test's output);
 - `--tail N`: the last N lines;

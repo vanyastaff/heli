@@ -737,6 +737,47 @@ fn log_test_shows_one_nextest_tests_output() {
     );
 }
 
+/// A test's output may end the record: with the outputs of passing tests
+/// at the end (`--success-output final`), nothing of nextest's follows the
+/// last one. `log --test` shows each test's, the last included.
+#[test]
+fn log_test_shows_an_output_that_ends_the_record() {
+    let fixture = Fixture::new("basic");
+    let output = heli(
+        &fixture,
+        &[
+            "nextest",
+            "run",
+            "-p",
+            "test-slots",
+            "--success-output",
+            "final",
+            "--final-status-level",
+            "pass",
+        ],
+    );
+    support::assert_success(&output, "cargo heli nextest run");
+    let run = support::split_footer(&output.stderr).1.run;
+    for test in ["a", "b", "c", "d"] {
+        let name = format!("tests::{test}");
+        let logged = log(&fixture, &[&run, "--test", &name]);
+        support::assert_success(&logged, "cargo heli log --test");
+        let logged = text(&logged.stderr);
+        assert!(
+            logged.trim_start().starts_with("PASS [")
+                && logged
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.ends_with(&name))
+                && logged
+                    .lines()
+                    .last()
+                    .is_some_and(|last| last.starts_with("    test result: ok. 1 passed;")),
+            "{name}: {logged}"
+        );
+    }
+}
+
 /// A test the record holds no output of (a passing test in a compact
 /// nextest run, or none of that name) gets one line saying so; `--test` is
 /// one selector among the others.
