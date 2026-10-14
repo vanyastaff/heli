@@ -39,3 +39,7 @@ windows-sys = { version = "0.61", features = [
 
 [dev-dependencies]
 tempfile = "3.27"
+
+# Pseudo-terminals, for the tests of output on a terminal.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["pty"] }

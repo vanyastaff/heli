@@ -13,6 +13,7 @@
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
+//! - [`output`]: what the client prints of a run, in the chosen output mode;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
@@ -27,6 +28,7 @@ mod ipc;
 mod launch;
 mod locations;
 mod nesting;
+mod output;
 mod pool;
 mod protocol;
 mod runlog;
