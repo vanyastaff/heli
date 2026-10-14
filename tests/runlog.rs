@@ -505,7 +505,9 @@ fn output_is_recorded_after_the_client_is_gone() {
     support::kill_tree(call.id());
     let _ = finish(call);
     assert_eq!(fixture.runs().len(), 1, "the run outlived its client");
-    fixture.wait_for_status("the run to end", |status| runs(status).is_empty());
+    fixture.wait_for_status("the run to end", |status| {
+        runs(status).iter().all(|run| run["phase"] == "done")
+    });
     let logged = log(&fixture, &[&id]);
     support::assert_success(&logged, "cargo heli log");
     assert!(logged.stdout == direct.stdout, "{}", text(&logged.stdout));

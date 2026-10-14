@@ -1,0 +1,257 @@
+//! A run belongs to the daemon, not to its client: a client that is killed
+//! or stops reading leaves the run going, and `status` shows who follows
+//! each run and how the runs nobody followed to their end ended.
+
+mod support;
+
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+use support::{Fixture, assert_success, runs};
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Starts `command` with its output captured.
+fn start(command: &mut Command) -> Child {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start heli")
+}
+
+fn finish(child: Child) -> Output {
+    child.wait_with_output().expect("wait for heli")
+}
+
+/// Polls `done` until it holds; panics after 60 s, naming `what` it waited
+/// for.
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The run `id` in a `status --json` document, if listed.
+fn listed(status: &Value, id: &str) -> Option<Value> {
+    runs(status).into_iter().find(|run| run["id"] == id)
+}
+
+/// A build whose client is killed mid-build goes on to its end: `status`
+/// then lists it as done, with its exit and no client attached, and `log`
+/// has its whole output, including what it printed after the client died.
+#[test]
+fn a_killed_clients_build_goes_on_to_its_end() {
+    let fixture = Fixture::new("basic");
+    let scripts = fixture.concurrency_log();
+    let mut build = fixture.heli(["build", "-p", "slow-a"]);
+    scripts.attach(&mut build, 3000);
+    let client = start(&mut build);
+    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let run = &runs(&status)[0];
+    let id = run["id"].as_str().expect("an id").to_owned();
+    assert_eq!(run["attached_clients"], 1, "its client: {status}");
+    assert_eq!(run["exit"], Value::Null, "{status}");
+    wait_until("the build script", || scripts.running() == 1);
+
+    support::kill_tree(client.id());
+    let _ = finish(client);
+    let status = fixture.wait_for_status("the build to end", |status| {
+        listed(status, &id).is_some_and(|run| run["phase"] == "done")
+    });
+    let run = listed(&status, &id).expect("listed");
+    assert_eq!(run["attached_clients"], 0, "{status}");
+    assert_eq!(
+        run["exit"],
+        json!({"code": 0, "signal": null, "cancelled": false}),
+        "{status}"
+    );
+    let started = run["started_at"].as_u64().expect("a start");
+    let ended = run["ended_at"].as_u64().expect("an end");
+    assert!(started <= ended, "{status}");
+    assert_eq!(scripts.intervals().len(), 1, "the script ran to its end");
+
+    let logged = fixture.heli(["log", &id]).output().expect("run heli log");
+    assert_success(&logged, "cargo heli log");
+    let stderr = text(&logged.stderr);
+    for part in ["Compiling slow-a v0.0.0", "Finished"] {
+        assert!(stderr.contains(part), "{part:?} missing from {stderr}");
+    }
+}
+
+/// Starts this fixture's daemon, with a run of `echo-args`.
+fn start_daemon(fixture: &Fixture) {
+    let echo = fixture.echo_args();
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(&echo)
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli exec");
+}
+
+/// A connection to the daemon that has handed it a run, as a client of
+/// this build's protocol would, and then reads nothing more.
+struct RawClient {
+    #[cfg(unix)]
+    _connection: std::os::unix::net::UnixStream,
+    #[cfg(windows)]
+    _connection: std::fs::File,
+    /// The run the daemon started, `r<number>`.
+    run: String,
+}
+
+/// Asks the daemon to run `argv` in the workspace, with this process's
+/// environment plus `env`, and reads its `Started` reply.
+fn submit_raw(
+    fixture: &Fixture,
+    argv: &[&std::ffi::OsStr],
+    env: &[(&str, &std::ffi::OsStr)],
+) -> RawClient {
+    use std::io::{Read, Write};
+
+    let text = |text: &std::ffi::OsStr| text.to_str().expect("Unicode").to_owned();
+    let mut variables: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter(|(name, _)| !env.iter().any(|(set, _)| set == name))
+        .collect();
+    variables.extend(
+        env.iter()
+            .map(|(name, value)| ((*name).to_owned(), text(value))),
+    );
+    let request = json!({"Run": {
+        "cwd": text(fixture.workspace().as_os_str()),
+        "argv": argv.iter().map(|arg| text(arg)).collect::<Vec<_>>(),
+        "env": variables,
+    }});
+    let request = serde_json::to_vec(&request).expect("JSON");
+
+    let mut connection = support::endpoint::connect(&fixture.endpoint());
+    let mut hello = b"HELI".to_vec();
+    hello.extend(support::fake_daemon::PROTOCOL.to_le_bytes());
+    connection.write_all(&hello).expect("send the hello");
+    let mut answer = [0u8; 8];
+    connection
+        .read_exact(&mut answer)
+        .expect("the daemon's hello");
+    // A message frame: kind 0, a little-endian u32 length, JSON.
+    let mut frame = vec![0u8];
+    frame.extend(u32::try_from(request.len()).expect("small").to_le_bytes());
+    frame.extend(request);
+    connection.write_all(&frame).expect("send the request");
+    let mut header = [0u8; 5];
+    connection
+        .read_exact(&mut header)
+        .expect("the daemon's answer");
+    let mut reply =
+        vec![0u8; u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize];
+    connection
+        .read_exact(&mut reply)
+        .expect("the daemon's answer");
+    let reply: Value = serde_json::from_slice(&reply).expect("a JSON reply");
+    let run = reply["Started"]["run"]
+        .as_str()
+        .unwrap_or_else(|| panic!("not started: {reply}"))
+        .to_owned();
+    RawClient {
+        _connection: connection,
+        run,
+    }
+}
+
+/// A client that stops reading holds up neither the run nor its record:
+/// the run, which writes far more than any pipe or socket buffer holds,
+/// goes on to its end, and its record is whole.
+#[test]
+fn a_client_that_stops_reading_holds_up_nothing() {
+    let fixture = Fixture::new("basic");
+    let chatter = fixture.binary("chatter");
+    let args = ["100000", "mix"];
+    let direct = fixture
+        .command(&chatter, args)
+        .output()
+        .expect("run chatter");
+    start_daemon(&fixture);
+
+    let mut argv = vec![chatter.as_os_str()];
+    argv.extend(args.iter().map(std::ffi::OsStr::new));
+    let client = submit_raw(&fixture, &argv, &[]);
+    fixture.wait_for_status("the run to end", |status| {
+        listed(status, &client.run).is_none()
+    });
+    let logged = fixture
+        .heli(["log", &client.run])
+        .output()
+        .expect("run heli log");
+    assert_success(&logged, "cargo heli log");
+    assert!(logged.stdout == direct.stdout, "stdout differs");
+    assert!(logged.stderr == direct.stderr, "stderr differs");
+}
+
+/// When the run log cannot be written (here `runs` in the state directory
+/// is a file), a run's client still gets all of its output.
+#[test]
+fn output_that_cannot_be_recorded_still_reaches_the_client() {
+    let fixture = Fixture::new("basic");
+    let chatter = fixture.binary("chatter");
+    let args = ["40", "mix", "unended"];
+    let direct = fixture
+        .command(&chatter, args)
+        .output()
+        .expect("run chatter");
+    std::fs::create_dir_all(fixture.state_dir()).expect("create the state directory");
+    std::fs::write(fixture.state_dir().join("runs"), "").expect("block the run log");
+
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(&chatter)
+        .args(args)
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli exec");
+    assert!(output.stdout == direct.stdout, "stdout differs");
+    let (stderr, _) = support::split_footer(&output.stderr);
+    // The footer starts a line of its own.
+    let mut expected = direct.stderr.clone();
+    expected.push(b'\n');
+    assert!(stderr == expected, "stderr differs: {}", text(&stderr));
+}
+
+/// `status` keeps listing the last 32 runs that ended while no client
+/// followed them; older ones go.
+#[test]
+fn status_lists_the_last_32_runs_nobody_followed_to_the_end() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    start_daemon(&fixture);
+    let ids: Vec<String> = (0..33)
+        .map(|number| {
+            let number = number.to_string();
+            let argv = [echo.as_os_str(), std::ffi::OsStr::new(&number)];
+            submit_raw(&fixture, &argv, &[("ECHO_WAIT_FOR", gate.as_os_str())]).run
+        })
+        .collect();
+    fixture.wait_for_status("every client to be gone", |status| {
+        let runs = runs(status);
+        runs.len() == 33 && runs.iter().all(|run| run["attached_clients"] == 0)
+    });
+
+    std::fs::write(&gate, "").expect("open the gate");
+    let status = fixture.wait_for_status("the runs to end", |status| {
+        let runs = runs(status);
+        runs.len() == 32 && runs.iter().all(|run| run["phase"] == "done")
+    });
+    let listed: Vec<String> = runs(&status)
+        .iter()
+        .map(|run| run["id"].as_str().expect("an id").to_owned())
+        .collect();
+    assert_eq!(listed, ids[1..], "{status}");
+}

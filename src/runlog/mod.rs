@@ -170,9 +170,12 @@ pub struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
-    /// Appends what the run wrote to `channel`.
-    pub fn output(&mut self, channel: Channel, bytes: &[u8]) {
-        let Some(file) = &mut self.file else { return };
+    /// Appends what the run wrote to `channel`; `false` when it is not in
+    /// the record (recording has failed).
+    pub fn output(&mut self, channel: Channel, bytes: &[u8]) -> bool {
+        let Some(file) = &mut self.file else {
+            return false;
+        };
         let kind = match channel {
             Channel::Stdout => STDOUT,
             Channel::Stderr => STDERR,
@@ -183,9 +186,13 @@ impl Recorder<'_> {
         event.push(kind);
         event.extend(length.to_le_bytes());
         event.extend(bytes);
-        if let Err(error) = file.write_all(&event) {
-            self.file = None;
-            self.error = Some(error);
+        match file.write_all(&event) {
+            Ok(()) => true,
+            Err(error) => {
+                self.file = None;
+                self.error = Some(error);
+                false
+            }
         }
     }
 

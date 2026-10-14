@@ -22,7 +22,11 @@
 //!   itself), or [`Reply::Started`], then output frames in the order the run
 //!   wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`]. The daemon
 //!   sends `Started` before it starts anything, so a client that never sees
-//!   it can safely run the command itself.
+//!   it can safely run the command itself. When the same command is already
+//!   in flight, the client attaches to it instead (`Started` says so): the
+//!   output frames then hold the run's output from its first byte.
+//! - [`Request::Cancel`]: [`Reply::Cancelled`] once every process of the run
+//!   is gone, or [`Reply::CancelFailed`].
 //! - [`Request::Log`]: output frames holding the part of the run's record
 //!   asked for (`crate::runlog`), each on the channel the run wrote it to,
 //!   then [`Reply::LogEnd`]; or [`Reply::LogFailed`].
@@ -100,6 +104,15 @@ pub enum Request {
     Status,
     /// Send part of a run's record (`crate::runlog`).
     Log(LogRequest),
+    /// Kill a run in flight, with every process it started.
+    Cancel(CancelRequest),
+}
+
+/// The run to cancel.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CancelRequest {
+    /// `r<number>`.
+    pub run: String,
 }
 
 /// The run whose record to send, and which part of it.
@@ -123,9 +136,15 @@ pub struct RunRequest {
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
-    /// The daemon accepted the run, and starts it now.
+    /// The daemon accepted the run, and starts it now; or, with `attached`,
+    /// the same command was already in flight as `run`, and the client
+    /// follows that run from its start.
     Started {
         run: String,
+        /// For an attached client: how long the run had been going, in
+        /// milliseconds.
+        #[serde(default)]
+        attached: Option<u64>,
     },
     /// The daemon takes no runs (it is retiring); nothing was started.
     Refused {
@@ -137,10 +156,13 @@ pub enum Reply {
         message: String,
     },
     /// The command exited. On Unix, `signal` is the signal that killed it,
-    /// and `code` is then 128 plus that signal.
+    /// and `code` is then 128 plus that signal. `cancelled`: `cargo heli
+    /// cancel` ended it.
     Exited {
         code: i32,
         signal: Option<i32>,
+        #[serde(default)]
+        cancelled: bool,
     },
     Status(Status),
     /// The daemon does not know the request: it is older than the client.
@@ -151,6 +173,23 @@ pub enum Reply {
     LogFailed {
         message: String,
     },
+    /// The run was cancelled: none of its processes is left.
+    Cancelled,
+    /// The run was not cancelled; `message` says why.
+    CancelFailed {
+        message: String,
+    },
+}
+
+impl Reply {
+    /// The reply that tells a client how its run ended.
+    pub fn exited(exit: crate::status::Exit) -> Self {
+        Self::Exited {
+            code: exit.code,
+            signal: exit.signal,
+            cancelled: exit.cancelled,
+        }
+    }
 }
 
 /// An output stream of a run.

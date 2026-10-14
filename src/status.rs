@@ -9,10 +9,18 @@
 //!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
-//!           "phase":"running","started_at":1791911112}]}
+//!           "phase":"running","started_at":1791911112,"attached_clients":1,
+//!           "ended_at":null,"exit":null},
+//!          {"id":"r16","worktree":"D:\\work\\agent-f1c0","argv":["cargo","test"],
+//!           "phase":"done","started_at":1791910990,"attached_clients":0,
+//!           "ended_at":1791911050,
+//!           "exit":{"code":101,"signal":null,"cancelled":false}}]}
 //! ```
 //!
-//! `daemon` and `pool` are `null` when no daemon answers.
+//! `daemon` and `pool` are `null` when no daemon answers. `runs` lists the
+//! runs in flight, and the last runs that ended while no client followed
+//! them (`daemon::registry`), so whoever started them can still learn how
+//! they ended.
 
 use serde::{Deserialize, Serialize};
 
@@ -51,10 +59,10 @@ pub struct Daemon {
     pub started_at: u64,
 }
 
-/// A run in flight.
+/// A run in flight, or one that ended while no client followed it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
-    /// `r<number>`, unique on this machine across daemon restarts.
+    /// `r<number>`, unique for the life of the state directory.
     pub id: String,
     /// The worktree the run works in (`crate::worktree`).
     pub worktree: String,
@@ -62,6 +70,44 @@ pub struct Run {
     pub argv: Vec<String>,
     pub phase: Phase,
     pub started_at: u64,
+    /// The clients following the run now: the call that started it and
+    /// those that attached to it.
+    #[serde(default)]
+    pub attached_clients: u32,
+    /// When it ended; `null` while it runs.
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+    /// How it ended; `null` while it runs.
+    #[serde(default)]
+    pub exit: Option<Exit>,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exit {
+    /// The code its clients exit with: the command's own, or on Unix 128
+    /// plus the signal that killed it.
+    pub code: i32,
+    /// On Unix, the signal that killed it.
+    pub signal: Option<i32>,
+    /// Whether `cargo heli cancel` ended it.
+    pub cancelled: bool,
+}
+
+impl Exit {
+    /// `exit <code>` or `signal <n>`, after `cancelled, ` for a cancelled
+    /// run.
+    pub fn describe(&self) -> String {
+        let ending = match self.signal {
+            Some(signal) => format!("signal {signal}"),
+            None => format!("exit {}", self.code),
+        };
+        if self.cancelled {
+            format!("cancelled, {ending}")
+        } else {
+            ending
+        }
+    }
 }
 
 /// Where a run is in its lifecycle.
@@ -70,6 +116,8 @@ pub struct Run {
 pub enum Phase {
     /// Executing, as one phase (no build and test phases of its own).
     Running,
+    /// Ended.
+    Done,
 }
 
 impl Phase {
@@ -77,6 +125,7 @@ impl Phase {
     pub fn name(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Done => "done",
         }
     }
 }
@@ -116,12 +165,15 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
+            let state = match &run.exit {
+                Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
+                None => format!("{}, {} attached", run.phase.name(), run.attached_clients),
+            };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {}s\n",
+                "{label:<6}  {}  {}  {}  {state}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
-                run.phase.name(),
                 age(run.started_at)
             ));
         }

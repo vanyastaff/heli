@@ -1,6 +1,13 @@
 //! The runs in flight: what `status` lists, and the source of run ids.
 //!
-//! A run is admitted before anything starts and leaves when it has finished.
+//! A run is admitted before anything starts, runs once its process has
+//! started, and leaves when it ends. The registry counts the clients
+//! following each run (`super::live`). A run that ends while no client
+//! follows it stays listed as done, with how it ended, since nobody was
+//! told; the oldest of those go once there are more than [`DONE_KEPT`].
+//!
+//! **Attaching.** A client asking for the same [`Command`] as a run in
+//! flight attaches to that run instead of starting another.
 //!
 //! **Run ids** are `r<number>`, unique for the life of the state directory
 //! ([`RunIds`]): run logs and markers are keyed by them, and on Windows
@@ -11,11 +18,17 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::SystemTime;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, SystemTime};
 
-use crate::status::{self, Phase};
+use super::live::Live;
+use crate::protocol::RunRequest;
+use crate::runlog::Events;
+use crate::status::{self, Exit, Phase};
 use crate::{clock, runlog};
+
+/// How many runs that ended while no client followed them stay listed.
+pub const DONE_KEPT: usize = 32;
 
 /// A run's id, `r<number>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -27,12 +40,85 @@ impl std::fmt::Display for RunId {
     }
 }
 
+/// What makes two runs the same command: the working directory (cargo
+/// picks the package from it), argv, and the environment (the target
+/// directory, flags and tool settings come from it), apart from the
+/// variables a shell keeps for itself ([`SHELL_BOOKKEEPING`]), which differ
+/// between two shells of one agent and which no build reads.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Command {
+    cwd: PathBuf,
+    argv: Vec<OsString>,
+    /// Sorted by name; on Windows, names are upper-cased, as they ignore
+    /// case there.
+    env: Vec<(OsString, OsString)>,
+}
+
+/// Variables a shell sets for its own bookkeeping.
+const SHELL_BOOKKEEPING: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+impl Command {
+    /// The command `request` asks for.
+    pub fn of(request: &RunRequest) -> Self {
+        let mut env: Vec<(OsString, OsString)> = request
+            .env
+            .iter()
+            .map(|(name, value)| {
+                let name = if cfg!(windows) {
+                    name.0.to_ascii_uppercase()
+                } else {
+                    name.0.clone()
+                };
+                (name, value.0.clone())
+            })
+            .filter(|(name, _)| !SHELL_BOOKKEEPING.iter().any(|shell| name == shell))
+            .collect();
+        env.sort();
+        Self {
+            cwd: PathBuf::from(&request.cwd.0),
+            argv: request.argv.iter().map(|arg| arg.0.clone()).collect(),
+            env,
+        }
+    }
+}
+
 /// What the registry knows of a run.
 struct Entry {
     worktree: PathBuf,
-    argv: Vec<OsString>,
-    phase: Phase,
+    command: Command,
     started_at: SystemTime,
+    /// The clients following it.
+    attached: u32,
+    state: State,
+}
+
+/// How a client's run request is met.
+pub enum Admission {
+    /// A new run, admitted: start it.
+    New(RunId),
+    /// The same command is in flight: follow it.
+    Attached(Attached),
+    /// Neither; the reason.
+    Refused(String),
+}
+
+/// A run in flight that a client has attached to.
+pub struct Attached {
+    pub id: RunId,
+    pub live: Arc<Live>,
+    /// Its record from the start (`Live::open`).
+    pub events: Option<Events>,
+    /// How long it has been going.
+    pub running_for: Duration,
+}
+
+enum State {
+    /// Admitted; its process has not started yet.
+    Starting,
+    /// Its process has started; clients follow `live`.
+    Running { live: Arc<Live> },
+    /// It ended while no client followed it.
+    Done { exit: Exit, ended_at: SystemTime },
 }
 
 /// Numbers runs for every daemon of one state directory.
@@ -112,43 +198,132 @@ impl Registry {
         }
     }
 
-    /// Admits a run of `argv` in `worktree`, and returns its new id; the
-    /// error says why it has none.
-    pub fn admit(&self, worktree: PathBuf, argv: Vec<OsString>) -> io::Result<RunId> {
+    /// Attaches a client to the run of `command` in flight, if there is
+    /// one; else admits a new run of it in `worktree`, unless the daemon is
+    /// `retiring`.
+    pub fn admit(&self, worktree: PathBuf, command: Command, retiring: bool) -> Admission {
         let mut inner = self.lock();
-        let id = self.ids.next()?;
+        let same = inner.runs.iter_mut().find(|(_, entry)| {
+            matches!(entry.state, State::Running { .. }) && entry.command == command
+        });
+        if let Some((&id, entry)) = same
+            && let State::Running { live } = &entry.state
+        {
+            entry.attached += 1;
+            return Admission::Attached(Attached {
+                id,
+                live: Arc::clone(live),
+                // Opened while it runs, so the record is not pruned first.
+                events: live.open(),
+                running_for: entry.started_at.elapsed().unwrap_or_default(),
+            });
+        }
+        if retiring {
+            return Admission::Refused("the heli daemon is shutting down".to_owned());
+        }
+        let id = match self.ids.next() {
+            Ok(id) => id,
+            Err(error) => {
+                return Admission::Refused(format!(
+                    "the heli daemon cannot number the run: {error}"
+                ));
+            }
+        };
         inner.runs.insert(
             id,
             Entry {
                 worktree,
-                argv,
-                phase: Phase::Running,
+                command,
                 started_at: SystemTime::now(),
+                attached: 0,
+                state: State::Starting,
             },
         );
-        Ok(id)
+        Admission::New(id)
     }
 
-    /// Removes a finished run.
-    pub fn finish(&self, id: RunId) {
+    /// Run `id`'s process has started, and the client that started it
+    /// follows `live`.
+    pub fn start(&self, id: RunId, live: Arc<Live>) {
+        if let Some(entry) = self.lock().runs.get_mut(&id) {
+            entry.state = State::Running { live };
+            entry.attached += 1;
+        }
+    }
+
+    /// Removes run `id`, which never started.
+    pub fn abandon(&self, id: RunId) {
         self.lock().runs.remove(&id);
     }
 
-    /// The runs in flight, oldest first.
+    /// A client no longer follows run `id`.
+    pub fn detach(&self, id: RunId) {
+        if let Some(entry) = self.lock().runs.get_mut(&id) {
+            entry.attached = entry.attached.saturating_sub(1);
+        }
+    }
+
+    /// Run `id` has ended with `code` (on Unix, of `signal`), and all its
+    /// output is recorded; returns how it ended. Clients still following it
+    /// are told next, so it leaves the registry; with none, it stays listed
+    /// as done.
+    pub fn end(&self, id: RunId, code: i32, signal: Option<i32>) -> Exit {
+        let exit = Exit {
+            code,
+            signal,
+            cancelled: false,
+        };
+        let mut inner = self.lock();
+        let followed = inner.runs.get(&id).is_some_and(|entry| entry.attached > 0);
+        if followed {
+            inner.runs.remove(&id);
+        } else if let Some(entry) = inner.runs.get_mut(&id) {
+            entry.state = State::Done {
+                exit,
+                ended_at: SystemTime::now(),
+            };
+            let done: Vec<RunId> = inner
+                .runs
+                .iter()
+                .filter(|(_, entry)| matches!(entry.state, State::Done { .. }))
+                .map(|(id, _)| *id)
+                .collect();
+            for old in &done[..done.len().saturating_sub(DONE_KEPT)] {
+                inner.runs.remove(old);
+            }
+        }
+        exit
+    }
+
+    /// The runs in flight and those that ended unfollowed, oldest first.
     pub fn snapshot(&self) -> Vec<status::Run> {
         self.lock()
             .runs
             .iter()
-            .map(|(id, entry)| status::Run {
-                id: id.to_string(),
-                worktree: entry.worktree.to_string_lossy().into_owned(),
-                argv: entry
-                    .argv
-                    .iter()
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect(),
-                phase: entry.phase,
-                started_at: clock::unix_seconds(entry.started_at),
+            .map(|(id, entry)| {
+                let (phase, ended_at, exit) = match &entry.state {
+                    State::Starting | State::Running { .. } => (Phase::Running, None, None),
+                    State::Done { exit, ended_at } => (
+                        Phase::Done,
+                        Some(clock::unix_seconds(*ended_at)),
+                        Some(*exit),
+                    ),
+                };
+                status::Run {
+                    id: id.to_string(),
+                    worktree: entry.worktree.to_string_lossy().into_owned(),
+                    argv: entry
+                        .command
+                        .argv
+                        .iter()
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect(),
+                    phase,
+                    started_at: clock::unix_seconds(entry.started_at),
+                    attached_clients: entry.attached,
+                    ended_at,
+                    exit,
+                }
             })
             .collect()
     }

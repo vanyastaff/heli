@@ -25,11 +25,13 @@
 //! (`daemon-<session>.log` on Windows), since it has no terminal.
 
 pub mod execute;
+pub mod live;
 pub mod registry;
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::num::NonZeroU32;
+use std::process::Child;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -38,11 +40,12 @@ use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::pool::{self, Pool};
 use crate::protocol::{self, LogRequest, Reply, Request, RunRequest};
-use crate::runlog::{self, Limits, RunLog};
+use crate::runlog::{self, Events, Limits, Recorder, RunLog};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
 
-use registry::{Registry, RunIds};
+use live::Live;
+use registry::{Admission, Attached, Command, Registry, RunId, RunIds};
 
 /// The daemon's exit code when another daemon already holds the lock: the
 /// client that started it then connects to that one.
@@ -198,7 +201,7 @@ impl Daemon {
             }
             Ok(Request::Run(request)) => self.run(stream, request),
             Ok(Request::Log(request)) => self.log(stream, &request),
-            Err(_) => {
+            Ok(Request::Cancel(_)) | Err(_) => {
                 if protocol::write_message(&mut stream, &Reply::Unsupported).is_ok() {
                     self.retire_if_asked(&mut stream, "a client with a request this daemon lacks");
                 }
@@ -234,60 +237,106 @@ impl Daemon {
         let _ = protocol::write_message(&mut stream, &reply);
     }
 
-    /// Executes `request` for the client on `stream`.
+    /// Executes `request` for the client on `stream`, or attaches the
+    /// client to the same command in flight.
     fn run(&self, mut stream: Stream, request: RunRequest) {
-        let Some(serving) = self.admit() else {
-            let reason = "the heli daemon is shutting down".to_owned();
-            let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
-            return;
-        };
-        let id = match self.registry.admit(
-            worktree::of(&execute::cwd(&request)),
-            execute::argv(&request),
-        ) {
-            Ok(id) => id,
-            Err(error) => {
-                let reason = format!("the heli daemon cannot number the run: {error}");
-                self.log.write(&reason);
+        let (serving, retiring) = self.serving();
+        let worktree = worktree::of(&execute::cwd(&request));
+        match self
+            .registry
+            .admit(worktree, Command::of(&request), retiring)
+        {
+            Admission::New(id) => self.start(stream, &request, id),
+            Admission::Attached(run) => self.attach(stream, run),
+            Admission::Refused(reason) => {
+                if !retiring {
+                    self.log.write(&reason);
+                }
                 let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
-                return;
             }
+        }
+        // The client heard how its run ended (or left) before a retiring
+        // daemon may exit.
+        drop(serving);
+    }
+
+    /// Follows run `run.id`, already in flight, for the client on `stream`.
+    fn attach(&self, mut stream: Stream, run: Attached) {
+        let started = Reply::Started {
+            run: run.id.to_string(),
+            attached: Some(u64::try_from(run.running_for.as_millis()).unwrap_or(u64::MAX)),
         };
+        if protocol::write_message(&mut stream, &started).is_err() {
+            self.registry.detach(run.id);
+            return;
+        }
+        self.follow(run.id, &run.live, run.events, stream);
+    }
+
+    /// Starts run `id` of `request`, and follows it for the client on
+    /// `stream`; returns once the run has ended.
+    fn start(&self, mut stream: Stream, request: &RunRequest, id: RunId) {
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
         let started = Reply::Started {
             run: id.to_string(),
+            attached: None,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
-            self.registry.finish(id);
+            self.registry.abandon(id);
             return;
         }
-        let mut record = self.runlog.record(&id.to_string());
-        let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
-            Err(error) => Reply::SpawnFailed {
-                not_found: error.kind() == std::io::ErrorKind::NotFound,
-                message: error.to_string(),
-            },
-            Ok(child) => match execute::pump(child, &mut stream, &mut record) {
-                Ok(status) => exited(status),
-                Err(error) => {
-                    self.log.write(&format!("cannot wait for {id}: {error}"));
-                    Reply::Exited {
-                        code: 1,
-                        signal: None,
-                    }
-                }
-            },
+        let record = self.runlog.record(&id.to_string());
+        let child = match execute::spawn(request, id, &self.pool.makeflags()) {
+            Ok(child) => child,
+            Err(error) => {
+                drop(record);
+                self.registry.abandon(id);
+                let failed = Reply::SpawnFailed {
+                    not_found: error.kind() == std::io::ErrorKind::NotFound,
+                    message: error.to_string(),
+                };
+                let _ = protocol::write_message(&mut stream, &failed);
+                return;
+            }
+        };
+        let live = Live::new(self.runlog.dir().to_path_buf(), id.to_string());
+        let events = live.open();
+        let live = Arc::new(live);
+        self.registry.start(id, Arc::clone(&live));
+        // The run goes on whether or not its client follows it to the end.
+        std::thread::scope(|scope| {
+            scope.spawn(|| self.execute(id, child, record, &live));
+            self.follow(id, &live, events, stream);
+        });
+    }
+
+    /// Runs `child`, the process of run `id`, to its end: records its
+    /// output, ends `live` with how it ended.
+    fn execute(&self, id: RunId, child: Child, mut record: Recorder<'_>, live: &Live) {
+        let (code, signal) = match execute::pump(child, &mut record, live) {
+            Ok(status) => exited(status),
+            Err(error) => {
+                self.log.write(&format!("cannot wait for {id}: {error}"));
+                (1, None)
+            }
         };
         if let Some(error) = record.take_error() {
             self.log.write(&format!("cannot record {id}: {error}"));
         }
+        // Taken out of the registry before the record may be pruned, so a
+        // client attaching to it still finds all of it.
+        let exit = self.registry.end(id, code, signal);
         drop(record);
-        self.registry.finish(id);
-        let _ = protocol::write_message(&mut stream, &reply);
-        // The reply is out before a retiring daemon may exit.
+        live.end(exit);
+    }
+
+    /// Sends run `id`'s output, from `events` on, to the client on
+    /// `stream`, until the run ends or the client goes away.
+    fn follow(&self, id: RunId, live: &Live, events: Option<Events>, mut stream: Stream) {
+        live::follow(live, events, &mut stream);
         drop(stream);
-        drop(serving);
+        self.registry.detach(id);
     }
 
     fn status(&self) -> Status {
@@ -303,14 +352,12 @@ impl Daemon {
         }
     }
 
-    /// Counts a run as served until the guard drops; `None` when retiring.
-    fn admit(&self) -> Option<Serving<'_>> {
+    /// Counts a client as served until the guard drops; also says whether
+    /// the daemon is retiring (then it starts no new run).
+    fn serving(&self) -> (Serving<'_>, bool) {
         let mut lifecycle = self.lifecycle();
-        if lifecycle.retiring {
-            return None;
-        }
         lifecycle.serving += 1;
-        Some(Serving(self))
+        (Serving(self), lifecycle.retiring)
     }
 
     /// Takes no more runs, and exits once the runs in flight are served.
@@ -345,22 +392,17 @@ impl Drop for Serving<'_> {
     }
 }
 
-/// The reply for a run that ended with `status`.
-fn exited(status: std::process::ExitStatus) -> Reply {
+/// The exit code of a run that ended with `status`, and on Unix the signal
+/// that killed it (the code is then 128 plus the signal).
+fn exited(status: std::process::ExitStatus) -> (i32, Option<i32>) {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return Reply::Exited {
-                code: 128 + signal,
-                signal: Some(signal),
-            };
+            return (128 + signal, Some(signal));
         }
     }
-    Reply::Exited {
-        code: status.code().unwrap_or(1),
-        signal: None,
-    }
+    (status.code().unwrap_or(1), None)
 }
 
 /// The daemon's own log file.

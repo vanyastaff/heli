@@ -241,7 +241,9 @@ fn the_daemon_outlives_the_call_that_started_it() {
     );
     assert_eq!(runs(&status).len(), 1, "its run goes on: {status}");
     open(&gate);
-    fixture.wait_for_status("the run to finish", |status| runs(status).is_empty());
+    fixture.wait_for_status("the run to finish", |status| {
+        runs(status).iter().all(|run| run["phase"] == "done")
+    });
 }
 
 /// `echo-args` with `args`, run by `heli` and directly: `heli` printed

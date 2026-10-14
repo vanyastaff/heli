@@ -5,28 +5,28 @@
 //! directory with exactly the client's environment (nothing of the
 //! daemon's), and with no stdin; what heli adds to every run's environment
 //! belongs in [`spawn`]: the pool it draws from ([`MAKEFLAGS_VAR`]) and its
-//! id ([`RUN_VAR`]). Its stdout and stderr are pipes the daemon forwards
-//! frame by frame ([`pump`]), the one place all of a run's output passes;
-//! there it is also recorded in the run log (`crate::runlog`).
+//! id ([`RUN_VAR`]). Its stdout and stderr are pipes the daemon drains
+//! ([`pump`]), the one place all of a run's output passes: into the run log
+//! (`crate::runlog`), and from there to the clients following the run
+//! (`super::live`). No client is written to here, so none can hold up the
+//! run: one that stops reading, or goes away, misses nothing in the record.
 //!
 //! **When a run is over** is when its process has exited, as for a command
 //! the client waited for itself: processes it left behind may keep its
-//! stdout open, so the daemon forwards what is left in the pipes for a short
+//! stdout open, so the daemon takes what is left in the pipes for a short
 //! grace period, then reports the exit and keeps draining the pipes into the
 //! void until they close.
-//!
-//! A client that goes away does not stop the run: the output it misses is
-//! still recorded.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use super::live::Live;
 use super::registry::RunId;
-use crate::protocol::{self, Channel, RunRequest};
+use crate::protocol::{Channel, RunRequest};
 use crate::runlog::Recorder;
 
 /// How long output may still arrive after the run's process has exited.
@@ -90,13 +90,10 @@ enum Event {
     Exited(io::Result<ExitStatus>),
 }
 
-/// Records the run's output in `record` and forwards it to `client` until
-/// the run is over (see the module docs), and returns how it ended.
-pub fn pump(
-    mut child: Child,
-    client: &mut impl Write,
-    record: &mut Recorder<'_>,
-) -> io::Result<ExitStatus> {
+/// Records the run's output in `record`, and adds it to `live` for its
+/// clients, until the run is over (see the module docs); returns how it
+/// ended.
+pub fn pump(mut child: Child, record: &mut Recorder<'_>, live: &Live) -> io::Result<ExitStatus> {
     let (events, received) = mpsc::sync_channel(16);
     let mut open = 0;
     for (channel, pipe) in [
@@ -126,7 +123,6 @@ pub fn pump(
         let _ = waiter.send(Event::Exited(child.wait()));
     });
 
-    let mut connected = true;
     let mut exit = None;
     let mut deadline: Option<Instant> = None;
     while exit.is_none() || open > 0 {
@@ -138,12 +134,8 @@ pub fn pump(
         };
         match event {
             Some(Event::Output(channel, bytes)) => {
-                // Recorded first, so the record is complete when the client
-                // hears of the exit, and whether or not a client listens.
-                record.output(channel, &bytes);
-                if connected && protocol::write_output(client, channel, &bytes).is_err() {
-                    connected = false;
-                }
+                let recorded = record.output(channel, &bytes);
+                live.append(channel, bytes, recorded);
             }
             Some(Event::Closed) => open -= 1,
             Some(Event::Exited(status)) => {

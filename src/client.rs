@@ -8,7 +8,10 @@
 //!   environment (`HELI_DEPTH` one deeper); print the run's stdout and
 //!   stderr to the same streams as they arrive; exit with the run's code
 //!   (on Unix, die of the run's signal). A command that cannot be started
-//!   is reported as direct execution reports it (exit 127 or 126).
+//!   is reported as direct execution reports it (exit 127 or 126). When the
+//!   same command is already in flight, the daemon attaches this client to
+//!   it: one notice line on stderr, then the same as for a run of its own,
+//!   from the run's first byte.
 //! - **Fallback.** Whenever the daemon cannot take the run (it does not
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
@@ -29,7 +32,7 @@ use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::protocol::{self, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text};
 use crate::runlog::{self, select::Select};
-use crate::status::Status;
+use crate::status::{Exit, Status};
 use crate::{clock, direct, environment, launch, nesting};
 
 /// How long a daemon may take to answer the handshake.
@@ -276,7 +279,19 @@ fn submit(
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
     match protocol::read_message::<Reply>(&mut stream) {
-        Ok(Reply::Started { run }) => follow(stream, invocation, &run, Instant::now()),
+        Ok(Reply::Started { run, attached }) => {
+            let mut started = Instant::now();
+            if let Some(milliseconds) = attached {
+                let running_for = Duration::from_millis(milliseconds);
+                started = started.checked_sub(running_for).unwrap_or(started);
+                eprintln!(
+                    "cargo-heli: attached to {run}, the same command started {:.1} s ago; \
+                     to run it anew, cargo heli cancel {run} first",
+                    running_for.as_secs_f64()
+                );
+            }
+            follow(stream, invocation, &run, started)
+        }
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
@@ -298,12 +313,18 @@ fn follow(mut stream: Stream, invocation: &Invocation, run: &str, started: Insta
                 print(&mut stderr, &bytes);
                 line_ended = bytes.last().is_none_or(|&byte| byte == b'\n');
             }
-            Ok(Frame::Message(Reply::Exited { code, signal })) => {
+            Ok(Frame::Message(Reply::Exited {
+                code,
+                signal,
+                cancelled,
+            })) => {
                 let _ = stdout.flush();
-                let ending = match signal {
-                    Some(signal) => format!("signal {signal}"),
-                    None => format!("exit {code}"),
-                };
+                let ending = Exit {
+                    code,
+                    signal,
+                    cancelled,
+                }
+                .describe();
                 let _ = writeln!(
                     stderr,
                     "{}cargo-heli: {run} {ending} in {:.1} s (output: cargo heli log {run})",
