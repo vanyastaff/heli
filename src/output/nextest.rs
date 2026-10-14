@@ -129,15 +129,16 @@ pub fn status_line(line: &str) -> Option<&str> {
 }
 
 /// Whether `line` (without its line end) ends the output nextest prints
-/// under a test's status line: another status line, a separator (`────`),
-/// or a line of nextest's own, indented less than the output (4 spaces)
-/// and not one of the output's headers (`  stdout ───`).
+/// under a test's status line: another status line, or a line of nextest's
+/// own (a separator, `warning: …`, `  Cancelling …`), indented less than
+/// the output (4 spaces) and not one of the output's headers
+/// (`  stdout ───`).
 pub fn ends_output(line: &str) -> bool {
     let trimmed = line.trim_start();
     if trimmed.is_empty() {
         return false;
     }
-    if status_line(line).is_some() || trimmed.starts_with('─') {
+    if status_line(line).is_some() {
         return true;
     }
     let header = line.strip_prefix("  ").is_some_and(|rest| {

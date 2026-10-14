@@ -261,7 +261,8 @@ fn nextest_output_levels_the_user_set_are_shown() {
         ],
     );
     support::assert_success(&output, "cargo heli nextest run");
-    let stderr = support::without_footer(&output.stderr);
+    let (stderr, footer) = support::split_footer(&output.stderr);
+    let stderr = text(&stderr);
     for shown in [
         "PASS [",
         "] (1/1) many-tests g0::t0\n",
@@ -269,6 +270,24 @@ fn nextest_output_levels_the_user_set_are_shown() {
     ] {
         assert!(stderr.contains(shown), "{shown:?} in {stderr}");
     }
+
+    // `log --test` shows the test's whole output, lines that look like
+    // nextest's status lines included, to libtest's summary.
+    let logged = log(&fixture, &[&footer.run, "--test", "g0::t0"]);
+    support::assert_success(&logged, "cargo heli log --test");
+    let logged = text(&logged.stderr);
+    let printed = "    output of many_tests::g0::t0\n    NOT [a] status line\n    \
+                   not a: status [   1.000s] line\n";
+    assert!(
+        logged.trim_start().starts_with("PASS [")
+            && logged.contains(printed)
+            && logged
+                .lines()
+                .last()
+                .is_some_and(|last| last.starts_with("    test result: ok. 1 passed;")),
+        "{logged}"
+    );
+    assert!(stderr.contains(&logged), "what the run printed: {logged}");
 }
 
 /// `text` without what differs between two runs of the same tests: the id
@@ -292,18 +311,22 @@ fn untimed(text: &str) -> String {
         .collect()
 }
 
-/// The sections of libtest's output `stdout` that compact mode keeps: from
-/// each `failures:` line to the `test result:` line after it, inclusive.
-fn failure_sections(stdout: &str) -> String {
+/// The lines of libtest's output `stdout` that compact mode keeps: from
+/// each `failures:` or `successes:` line to the `test result:` line after
+/// it, and the `test result:` lines of binaries whose tests failed.
+fn kept_sections(stdout: &str) -> String {
     let mut kept = String::new();
     let mut keeping = false;
     for line in stdout.split_inclusive('\n') {
-        keeping |= line == "failures:\n";
-        if keeping {
-            kept.push_str(line);
-        }
+        keeping |= line == "failures:\n" || line == "successes:\n";
         if line.starts_with("test result: ") {
             keeping = false;
+            if !line.starts_with("test result: ok.") {
+                kept.push_str(line);
+            }
+        }
+        if keeping {
+            kept.push_str(line);
         }
     }
     kept
@@ -322,7 +345,7 @@ fn libtest_failures_are_shown_in_compact_mode() {
         .output()
         .expect("run cargo");
     assert_eq!(plain.status.code(), Some(101), "{plain:?}");
-    let expected = failure_sections(&text(&plain.stdout));
+    let expected = kept_sections(&text(&plain.stdout));
     assert!(
         expected.contains("captured output of the failing test\n")
             && expected.contains("fixture failure: expected to fail\n")
@@ -363,6 +386,39 @@ fn a_green_libtest_run_prints_its_count() {
 
     let output = heli(&fixture, &["-q", "--no-cache", "test", "-p", "many-tests"]);
     quiet_line(&output, "test -p many-tests", "100 passed, ");
+}
+
+/// Under `--show-output`, libtest lists what passing tests printed in a
+/// `successes:` section: compact mode keeps it, as plain cargo prints it,
+/// and `log --test` shows a test's part of it. The count names the tests
+/// that libtest's filter left out.
+#[test]
+fn libtest_successes_are_kept_and_filtered_tests_counted() {
+    let fixture = Fixture::new("basic");
+    let args = ["test", "-p", "many-tests", "--", "g0::t0", "--show-output"];
+    let plain = fixture
+        .cargo(args)
+        .env_remove("RUST_TEST_THREADS")
+        .output()
+        .expect("run cargo");
+    support::assert_success(&plain, "cargo test");
+    let expected = kept_sections(&text(&plain.stdout));
+    let section = "---- g0::t0 stdout ----\noutput of many_tests::g0::t0\nNOT [a] status line\n\
+                   not a: status [   1.000s] line\n";
+    assert!(expected.contains(section), "plain cargo's: {expected}");
+
+    let output = heli(&fixture, &args);
+    support::assert_success(&output, "cargo heli test");
+    assert_eq!(text(&output.stdout), expected);
+    let (stderr, footer) = support::split_footer(&output.stderr);
+    let stderr = text(&stderr);
+    assert!(
+        stderr.ends_with("\ntests: 1 passed, 99 filtered out\n"),
+        "{stderr}"
+    );
+    let logged = log(&fixture, &[&footer.run, "--test", "g0::t0"]);
+    support::assert_success(&logged, "cargo heli log --test");
+    assert_eq!(text(&logged.stdout), section);
 }
 
 /// `cargo heli log` with `args`.
