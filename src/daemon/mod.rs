@@ -119,13 +119,7 @@ pub fn main() -> ! {
     let pool = Arc::new(open_pool(&locations, &config, &log));
     let governor = Governor::new(&config, locations.config.clone())
         .unwrap_or_else(|error| fail(Some(&log), &error));
-    let events = Events::new(
-        locations.event_log(),
-        config
-            .event_log
-            .max_kb
-            .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
-    );
+    let events = Arc::new(Events::configured(&locations, &config));
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
@@ -147,6 +141,7 @@ pub fn main() -> ! {
             config.store.clone(),
             locations.state_dir.clone(),
             log.clone(),
+            Arc::clone(&events),
         ),
         registry: Registry::new(RunIds::new(
             locations.run_counter(),
@@ -249,7 +244,7 @@ struct Daemon {
     /// Lends the host pool's slots to the runs' own pools.
     broker: Arc<Broker>,
     governor: Governor,
-    events: Events,
+    events: Arc<Events>,
     runlog: RunLog,
     results: results::Store,
     lifecycle: Mutex<Lifecycle>,
@@ -442,21 +437,29 @@ impl Daemon {
         }
         // Kept until the run has ended (the scope below waits for it), when
         // its directories are counted again.
-        let _learning = self.accounts.learn(request);
+        let learning = self.accounts.learn(request);
         let _pin = self.runlog.pin(&id.to_string());
         let live = Arc::new(Live::new(self.runlog.dir().to_path_buf(), id.to_string()));
         self.registry.told(id, Arc::clone(&live));
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
-            scope.spawn(|| self.execute(id, request, &live, known));
+            scope.spawn(|| self.execute(id, request, &live, known, learning.as_ref()));
             self.follow(id, &live, stream, request.class.is_some());
         });
     }
 
     /// Run `id` of `request`, from its turn at the worktree lock to its end;
     /// all of it reaches its clients through `live`. `known` is the key it
-    /// keeps, if any (it waits for nothing).
-    fn execute(&self, id: RunId, request: &RunRequest, live: &Live, known: Option<Key>) {
+    /// keeps, if any (it waits for nothing). Before it starts, its build
+    /// directory is recycled if `learning` says it may be.
+    fn execute(
+        &self,
+        id: RunId,
+        request: &RunRequest,
+        live: &Live,
+        known: Option<Key>,
+        learning: Option<&accounts::Learning>,
+    ) {
         // The worktree lock: its clients hear which runs it waits for, if
         // any.
         self.registry
@@ -489,6 +492,11 @@ impl Daemon {
                 key
             }
         };
+        // A worktree without a build directory may get a recycled one,
+        // which must be in place before cargo starts (DESIGN.md §6.4).
+        if let Some(recycled) = learning.and_then(accounts::Learning::prepared) {
+            live.note(&recycled.describe());
+        }
         let mut record = self.runlog.record(&id.to_string());
         let (makeflags, error) = self.broker.open(id);
         if let Some(error) = error {

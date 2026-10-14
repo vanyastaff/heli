@@ -13,7 +13,10 @@
 //! that volume, and `<volume>/.heli/build` otherwise.
 
 pub mod owner;
+pub mod probe;
+pub mod recycle;
 pub mod registry;
+pub mod scan;
 pub mod sizes;
 pub mod volume;
 

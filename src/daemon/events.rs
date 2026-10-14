@@ -11,7 +11,15 @@
 //!   `commit_available` and `high_watermark`;
 //! - `top-up`: slots given back to the pool at quiescence;
 //! - `drain`: surplus slots taken out of the pool. Both have `slots`,
-//!   `free` (after it) and `target`.
+//!   `free` (after it) and `target`;
+//! - `recycle`: a worktree got an orphan's build directory
+//!   (`crate::store::recycle`): `trigger` (`run`, its first run; `hook`,
+//!   git's `post-checkout` hook; `look`, the daemon's look at a
+//!   repository's worktrees), `workspace` and `to`, the new workspace and
+//!   the build directory's path now, `donor` and `from`, the removed
+//!   workspace and the path it had, and `invalidated`, the units whose
+//!   fingerprints the path scan deleted. The hook writes its event itself,
+//!   to the log of its logon session's daemon.
 //!
 //! It is `events.log` in the state directory (`events-<session>.log` on
 //! Windows). Past its size limit it rotates: it becomes `<name>.1`, replacing
@@ -27,6 +35,8 @@ use serde_json::{Map, Value};
 
 use super::registry::RunId;
 use crate::clock;
+use crate::config::Config;
+use crate::locations::Locations;
 
 /// The size limit when the configuration sets none: 1 MB.
 pub const DEFAULT_MAX: u64 = 1 << 20;
@@ -47,6 +57,15 @@ impl Events {
             max,
             file: Mutex::new(None),
         }
+    }
+
+    /// The log of `locations`, of the size `config` sets.
+    pub fn configured(locations: &Locations, config: &Config) -> Self {
+        let max = config
+            .event_log
+            .max_kb
+            .map_or(DEFAULT_MAX, |kb| kb.get().saturating_mul(1024));
+        Self::new(locations.event_log(), max)
     }
 
     /// Logs the admission of run `run`, with `fields` (a JSON object).

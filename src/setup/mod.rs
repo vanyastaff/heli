@@ -24,6 +24,10 @@
 //! `build.build-dir`, pointing at heli's build store, for this repository
 //! and for every project, each file with its own question, as above.
 //!
+//! **Recycling** ([`hook`]): last, in a repository, setup offers its git
+//! `post-checkout` hook, with which `git worktree add` gives the new
+//! worktree a removed worktree's build directory. It is written executable.
+//!
 //! **`--autostart`** also registers the daemon to start at logon, and
 //! **`--no-autostart`** removes that registration ([`autostart`]); the flag
 //! is the consent. When heli cannot make the registration at all (location
@@ -32,6 +36,7 @@
 mod autostart;
 mod cargo;
 mod claude;
+mod hook;
 mod profile;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -118,6 +123,14 @@ pub fn main(print: bool, autostart: Option<bool>) -> ! {
     );
     present(repository);
     present(user);
+    if let Some(hook) = hook_offer() {
+        println!(
+            "\nWith the repository's post-checkout hook, `git worktree add` gives the new \
+             worktree the build directory of a removed worktree of the repository, renamed \
+             into place, so that its first build is warm."
+        );
+        present(Ok(hook));
+    }
     if let Some((register, registration)) = &registration {
         println!();
         failed |= !if *register {
@@ -183,6 +196,23 @@ fn build_store_offers(locations: &Locations) -> (Result<Offer, String>, Result<O
     (repository, user)
 }
 
+/// The `post-checkout` hook of the repository setup runs in, running this
+/// very program; none outside a repository.
+fn hook_offer() -> Option<Offer> {
+    let cwd = std::env::current_dir().ok()?;
+    let path = hook::path(&cwd).ok()?;
+    let edit = match std::env::current_exe() {
+        Ok(program) => hook::edit(&path, &program),
+        Err(error) => Edit::Refused(format!("heli cannot tell its own path ({error})")),
+    };
+    Some(Offer {
+        what: "Git post-checkout hook for this repository",
+        sets: hook::SETTING,
+        path,
+        edit,
+    })
+}
+
 /// A file setup offers to edit.
 struct Offer {
     /// What the file is, for people.
@@ -201,6 +231,9 @@ enum Edit {
     Refused(String),
     /// Write `content` as the file's whole content, shown as `shown` says.
     Write { content: String, shown: Shown },
+    /// Write `content` as the file's whole content, shown whole, and make
+    /// it executable: a script.
+    Script { content: String },
 }
 
 /// How an [`Edit::Write`] is shown.
@@ -253,7 +286,7 @@ impl Offer {
             edit,
         } = self;
         let place = path.display();
-        let (content, shown) = match edit {
+        let (content, shown, executable) = match edit {
             Edit::Done => {
                 println!("{what} {place} already sets {sets} to this.");
                 return true;
@@ -262,7 +295,8 @@ impl Offer {
                 println!("{what} {place} is left as it is: {reason}.");
                 return true;
             }
-            Edit::Write { content, shown } => (content, shown),
+            Edit::Write { content, shown } => (content, shown, false),
+            Edit::Script { content } => (content, Shown::Whole, true),
         };
         // What is shown ends with a line break; an empty line follows, here
         // or as the next part of the output begins.
@@ -281,7 +315,14 @@ impl Offer {
         let written = path
             .parent()
             .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, content));
+            .and_then(|()| std::fs::write(&path, content))
+            .and_then(|()| {
+                if executable {
+                    make_executable(&path)
+                } else {
+                    Ok(())
+                }
+            });
         match written {
             Ok(()) => {
                 println!("Written.");
@@ -293,6 +334,23 @@ impl Offer {
             }
         }
     }
+}
+
+/// Lets everyone who may read the file at `path` run it too; on Windows
+/// there is nothing to change.
+fn make_executable(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)?.permissions();
+        let mode = permissions.mode();
+        // Each read bit grants the execute bit beside it.
+        permissions.set_mode(mode | ((mode & 0o444) >> 2));
+        std::fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// The user's home: `HOME`, or on Windows the first of the variables

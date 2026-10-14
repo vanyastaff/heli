@@ -40,6 +40,9 @@ pub enum Action {
     Cancel { run: String },
     /// List the build store's directories (`dry_run`), as JSON with `json`.
     Gc { dry_run: bool, json: bool },
+    /// Give the worktree here a removed worktree's build directory, as
+    /// git's `post-checkout` hook asks.
+    Recycle,
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
@@ -176,6 +179,11 @@ enum Command {
         #[arg(long, requires = "dry_run")]
         json: bool,
     },
+    /// Give the worktree here the build directory of a removed worktree of
+    /// its repository, if it has none (run by the `post-checkout` hook
+    /// `cargo heli setup` installs).
+    #[command(hide = true)]
+    Recycle,
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -266,6 +274,7 @@ pub fn parse(
             },
         },
         Command::Cancel { run } => Action::Cancel { run },
+        Command::Recycle => Action::Recycle,
         Command::Daemon { warden: true, .. } => Action::Warden,
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => {

@@ -14,9 +14,27 @@
 //! registered (`crate::store::registry`). When the build directory is in a
 //! store heli manages (`crate::store::store_of`), heli writes its owner
 //! manifest (`crate::store::owner`), with the run's start as the last run
-//! and the repository git names for the workspace. Nothing of this delays
-//! the run, and nothing of it can fail the run: what goes wrong goes to the
-//! daemon's log.
+//! and the repository git names for the workspace. Nothing of this can
+//! fail the run: what goes wrong goes to the daemon's log.
+//!
+//! **Recycling** (DESIGN.md §6.4). When the build directory cargo names is
+//! in a store heli manages and does not exist yet, the run's worktree gets
+//! the most recently used orphan of its repository, renamed into place
+//! (`crate::store::recycle`), before the owner manifest is written. That
+//! must happen before the run's cargo creates the build directory, so the
+//! first run from a directory waits for its learning
+//! ([`Learning::prepared`], at most [`PREPARE_WAIT`]) while a store holds
+//! an orphan that could be recycled; no other run waits for it. Each
+//! recycling is a `recycle` event in the event log, with what it moved and
+//! how many units the path scan invalidated, and a note to the run's
+//! clients.
+//!
+//! **The look** (`Accounts::look`). Each pass of the accountant first
+//! lists the worktrees of every repository with an orphan in a store
+//! (`git worktree list`); each linked worktree it has not looked at before
+//! gets a build directory recycled if it has none
+//! (`crate::store::recycle::for_worktree`): one added without the
+//! `post-checkout` hook, or before the daemon started.
 //!
 //! **Sizes** ([`Accounts::disk`]). The accountant, a thread of the daemon's,
 //! keeps the sizes of every directory `crate::store::survey` finds, by
@@ -29,29 +47,31 @@
 //! per registered `target/` directory.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
 use super::Log;
+use super::events::Events;
 use crate::clock;
 use crate::config::StoreConfig;
 use crate::protocol::RunRequest;
 use crate::status::{Disk, StoreUse, TargetUse};
+use crate::store::probe::Probe;
+use crate::store::recycle::{self, Recycled};
 use crate::store::registry::{Registry, Target};
 use crate::store::sizes::Sizes;
-use crate::store::{self, Kind, owner};
+use crate::store::{self, Kind, State, owner};
 
 /// How often the accountant looks for new directories when no run ends.
 const LOOK: Duration = Duration::from_secs(60);
 
 /// How old a directory's figures may grow before it is scanned again.
 const STALE: Duration = Duration::from_secs(3600);
+
+/// The longest a run waits for its build directory to be recycled.
+pub const PREPARE_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Accounts {
     config: StoreConfig,
@@ -64,6 +84,10 @@ pub struct Accounts {
     /// Signalled when a directory needs scanning.
     wake: Condvar,
     log: Log,
+    events: Arc<Events>,
+    /// The directories a run was learnt from, its build directory recycled
+    /// if it could be: later runs from there never wait.
+    prepared: Mutex<BTreeSet<PathBuf>>,
 }
 
 /// What the accountant knows.
@@ -84,34 +108,35 @@ struct Figures {
     scanned: Instant,
 }
 
-/// A workspace as cargo places it for a run.
-#[derive(Debug, Deserialize)]
-struct Workspace {
-    #[serde(rename = "workspace_root")]
-    root: PathBuf,
-    #[serde(rename = "target_directory")]
-    target: PathBuf,
-    /// Absent from a cargo older than `build-dir`, whose build directory is
-    /// the target directory.
-    #[serde(rename = "build_directory")]
-    build: Option<PathBuf>,
-}
-
-/// What it takes to ask about a run's workspace as the run would.
-struct Probe {
-    cwd: PathBuf,
-    cargo: OsString,
-    env: Vec<(OsString, OsString)>,
-}
-
 /// Kept while a run lasts; dropping it tells the accounts the run ended.
 pub struct Learning {
     _ended: mpsc::Sender<()>,
+    /// Hears what was recycled for the run, once that is settled; `None`
+    /// when the run need not wait for it.
+    ready: Option<Mutex<mpsc::Receiver<Option<Recycled>>>>,
+}
+
+impl Learning {
+    /// Waits, at most [`PREPARE_WAIT`], until the run's build directory is
+    /// recycled or will not be; returns what was recycled for it.
+    pub fn prepared(&self) -> Option<Recycled> {
+        let ready = self
+            .ready
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        ready.recv_timeout(PREPARE_WAIT).ok().flatten()
+    }
 }
 
 impl Accounts {
     /// The accounts, with their accountant started.
-    pub(super) fn start(config: StoreConfig, state_dir: PathBuf, log: Log) -> Arc<Self> {
+    pub(super) fn start(
+        config: StoreConfig,
+        state_dir: PathBuf,
+        log: Log,
+        events: Arc<Events>,
+    ) -> Arc<Self> {
         let accounts = Arc::new(Self {
             config,
             state_dir,
@@ -119,6 +144,8 @@ impl Accounts {
             ledger: Mutex::new(Ledger::default()),
             wake: Condvar::new(),
             log,
+            events,
+            prepared: Mutex::new(BTreeSet::new()),
         });
         let accountant = Arc::clone(&accounts);
         std::thread::spawn(move || accountant.keep());
@@ -126,16 +153,18 @@ impl Accounts {
     }
 
     /// Learns, in the background, the workspace that run `request` builds
-    /// in, if it is a run of cargo (see the module docs). Once the run has
-    /// ended (the returned value is dropped), its directories are scanned
-    /// again.
+    /// in, if it is a run of cargo (see the module docs), and recycles a
+    /// build directory for it if it has none. Once the run has ended (the
+    /// returned value is dropped), its directories are scanned again.
     pub fn learn(self: &Arc<Self>, request: &RunRequest) -> Option<Learning> {
         let probe = Probe::of(request)?;
         let at = clock::now();
         let (ended, end) = mpsc::channel();
+        let (prepared, ready) = mpsc::channel();
+        let wait = self.may_recycle(&probe.cwd);
         let accounts = Arc::clone(self);
         std::thread::spawn(move || {
-            let Some(dirs) = accounts.discover(&probe, at) else {
+            let Some(dirs) = accounts.discover(&probe, at, prepared) else {
                 return;
             };
             // An error: the run has ended.
@@ -145,7 +174,30 @@ impl Accounts {
             drop(ledger);
             accounts.wake.notify_all();
         });
-        Some(Learning { _ended: ended })
+        Some(Learning {
+            _ended: ended,
+            ready: wait.then(|| Mutex::new(ready)),
+        })
+    }
+
+    /// Whether the first run from `cwd` must wait for its learning: no run
+    /// from there was learnt yet, and a store holds an orphan of some
+    /// repository, which its worktree may get.
+    fn may_recycle(&self, cwd: &Path) -> bool {
+        let prepared = self.prepared.lock().unwrap_or_else(PoisonError::into_inner);
+        if prepared.contains(cwd) {
+            return false;
+        }
+        drop(prepared);
+        let registry = Registry::load(&self.state_dir);
+        store::survey(&self.config, &registry).iter().any(|dir| {
+            dir.kind == Kind::Build
+                && dir
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.repository.is_some())
+                && dir.state() == State::Orphan
+        })
     }
 
     /// The disk the store takes, as last counted.
@@ -184,13 +236,25 @@ impl Accounts {
         Disk { stores, targets }
     }
 
-    /// Asks cargo where the workspace of `probe` builds, and records a run
-    /// there that started `at`. Returns the directories the run builds in.
-    fn discover(&self, probe: &Probe, at: u64) -> Option<Vec<PathBuf>> {
+    /// Asks cargo where the workspace of `probe` builds, recycles a build
+    /// directory for it if it has none (and tells `prepared` what, or that
+    /// nothing was), and records a run there that started `at`. Returns the
+    /// directories the run builds in.
+    fn discover(
+        &self,
+        probe: &Probe,
+        at: u64,
+        prepared: mpsc::Sender<Option<Recycled>>,
+    ) -> Option<Vec<PathBuf>> {
         let workspace = probe.workspace()?;
-        let build = workspace.build.clone().unwrap_or(workspace.target.clone());
+        let build = workspace.build_dir();
         if store::store_of(&self.config, &build).is_some() {
             let repository = probe.repository(&workspace.root);
+            let recycled = repository.as_deref().and_then(|repository| {
+                self.recycle(&build, &workspace.root, repository, at, "run")
+            });
+            self.prepared(&probe.cwd);
+            let _ = prepared.send(recycled);
             let recorded = owner::record_run(&build, &workspace.root, repository.as_deref(), at);
             if let Err(error) = recorded {
                 self.log.write(&format!(
@@ -198,6 +262,8 @@ impl Accounts {
                     build.display()
                 ));
             }
+        } else {
+            self.prepared(&probe.cwd);
         }
         // Last, so that a registered target directory says that all of this
         // is done.
@@ -206,6 +272,52 @@ impl Accounts {
             workspace: workspace.root.clone(),
         });
         Some(vec![workspace.target, build])
+    }
+
+    /// Recycles an orphan into `build`, the build directory of `workspace`
+    /// in `repository`, if it has none; logs it as set off by `trigger`.
+    fn recycle(
+        &self,
+        build: &Path,
+        workspace: &Path,
+        repository: &Path,
+        at: u64,
+        trigger: &str,
+    ) -> Option<Recycled> {
+        match recycle::claim(&self.config, build, workspace, repository, at) {
+            Ok(Some(recycled)) => {
+                self.recycled(&recycled, trigger);
+                Some(recycled)
+            }
+            Ok(None) => None,
+            Err(error) => {
+                self.log.write(&format!(
+                    "cannot recycle a build directory for {}: {error}",
+                    workspace.display()
+                ));
+                None
+            }
+        }
+    }
+
+    /// Logs `recycled`, set off by `trigger`: in the daemon's log, and as a
+    /// `recycle` event.
+    fn recycled(&self, recycled: &Recycled, trigger: &str) {
+        self.log.write(&format!(
+            "{} ({}): {}",
+            recycled.workspace.display(),
+            recycled.to.display(),
+            recycled.describe()
+        ));
+        self.events.record("recycle", recycled.event(trigger));
+    }
+
+    /// Notes that runs from `cwd` need not wait for their learning.
+    fn prepared(&self, cwd: &Path) {
+        self.prepared
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(cwd.to_path_buf());
     }
 
     /// Registers `target`.
@@ -217,13 +329,16 @@ impl Accounts {
         }
     }
 
-    /// The accountant: surveys the store and scans what needs it, for ever.
+    /// The accountant: looks for worktrees to recycle for, surveys the store
+    /// and scans what needs it, for ever.
     fn keep(&self) {
+        let mut looked = BTreeSet::new();
         loop {
             // Each run that ended is in `ended` once: after it ended, the
             // survey below sees every directory it built.
             let ended = std::mem::take(&mut self.ledger().dirty);
             let registry = Registry::load(&self.state_dir);
+            self.look(&registry, &mut looked);
             let dirs = store::survey(&self.config, &registry);
             let stores = store::stores(&self.config, &registry);
             for dir in &dirs {
@@ -259,79 +374,48 @@ impl Accounts {
         }
     }
 
+    /// The look at worktrees: each linked worktree of a repository that has
+    /// an orphan in a store, which this look has not seen before, gets a
+    /// build directory recycled if it has none (`recycle::for_worktree`).
+    /// The main worktree is never new, and is left to its first run.
+    fn look(&self, registry: &Registry, looked: &mut BTreeSet<PathBuf>) {
+        let mut repositories: Vec<PathBuf> = Vec::new();
+        for dir in store::survey(&self.config, registry) {
+            let Some(repository) = dir
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.repository.clone())
+            else {
+                continue;
+            };
+            let known = repositories
+                .iter()
+                .any(|known| store::same_path(known, &repository));
+            if !known && dir.kind == Kind::Build && dir.state() == State::Orphan {
+                repositories.push(repository);
+            }
+        }
+        let lister = Probe::here(self.state_dir.clone());
+        for repository in repositories {
+            for worktree in lister.worktrees(&repository).into_iter().skip(1) {
+                if !looked.insert(worktree.clone()) {
+                    continue;
+                }
+                let probe = Probe::here(worktree.clone());
+                let at = clock::now();
+                match recycle::for_worktree(&self.config, registry, &probe, &worktree, at) {
+                    Ok(Some(recycled)) => self.recycled(&recycled, "look"),
+                    Ok(None) => {}
+                    Err(error) => self.log.write(&format!(
+                        "cannot recycle a build directory for {}: {error}",
+                        worktree.display()
+                    )),
+                }
+            }
+        }
+    }
+
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-impl Probe {
-    /// The probe for run `request`, if its program is named `cargo`.
-    fn of(request: &RunRequest) -> Option<Self> {
-        let program = &request.argv.first()?.0;
-        let named_cargo = Path::new(program)
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.eq_ignore_ascii_case("cargo"));
-        if !named_cargo {
-            return None;
-        }
-        Some(Self {
-            cwd: PathBuf::from(&request.cwd.0),
-            cargo: program.clone(),
-            env: request
-                .env
-                .iter()
-                .map(|(name, value)| (name.0.clone(), value.0.clone()))
-                .collect(),
-        })
-    }
-
-    /// `program args` as the run would start it, its stdout captured.
-    fn command(&self, program: &OsString, args: &[&str], dir: &Path) -> Command {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(dir)
-            .env_clear()
-            .envs(self.env.iter().map(|(name, value)| (name, value)))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        command
-    }
-
-    /// The workspace as `cargo metadata` describes it.
-    fn workspace(&self) -> Option<Workspace> {
-        let output = self
-            .command(
-                &self.cargo,
-                &["metadata", "--format-version", "1", "--no-deps"],
-                &self.cwd,
-            )
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        serde_json::from_slice(&output.stdout).ok()
-    }
-
-    /// The git common directory of the repository holding `dir`, if any.
-    fn repository(&self, dir: &Path) -> Option<PathBuf> {
-        let output = self
-            .command(
-                &OsString::from("git"),
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                dir,
-            )
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8(output.stdout).ok()?;
-        let common = Path::new(text.trim_end());
-        Some(store::simplified(common))
     }
 }
