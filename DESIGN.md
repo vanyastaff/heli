@@ -295,10 +295,14 @@ its own, as without heli.
   `cargo heli daemon --warden`, a process of its own (its own process group,
   no stdio but the read end of a pipe whose write end only the daemon
   holds). However the daemon ends (it retires, is killed, crashes), the
-  warden reads the end of the pipe. It then removes the FIFO as soon as no
-  process holds it (the `ENXIO` probe above), looking again every 250 ms
-  while one does: a cargo still building keeps the pool alive, as it would
-  keep a semaphore.
+  warden reads the end of the pipe. That end comes as the kernel closes the
+  dying daemon's files one by one, when the pool's lock (below) may still be
+  held, as by a daemon that owns the pool; so the warden first waits (at
+  most 5 s) until the daemon, whose process id it is given, is no longer its
+  parent: the process is gone then, with every file it held. It then
+  removes the FIFO as soon as no process holds it (the `ENXIO` probe above),
+  looking again every 250 ms while one does: a cargo still building keeps
+  the pool alive, as it would keep a semaphore.
 - **The pool's lock**, `<fifo>.lock`, keeps a warden from removing a FIFO
   that a daemon owns. A daemon takes it before it opens the FIFO and holds
   it for life (it waits up to 1 s for it, since a warden holds it for a
