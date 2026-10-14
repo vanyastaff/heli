@@ -99,11 +99,15 @@ pub fn path(build_dir: &Path) -> PathBuf {
 /// most [`COARSE_SLACK`], until the last build there is a slack old
 /// ([`LastBuild::until`]), so that the record counts.
 pub fn write(build_dir: &Path, worktree: &Path, probe: &Probe) -> Result<bool, String> {
+    let unwritable = || !build_dir.is_dir() || super::busy(build_dir);
+    if unwritable() {
+        return Ok(false);
+    }
     if let Ok(last) = last_build(build_dir) {
         wait_until(last.until);
     }
     let taken_at = nanos(SystemTime::now()).ok_or("the clock is before 1970")?;
-    if !build_dir.is_dir() || super::busy(build_dir) {
+    if unwritable() {
         return Ok(false);
     }
     let dir = build_dir.join(".heli");
