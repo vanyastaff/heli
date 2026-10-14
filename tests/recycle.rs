@@ -1189,12 +1189,18 @@ impl Repo {
 /// record, and git shows heli's line. A checkout in a worktree that exists
 /// already recycles nothing, though an orphan waits. Run again, setup finds
 /// the hook in place.
+///
+/// The hook needs no daemon. The one that built a is stopped before a is
+/// removed: its look at the repository's worktrees, as the build ended,
+/// could otherwise come late enough to recycle for b first, and the hook
+/// would find b's build directory there.
 #[test]
 fn setup_installs_a_hook_that_recycles_as_a_worktree_is_added() {
     let repo = Repo::new();
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    repo.fixture.kill_daemon();
     repo.remove_worktree("a");
     let gone = repo.fixture.workspace().join("gone");
     let spare = repo.craft(
@@ -1237,7 +1243,8 @@ fn setup_installs_a_hook_that_recycles_as_a_worktree_is_added() {
         stderr.contains("cargo-heli: recycled the build directory of ")
             && stderr.contains(", precisely (")
             && stderr.contains("the path scan invalidated 2 units"),
-        "{stderr}"
+        "{stderr}\n{}",
+        repo.store_diagnosis()
     );
     let b_dir = repo.build_dir_of(&b);
     assert!(!a_dir.exists() && b_dir.join("debug").is_dir(), "a's moved");
@@ -1355,25 +1362,27 @@ fn a_hook_never_fails_a_checkout_and_follows_heli() {
 /// its first build, which is then warm, and precise with a's record: only
 /// what the path scan invalidated compiles. The main worktree, which is
 /// never new, is left to its own first run.
+///
+/// The daemon that built a is stopped before a is removed: its look as the
+/// build ended could otherwise come late enough to find b, and be stopped
+/// halfway through recycling for it, leaving a's build directory claimed
+/// for b and no recycle event.
 #[test]
 fn the_daemon_recycles_for_a_worktree_it_finds() {
     let repo = Repo::new();
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    repo.fixture.kill_daemon();
     repo.remove_worktree("a");
     let b = repo.add_worktree("b");
 
-    repo.fixture.kill_daemon();
     let output = repo
         .heli(&repo.main(), &["ensure"])
         .output()
         .expect("run heli ensure");
     assert_success(&output, "cargo heli ensure");
-    let recycled = wait_for("the recycle event", || {
-        let recycled = repo.recycled();
-        (!recycled.is_empty()).then_some(recycled)
-    });
+    let recycled = repo.wait_for_recycling();
     let b_dir = repo.build_dir_of(&b);
     assert!(!a_dir.exists(), "a's moved");
     assert_eq!(recycled.len(), 1, "{recycled:?}");
@@ -1738,6 +1747,72 @@ fn a_build_after_the_record_makes_recycling_conservative() {
     assert_eq!(recycled[0]["mode"], "conservative", "{recycled:?}");
 }
 
+/// Dates `to` every file under `dir` (but in heli's `.heli/`) last written
+/// after `after`, in nanoseconds since 1970.
+fn redate_newer(dir: &Path, after: u128, to: std::time::SystemTime) {
+    for entry in std::fs::read_dir(dir).expect("read a directory").flatten() {
+        let path = entry.path();
+        let kind = entry.file_type().expect("a file type");
+        if kind.is_dir() {
+            if entry.file_name() != ".heli" {
+                redate_newer(&path, after, to);
+            }
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .expect("a modification time");
+        let nanos = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        if kind.is_file() && nanos > after {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(to))
+                .expect("date a file");
+        }
+    }
+}
+
+/// A build in the build directory right after the source-state record,
+/// dated before the record, as the kernel's coarse clock (a tick behind the
+/// clock heli reads) may date a write right after it, makes the record
+/// stale all the same: a record counts only if it was taken a slack after
+/// the time of each file there. Here plain cargo builds a after `leaf`
+/// changed, and what it wrote is dated a millisecond before the record.
+/// Recycling is then conservative; taken at its word, the record would keep
+/// `leaf` fresh in b, with a's change.
+#[test]
+fn a_build_dated_just_before_the_record_makes_recycling_conservative() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    let a_dir = repo.build_dir_of(&a);
+    // No daemon, which could write a record after this build.
+    repo.fixture.kill_daemon();
+    let record = std::fs::read_to_string(record_file(&a_dir)).expect("a's record");
+    let record: Value = serde_json::from_str(&record).expect("a record in JSON");
+    let taken_at = record["taken_at"].as_u64().expect("its time");
+    change(
+        &a,
+        "leaf/src/lib.rs",
+        "leaf from the commit",
+        "leaf changed in a",
+    );
+    repo.bare_cargo(&a, &["build", "--all-targets"]);
+    let before = std::time::UNIX_EPOCH + Duration::from_nanos(taken_at - 1_000_000);
+    redate_newer(&a_dir, u128::from(taken_at), before);
+    repo.remove_worktree("a");
+    let b = repo.add_worktree("b");
+
+    let (built, _) = repo.build_like_a_clean_build(&b);
+    assert_eq!(names(&built, false), CONSERVATIVE_UNITS, "{built:?}");
+    let recycled = repo.recycled();
+    assert_eq!(recycled[0]["mode"], "conservative", "{recycled:?}");
+}
+
 /// What rustc writes in its incremental caches after the record does not
 /// make the record stale: cargo decides nothing from them.
 #[test]
@@ -1777,6 +1852,81 @@ fn a_file_written_while_heli_stages_the_worktree_keeps_its_time() {
         scanned_and(&["extra (test)", "leaf", "leaf (test)", "root", "root (test)"]),
         "{built:?}"
     );
+}
+
+/// git's clean filter `later` (in Perl, which git for Windows has too), for
+/// `leaf/src/lib.rs`: it passes the file through, and the first time it
+/// runs after file `$marker` appears, it also writes the file again, right
+/// after git read it, with leaf's text changed to b's, of the same size,
+/// and dates it a whole second, one to two seconds back, as a file system
+/// that keeps whole seconds (HFS+) or two (FAT) may date a write.
+const CHANGE_AS_STAGED: &str = r#"
+my ($file, $marker) = @ARGV;
+binmode STDIN;
+binmode STDOUT;
+my $content = do { local $/; <STDIN> };
+print $content;
+if (unlink $marker) {
+    (my $changed = $content) =~ s/leaf from the commit/leaf from b's change/ or die "no leaf";
+    open my $out, '>', $file or die "$file: $!";
+    binmode $out;
+    print $out $changed;
+    close $out or die "$file: $!";
+    my $second = time() - 1;
+    utime $second, $second, $file or die "$file: $!";
+}
+"#;
+
+/// A file changed right after heli staged it, from the content the record
+/// holds to another of the same size, keeps its time even when it is dated
+/// before the staging, as a coarse file system or clock dates a write: the
+/// record's time is only for a file written a slack before. Here git's
+/// clean filter for b's `leaf/src/lib.rs` ([`CHANGE_AS_STAGED`]) changes it
+/// as heli's staging reads it. Taken as written before the staging, the
+/// file would get the recorded time, and b's build would link a's build of
+/// the commit's `leaf`; it compiles b's change instead.
+#[test]
+fn a_file_changed_right_after_staging_keeps_its_time() {
+    let repo = Repo::new();
+    let script = repo.fixture.path("change-as-staged.pl");
+    std::fs::write(&script, CHANGE_AS_STAGED).expect("write the filter");
+    let marker = repo.fixture.path("change-once");
+    let slashed = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let main = repo.main();
+    let filter = format!("perl '{}' %f '{}'", slashed(&script), slashed(&marker));
+    repo.git(&main, &["config", "filter.later.clean", &filter]);
+    let info = main.join(".git").join("info");
+    std::fs::create_dir_all(&info).expect("create .git/info");
+    std::fs::write(info.join("attributes"), "leaf/src/lib.rs filter=later\n")
+        .expect("write the attributes");
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    repo.build_dir_of(&a);
+    let b = repo.replace_worktree("a", "b");
+    // Dated otherwise than b's index says, so that git reads it again, and
+    // runs the filter, as heli stages b.
+    let lib = b.join("leaf").join("src").join("lib.rs");
+    std::fs::File::options()
+        .write(true)
+        .open(&lib)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .expect("date b's leaf now");
+    std::fs::write(&marker, "").expect("arm the filter");
+
+    let output = repo.build_output(&b);
+    assert!(
+        !marker.exists(),
+        "the filter changed b's leaf as heli staged it"
+    );
+    assert_eq!(
+        leaf_says(&output.stdout, &b),
+        "leaf: leaf from b's change over root from the commit",
+        "{}",
+        repo.diagnosis(&lib)
+    );
+    let recycled = repo.recycled();
+    assert_eq!(recycled.len(), 1, "{recycled:?}");
+    assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
 }
 
 /// git's blob id is of the content after its filters, so a file whose line
@@ -2061,10 +2211,7 @@ fn the_look_recycles_precisely_for_an_older_worktree_without_the_donors_code() {
         .output()
         .expect("run heli ensure");
     assert_success(&ensure, "cargo heli ensure");
-    let recycled = wait_for("the recycle event", || {
-        let recycled = repo.recycled();
-        (!recycled.is_empty()).then_some(recycled)
-    });
+    let recycled = repo.wait_for_recycling();
     assert_eq!(recycled[0]["trigger"], "look", "{recycled:?}");
     assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
     let b_dir = repo.build_dir_of(&b);
@@ -2172,6 +2319,41 @@ impl Repo {
             self.recycled(),
             self.fixture.daemon_log()
         )
+    }
+
+    /// What a failing recycling test shows of the store: each build
+    /// directory with its owner manifest, the recycle events and the
+    /// daemon's log.
+    fn store_diagnosis(&self) -> String {
+        let mut text = String::from("--- the store's build directories\n");
+        for dir in build_dirs(&self.store) {
+            let owner =
+                owner(&dir).map_or_else(|| "no owner".to_owned(), |owner| owner.to_string());
+            text.push_str(&format!("{} {owner}\n", dir.display()));
+        }
+        format!(
+            "{text}--- recycle events\n{:?}\n--- the daemon's log\n{}",
+            self.recycled(),
+            self.fixture.daemon_log()
+        )
+    }
+
+    /// The recycle events, once there is one; panics after 60 s with what
+    /// the store holds.
+    fn wait_for_recycling(&self) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let recycled = self.recycled();
+            if !recycled.is_empty() {
+                return recycled;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the recycle event\n{}",
+                self.store_diagnosis()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

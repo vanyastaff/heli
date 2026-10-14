@@ -33,8 +33,9 @@
 //! 4. What cargo would find: when the donor was last built in
 //!    (`crate::store::record::last_build`), and its source-state record if
 //!    it counts (taken after that build). The new worktree is staged
-//!    (`crate::store::record::stage`); a worktree git cannot stage gets
-//!    nothing. Without a record, recycling is **conservative**, and only
+//!    (`crate::store::record::stage`; with a record, once no file of it may
+//!    have been written after the staging began, which in a worktree just
+//!    made takes a moment); a worktree git cannot stage gets nothing. Without a record, recycling is **conservative**, and only
 //!    for a worktree whose every file is newer than that build, as in a
 //!    worktree just made: cargo then rebuilds every unit built from them.
 //!    Otherwise (a worktree older than the build) the next orphan is tried:
@@ -50,7 +51,8 @@
 //! 7. The owner manifest names the new workspace again, in case another
 //!    recycler claimed the donor too, after this one.
 //! 8. **Precise** recycling, with a record: each file of the new worktree
-//!    with the content the record holds gets the recorded time, so that
+//!    with the content the record holds, written before the staging, gets
+//!    the recorded time, so that
 //!    cargo finds fresh what it found fresh in the donor, and each other
 //!    file last written at the donor's last build or before gets the time
 //!    now, so that cargo rebuilds what was built from another content
@@ -183,20 +185,21 @@ pub fn claim(
             }
         };
         // What cargo would find, read before the scan changes the directory.
-        let Ok(newest) = record::last_build(&donor.path) else {
+        let Ok(last) = record::last_build(&donor.path) else {
             failure = Some(format!(
                 "cannot tell when {} was last built in",
                 donor.path.display()
             ));
             continue;
         };
-        let record = record::valid_after(&donor.path, newest);
-        let files = record::stage(&worktree, probe, &donor.path.join(".heli"))
+        let record = record::valid_after(&donor.path, last);
+        let scratch = donor.path.join(".heli");
+        let files = record::stage(&worktree, probe, &scratch, record.is_some())
             .map_err(|error| format!("cannot stage {}: {error}", worktree.display()))?;
         // Without a record, the worktree's files must be newer than every
         // artifact already (as in a worktree just made): nothing tells
         // which of them the donor built from the same content.
-        if record.is_none() && !files.newer_than(&worktree, newest) {
+        if record.is_none() && !files.newer_than(&worktree, last.newest) {
             continue;
         }
         let old = [claimed.donor().workspace.clone(), donor.path.clone()];
@@ -232,7 +235,7 @@ pub fn claim(
             ));
         }
         let restored = record.map(|record| {
-            let settled = files.settle(&worktree, &record, newest);
+            let settled = files.settle(&worktree, &record, last.newest);
             if settled.failed > 0 {
                 // Some file still looks older than what was built from
                 // another content: cargo rebuilds every unit instead.

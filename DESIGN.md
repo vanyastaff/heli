@@ -314,10 +314,14 @@ its own, as without heli.
   `cargo heli daemon --warden`, a process of its own (its own process group,
   no stdio but the read end of a pipe whose write end only the daemon
   holds). However the daemon ends (it retires, is killed, crashes), the
-  warden reads the end of the pipe. It then removes the FIFO as soon as no
-  process holds it (the `ENXIO` probe above), looking again every 250 ms
-  while one does: a cargo still building keeps the pool alive, as it would
-  keep a semaphore.
+  warden reads the end of the pipe. That end comes as the kernel closes the
+  dying daemon's files one by one, when the pool's lock (below) may still be
+  held, as by a daemon that owns the pool; so the warden first waits (at
+  most 5 s) until the daemon, whose process id it is given, is no longer its
+  parent: the process is gone then, with every file it held. It then
+  removes the FIFO as soon as no process holds it (the `ENXIO` probe above),
+  looking again every 250 ms while one does: a cargo still building keeps
+  the pool alive, as it would keep a semaphore.
 - **The pool's lock**, `<fifo>.lock`, keeps a warden from removing a FIFO
   that a daemon owns. A daemon takes it before it opens the FIFO and holds
   it for life (it waits up to 1 s for it, since a warden holds it for a
@@ -1521,31 +1525,49 @@ worktree git cannot stage gets no recycled directory.
   builds cold. The cost of the `OUT_DIR` invalidations is to be measured.
 - **Precise.** The donor has a *source-state record*: the blob id, size and
   mtime of every tracked or untracked file.
+  - **File times and the clock.** A file's mtime can be earlier than the
+    moment, by the clock heli reads, at which it was written: the kernel
+    dates a write by a coarse clock, up to a tick (some milliseconds)
+    behind, and a file system keeps what its format holds, whole seconds on
+    HFS+ and two on FAT. So wherever heli compares a file's mtime with the
+    clock, it takes the file as written as late as its mtime plus a
+    *slack*: 50 ms for an mtime with a fraction of a second, which comes
+    from a file system that keeps fractions (10 ms or finer), and 2.05 s
+    for a whole second, which may come from one that keeps whole seconds or
+    two. A file changed right after heli's staging read it (below), to
+    content of the same size, may be dated before the staging all the same;
+    without the slack it would get the recorded mtime, and cargo would link
+    the donor's build of the old content.
   - The record counts only if it was taken after the donor's last build: its
-    time is at least the newest mtime of a file in the build directory,
-    leaving out heli's own `.heli/` and rustc's `incremental/` caches, which
-    no freshness decision reads (a build that changes what cargo decides
-    writes a fingerprint). Otherwise heli ignores it. It is read before the
-    path scan, which changes the directory.
+    time is no earlier than the mtime of each file in the build directory
+    plus its slack, leaving out heli's own `.heli/` and rustc's
+    `incremental/` caches, which no freshness decision reads (a build that
+    changes what cargo decides writes a fingerprint). Otherwise heli ignores
+    it. It is read before the path scan, which changes the directory.
   - For each file in the new worktree whose blob and size match the record,
-    heli sets the recorded mtime. Every other file last written at the
-    donor's last build or before gets the time now (a worktree made before
-    that build has such files); any other keeps its time, newer than every
-    artifact already. The size counts because a blob id is of the content
-    after git's filters: two files that differ only in line endings share
-    one, and `include_str!` compiles in bytes. Should a file not get its
-    newer time, heli deletes the fingerprint of every unit, and cargo
-    rebuilds them all.
+    heli sets the recorded mtime, if the file was written before heli began
+    to stage the worktree: its mtime plus its slack is no later. So that a
+    worktree just made gets the recorded mtimes, heli stages it again, once,
+    when some file may have been written after the staging began, after
+    waiting until none may have been (at most 2.05 s; a file dated later
+    than that is not waited for). Every other file last written at the
+    donor's last build or before gets the time now, and at least its slack
+    after that build, so that a time cut to whole seconds stays after it (a
+    worktree made before that build has such files); any other keeps its
+    time, newer than every artifact already. The size counts because a blob
+    id is of the content after git's filters: two files that differ only in
+    line endings share one, and `include_str!` compiles in bytes. Should a
+    file not get its newer time, heli deletes the fingerprint of every unit,
+    and cargo rebuilds them all.
   - Every file with the donor's content then looks to cargo exactly as it did
     in the donor, and every changed file is newer than any artifact. Only the
     changed crates, their dependents and the units the scan invalidated
     rebuild.
   - Only the recycler whose rename succeeded sets times, with the record of
     the directory it moved, after the owner manifest names the new
-    workspace. It sets a file's time only if the file was last written
-    before heli staged the new worktree, through a handle that on Windows
-    lets nobody write to the file meanwhile: a file an agent writes while
-    heli looks keeps its time.
+    workspace. It sets a file's time through a handle that on Windows lets
+    nobody write to the file meanwhile: a file an agent writes while heli
+    looks keeps its time.
   - The daemon writes a record after every run it executes, before the
     run's clients hear its end, so that a worktree removed right after its
     last run leaves one; and when it sees a build lock released: held at one
@@ -1553,7 +1575,10 @@ worktree git cannot stage gets no recycled directory.
     there will write one as it ends, or the record still counts. Never while
     one of cargo's locks in the build directory is held, and not for a build
     the daemon did not see. A run the client executes without a daemon
-    writes none.
+    writes none. Before taking its time, the daemon waits until each file of
+    the build directory is a slack old (at most 2.05 s, and 50 ms on a file
+    system that keeps fractions of a second), so that the record of the
+    build that just ended counts.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
     recorded, and neither mode looks at them. Cargo rebuilds when one is
     missing; one that is present triggers a rebuild when it was written
@@ -1567,7 +1592,8 @@ worktree git cannot stage gets no recycled directory.
   whole: `{"taken_at":…,"files":{"<path>":{"blob":…,"size":…,"mtime":…}}}`,
   each path from the top of the worktree as git writes it, times in
   nanoseconds since 1970. `taken_at` is read before anything else, so a
-  build that starts meanwhile makes the record stale. The blob ids come from
+  build that starts meanwhile makes the record stale, its files dated at
+  most a slack before `taken_at`. The blob ids come from
   the result store's snapshot (§7): `git add -A` into a scratch copy of the
   index, then `git ls-files --stage`; sizes and mtimes are read afterwards,
   so a file changed in between looks newer, never older. Symbolic links and
