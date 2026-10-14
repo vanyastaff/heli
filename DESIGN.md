@@ -1503,8 +1503,10 @@ was found by a failing test.
   toolchain answers. A missing tool is keyed as absent.
 - **Cargo configuration.** The content of every `config.toml` and `config` on
   cargo's discovery path: `.cargo/` in the working directory and every
-  directory above it, then the Cargo home. They are keyed in the order cargo
-  reads them, not by path, so worktrees in different places can share a key.
+  directory above it, then the Cargo home (a relative `CARGO_HOME` against
+  the working directory). They are keyed in the order cargo reads them, not
+  by path, so worktrees in different places can share a key. A file that is
+  there but cannot be read is keyed by its error, never as absent.
 - **Argv**, normalized: without the program, which the toolchain stands for,
   and with the working directory relative to the worktree, which selects
   packages and configuration as an argument would. The worktree's own path is
@@ -1513,7 +1515,9 @@ was found by a failing test.
   - Names are case-folded on Windows only.
   - `PATH`, `LD_LIBRARY_PATH` and the `DYLD_*` search paths are keyed without
     their entries inside the worktree, which cargo prepends for the programs
-    it runs; one left without entries counts as unset.
+    it runs; one left without entries counts as unset. An entry is compared
+    with the worktree on Windows without case and with `\` read as `/`;
+    elsewhere `\` is part of a name.
   - Neutral, and so not keyed:
     - job and thread counts holding a value the tool accepts (an invalid one
       fails the run, so it is keyed);
@@ -1538,10 +1542,11 @@ as a run: it takes no run id; a miss goes on to single-flight with that key
 (§5, step 3). The key is computed afresh after a wait, since the runs waited
 for may have changed the tree. A run that waited for nothing keeps the key
 of the first check, taken a moment before, so its clients from other
-worktrees attached to the tree it runs on. That snapshot of the tree, taken
-before the steps, is compared with one taken after them, so a change in
-between counts as one during the run. A marker is written only
-when the run passed and both snapshots match. A run that fails drops the
+worktrees attached to the tree it runs on. After the steps the whole key is
+computed again, every input read anew, and compared with the one taken
+before them, so a change in between (to the tree, the Cargo configuration
+or the toolchain) counts as one during the run. A marker is written only
+when the run passed and both keys match. A run that fails drops the
 marker of its key, so a flaky pass is reused only until a run of the same key
 fails.
 
