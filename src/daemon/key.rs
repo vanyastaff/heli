@@ -22,6 +22,7 @@
 //! - the environment ([`environment`]): every variable but the neutral ones.
 
 use std::ffi::{OsStr, OsString};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -222,7 +223,8 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
 /// order cargo reads it: `.cargo/config.toml` and `.cargo/config` in the
 /// working directory and every directory above it, nearest first, then in
 /// the Cargo home. Their paths are not keyed, so worktrees in different
-/// places share a key.
+/// places share a key. A file that is there but cannot be read is keyed by
+/// its error, never as absent: cargo may fail on it.
 fn cargo_config(request: &RunRequest, fields: &mut Fields) {
     let cwd = execute::cwd(request);
     let dirs = cwd
@@ -231,8 +233,17 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
         .chain(cargo_home(request, &cwd).map(|home| ("cargo-home-config", home)));
     for (place, dir) in dirs {
         for file in ["config.toml", "config"] {
-            if let Ok(content) = std::fs::read(dir.join(file)) {
-                fields.push(format!("{place} {file}").as_bytes(), &content);
+            match std::fs::read(dir.join(file)) {
+                Ok(content) => fields.push(format!("{place} {file}").as_bytes(), &content),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(error) => fields.push(
+                    format!("unreadable {place} {file}").as_bytes(),
+                    format!("{:?} {:?}", error.kind(), error.raw_os_error()).as_bytes(),
+                ),
             }
         }
     }
@@ -305,12 +316,19 @@ fn outside(value: &OsStr, worktree: &Path) -> Vec<u8> {
 }
 
 /// `path` for comparing places: `/` as the separator, no trailing one, and
-/// on Windows without case.
+/// on Windows, where `\` separates too, without case. Elsewhere `\` is a
+/// character of a name like any other.
 fn spelled(path: &OsStr) -> Vec<u8> {
     let mut bytes: Vec<u8> = path
         .as_encoded_bytes()
         .iter()
-        .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+        .map(|&byte| {
+            if cfg!(windows) && byte == b'\\' {
+                b'/'
+            } else {
+                byte
+            }
+        })
         .collect();
     while bytes.len() > 1 && bytes.last() == Some(&b'/') {
         bytes.pop();

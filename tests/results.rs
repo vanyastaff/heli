@@ -1076,3 +1076,100 @@ fn a_run_whose_tree_changed_is_not_recorded() {
         "the tree it started on"
     );
 }
+
+/// A Cargo configuration file that exists but cannot be read (here a
+/// directory in its place) is keyed by its error, never as an absent file:
+/// a run that cannot read it may fail, so it never shares a verdict with
+/// one that has no such file.
+#[test]
+fn an_unreadable_cargo_configuration_is_keyed_by_its_error() {
+    let verifier = Verifier::new();
+    assert_each_misses(
+        &verifier,
+        &[Change {
+            name: "an unreadable configuration in the Cargo home",
+            apply: |verifier| {
+                std::fs::create_dir_all(verifier.cargo_home().join("config.toml"))
+                    .expect("create a directory in its place");
+                verifier.check()
+            },
+            revert: |verifier| {
+                std::fs::remove_dir(verifier.cargo_home().join("config.toml")).expect("remove");
+            },
+        }],
+    );
+}
+
+/// `\` separates the components of a search path's entries on Windows only:
+/// elsewhere `<worktree>\bin` is a directory beside the worktree, and keyed.
+#[test]
+fn a_backslash_separates_paths_on_windows_only() {
+    let verifier = Verifier::new();
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+    let workspace = if cfg!(unix) {
+        std::fs::canonicalize(verifier.fixture.workspace()).expect("the workspace")
+    } else {
+        verifier.fixture.workspace()
+    };
+    let mut entry = workspace.into_os_string();
+    entry.push("\\bin");
+    let expected = if cfg!(windows) {
+        Outcome::Hit
+    } else {
+        Outcome::Ran
+    };
+    assert_eq!(
+        outcome(verifier.check().env("PATH", verifier.path_with(entry))),
+        expected
+    );
+}
+
+/// A run whose inputs other than the tree changed while it ran (here the
+/// Cargo configuration) is not recorded: after the run its whole key is
+/// computed again, and a pass is recorded only under an unchanged key.
+#[test]
+fn a_run_whose_configuration_changed_is_not_recorded() {
+    use std::io::BufRead;
+
+    let verifier = Verifier::new();
+    let gate = verifier.fixture.path("gate");
+    let check = || {
+        let mut command = verifier.check();
+        command.env("ECHO_WAIT_FOR", &gate);
+        command
+    };
+    let mut call = check()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start heli");
+    let stdout = call.stdout.take().expect("a stdout");
+    let (started, running) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if line.is_ok_and(|line| line == "arg: \"check\"") {
+                let _ = started.send(());
+            }
+        }
+    });
+    running
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("the run started");
+    let config = verifier.cargo_home().join("config.toml");
+    std::fs::write(&config, "[build]\nincremental = false\n").expect("write");
+    std::fs::write(&gate, "").expect("open the gate");
+    let output = call.wait_with_output().expect("wait for heli");
+    assert_success(&output, "the run");
+    assert!(
+        text(&output.stderr).contains("changed during the run"),
+        "{}",
+        text(&output.stderr)
+    );
+
+    std::fs::remove_file(&config).expect("restore");
+    assert_eq!(
+        outcome(&mut check()),
+        Outcome::Ran,
+        "the configuration it started with"
+    );
+}

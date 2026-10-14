@@ -165,9 +165,11 @@ impl Store {
     }
 
     /// After run `run` of `request`, keyed `key`, ended: records it when it
-    /// `passed` on the tree it started on. A run that failed drops the pass
-    /// recorded for its key, which a flaky run may have left. Returns a note
-    /// when it passed but is not recorded.
+    /// `passed` with the inputs it started with, its key computed again
+    /// (the tree, and the configuration and toolchain it read, may have
+    /// changed meanwhile). A run that failed drops the pass recorded for
+    /// its key, which a flaky run may have left. Returns a note when it
+    /// passed but is not recorded.
     pub fn after(
         &self,
         request: &RunRequest,
@@ -179,16 +181,21 @@ impl Store {
             let _ = std::fs::remove_file(self.marker(key));
             return None;
         }
-        match key::snapshot(request, &self.scratch) {
-            Ok(now) if now == key.snapshot => {}
-            Ok(_) => {
+        match key::compute(request, &self.scratch) {
+            Ok(Some(now)) if now.snapshot != key.snapshot => {
                 return Some(
                     "the worktree changed during the run, so it is not recorded".to_owned(),
                 );
             }
+            Ok(Some(now)) if now.digest == key.digest => {}
+            Ok(_) => {
+                return Some(
+                    "the run's inputs changed during the run, so it is not recorded".to_owned(),
+                );
+            }
             Err(error) => {
                 return Some(format!(
-                    "cannot snapshot the worktree, so the run is not recorded: {error}"
+                    "cannot key the run again, so it is not recorded: {error}"
                 ));
             }
         }
