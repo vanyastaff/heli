@@ -404,12 +404,13 @@ impl Daemon {
             run: run.id.to_string(),
             attached: Some(u64::try_from(run.running_for.as_millis()).unwrap_or(u64::MAX)),
             keyed_in: run.keyed_in.map(|worktree| Text(worktree.into_os_string())),
+            spawned_follows: request.reads_spawned,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.detach(run.id);
             return;
         }
-        self.follow(run.id, &run.live, stream, request.class.is_some());
+        self.follow(run.id, &run.live, stream, reads(request));
     }
 
     /// Starts run `id` of `request` in `worktree`, and follows it for the
@@ -430,11 +431,14 @@ impl Daemon {
         });
         self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
-        // never hears of it runs the command itself.
+        // never hears of it runs the command itself. One that reads it also
+        // hears when the command has started (`Spawned`), after the waits
+        // below; until then, it too may run the command itself.
         let started = Reply::Started {
             run: id.to_string(),
             attached: None,
             keyed_in: None,
+            spawned_follows: request.reads_spawned,
         };
         if protocol::write_message(&mut stream, &started).is_err() {
             self.registry.abandon(id);
@@ -449,7 +453,7 @@ impl Daemon {
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
             scope.spawn(|| self.execute(id, request, &live, known, learning.as_ref()));
-            self.follow(id, &live, stream, request.class.is_some());
+            self.follow(id, &live, stream, reads(request));
         });
     }
 
@@ -568,6 +572,8 @@ impl Daemon {
                 }
             })?;
         let tree = Arc::new(tree);
+        // From here on its clients never run the command themselves.
+        run.live.spawned();
         if !self.registry.run(run.id, Arc::clone(&tree))
             && let Err(error) = tree.kill()
         {
@@ -623,10 +629,10 @@ impl Daemon {
     }
 
     /// Sends run `id`'s output to the client on `stream`, from its first
-    /// byte, until the run ends or the client goes away; a client that
-    /// `can_wait` also hears what the run waits for.
-    fn follow(&self, id: RunId, live: &Live, mut stream: Stream, can_wait: bool) {
-        live::follow(live, &mut stream, can_wait);
+    /// byte, until the run ends or the client goes away; the client also
+    /// hears what it `reads` of the run's waits and start.
+    fn follow(&self, id: RunId, live: &Live, mut stream: Stream, reads: live::Reads) {
+        live::follow(live, &mut stream, reads);
         drop(stream);
         self.registry.detach(id);
     }
@@ -760,6 +766,16 @@ fn loans_event(id: RunId, loans: &Loans) -> serde_json::Value {
         "wait_median_ms": median,
         "wait_longest_ms": longest,
     })
+}
+
+/// What the client of `request` reads besides a run's output and end: what
+/// the run waits for, if it knows run classes (a client older than them
+/// sends none), and when its command started, if it says so.
+fn reads(request: &RunRequest) -> live::Reads {
+    live::Reads {
+        waiting: request.class.is_some(),
+        spawned: request.reads_spawned,
+    }
 }
 
 /// Whether `request` comes from inside another heli run: its client runs

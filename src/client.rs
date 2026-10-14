@@ -26,9 +26,13 @@
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
 //!   directly (`crate::direct`), as the user gave it, with its output
-//!   untouched: a failure of heli never fails a run. Once
-//!   the daemon has said the run started, there is no fallback: the command
-//!   may already have run, so losing the daemon is an error (exit 1).
+//!   untouched: a failure of heli never fails a run. That holds while the
+//!   run waits too (for its worktree's lock, or for recycling): a daemon
+//!   lost before it says the command has started (`Spawned`) means a direct
+//!   run, after one warning. Once the command has started (or, with a
+//!   daemon older than `Spawned`, once the run is accepted), there is no
+//!   fallback: the command may already have run, so losing the daemon is an
+//!   error (exit 1).
 //! - **Status.** Ask the daemon, or report that none runs; never start one.
 //! - **Ensure.** Reach the daemon, starting it if need be, and nothing else.
 //! - **Cancel.** Ask the daemon to kill a run's process tree; without a
@@ -365,6 +369,7 @@ fn submit(
             .collect(),
         class: Some(invocation.class),
         cache: invocation.cache,
+        reads_spawned: true,
     };
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
@@ -373,6 +378,7 @@ fn submit(
             run,
             attached,
             keyed_in,
+            spawned_follows,
         }) => {
             let mut printer = plan.printer();
             let mut started = Instant::now();
@@ -381,7 +387,10 @@ fn submit(
                 started = started.checked_sub(running_for).unwrap_or(started);
                 printer.note(&attached_notice(&run, running_for, keyed_in.as_ref()));
             }
-            follow(stream, invocation, &run, started, printer)
+            // A daemon older than `Spawned` may start the command any time
+            // after `Started`.
+            let spawned = !spawned_follows;
+            follow(stream, invocation, &run, started, printer, spawned)
         }
         Ok(Reply::Passed { run, worktree, at }) => already_passed(&run, &worktree, at),
         Ok(Reply::Refused { reason }) => Err(reason),
@@ -412,22 +421,34 @@ fn attached_notice(run: &str, running_for: Duration, keyed_in: Option<&Text>) ->
 
 /// Prints run `run`'s output through `printer` as it arrives, then the
 /// closing line, and exits as the run did; it started at `started`.
+/// `spawned` says whether its command may have started already; until it
+/// may (the daemon says `Spawned`), losing the daemon returns the reason to
+/// run the command directly.
 fn follow(
     mut stream: Stream,
     invocation: &Invocation,
     run: &str,
     started: Instant,
     mut printer: Printer,
-) -> ! {
+    mut spawned: bool,
+) -> Result<Infallible, String> {
     loop {
-        match protocol::read_frame::<Reply>(&mut stream) {
-            Ok(Frame::Output(channel, bytes)) => printer.output(channel, &bytes),
+        let failure = match protocol::read_frame::<Reply>(&mut stream) {
+            Ok(Frame::Output(channel, bytes)) => {
+                printer.output(channel, &bytes);
+                continue;
+            }
             Ok(Frame::Message(Reply::Waiting { runs })) => {
                 printer.note(&format!("cargo-heli: {}", waiting_for(&runs)));
+                continue;
+            }
+            Ok(Frame::Message(Reply::Spawned)) => {
+                spawned = true;
+                continue;
             }
             // A newer daemon's word about the run, which this client cannot
             // read: the run goes on all the same.
-            Ok(Frame::Message(Reply::Unknown(_))) => {}
+            Ok(Frame::Message(Reply::Unknown(_))) => continue,
             Ok(Frame::Message(Reply::Exited {
                 code,
                 signal,
@@ -452,11 +473,17 @@ fn follow(
                 drop(printer);
                 already_passed(&passed, &worktree, at)
             }
-            Ok(Frame::Message(other)) => {
-                lost(run, &format!("unexpected message {other:?}"), printer)
-            }
-            Err(error) => lost(run, &error.to_string(), printer),
+            Ok(Frame::Message(other)) => format!("unexpected message {other:?}"),
+            Err(error) => error.to_string(),
+        };
+        if spawned {
+            lost(run, &failure, printer)
         }
+        // The command never started: running it is no second run.
+        printer.abandon(run);
+        return Err(format!(
+            "lost the heli daemon before {run} started: {failure}"
+        ));
     }
 }
 

@@ -20,10 +20,13 @@
 //! - [`Request::Status`]: one [`Reply::Status`].
 //! - [`Request::Run`]: [`Reply::Refused`] (the client then runs the command
 //!   itself), or [`Reply::Started`], then [`Reply::Waiting`] if the run
-//!   has to wait for its worktree's lock, then output frames in the order
-//!   the run wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`].
-//!   The daemon sends `Started` before it starts anything, so a client that
-//!   never sees it can safely run the command itself. Either before
+//!   has to wait for its worktree's lock, then [`Reply::Spawned`] once its
+//!   command has started (to a client that reads it, and then `Started`
+//!   says it follows), then output frames in the order the run wrote them,
+//!   then [`Reply::Exited`] or [`Reply::SpawnFailed`]. The daemon sends
+//!   `Started` before it starts anything, so a client that never sees it can
+//!   safely run the command itself, and so can one told that `Spawned`
+//!   follows, until it sees that. Either before
 //!   `Started` or in place of the output, [`Reply::Passed`] ends the run
 //!   without starting it: the result store holds a pass for its key. A
 //!   client that sends no [`RunRequest::class`] predates the worktree lock
@@ -151,6 +154,10 @@ pub struct RunRequest {
     /// no result store.
     #[serde(default)]
     pub cache: Cache,
+    /// The client reads [`Reply::Spawned`]; absent (false) from a client
+    /// older than it, which is never sent one.
+    #[serde(default)]
+    pub reads_spawned: bool,
 }
 
 /// How a run uses the result store (`crate::daemon::results`).
@@ -183,12 +190,22 @@ pub enum Reply {
         /// than the client's.
         #[serde(default)]
         keyed_in: Option<Text>,
+        /// [`Reply::Spawned`] will say when the run's command has started:
+        /// until then, a client that loses the daemon may run the command
+        /// itself. Absent (false) from a daemon older than `Spawned`, and
+        /// for a client that does not read it.
+        #[serde(default)]
+        spawned_follows: bool,
     },
     /// The run waits for these runs, which use its worktree, before it
     /// starts (the worktree lock).
     Waiting {
         runs: Vec<status::Run>,
     },
+    /// The run's command has started (the first process of its first
+    /// phase): from here on its client never runs it itself. Sent only to a
+    /// client whose request [`RunRequest::reads_spawned`].
+    Spawned,
     /// The daemon takes no runs (it is retiring); nothing was started.
     Refused {
         reason: String,

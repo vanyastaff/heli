@@ -57,6 +57,8 @@ enum Item {
     Kept(Channel, Vec<u8>),
     /// The runs the run waits for, before it starts.
     Waiting(Vec<status::Run>),
+    /// The run's command has started.
+    Spawned,
 }
 
 impl Item {
@@ -64,7 +66,7 @@ impl Item {
     fn len(&self) -> u64 {
         match self {
             Self::Recorded(count) => *count,
-            Self::Kept(..) | Self::Waiting(_) => 1,
+            Self::Kept(..) | Self::Waiting(_) | Self::Spawned => 1,
         }
     }
 }
@@ -101,6 +103,20 @@ impl Live {
     /// Adds the runs the run waits for before it starts.
     pub fn waiting(&self, runs: Vec<status::Run>) {
         self.push(Item::Waiting(runs));
+    }
+
+    /// Adds that the run's command has started, once: a later phase's start
+    /// adds nothing.
+    pub fn spawned(&self) {
+        let mut journal = self.journal();
+        if !journal
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Spawned))
+        {
+            journal.items.push(Item::Spawned);
+            self.changed.notify_all();
+        }
     }
 
     /// Ends the run for its clients with `reply`, after all of the above.
@@ -149,11 +165,21 @@ impl Live {
     }
 }
 
+/// What a client following a run reads besides its output and its end.
+#[derive(Debug, Clone, Copy)]
+pub struct Reads {
+    /// What the run waits for ([`Reply::Waiting`]): a client that knows run
+    /// classes.
+    pub waiting: bool,
+    /// That the run's command started ([`Reply::Spawned`]).
+    pub spawned: bool,
+}
+
 /// Sends `client` the run's output from its first byte, then the rest as
 /// it comes, then the run's end; returns early when the client goes away,
-/// or the record cannot be read back. A client that `can_wait` (one that
-/// knows run classes) is also told what the run waits for.
-pub fn follow(live: &Live, client: &mut Stream, can_wait: bool) {
+/// or the record cannot be read back. A client is also told what the run
+/// waits for, and when its command started, as far as it `reads` them.
+pub fn follow(live: &Live, client: &mut Stream, reads: Reads) {
     let mut record: Option<Events> = None;
     // Events read from the record, and things sent (or skipped).
     let mut read = 0;
@@ -186,9 +212,15 @@ pub fn follow(live: &Live, client: &mut Stream, can_wait: bool) {
                     sent += 1;
                 }
                 Item::Waiting(runs) => {
-                    if can_wait
+                    if reads.waiting
                         && protocol::write_message(client, &Reply::Waiting { runs }).is_err()
                     {
+                        return;
+                    }
+                    sent += 1;
+                }
+                Item::Spawned => {
+                    if reads.spawned && protocol::write_message(client, &Reply::Spawned).is_err() {
                         return;
                     }
                     sent += 1;

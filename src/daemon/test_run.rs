@@ -181,6 +181,7 @@ impl TestRun {
             env,
             class: request.class,
             cache: request.cache,
+            reads_spawned: request.reads_spawned,
         })
     }
 

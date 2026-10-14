@@ -208,9 +208,16 @@ stderr stream back to the client through the run's record, and the client
 exits with the run's code (on Unix, of its signal). The run belongs to the
 daemon: a client that goes away does not stop it. A run is over when its
 process exits: output still arriving within 500 ms is forwarded, and
-processes it left behind holding its pipes do not hold the client. Once the
-daemon has told the client that the run started, the client never runs the
-command itself: if the daemon is lost mid-run, it exits 1.
+processes it left behind holding its pipes do not hold the client. The
+daemon tells the client when it accepts the run, and again when the run's
+command has started (its first process, after any wait for the worktree
+lock or for recycling, §5): a client that loses the daemon in between runs
+the command itself, after one warning line, since the command never
+started. Once the daemon has said the command started, the client never
+runs it itself: if the daemon is lost then, it exits 1. A client asks for
+the second message in its run request (protocol version 1 still), and a
+daemon older than it says in its first that none follows: with one, the
+run counts as started once accepted, as before.
 
 ## 4. Host pool
 
@@ -793,8 +800,8 @@ cargo heli recycle                                 (internal: the post-checkout 
     (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. For `log`, also a
     run id that is not `r<number>` (or a bare number), a bad regular
     expression, or two selectors at once.
-  - 1 when the daemon is lost during a run (§3), and when `log` has no
-    record of the run or cannot read it.
+  - 1 when the daemon is lost once a run's command has started (§3), and
+    when `log` has no record of the run or cannot read it.
   - For `cancel`: 0 once the run's processes are gone; 1 when the run is
     not in flight (it ended, or never was), when no daemon runs (`cancel`
     starts none), or when the daemon cannot cancel it (too old: it is asked
@@ -1705,7 +1712,8 @@ the one before, and the next event starts a new file.
 | Daemon not running | A bare cargo warns and uses its own pool, as today | The pool goes with its daemon once nobody holds it: a semaphore by itself, a FIFO through the daemon's warden (§4, Lifetime). `cargo heli` or `cargo heli ensure` starts the daemon; logon task or session hook |
 | Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
-| Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
+| Daemon lost while a run waits (worktree lock, recycling) | The command never started | The client runs it directly, after one warning (§3) |
+| Daemon lost once a run's command started | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
 | A client is killed, or stops reading, during a run | none | The run goes on and its record is complete; `status` lists it as done if no client heard its end; the same command attaches to it while it runs (§5) |
 | Two daemons on one state directory (Windows logon sessions) | They could give the same run id, and write one record over another | Ids come from the state directory's counter under a lock, above every record (§5) |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
