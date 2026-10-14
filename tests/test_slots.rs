@@ -422,7 +422,11 @@ fn a_test_run_shows_its_build_and_stops_when_it_fails() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("start heli");
-    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    // A run is admitted as `running` and becomes `building` once its build
+    // phase starts; the gated build cannot get past `building` meanwhile.
+    let status = fixture.wait_for_status("the run building", |status| {
+        runs(status).len() == 1 && only_run(status)["phase"] == "building"
+    });
     assert_eq!(only_run(&status)["phase"], "building", "{status}");
     std::fs::write(&gate, "").expect("open the gate");
     let output = building.wait_with_output().expect("wait for heli");
