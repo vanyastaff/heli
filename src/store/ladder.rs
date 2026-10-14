@@ -236,7 +236,10 @@ fn measure_root(dir: &Dir) -> Measure {
         }
     }
     if total.newest.is_none() {
-        total.newest = measure(&dir.path).newest;
+        total.newest = std::fs::symlink_metadata(&dir.path)
+            .ok()
+            .as_ref()
+            .and_then(modified);
     }
     total
 }

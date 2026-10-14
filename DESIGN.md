@@ -717,7 +717,7 @@ cargo heli exec [heli flags] -- <command…>
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
 cargo heli cancel <run>
-cargo heli gc [--dry-run [--json]]
+cargo heli gc [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli daemon [--detach | --warden]            (internal)
@@ -756,12 +756,14 @@ cargo heli daemon [--detach | --warden]            (internal)
   - memory watermarks (`[memory] low_watermark_mb`, `high_watermark_mb`,
     §4);
   - the event log's size (`[event_log] max_kb`, §8);
-  - disk budget and free-space floor;
+  - disk budget and free-space floor (`[store] budget_mb` and `floor_mb`,
+    in megabytes of 2^20 bytes; no default, §6.3);
   - the store per volume (`[store] paths`: absolute paths; on each volume
     the first one there serves it, §6.1);
   - tool-cache patterns (`[store] tool_caches`: paths below `target/`, `/`
     between components, `*` and `?` within one; §6.2, §6.3);
-  - eviction ages;
+  - eviction ages, in hours (`[store] unit_hours`, default 24;
+    `orphan_hours`, 24; `idle_hours`, 6; `dir_hours`, 168; §6.3);
   - the default output mode (`[output] mode`, "Output" below; the client
     reads it too, and ignores a file it cannot use);
   - log retention (`[log] runs`, the records kept, default 200, and
@@ -769,9 +771,11 @@ cargo heli daemon [--detach | --warden]            (internal)
     below).
 
   Debug builds also read a `[test]` table, the one seam tests have into the
-  daemon: memory figures (`[test.memory]`) and a clock for the memory
-  governor (`clock_ms`), read again at each of its looks. Release builds
-  ignore it.
+  daemon: memory figures (`[test.memory]`) and a clock (`clock_ms`,
+  milliseconds since 1970), read again at each look of the memory governor,
+  which counts only the time between its readings, and of the eviction
+  ladder, for which it is the time now (§6.3; `gc` reads it too). Release
+  builds ignore it.
 
 ### Output (G7)
 
@@ -1061,46 +1065,109 @@ A build directory without a manifest, which only bare cargo has built in, is
 have the same states, from the same locks and their registered workspace.
 
 `cargo heli gc --dry-run` lists every directory, build and target, with its
-state, size, workspace and repository, and deletes nothing; until eviction
-exists (§6.3), `gc` without `--dry-run` is refused. It reads the store
-itself and needs no daemon. `--json` prints a versioned document
-(`schema`, now 1): `dirs`, one entry per directory, with `kind` (`build` or
-`target`), `path`, `store`, `state`, `workspace`, `repository`,
-`created_at`, `last_run`, `size` and `by_category`.
+state, size, workspace and repository, and the victims an eviction pass
+would take (§6.3), and deletes nothing; `gc` without `--dry-run` evicts
+them. It reads the store itself and needs no daemon. `--json` prints a
+versioned document (`schema`, now 1): `dry_run`; `dirs`, one entry per
+directory, with `kind` (`build` or `target`), `path`, `store`, `state`,
+`workspace`, `repository`, `created_at`, `last_run`, `size` and
+`by_category`; `used` (what every directory takes), `budget` and `floor`
+(bytes, `null` without one); `volumes`, each with `root`, `free` (`null`
+when unknown) and `pending` (bytes still in its trash); `victims`, planned
+in a dry run, else evicted, in order, each with `tier`, `path`, `bytes`,
+`age` (seconds, as its tier counts it) and `reason`; and `skipped`, the
+victims that could not be evicted, each also with `why`.
 
 ### 6.3 Budget and eviction
 
-The budget is B GB for all build directories plus registered `target/`
-directories, with a free-space floor F on each volume. Over budget, heli
-evicts down to 85 % of B, cheapest to regenerate first:
+The budget is B for all build directories plus registered `target/`
+directories (`[store] budget_mb`), with a free-space floor F on each volume
+that holds a store or a registered `target/` directory (`[store]
+floor_mb`). Neither has a default until open question 3 is settled:
+without them, nothing is evicted. Over budget, heli evicts down to 85 % of
+B. Under the floor, it evicts on that volume until F is free there,
+counting what its trash still holds as free. It evicts what is cheapest to
+regenerate first, oldest first within each tier (the ages are `[store]
+unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
 
 1. `incremental/<unit>` directories untouched for 24 h, oldest first across
    the store. Each unit ever built leaves one; in the example they make up
    114 GB of one worktree.
-2. Orphans that no new worktree claimed within 24 h (§6.4), oldest first.
-3. All of `incremental/` in build directories idle for 6 h.
-4. Tool caches in idle worktrees' `target/`, named by patterns in the
-   configuration and nowhere else: for example `tests/trybuild`, and for flui
-   `cli-template-check` and `facade-consumer-check`.
-5. Units in `deps/` and `.fingerprint/` unused for 7 days. This is
-   cargo-sweep's approach, planned for later.
-6. Whole build directories idle for 7 days, oldest first.
+2. Orphans that no new worktree claimed within 24 h (§6.4), longest
+   unclaimed first.
+3. All of a profile's `incremental/` in directories idle for 6 h.
+4. Tool caches in the `target/` of worktrees idle for 6 h, named by patterns
+   in the configuration and nowhere else: for example `tests/trybuild`, and
+   for flui `cli-template-check` and `facade-consumer-check`.
+5. Whole build directories of live workspaces idle for 7 days.
+
+Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
+days, cargo-sweep's approach (out of scope for now).
+
+A unit is untouched since its newest file was written. A directory is idle
+since its newest file was written or its last heli run started (§6.2),
+whichever is later. A profile directory is `<dir>/<profile>/`, or
+`<dir>/<triple>/<profile>/` where a triple holds a `-`. A victim inside one
+taken before counts only what is left in it, and nothing inside a victim
+taken before is one. The clock is the test seam's in debug builds that set
+one (§5).
+
+Which directories have which tiers:
+
+- A busy directory has none.
+- A live build directory has tiers 1, 3 and 5; an orphan 1, 2 and 3. An
+  orphan is deleted whole by tier 2 only, so it always has its 24 h.
+- An **unknown** build directory, which only bare cargo built in, has tiers
+  1 and 3 only. heli cannot tell whether its workspace lives, so it is
+  never an orphan and never deleted whole: only the caches cargo
+  regenerates unit by unit go. Its first heli run gives it a manifest.
+- A registered `target/` directory has tiers 1 and 3 where cargo keeps its
+  intermediates there (no `build-dir`), and tier 4. It is in the user's
+  worktree, so it is never deleted whole.
 
 Safety rules:
 
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
   directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
-  directory) exclusively. If the lock is held, the directory is busy and
-  skipped.
-- **Rename, then delete.** Under the lock, heli only renames the victim into
-  `<store>/.trash/`, which on one volume takes constant time, and releases the
-  lock. It deletes the trash in the background at low I/O priority. A cargo
-  that starts meanwhile finds the directory gone and rebuilds.
-- **Narrow scope.** heli deletes only below registered roots, only the
-  subpaths listed above, and never through a symlink or a junction.
-- **Unknown layout.** Lock names change between cargo versions. If the layout
-  is unknown, heli treats a directory as busy when anything in it changed
-  within the last hour.
+  directory) exclusively, in every profile directory of the victim's
+  directory, and anywhere inside a tool cache (a nested build's). If one is
+  held, or cannot be opened, the directory is busy and skipped. heli checks
+  as it plans, and again as it evicts.
+- **Rename, then delete.** Under the locks, heli only renames the victim
+  into the trash on its volume, which takes constant time, and releases the
+  locks: `<store>/.trash/` for a build directory's victim,
+  `<target>/.heli-trash/` for a registered `target/` directory's. Windows
+  refuses to rename a directory with a file open inside, so there heli lets
+  go of the locks inside the victim (a whole build directory's) just before
+  it renames, and the rename fails if a cargo opened one meanwhile. The
+  trash is deleted afterwards, at low I/O priority (background mode on
+  Windows, the I/O throttle on macOS, the lowest nice value on Linux): by
+  `gc` before it exits, and by a thread of the daemon's, which also deletes
+  what a `gc` that was stopped left there. A cargo that starts meanwhile
+  finds its directory without the victim and rebuilds it; it never waits
+  for the deletion. A trash counts in no directory's size.
+- **Narrow scope.** heli deletes only below registered roots (the stores'
+  build directories and the registered `target/` directories), only the
+  subpaths listed above, and never through a symlink or a junction: no path
+  to a victim crosses a link, a link is never a victim, a link inside a
+  victim is removed and not followed, and a trash that is a link is never
+  used.
+- **Unknown layout.** Lock names change between cargo versions. A profile
+  directory with cargo's intermediates (`deps/`, `incremental/`,
+  `.fingerprint/`, `build/`) and none of the three lock files has a layout
+  heli does not know. Then heli treats its directory as busy when anything
+  in it changed within the last hour.
+
+**Passes.** `cargo heli gc` makes an eviction pass: it plans the victims,
+evicts them, logs each eviction in the event log (§8), and deletes the
+trash; `--dry-run` names each victim with its tier and reason and changes
+nothing. With a budget or a floor configured, the daemon's accountant
+(§6.2), at each look (every minute, and when a run ends), keeps the
+orphans' notes (§6.4) and makes a pass when its figures are over B or a
+volume they are on is under F. One pass evicts at a time (`evict.lock` in
+the state directory): `gc` waits for the daemon's, and the daemon skips its
+own while `gc` runs. `status` shows the daemon's last pass that evicted
+anything (§8).
 
 ### 6.4 Recycling: warm starts without sharing
 
@@ -1111,6 +1178,19 @@ installs (git runs it for `git worktree add`), or the daemon's periodic
 repository, renamed to the new worktree's `{workspace-path-hash}` path. On one
 volume that is a rename: no copy and no extra disk. One build directory still
 belongs to one live worktree.
+
+**Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
+from the first eviction pass that finds its workspace gone: the daemon's,
+every minute while a budget or a floor is set, or `gc`'s. That pass writes
+`.heli/orphaned` in it, `{"workspace":…,"since":…}`. The note counts while
+it names the owner manifest's workspace and is no older than its last run;
+a directory found live loses it, and `gc --dry-run` writes none. An orphan
+becomes evictable (tier 2) only after 24 h unclaimed, and no other tier
+deletes it whole, so recycling has at least that long to claim it. A
+recycled directory names its new workspace, so its old note no longer
+counts. Recycling never takes a directory that is already in the trash:
+`<store>/.trash/` is not a build directory (`<2 hex digits>/<hex digits>`),
+and an eviction renames its victim there before deleting anything.
 
 What makes this sound, verified in cargo's source:
 
@@ -1288,12 +1368,15 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   was told how they ended. A run whose clients heard its end leaves the
   list; a done run holds no worktree lock and counts as no run in flight
   (for the top-up's quiescence, §4);
-- `disk`: `stores`, one entry per store, with `path`, `budget` (`null` until
-  budgets exist), `used` and `by_category` (`incremental`, `deps`,
+- `disk`: `stores`, one entry per store, with `path`, `budget` (B, which
+  every store and registered `target/` directory share, in bytes; `null`
+  without one), `used` and `by_category` (`incremental`, `deps`,
   `build_scripts`, `fingerprints`, `tool_caches`, `other`, in bytes); and
   `targets`, one entry per registered `target/` directory, with `path`,
   `used` and `by_category`. `null` when no daemon answers;
-- `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
+- `last_gc`: the daemon's last eviction pass that evicted anything (§6.3):
+  `at`, and `evicted`, one entry per victim with its `path`, `tier` and
+  `bytes`; `null` before the first, and when no daemon answers.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,
 drains and evictions, and `cargo heli gc --dry-run`.
@@ -1311,7 +1394,9 @@ drains and evictions, and `cargo heli gc --dry-run`.
   `taken_back` (slots the broker took back while it had work pending),
   `most` (the most slots it was seen using), `wait_median_ms` and
   `wait_longest_ms` (how long it waited for a lent slot, at most; `null`
-  without loans).
+  without loans);
+- `evict`, for each victim an eviction pass of the daemon's or of `gc`
+  renamed into the trash (§6.3): `tier`, `path`, `bytes` and `reason`.
 
 Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
 the one before, and the next event starts a new file.
@@ -1348,6 +1433,7 @@ the one before, and the next event starts a new file.
 | The pool holds more than the target (a FIFO has no maximum; a semaphore's is N, above the target while slots are withheld) | Oversubscription | The daemon drains the surplus at once (§4) |
 | Memory spike | New jobs wait | Slots are withheld; running jobs finish |
 | GC races a build | none | Try-lock, rename to trash, skip busy directories |
+| `gc` or the daemon stopped while deleting the trash | What is left there takes disk | It counts as free for the floor and in no directory's size; the daemon's deleter, at start and every minute, or the next `gc`, deletes it |
 | Recycled unit with a donor path compiled in | Tests read the removed worktree | The rustc dep-info scan invalidates the unit (§6.4) |
 | Recycled directory with a stale record | Could link stale code | A record counts only if it is newer than every file in the build directory; otherwise conservative mode |
 | Tools looking in `target/<profile>/deps` | They miss moved intermediates | Validated on a real workspace before phase 2 (§6.1) |
@@ -1411,6 +1497,8 @@ Measure throughout:
 2. `build-dir` in the user's Cargo configuration affects every project on the
    machine. Should it be opt-in per repository instead?
 3. The default budget B (proposed: 150 GB on D:) and floor F (proposed: 50 GB).
+   Until this is settled, neither has a default, and nothing is evicted
+   unless the configuration sets one (§6.3).
 4. Is a pool per logon session enough, or do agents run in other sessions
    (SSH, services)?
 5. Should the default without a terminal be `compact` or `quiet`?

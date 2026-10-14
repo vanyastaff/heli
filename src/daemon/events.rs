@@ -1,5 +1,6 @@
-//! The daemon's event log (DESIGN.md §8): what it decided about runs and
-//! the host pool, one JSON object per line, for people and tools.
+//! The daemon's event log (DESIGN.md §8): what it decided about runs, the
+//! host pool and the build store, one JSON object per line, for people and
+//! tools.
 //!
 //! Each event has `at` (seconds since 1970, UTC) and `event`, then fields of
 //! its own:
@@ -11,7 +12,10 @@
 //!   `commit_available` and `high_watermark`;
 //! - `top-up`: slots given back to the pool at quiescence;
 //! - `drain`: surplus slots taken out of the pool. Both have `slots`,
-//!   `free` (after it) and `target`.
+//!   `free` (after it) and `target`;
+//! - `evict`: an eviction pass (the daemon's, or `cargo heli gc`'s, which
+//!   writes to the same log) renamed a victim into the trash
+//!   (`crate::store::evict`): `tier`, `path`, `bytes` and `reason`.
 //!
 //! It is `events.log` in the state directory (`events-<session>.log` on
 //! Windows). Past its size limit it rotates: it becomes `<name>.1`, replacing

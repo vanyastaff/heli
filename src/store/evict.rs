@@ -58,7 +58,7 @@ pub struct Pass {
     /// What every directory takes together.
     pub used: u64,
     pub volumes: Vec<Volume>,
-    /// Whether the pass had anything to free.
+    /// What the pass had to free.
     pub goals: Goals,
     /// The victims: planned in a dry run, else evicted, in order.
     pub victims: Vec<Victim>,
@@ -201,9 +201,10 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     let Some(trash) = trash::of(&surveyed.dir) else {
         return Err("no trash".to_owned());
     };
+    let profiles = super::lock_dirs(root);
     let mut outer = Vec::new();
     let mut inner = Vec::new();
-    for profile in super::lock_dirs(root) {
+    for profile in &profiles {
         for name in super::LOCKS {
             let lock = profile.join(name);
             if lock.starts_with(&victim.path) {
@@ -218,7 +219,7 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     }
     let _outer = hold(&outer)?;
     let inner = hold(&inner)?;
-    if super::unknown_layout(&super::lock_dirs(root)) && super::recently_changed(root, now) {
+    if super::unknown_layout(&profiles) && super::recently_changed(root, now) {
         return Err("busy: changed within the hour".to_owned());
     }
     if victim.tier == Tier::Orphan && !still_orphan(&surveyed.dir) {
@@ -267,12 +268,15 @@ fn locks_inside(dir: &Path) -> Vec<PathBuf> {
     locks
 }
 
-/// Whether `victim`, at or below `root`, exists, is no link, and is reached
-/// from `root` through directories of their own.
+/// Whether `victim`, at or below the directory `root`, exists, is no link,
+/// and is reached from `root` through directories of their own.
 fn reached_without_links(root: &Path, victim: &Path) -> bool {
     let Ok(below) = victim.strip_prefix(root) else {
         return false;
     };
+    if !super::is_real_dir(root) {
+        return false;
+    }
     let mut path = root.to_path_buf();
     let mut components = below.components().peekable();
     while let Some(component) = components.next() {
@@ -285,7 +289,7 @@ fn reached_without_links(root: &Path, victim: &Path) -> bool {
             return false;
         }
     }
-    super::is_real_dir(root) || !below.as_os_str().is_empty()
+    true
 }
 
 /// Whether build directory `dir` is still the orphan it was: its owner

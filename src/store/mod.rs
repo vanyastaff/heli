@@ -11,6 +11,15 @@
 //! writable, so the default there is the user's cache,
 //! `$XDG_CACHE_HOME/heli/build` (else `~/.cache/heli/build`), when it is on
 //! that volume, and `<volume>/.heli/build` otherwise.
+//!
+//! **Accounting** ([`survey`], [`Dir`], [`owner`], [`registry`], [`sizes`]):
+//! every directory the store accounts for, whose it is, its state and its
+//! sizes by category.
+//!
+//! **Eviction** (DESIGN.md §6.3): the [`ladder`] says what to evict over
+//! the budget or under the floor, an [`evict`] pass renames it into the
+//! [`trash`] under cargo's locks, and the trash is deleted afterwards. An
+//! [`orphan`] counts as unclaimed from the first pass that finds it.
 
 pub mod evict;
 pub mod ladder;
