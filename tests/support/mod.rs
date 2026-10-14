@@ -604,8 +604,10 @@ impl Fixture {
     }
 
     /// Kills this fixture's daemon and every process it started, and waits
-    /// until it no longer answers. Never panics: it also runs while a failed
-    /// test unwinds.
+    /// until it no longer answers and its process is gone, with its files:
+    /// a daemon started next takes the state directory's lock, which a
+    /// killed process may hold a while after `status` stops reaching it.
+    /// Never panics: it also runs while a failed test unwinds.
     pub fn kill_daemon(&self) {
         let Some(pid) = self.daemon_pid() else {
             return;
@@ -614,6 +616,9 @@ impl Fixture {
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.daemon_pid() == Some(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
+        }
+        while process_runs(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -718,6 +723,40 @@ pub fn kill_tree(pid: u32) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// Whether process `pid` still runs. A process that has exited, even if
+/// nobody has reaped it yet (a zombie, on Unix), has closed its files.
+pub fn process_runs(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // SAFETY: opens a handle that only waits, closed below.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        // SAFETY: a process handle with synchronize access; no wait.
+        let runs = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+        // SAFETY: the handle is ours.
+        unsafe { CloseHandle(process) };
+        runs
+    }
+    #[cfg(unix)]
+    {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_default();
+        !state.is_empty() && !state.starts_with('Z')
     }
 }
 
