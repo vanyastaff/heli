@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use super::live::Live;
+use super::tree::Tree;
 use crate::protocol::RunRequest;
 use crate::runlog::Events;
 use crate::status::{self, Exit, Phase};
@@ -115,8 +116,13 @@ pub struct Attached {
 enum State {
     /// Admitted; its process has not started yet.
     Starting,
-    /// Its process has started; clients follow `live`.
-    Running { live: Arc<Live> },
+    /// Its process has started; clients follow `live`. A cancelled run
+    /// takes no more clients.
+    Running {
+        live: Arc<Live>,
+        tree: Arc<Tree>,
+        cancelled: bool,
+    },
     /// It ended while no client followed it.
     Done { exit: Exit, ended_at: SystemTime },
 }
@@ -204,10 +210,16 @@ impl Registry {
     pub fn admit(&self, worktree: PathBuf, command: Command, retiring: bool) -> Admission {
         let mut inner = self.lock();
         let same = inner.runs.iter_mut().find(|(_, entry)| {
-            matches!(entry.state, State::Running { .. }) && entry.command == command
+            matches!(
+                entry.state,
+                State::Running {
+                    cancelled: false,
+                    ..
+                }
+            ) && entry.command == command
         });
         if let Some((&id, entry)) = same
-            && let State::Running { live } = &entry.state
+            && let State::Running { live, .. } = &entry.state
         {
             entry.attached += 1;
             return Admission::Attached(Attached {
@@ -235,19 +247,43 @@ impl Registry {
                 worktree,
                 command,
                 started_at: SystemTime::now(),
-                attached: 0,
+                // The client that asked for it.
+                attached: 1,
                 state: State::Starting,
             },
         );
         Admission::New(id)
     }
 
-    /// Run `id`'s process has started, and the client that started it
-    /// follows `live`.
-    pub fn start(&self, id: RunId, live: Arc<Live>) {
+    /// Run `id`'s process has started as the first of `tree`, and its
+    /// output goes to `live`.
+    pub fn start(&self, id: RunId, live: Arc<Live>, tree: Tree) {
         if let Some(entry) = self.lock().runs.get_mut(&id) {
-            entry.state = State::Running { live };
-            entry.attached += 1;
+            entry.state = State::Running {
+                live,
+                tree: Arc::new(tree),
+                cancelled: false,
+            };
+        }
+    }
+
+    /// Marks run `run` (`r<number>`) as cancelled, and returns its process
+    /// tree to kill; the error says why there is none.
+    pub fn cancel(&self, run: &str) -> Result<Arc<Tree>, String> {
+        let mut inner = self.lock();
+        let entry = runlog::run_number(run).and_then(|number| inner.runs.get_mut(&RunId(number)));
+        match entry.map(|entry| &mut entry.state) {
+            None => Err(format!("no run {run} is in flight")),
+            Some(State::Starting) => Err(format!("{run} is only starting; try again")),
+            Some(State::Running {
+                tree, cancelled, ..
+            }) => {
+                *cancelled = true;
+                Ok(Arc::clone(tree))
+            }
+            Some(State::Done { exit, .. }) => {
+                Err(format!("{run} has already ended: {}", exit.describe()))
+            }
         }
     }
 
@@ -268,12 +304,20 @@ impl Registry {
     /// are told next, so it leaves the registry; with none, it stays listed
     /// as done.
     pub fn end(&self, id: RunId, code: i32, signal: Option<i32>) -> Exit {
+        let mut inner = self.lock();
         let exit = Exit {
             code,
             signal,
-            cancelled: false,
+            cancelled: inner.runs.get(&id).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    State::Running {
+                        cancelled: true,
+                        ..
+                    }
+                )
+            }),
         };
-        let mut inner = self.lock();
         let followed = inner.runs.get(&id).is_some_and(|entry| entry.attached > 0);
         if followed {
             inner.runs.remove(&id);

@@ -27,6 +27,7 @@
 pub mod execute;
 pub mod live;
 pub mod registry;
+pub mod tree;
 
 use std::fs::{File, TryLockError};
 use std::io::Write;
@@ -39,7 +40,7 @@ use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::pool::{self, Pool};
-use crate::protocol::{self, LogRequest, Reply, Request, RunRequest};
+use crate::protocol::{self, CancelRequest, LogRequest, Reply, Request, RunRequest};
 use crate::runlog::{self, Events, Limits, Recorder, RunLog};
 use crate::status::{self, Status};
 use crate::{clock, worktree};
@@ -201,7 +202,8 @@ impl Daemon {
             }
             Ok(Request::Run(request)) => self.run(stream, request),
             Ok(Request::Log(request)) => self.log(stream, &request),
-            Ok(Request::Cancel(_)) | Err(_) => {
+            Ok(Request::Cancel(request)) => self.cancel(stream, &request),
+            Err(_) => {
                 if protocol::write_message(&mut stream, &Reply::Unsupported).is_ok() {
                     self.retire_if_asked(&mut stream, "a client with a request this daemon lacks");
                 }
@@ -232,6 +234,28 @@ impl Daemon {
             Ok(()) => Reply::LogEnd,
             Err(error) => Reply::LogFailed {
                 message: error.to_string(),
+            },
+        };
+        let _ = protocol::write_message(&mut stream, &reply);
+    }
+
+    /// Cancels the run `request` names: kills its process tree, and answers
+    /// once none of its processes is left. The run then ends as usual, and
+    /// its clients hear that it was cancelled.
+    fn cancel(&self, mut stream: Stream, request: &CancelRequest) {
+        let run = &request.run;
+        let reply = match self.registry.cancel(run) {
+            Err(message) => Reply::CancelFailed { message },
+            Ok(tree) => match tree.kill() {
+                Ok(()) => {
+                    self.log.write(&format!("cancelled {run}"));
+                    Reply::Cancelled
+                }
+                Err(error) => {
+                    let message = format!("cannot cancel {run}: {error}");
+                    self.log.write(&message);
+                    Reply::CancelFailed { message }
+                }
             },
         };
         let _ = protocol::write_message(&mut stream, &reply);
@@ -287,8 +311,8 @@ impl Daemon {
             return;
         }
         let record = self.runlog.record(&id.to_string());
-        let child = match execute::spawn(request, id, &self.pool.makeflags()) {
-            Ok(child) => child,
+        let (child, tree) = match execute::spawn(request, id, &self.pool.makeflags()) {
+            Ok(spawned) => spawned,
             Err(error) => {
                 drop(record);
                 self.registry.abandon(id);
@@ -303,7 +327,7 @@ impl Daemon {
         let live = Live::new(self.runlog.dir().to_path_buf(), id.to_string());
         let events = live.open();
         let live = Arc::new(live);
-        self.registry.start(id, Arc::clone(&live));
+        self.registry.start(id, Arc::clone(&live), tree);
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
             scope.spawn(|| self.execute(id, child, record, &live));

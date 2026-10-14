@@ -19,6 +19,8 @@
 //!   the daemon has said the run started, there is no fallback: the command
 //!   may already have run, so losing the daemon is an error (exit 1).
 //! - **Status.** Ask the daemon, or report that none runs; never start one.
+//! - **Cancel.** Ask the daemon to kill a run's process tree; without a
+//!   daemon there is no run to cancel, and none is started.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -30,7 +32,9 @@ use std::time::{Duration, Instant};
 use crate::cli::Invocation;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
-use crate::protocol::{self, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text};
+use crate::protocol::{
+    self, CancelRequest, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text,
+};
 use crate::runlog::{self, select::Select};
 use crate::status::{Exit, Status};
 use crate::{clock, direct, environment, launch, nesting};
@@ -162,6 +166,38 @@ fn ask_log(mut stream: Stream, run: &str, select: &Select) -> Result<Infallible,
         eprintln!("cargo-heli: lost the heli daemon while printing {run}: {failure}");
         std::process::exit(FAILED)
     }
+}
+
+/// Cancels run `run`: asks the daemon, and starts none. Exits 0 once the
+/// run's processes are gone, else 1 after one line saying why.
+pub fn cancel(run: &str) -> ! {
+    let failure = match Locations::resolve().and_then(|locations| reach(&locations, None)) {
+        Ok(None) => "no heli daemon is running, so no run is in flight".to_owned(),
+        Err(reason) => format!("cannot cancel {run}: {reason}"),
+        Ok(Some(mut stream)) => {
+            let request = Request::Cancel(CancelRequest {
+                run: run.to_owned(),
+            });
+            let asked = protocol::write_message(&mut stream, &request)
+                .and_then(|()| protocol::read_message::<Reply>(&mut stream));
+            match asked {
+                Ok(Reply::Cancelled) => {
+                    eprintln!("cargo-heli: cancelled {run}");
+                    std::process::exit(0)
+                }
+                Ok(Reply::CancelFailed { message }) => message,
+                Ok(Reply::Unsupported) => {
+                    format!("cannot cancel {run}: {}", unsupported(&mut stream))
+                }
+                Ok(other) => format!("cannot cancel {run}: the heli daemon answered {other:?}"),
+                Err(error) => {
+                    format!("cannot cancel {run}: the heli daemon did not answer: {error}")
+                }
+            }
+        }
+    };
+    eprintln!("cargo-heli: {failure}");
+    std::process::exit(FAILED)
 }
 
 fn query_status() -> Result<Status, String> {

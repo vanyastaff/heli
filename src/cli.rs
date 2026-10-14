@@ -18,6 +18,8 @@ pub enum Action {
     Status { json: bool },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
     Log { run: String, select: Select },
+    /// Kill run `run` (`r<number>`) with every process it started.
+    Cancel { run: String },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
 }
@@ -69,6 +71,14 @@ enum Command {
         /// Only the lines that match this regular expression.
         #[arg(long, value_name = "RE", group = "select", value_parser = parse_pattern)]
         grep: Option<String>,
+    },
+    /// Kill a run in flight with every process it started; its clients
+    /// report it as cancelled.
+    Cancel {
+        /// The run, as the footer after it and `status` name it: `r17` (or
+        /// `17`).
+        #[arg(value_parser = parse_run)]
+        run: String,
     },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
@@ -124,6 +134,7 @@ pub fn parse(
                 (None, None) => Select::All,
             },
         },
+        Command::Cancel { run } => Action::Cancel { run },
         Command::Daemon { detach } => Action::Daemon { detach },
         Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,

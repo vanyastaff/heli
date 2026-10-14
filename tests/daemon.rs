@@ -420,8 +420,10 @@ fn only_the_user_can_open_the_endpoint() {
     }
 }
 
-/// A run is in the client's logon session, window station and desktop (on
-/// Unix: its session), so it can reach the user's desktop.
+/// On Windows, a run is in the client's logon session, window station and
+/// desktop, so it can reach the user's desktop. On Unix it leads a session
+/// of its own (the user's login session reaches it through the
+/// environment), so that `cancel` finds every process it started.
 #[test]
 fn a_run_is_in_the_clients_session() {
     let fixture = Fixture::new("basic");
@@ -435,11 +437,19 @@ fn a_run_is_in_the_clients_session() {
         .heli(["exec", "--"])
         .arg(&echo)
         .env("ECHO_SESSION", "1")
+        .env("ECHO_PID", "1")
         .output()
         .expect("run heli");
     assert_success(&heli, "cargo heli exec");
     assert!(text(&direct.stdout).starts_with("session "));
-    assert_eq!(text(&heli.stdout), text(&direct.stdout));
+    let lines = lines(&heli.stdout);
+    #[cfg(windows)]
+    assert_eq!(lines[0], text(&direct.stdout).trim_end());
+    #[cfg(unix)]
+    {
+        let pid = lines[1].strip_prefix("pid ").expect("a pid line");
+        assert_eq!(lines[0], format!("session {pid}"), "it leads its session");
+    }
 }
 
 /// The self-run guards hold through the daemon: each nested call sees

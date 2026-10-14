@@ -56,6 +56,7 @@ fn main() {
         cli::Action::Run(invocation) => client::run(invocation, depth),
         cli::Action::Status { json } => client::status(json),
         cli::Action::Log { run, select } => client::log(&run, &select),
+        cli::Action::Cancel { run } => client::cancel(&run),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
     }

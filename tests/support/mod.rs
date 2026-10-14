@@ -23,10 +23,13 @@
 //! - `tests-mixed`: passing, failing and slow tests;
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
-//!   working directory or its session; waits for a file, leaves an orphan
-//!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
+//!   working directory, its session or its process id; waits for a file,
+//!   leaves an orphan behind, starts a child in a process group of its own,
+//!   counts its starts; exits with `ECHO_EXIT` (see its `main.rs`);
 //! - `chatter`: numbered lines on stdout and stderr, and on request bytes
-//!   that test a run log's fidelity (see its `main.rs`).
+//!   that test a run log's fidelity (see its `main.rs`);
+//! - `linger`: a test that, on request, starts a child in a process group
+//!   of its own and waits for a file with it (see its `lib.rs`).
 //!
 //! After every run the daemon executes, heli prints a footer line on stderr
 //! ([`split_footer`], [`without_footer`]).
@@ -376,8 +379,9 @@ pub fn daemon_pid(status: &Value) -> Option<u32> {
 }
 
 /// Kills process `pid` and its descendants, found by their parent process
-/// (as agent harnesses kill a command), and on Unix its process group: only
-/// for processes the tests started themselves.
+/// (as agent harnesses kill a command), and on Unix its process group and
+/// the sessions its children lead (a daemon's runs): only for processes the
+/// tests started themselves.
 pub fn kill_tree(pid: u32) {
     let pid = pid.to_string();
     let mut commands = Vec::new();
@@ -386,7 +390,20 @@ pub fn kill_tree(pid: u32) {
         taskkill.args(["/F", "/T", "/PID", &pid]);
         commands.push(taskkill);
     } else {
-        // A daemon leads its own process group, which its runs share.
+        // Each run of a daemon leads a session of its own.
+        let children = Command::new("pgrep")
+            .args(["-P", &pid])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default();
+        for child in children.split_whitespace() {
+            let mut session = Command::new("pkill");
+            session.args(["-KILL", "-s", child]);
+            commands.push(session);
+        }
+        // A daemon leads its own process group.
         let mut group = Command::new("kill");
         group.args(["-KILL", "--", &format!("-{pid}")]);
         let mut children = Command::new("pkill");

@@ -3,7 +3,8 @@
 //!
 //! The run is the daemon's own child, started in the client's working
 //! directory with exactly the client's environment (nothing of the
-//! daemon's), and with no stdin; what heli adds to every run's environment
+//! daemon's), and with no stdin, as the first process of a process tree of
+//! its own (`super::tree`); what heli adds to every run's environment
 //! belongs in [`spawn`]: the pool it draws from ([`MAKEFLAGS_VAR`]) and its
 //! id ([`RUN_VAR`]). Its stdout and stderr are pipes the daemon drains
 //! ([`pump`]), the one place all of a run's output passes: into the run log
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use super::live::Live;
 use super::registry::RunId;
+use super::tree::{self, Tree};
 use crate::protocol::{Channel, RunRequest};
 use crate::runlog::Recorder;
 
@@ -53,12 +55,14 @@ pub const MAKEFLAGS_VAR: &str = "CARGO_MAKEFLAGS";
 /// heli.
 pub const RUN_VAR: &str = "HELI_RUN";
 
-/// Starts run `id`'s process, drawing from the jobserver `makeflags` names.
-pub fn spawn(request: &RunRequest, id: RunId, makeflags: &OsStr) -> io::Result<Child> {
+/// Starts run `id`'s process, drawing from the jobserver `makeflags` names,
+/// as the first of a process tree of its own (`super::tree`).
+pub fn spawn(request: &RunRequest, id: RunId, makeflags: &OsStr) -> io::Result<(Child, Tree)> {
     let cwd = cwd(request);
     let mut argv = argv(request).into_iter();
     let program = argv.next().unwrap_or_default();
-    Command::new(resolve(&cwd, program))
+    let mut command = Command::new(resolve(&cwd, program));
+    command
         .args(argv)
         .current_dir(&cwd)
         .env_clear()
@@ -67,8 +71,8 @@ pub fn spawn(request: &RunRequest, id: RunId, makeflags: &OsStr) -> io::Result<C
         .env(RUN_VAR, id.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    tree::spawn(&mut command)
 }
 
 /// A program given as a relative path (`./script`, `bin\tool`) is relative
