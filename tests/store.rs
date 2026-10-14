@@ -476,6 +476,257 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
     assert_eq!(orphans.len(), 1, "{orphans:?}");
     assert_eq!(orphans[0]["state"], "orphan", "{orphans:?}");
     assert!(path.is_dir(), "gc --dry-run deletes nothing");
+
+    let output = fixture
+        .heli(["gc", "--dry-run"])
+        .output()
+        .expect("run heli gc --dry-run");
+    assert_success(&output, "cargo heli gc --dry-run");
+    let stdout = text(&output.stdout);
+    let shown = path.display().to_string();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("build ")
+            && line.contains(" orphan ")
+            && line.contains(&shown)),
+        "{stdout}"
+    );
+    let output = fixture.heli(["gc"]).output().expect("run heli gc");
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "gc evicts nothing yet: {output:?}"
+    );
+    assert!(path.is_dir(), "gc deletes nothing");
+}
+
+/// The bytes in the files under `path`, never through a link.
+fn du(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.is_dir() {
+        std::fs::read_dir(path)
+            .expect("read a directory")
+            .map(|entry| du(&entry.expect("an entry").path()))
+            .sum()
+    } else if metadata.is_file() {
+        metadata.len()
+    } else {
+        0
+    }
+}
+
+/// The sizes a listed directory gives, by category.
+fn categories(dir: &Value) -> [(&'static str, u64); 6] {
+    let size = |name: &str| {
+        dir["by_category"][name]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no {name} in {dir}"))
+    };
+    [
+        ("incremental", size("incremental")),
+        ("deps", size("deps")),
+        ("build_scripts", size("build_scripts")),
+        ("fingerprints", size("fingerprints")),
+        ("tool_caches", size("tool_caches")),
+        ("other", size("other")),
+    ]
+}
+
+/// Sizes by category of a build directory: what cargo writes in the
+/// profile's `incremental/`, `deps/`, `build/` and `.fingerprint/`, and the
+/// rest.
+fn build_dir_sizes(dir: &Path) -> [(&'static str, u64); 6] {
+    let debug = dir.join("debug");
+    let [incremental, deps, build_scripts, fingerprints] =
+        ["incremental", "deps", "build", ".fingerprint"].map(|name| du(&debug.join(name)));
+    let other = du(dir) - incremental - deps - build_scripts - fingerprints;
+    [
+        ("incremental", incremental),
+        ("deps", deps),
+        ("build_scripts", build_scripts),
+        ("fingerprints", fingerprints),
+        ("tool_caches", 0),
+        ("other", other),
+    ]
+}
+
+/// `gc --dry-run` gives each directory's size, by category, as the files
+/// in it add up: a build directory's intermediates by kind, and a `target/`
+/// directory's tool caches, which only the configuration's patterns name.
+#[test]
+fn sizes_by_category_match_the_files() {
+    let fixture = Fixture::new("basic");
+    configure_store(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    set_up_repository(&fixture, &main);
+    let output = heli_in(
+        &fixture,
+        &main,
+        &["build", "--quiet", "-p", "echo-args", "-p", "slow-a"],
+    )
+    .output()
+    .expect("run heli build");
+    assert_success(&output, "cargo heli build");
+    let target = main.join("target");
+    let trybuild = target.join("tests").join("trybuild").join("project");
+    std::fs::create_dir_all(&trybuild).expect("create a tool cache");
+    std::fs::write(trybuild.join("out.bin"), vec![0u8; 1000]).expect("fill it");
+    let check = target.join("cli-template-check");
+    std::fs::create_dir_all(&check).expect("create another tool cache");
+    std::fs::write(check.join("out.bin"), vec![0u8; 300]).expect("fill it");
+
+    let listed_target = |fixture: &Fixture| {
+        let target = canonical(&target);
+        gc(fixture).into_iter().find(|dir| {
+            dir["kind"] == "target"
+                && std::fs::canonicalize(dir["path"].as_str().expect("a path")).ok()
+                    == Some(target.clone())
+        })
+    };
+    let build = wait_for("the build directory", || listed_build_dir(&fixture, &main));
+    let path = PathBuf::from(build["path"].as_str().expect("a path"));
+    let expected = build_dir_sizes(&path);
+    for (category, size) in expected {
+        assert!(
+            category == "tool_caches" || size > 0,
+            "the build left nothing in {category}: {expected:?}"
+        );
+    }
+    assert_eq!(categories(&build), expected, "{build}");
+    assert_eq!(build["size"].as_u64(), Some(du(&path)), "{build}");
+
+    let listed = wait_for("the target directory", || listed_target(&fixture));
+    assert_eq!(listed["state"], "live", "{listed}");
+    let total = du(&target);
+    assert_eq!(listed["size"].as_u64(), Some(total), "{listed}");
+    let only_other = [
+        ("incremental", 0),
+        ("deps", 0),
+        ("build_scripts", 0),
+        ("fingerprints", 0),
+        ("tool_caches", 0),
+        ("other", total),
+    ];
+    assert_eq!(categories(&listed), only_other, "no pattern, no tool cache");
+
+    configure_store(
+        &fixture,
+        "tool-caches = [\"tests/trybuild\", \"cli-*-check\"]\n",
+    );
+    let listed = listed_target(&fixture).expect("the target directory");
+    let with_caches = [
+        ("incremental", 0),
+        ("deps", 0),
+        ("build_scripts", 0),
+        ("fingerprints", 0),
+        ("tool_caches", 1300),
+        ("other", total - 1300),
+    ];
+    assert_eq!(categories(&listed), with_caches, "{listed}");
+}
+
+/// What `status --json` says of `store`, once its figures are
+/// `expected_used` bytes by `expected` categories.
+fn wait_for_store(
+    fixture: &Fixture,
+    store: &Path,
+    expected: impl Fn() -> (u64, [(&'static str, u64); 6]),
+) -> Value {
+    let store = canonical(store);
+    let mut last = Value::Null;
+    let found = (0..600).find_map(|_| {
+        let status = fixture.status();
+        let listed = status["disk"]["stores"].as_array().and_then(|stores| {
+            stores.iter().find(|entry| {
+                std::fs::canonicalize(entry["path"].as_str().unwrap_or_default()).ok()
+                    == Some(store.clone())
+            })
+        });
+        if let Some(listed) = listed {
+            let (used, by_category) = expected();
+            if listed["used"].as_u64() == Some(used) && categories(listed) == by_category {
+                return Some(listed.clone());
+            }
+            last = listed.clone();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        None
+    });
+    found.unwrap_or_else(|| panic!("the store's figures never matched; last: {last}"))
+}
+
+/// The sizes of every build directory in `store`, added up.
+fn store_sizes(store: &Path) -> (u64, [(&'static str, u64); 6]) {
+    let mut sums = [
+        ("incremental", 0),
+        ("deps", 0),
+        ("build_scripts", 0),
+        ("fingerprints", 0),
+        ("tool_caches", 0),
+        ("other", 0),
+    ];
+    for dir in build_dirs(store) {
+        for (sum, (_, size)) in sums.iter_mut().zip(build_dir_sizes(&dir)) {
+            sum.1 += size;
+        }
+    }
+    (du(store), sums)
+}
+
+/// `status` shows the disk each store takes, by category, as the daemon
+/// counts it after each run; and the registered `target/` directories.
+#[test]
+fn status_shows_disk_use_per_store() {
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    set_up_repository(&fixture, &main);
+    let build = |package: &str| {
+        let output = heli_in(&fixture, &main, &["build", "--quiet", "-p", package])
+            .output()
+            .expect("run heli build");
+        assert_success(&output, "cargo heli build");
+    };
+
+    build("slow-a");
+    let first = wait_for_store(&fixture, &store, || store_sizes(&store));
+    assert_eq!(first["budget"], Value::Null, "{first}");
+    build("echo-args");
+    let second = wait_for_store(&fixture, &store, || store_sizes(&store));
+    assert!(
+        second["used"].as_u64() > first["used"].as_u64(),
+        "a run's growth is counted: {first} then {second}"
+    );
+
+    let status = fixture.status();
+    let target = canonical(main.join("target"));
+    let targets = status["disk"]["targets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let listed = targets
+        .iter()
+        .find(|entry| {
+            std::fs::canonicalize(entry["path"].as_str().unwrap_or_default()).ok()
+                == Some(target.clone())
+        })
+        .unwrap_or_else(|| panic!("no target directory: {status}"));
+    assert_eq!(listed["used"].as_u64(), Some(du(&target)), "{listed}");
+
+    let output = fixture.heli(["status"]).output().expect("run heli status");
+    assert_success(&output, "cargo heli status");
+    let stdout = text(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("disk "))
+        .unwrap_or_else(|| panic!("no disk line: {stdout}"));
+    assert!(
+        line.contains(&store.display().to_string()) && line.contains("incremental"),
+        "{line}"
+    );
 }
 
 /// The owner manifest of `workspace`'s build directory in `store`.

@@ -106,7 +106,7 @@ pub fn main() -> ! {
     ));
 
     let daemon = Arc::new(Daemon {
-        accounts: accounts::Accounts::new(
+        accounts: accounts::Accounts::start(
             config.store.clone(),
             locations.state_dir.clone(),
             log.clone(),
@@ -293,7 +293,9 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
-        self.accounts
+        // Kept until the run ends, when its directories are counted again.
+        let _learning = self
+            .accounts
             .learn(&request, request.class.unwrap_or(Class::Exec));
         // Once admitted, after any wait (which belongs above): another run
         // may have passed with the same key meanwhile.
@@ -375,6 +377,7 @@ impl Daemon {
             }),
             pool: Some(self.pool.status()),
             runs: self.registry.snapshot(),
+            disk: Some(self.accounts.disk()),
         }
     }
 

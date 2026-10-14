@@ -13,17 +13,30 @@
 //!           "waiting_since":null,"waiting_for":[]},
 //!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
 //!           "class":"mutate","phase":"running","started_at":1791911120,
-//!           "waiting_since":1791911120,"waiting_for":["r17"]}]}
+//!           "waiting_since":1791911120,"waiting_for":["r17"]}],
+//!  "disk":{"stores":[{"path":"D:\.heli\build","budget":null,"used":1000,
+//!                     "by_category":{"incremental":600,"deps":300,"build_scripts":50,
+//!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
+//!          "targets":[{"path":"D:\work\agent-a64b\target","used":120,
+//!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
+//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]}}
 //! ```
 //!
 //! `daemon` and `pool` are `null` when no daemon answers. A run waiting for
 //! its worktree's lock has `waiting_since` and, in `waiting_for`, the runs
 //! it waits for; otherwise they are `null` and empty. `class` is `null` only
 //! from a daemon older than run classes.
+//!
+//! `disk` is the build store as the daemon last counted it
+//! (`crate::daemon::accounts`): each store's bytes in use, by category
+//! (`crate::store::sizes`), and its `budget` (`null`: no budget yet); and
+//! each registered `target/` directory's. It is `null` when no daemon
+//! answers, or one older than the build store.
 
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::store::sizes::{self, Sizes};
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -36,6 +49,37 @@ pub struct Status {
     #[serde(default)]
     pub pool: Option<Pool>,
     pub runs: Vec<Run>,
+    /// Absent from a daemon older than the build store.
+    #[serde(default)]
+    pub disk: Option<Disk>,
+}
+
+/// The disk the build store takes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Disk {
+    /// One entry per store.
+    pub stores: Vec<StoreUse>,
+    /// One entry per registered `target/` directory.
+    #[serde(default)]
+    pub targets: Vec<TargetUse>,
+}
+
+/// A store's build directories, added up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreUse {
+    pub path: String,
+    /// The bytes the store may take; `None` until budgets exist.
+    pub budget: Option<u64>,
+    pub used: u64,
+    pub by_category: Sizes,
+}
+
+/// A registered `target/` directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetUse {
+    pub path: String,
+    pub used: u64,
+    pub by_category: Sizes,
 }
 
 /// The host pool's slots (`crate::pool`), counted as the status was taken.
@@ -106,6 +150,7 @@ impl Status {
             daemon: None,
             pool: None,
             runs: Vec::new(),
+            disk: None,
         }
     }
 
@@ -147,6 +192,49 @@ impl Status {
                 age(run.started_at)
             ));
         }
+        if let Some(disk) = &self.disk {
+            let mut label = "disk";
+            for store in &disk.stores {
+                text.push_str(&format!(
+                    "{label:<6}  {}  {}
+",
+                    store.path,
+                    used(store.used, &store.by_category)
+                ));
+                label = "";
+            }
+            for target in &disk.targets {
+                text.push_str(&format!(
+                    "{label:<6}  target {}  {}
+",
+                    target.path,
+                    used(target.used, &target.by_category)
+                ));
+                label = "";
+            }
+        }
         text
+    }
+}
+
+/// `used` bytes, then the categories that hold any:
+/// `1.2 GiB (incremental 800.0 MiB, deps 400.0 MiB)`.
+fn used(used: u64, by_category: &Sizes) -> String {
+    let parts: Vec<String> = [
+        ("incremental", by_category.incremental),
+        ("deps", by_category.deps),
+        ("build scripts", by_category.build_scripts),
+        ("fingerprints", by_category.fingerprints),
+        ("tool caches", by_category.tool_caches),
+        ("other", by_category.other),
+    ]
+    .into_iter()
+    .filter(|(_, bytes)| *bytes > 0)
+    .map(|(name, bytes)| format!("{name} {}", sizes::human(bytes)))
+    .collect();
+    if parts.is_empty() {
+        sizes::human(used)
+    } else {
+        format!("{} ({})", sizes::human(used), parts.join(", "))
     }
 }

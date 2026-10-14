@@ -27,9 +27,10 @@
 use serde::Serialize;
 
 use crate::clock;
-use crate::config::Config;
+use crate::config::{Config, StoreConfig};
 use crate::locations::Locations;
 use crate::store::registry::Registry;
+use crate::store::sizes::{self, Sizes};
 use crate::store::{self, Dir, Kind, State};
 
 /// The version of the `--json` document.
@@ -54,10 +55,14 @@ struct Entry {
     repository: Option<String>,
     created_at: Option<u64>,
     last_run: Option<u64>,
+    /// Bytes in its files.
+    size: u64,
+    by_category: Sizes,
 }
 
 impl Entry {
-    fn of(dir: &Dir) -> Self {
+    fn of(dir: &Dir, config: &StoreConfig) -> Self {
+        let sizes = dir.scan(config);
         let text = |path: &std::path::Path| path.to_string_lossy().into_owned();
         Self {
             kind: dir.kind,
@@ -72,6 +77,8 @@ impl Entry {
                 .map(text),
             created_at: dir.owner.as_ref().map(|owner| owner.created_at),
             last_run: dir.owner.as_ref().map(|owner| owner.last_run),
+            size: sizes.total(),
+            by_category: sizes,
         }
     }
 }
@@ -99,7 +106,7 @@ pub fn main(dry_run: bool, json: bool) -> ! {
         schema: SCHEMA,
         dirs: store::survey(&config.store, &registry)
             .iter()
-            .map(Entry::of)
+            .map(|dir| Entry::of(dir, &config.store))
             .collect(),
     };
     if json {
@@ -111,7 +118,8 @@ pub fn main(dry_run: bool, json: bool) -> ! {
     std::process::exit(0)
 }
 
-/// One line per directory: kind, state, path, and whose it is.
+/// One line per directory: kind, state, size, path, and whose it is; then
+/// the total.
 fn to_text(listing: &Listing) -> String {
     let now = clock::now();
     let mut text = String::new();
@@ -121,8 +129,9 @@ fn to_text(listing: &Listing) -> String {
             Kind::Target => "target",
         };
         text.push_str(&format!(
-            "{kind:<6}  {:<7}  {}",
+            "{kind:<6}  {:<7}  {:>10}  {}",
             entry.state.name(),
+            sizes::human(entry.size),
             entry.path
         ));
         if let Some(workspace) = &entry.workspace {
@@ -134,9 +143,11 @@ fn to_text(listing: &Listing) -> String {
         }
         text.push('\n');
     }
+    let total = listing.dirs.iter().map(|entry| entry.size).sum();
     text.push_str(&format!(
-        "{} directories; nothing deleted (--dry-run)\n",
-        listing.dirs.len()
+        "{} directories, {}; nothing deleted (--dry-run)\n",
+        listing.dirs.len(),
+        sizes::human(total)
     ));
     text
 }

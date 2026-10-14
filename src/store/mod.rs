@@ -14,6 +14,7 @@
 
 pub mod owner;
 pub mod registry;
+pub mod sizes;
 pub mod volume;
 
 use std::fs::{File, TryLockError};
@@ -25,6 +26,7 @@ use serde::Serialize;
 use crate::config::StoreConfig;
 use owner::Owner;
 use registry::Registry;
+use sizes::Sizes;
 
 /// The lock files cargo holds while it builds, in each profile directory
 /// (`<dir>/<profile>/`, or `<dir>/<target triple>/<profile>/`): the build
@@ -83,6 +85,16 @@ pub struct Dir {
 }
 
 impl Dir {
+    /// The sizes of its files, by category (`sizes`): the configuration's
+    /// tool-cache patterns apply to a `target/` directory.
+    pub fn scan(&self, config: &StoreConfig) -> Sizes {
+        let patterns: &[String] = match self.kind {
+            Kind::Build => &[],
+            Kind::Target => &config.tool_caches,
+        };
+        sizes::scan(&self.path, patterns)
+    }
+
     /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
     /// a removed worktree can leave files behind.
     pub fn state(&self) -> State {
