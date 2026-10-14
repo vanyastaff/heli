@@ -135,7 +135,7 @@ fn a_run_matches_direct_execution() {
         "{}",
         text(&heli.stdout)
     );
-    assert_eq!(text(&heli.stderr), text(&direct.stderr));
+    assert_eq!(support::without_footer(&heli.stderr), text(&direct.stderr));
     assert!(fixture.daemon_pid().is_some(), "the daemon ran it");
 }
 
@@ -170,7 +170,7 @@ fn one_daemon_serves_two_concurrent_calls() {
         assert_success(&output, "cargo heli exec");
         assert_eq!(text(&output.stdout), format!("arg: {arg:?}\n"));
         assert_eq!(
-            text(&output.stderr),
+            support::without_footer(&output.stderr),
             "echo-args: stderr\n",
             "no fallback warning"
         );
@@ -197,7 +197,11 @@ fn a_killed_daemon_is_replaced_by_the_next_call() {
         open(&gate);
         let output = finish(call);
         assert_success(&output, "cargo heli exec");
-        assert_eq!(text(&output.stderr), "echo-args: stderr\n", "no warning");
+        assert_eq!(
+            support::without_footer(&output.stderr),
+            "echo-args: stderr\n",
+            "no warning"
+        );
         (
             runs(&status)[0]["id"].as_str().expect("an id").to_owned(),
             support::daemon_pid(&status).expect("a daemon"),
@@ -366,7 +370,11 @@ fn a_retiring_daemon_finishes_its_runs_then_exits() {
         .output()
         .expect("run heli");
     assert_success(&output, "a later call");
-    assert_eq!(text(&output.stderr), "echo-args: stderr\n", "no warning");
+    assert_eq!(
+        support::without_footer(&output.stderr),
+        "echo-args: stderr\n",
+        "no warning"
+    );
     let replacement = fixture.daemon_pid().expect("a new daemon");
     assert_ne!(replacement, daemon);
 }
@@ -528,7 +536,11 @@ fn the_default_state_directory_is_in_the_users_home() {
             .output()
             .expect("run heli");
         assert_success(&output, "cargo heli exec");
-        assert_eq!(text(&output.stderr), "echo-args: stderr\n", "no warning");
+        assert_eq!(
+            support::without_footer(&output.stderr),
+            "echo-args: stderr\n",
+            "no warning"
+        );
         let state_dir = state
             .iter()
             .fold(fixture.home(), |dir, part| dir.join(part));
@@ -848,4 +860,57 @@ fn a_run_does_not_see_the_daemons_environment() {
         .expect("run heli");
     assert_success(&second, "the second run");
     assert_eq!(text(&second.stdout), "env HELI_TEST_LEAK=None\n");
+}
+
+/// A request the daemon does not know, from a newer client of the same
+/// protocol version, gets the answer "unsupported"; asked to, the daemon
+/// then retires.
+#[test]
+fn an_unknown_request_is_answered_as_unsupported() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(&echo)
+        .output()
+        .expect("run heli");
+    assert_success(&output, "a call that starts the daemon");
+    assert!(fixture.daemon_pid().is_some(), "a daemon");
+
+    let mut newer = support::endpoint::connect(&fixture.endpoint());
+    let mut hello = b"HELI".to_vec();
+    hello.extend(support::fake_daemon::PROTOCOL.to_le_bytes());
+    newer.write_all(&hello).expect("send the hello");
+    let mut answer = [0u8; 8];
+    newer.read_exact(&mut answer).expect("the daemon's hello");
+    assert_eq!(answer[..], hello[..], "the same protocol version");
+    // A message frame: kind 0, a little-endian u32 length, JSON.
+    let request = br#"{"FromTheFuture":{"what":1}}"#;
+    let mut frame = vec![0u8];
+    frame.extend((request.len() as u32).to_le_bytes());
+    frame.extend(request);
+    newer.write_all(&frame).expect("send the request");
+    let mut header = [0u8; 5];
+    newer.read_exact(&mut header).expect("the daemon's answer");
+    assert_eq!(header[0], 0, "a message");
+    let mut reply =
+        vec![0u8; u32::from_le_bytes([header[1], header[2], header[3], header[4]]) as usize];
+    newer.read_exact(&mut reply).expect("the daemon's answer");
+    assert_eq!(text(&reply), "\"Unsupported\"");
+    newer.write_all(b"R").expect("ask to retire");
+    let _ = newer.read_to_end(&mut Vec::new());
+
+    fixture.wait_for_status("the daemon to exit", |status| status["daemon"].is_null());
+}
+
+/// A daemon that answers "unsupported" is older than the client: the client
+/// asks it to retire, and runs the command directly after one warning.
+#[test]
+fn an_unsupported_answer_means_a_direct_run() {
+    let fixture = Fixture::new("basic");
+    let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Unsupported);
+    let warning =
+        assert_ran_directly_with_one_warning(&fixture, &mut fixture.heli(Vec::<String>::new()));
+    assert!(warning.contains("does not support"), "{warning}");
+    assert_eq!(fake.received(), b"R", "asked to retire");
 }

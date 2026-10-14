@@ -4,8 +4,10 @@
 //! The run is the daemon's own child, started in the client's working
 //! directory with exactly the client's environment (nothing of the
 //! daemon's), and with no stdin; what heli adds to every run's environment
-//! belongs in [`spawn`]. Its stdout and stderr are pipes the daemon forwards
-//! frame by frame ([`pump`]), the one place all of a run's output passes.
+//! belongs in [`spawn`]: the pool it draws from ([`MAKEFLAGS_VAR`]) and its
+//! id ([`RUN_VAR`]). Its stdout and stderr are pipes the daemon forwards
+//! frame by frame ([`pump`]), the one place all of a run's output passes;
+//! there it is also recorded in the run log (`crate::runlog`).
 //!
 //! **When a run is over** is when its process has exited, as for a command
 //! the client waited for itself: processes it left behind may keep its
@@ -14,16 +16,18 @@
 //! void until they close.
 //!
 //! A client that goes away does not stop the run: the output it misses is
-//! drained and dropped.
+//! still recorded.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use super::registry::RunId;
 use crate::protocol::{self, Channel, RunRequest};
+use crate::runlog::Recorder;
 
 /// How long output may still arrive after the run's process has exited.
 const GRACE: Duration = Duration::from_millis(500);
@@ -41,8 +45,16 @@ pub fn cwd(request: &RunRequest) -> PathBuf {
     PathBuf::from(&request.cwd.0)
 }
 
-/// Starts the run's process.
-pub fn spawn(request: &RunRequest) -> io::Result<Child> {
+/// Points cargo, rustc and build scripts at the jobserver they draw from,
+/// replacing the client's own value.
+pub const MAKEFLAGS_VAR: &str = "CARGO_MAKEFLAGS";
+
+/// The run's id: tools that keep a host lock of their own can skip it under
+/// heli.
+pub const RUN_VAR: &str = "HELI_RUN";
+
+/// Starts run `id`'s process, drawing from the jobserver `makeflags` names.
+pub fn spawn(request: &RunRequest, id: RunId, makeflags: &OsStr) -> io::Result<Child> {
     let cwd = cwd(request);
     let mut argv = argv(request).into_iter();
     let program = argv.next().unwrap_or_default();
@@ -51,6 +63,8 @@ pub fn spawn(request: &RunRequest) -> io::Result<Child> {
         .current_dir(&cwd)
         .env_clear()
         .envs(request.env.iter().map(|(name, value)| (&name.0, &value.0)))
+        .env(MAKEFLAGS_VAR, makeflags)
+        .env(RUN_VAR, id.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -76,9 +90,13 @@ enum Event {
     Exited(io::Result<ExitStatus>),
 }
 
-/// Forwards the run's output to `client` until the run is over (see the
-/// module docs), and returns how it ended.
-pub fn pump(mut child: Child, client: &mut impl Write) -> io::Result<ExitStatus> {
+/// Records the run's output in `record` and forwards it to `client` until
+/// the run is over (see the module docs), and returns how it ended.
+pub fn pump(
+    mut child: Child,
+    client: &mut impl Write,
+    record: &mut Recorder<'_>,
+) -> io::Result<ExitStatus> {
     let (events, received) = mpsc::sync_channel(16);
     let mut open = 0;
     for (channel, pipe) in [
@@ -120,6 +138,9 @@ pub fn pump(mut child: Child, client: &mut impl Write) -> io::Result<ExitStatus>
         };
         match event {
             Some(Event::Output(channel, bytes)) => {
+                // Recorded first, so the record is complete when the client
+                // hears of the exit, and whether or not a client listens.
+                record.output(channel, &bytes);
                 if connected && protocol::write_output(client, channel, &bytes).is_err() {
                     connected = false;
                 }

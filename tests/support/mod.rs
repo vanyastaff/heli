@@ -10,7 +10,10 @@
 //! `HELI_STATE_DIR` and `HELI_ENDPOINT` inside the fixture's temporary
 //! directory, so no test meets another test's daemon or the user's real one.
 //! Dropping the fixture kills the daemon, and with it any run still going,
-//! even when the test panics.
+//! even when the test panics. Its host pool (`HELI_POOL`: a semaphore name
+//! unique to the fixture on Windows, a FIFO in its temporary directory
+//! elsewhere) and its configuration file (`HELI_CONFIG`, absent until
+//! [`Fixture::configure`]) are the fixture's own too.
 //!
 //! Fixture `basic` (see its `Cargo.toml`):
 //! - `slow-a`, `slow-b`, `slow-c`: build scripts that log their start and end
@@ -21,7 +24,12 @@
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
 //!   working directory or its session; waits for a file, leaves an orphan
-//!   behind; exits with `ECHO_EXIT` (see its `main.rs`).
+//!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
+//! - `chatter`: numbered lines on stdout and stderr, and on request bytes
+//!   that test a run log's fidelity (see its `main.rs`).
+//!
+//! After every run the daemon executes, heli prints a footer line on stderr
+//! ([`split_footer`], [`without_footer`]).
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
@@ -54,14 +62,22 @@ const ISOLATED_VARS: [&str; 11] = [
 ];
 
 /// heli's variables a test command must not inherit from whoever runs the
-/// tests: they could point it at the user's real daemon.
-const HELI_VARS: [&str; 3] = ["HELI_STATE_DIR", "HELI_ENDPOINT", "HELI_DEPTH"];
+/// tests: they could point it at the user's real daemon, pool or
+/// configuration.
+const HELI_VARS: [&str; 5] = [
+    "HELI_STATE_DIR",
+    "HELI_ENDPOINT",
+    "HELI_DEPTH",
+    "HELI_POOL",
+    "HELI_CONFIG",
+];
 
 /// A fixture workspace copied into a temporary directory, with a target
 /// directory, a concurrency log and heli's state directory beside it.
 pub struct Fixture {
     root: tempfile::TempDir,
     endpoint: OsString,
+    pool: OsString,
     /// Variables set (or, when `None`, removed) on every command, which
     /// select this fixture's daemon.
     isolation: Vec<(OsString, Option<OsString>)>,
@@ -77,6 +93,8 @@ impl Fixture {
         fixture.isolation = vec![
             ("HELI_STATE_DIR".into(), Some(state_dir.into())),
             ("HELI_ENDPOINT".into(), Some(endpoint)),
+            ("HELI_POOL".into(), Some(fixture.pool())),
+            ("HELI_CONFIG".into(), Some(fixture.config_file().into())),
         ];
         fixture
     }
@@ -84,7 +102,9 @@ impl Fixture {
     /// Copies `tests/fixtures/<name>`, and leaves heli to find its state
     /// directory and endpoint where it would for a user whose home is
     /// [`Fixture::home`] (`LOCALAPPDATA` and `HOME`), with
-    /// `XDG_STATE_HOME` set to `<home>/xdg-state` or unset. Only for
+    /// `XDG_STATE_HOME` set to `<home>/xdg-state` or unset. Its pool and
+    /// configuration follow from that home too (`APPDATA` is the home;
+    /// `XDG_CONFIG_HOME` and `XDG_RUNTIME_DIR` are unset). Only for
     /// commands that do not need the real home (cargo and rustup live there).
     pub fn with_home(name: &str, xdg_state_home: bool) -> Self {
         let mut fixture = Self::bare(name);
@@ -92,9 +112,10 @@ impl Fixture {
         std::fs::create_dir_all(&home).expect("create the temporary home");
         let mut isolation: Vec<(OsString, Option<OsString>)> = HELI_VARS
             .iter()
+            .chain(&["XDG_CONFIG_HOME", "XDG_RUNTIME_DIR"])
             .map(|var| (OsString::from(var), None))
             .collect();
-        for var in ["LOCALAPPDATA", "HOME"] {
+        for var in ["LOCALAPPDATA", "APPDATA", "HOME"] {
             isolation.push((var.into(), Some(home.clone().into())));
         }
         let xdg = xdg_state_home.then(|| home.join("xdg-state").into());
@@ -110,7 +131,7 @@ impl Fixture {
             .join("fixtures")
             .join(name);
         copy_dir(&source, &root.path().join("ws"));
-        let endpoint = if cfg!(windows) {
+        let endpoint: OsString = if cfg!(windows) {
             static NEXT: AtomicU32 = AtomicU32::new(0);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -125,9 +146,17 @@ impl Fixture {
         } else {
             root.path().join("heli.sock").into()
         };
+        let pool = if cfg!(windows) {
+            // The pipe's unique name, as a semaphore name.
+            let endpoint = endpoint.to_str().expect("an ASCII pipe name");
+            endpoint.replace(r"\\.\pipe\", "").into()
+        } else {
+            root.path().join("jobserver").into()
+        };
         Self {
             root,
             endpoint,
+            pool,
             isolation: Vec::new(),
         }
     }
@@ -161,6 +190,23 @@ impl Fixture {
     /// pipe on Windows, a socket in the temporary directory elsewhere.
     pub fn endpoint(&self) -> OsString {
         self.endpoint.clone()
+    }
+
+    /// The host pool of this fixture's daemon ([`Fixture::new`]): a
+    /// semaphore name on Windows, a FIFO path elsewhere.
+    pub fn pool(&self) -> OsString {
+        self.pool.clone()
+    }
+
+    /// The configuration file of this fixture's daemon ([`Fixture::new`]).
+    pub fn config_file(&self) -> PathBuf {
+        self.root.path().join("config.toml")
+    }
+
+    /// Writes `toml` as the configuration file; a daemon reads it as it
+    /// starts.
+    pub fn configure(&self, toml: &str) {
+        std::fs::write(self.config_file(), toml).expect("write the configuration");
     }
 
     /// `cargo-heli` with `args`, run in the workspace.
@@ -280,10 +326,30 @@ impl Fixture {
             .join(format!("echo-args{}", std::env::consts::EXE_SUFFIX))
     }
 
+    /// Builds the binary of fixture package `package` and returns its path.
+    pub fn binary(&self, package: &str) -> PathBuf {
+        let output = self
+            .cargo(["build", "--quiet", "-p", package])
+            .output()
+            .expect("run cargo");
+        assert_success(&output, &format!("building {package}"));
+        self.target_dir()
+            .join("debug")
+            .join(format!("{package}{}", std::env::consts::EXE_SUFFIX))
+    }
+
     /// A concurrency log in this fixture's temporary directory.
     pub fn concurrency_log(&self) -> ConcurrencyLog {
         ConcurrencyLog {
             path: self.root.path().join("concurrency.log"),
+        }
+    }
+
+    /// Another concurrency log, `<name>.log` in this fixture's temporary
+    /// directory, for builds whose scripts must be told apart.
+    pub fn concurrency_log_named(&self, name: &str) -> ConcurrencyLog {
+        ConcurrencyLog {
+            path: self.root.path().join(format!("{name}.log")),
         }
     }
 }
@@ -338,12 +404,89 @@ pub fn kill_tree(pid: u32) {
     }
 }
 
+/// Kills process `pid` alone, as a crash would end it: its children live
+/// on. Only for processes the tests started themselves.
+pub fn kill_process(pid: u32) {
+    let pid = pid.to_string();
+    let mut command = if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/F", "/PID", &pid]);
+        taskkill
+    } else {
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", "--", &pid]);
+        kill
+    };
+    let _ = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The most of `intervals` in progress at the same moment; touching ones
+/// do not overlap.
+pub fn max_overlap(intervals: &[Interval]) -> usize {
+    let mut events: Vec<(u128, i32)> = intervals
+        .iter()
+        .flat_map(|run| [(run.start, 1), (run.end, -1)])
+        .collect();
+    events.sort();
+    let (mut now, mut max) = (0i32, 0i32);
+    for (_, delta) in events {
+        now += delta;
+        max = max.max(now);
+    }
+    usize::try_from(max).expect("never negative")
+}
+
 /// The lines of `bytes`, lossily decoded.
 pub fn lines(bytes: &[u8]) -> Vec<String> {
     String::from_utf8_lossy(bytes)
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// heli's footer after a run the daemon executed: the last line of the
+/// client's stderr, `cargo-heli: <run> … (output: cargo heli log <run>)`.
+#[derive(Debug)]
+pub struct Footer {
+    /// The run it names, `r<number>`.
+    pub run: String,
+    /// The whole line, without its line end.
+    pub line: String,
+}
+
+/// Splits a client's stderr into what the run wrote and heli's footer;
+/// panics when the last line is not a footer.
+pub fn split_footer(stderr: &[u8]) -> (Vec<u8>, Footer) {
+    let body = stderr
+        .strip_suffix(b"\n")
+        .unwrap_or_else(|| panic!("stderr does not end a line: {stderr:?}"));
+    let start = body
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |end| end + 1);
+    let line = String::from_utf8_lossy(&body[start..]).into_owned();
+    let run = line
+        .strip_prefix("cargo-heli: ")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|rest| rest.rsplit_once("(output: cargo heli log "))
+        .map(|(_, run)| run.to_owned())
+        .unwrap_or_else(|| {
+            panic!(
+                "no footer at the end of stderr: {}",
+                String::from_utf8_lossy(stderr)
+            )
+        });
+    (stderr[..start].to_vec(), Footer { run, line })
+}
+
+/// A client's stderr without heli's footer, lossily decoded; panics when it
+/// has no footer.
+pub fn without_footer(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(&split_footer(stderr).0).into_owned()
 }
 
 /// The `cargo-heli` binary under test.
@@ -390,6 +533,17 @@ impl ConcurrencyLog {
         command
             .env("HELI_FIXTURE_LOG", &self.path)
             .env("HELI_FIXTURE_SLEEP_MS", sleep_ms.to_string());
+    }
+
+    /// How many runs have started and not yet ended, as of now.
+    pub fn running(&self) -> usize {
+        let text = std::fs::read_to_string(&self.path).unwrap_or_default();
+        let count = |event: &str| {
+            text.lines()
+                .filter(|line| line.split_whitespace().nth(1) == Some(event))
+                .count()
+        };
+        count("start").saturating_sub(count("end"))
     }
 
     /// Every logged run, an `end` paired with the latest open `start` of the

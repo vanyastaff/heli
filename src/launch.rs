@@ -40,11 +40,17 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::ipc::{self, Stream};
-use crate::locations::{ENDPOINT_VAR, Locations, STATE_DIR_VAR};
+use crate::locations::{CONFIG_VAR, ENDPOINT_VAR, Locations, POOL_VAR, STATE_DIR_VAR};
 use crate::{daemon, environment, nesting};
 
 /// How long a starting daemon may take to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Exit code of `daemon --detach` when no daemon listened within
+/// [`START_TIMEOUT`]. The client waits with the same deadline, and which of
+/// the two expires first is a race; the client reads this code as
+/// [`StartError::TimedOut`], so it reports a timeout either way.
+const DETACH_TIMED_OUT: i32 = 4;
 
 /// A stage of the start this process launched.
 pub struct Launched {
@@ -71,7 +77,8 @@ pub fn start(locations: &Locations, depth: u32) -> io::Result<Launched> {
 }
 
 /// `cargo-heli daemon --detach`: starts the daemon, exits 0 once it listens,
-/// or with the code the daemon exited with, or 1.
+/// [`DETACH_TIMED_OUT`] when nothing listened in time, or with the code the
+/// daemon exited with, or 1.
 pub fn detach(depth: u32) -> ! {
     let Ok(locations) = Locations::resolve() else {
         std::process::exit(1)
@@ -82,7 +89,8 @@ pub fn detach(depth: u32) -> ! {
     std::process::exit(match wait(&locations, &mut daemon) {
         Ok(_probe) => 0,
         Err(StartError::Exited(code)) => code,
-        Err(StartError::TimedOut | StartError::Unreachable(_)) => 1,
+        Err(StartError::TimedOut) => DETACH_TIMED_OUT,
+        Err(StartError::Unreachable(_)) => 1,
     })
 }
 
@@ -100,6 +108,7 @@ pub fn wait(locations: &Locations, launched: &mut Launched) -> Result<Stream, St
         }
         match launched.exit_code() {
             None | Some(0 | daemon::ALREADY_RUNNING) => {}
+            Some(DETACH_TIMED_OUT) => return Err(StartError::TimedOut),
             Some(code) => return Err(StartError::Exited(code)),
         }
         if Instant::now() >= deadline {
@@ -135,6 +144,8 @@ fn spawn_stage(locations: &Locations, depth: u32, args: &[&str]) -> io::Result<L
     let env = environment::current_with(&[
         (STATE_DIR_VAR, OsString::from(&locations.state_dir)),
         (ENDPOINT_VAR, OsString::from(&locations.endpoint)),
+        (POOL_VAR, locations.pool.clone()),
+        (CONFIG_VAR, OsString::from(&locations.config)),
         (nesting::VAR, OsString::from((depth + 1).to_string())),
     ]);
     spawn(&program, args, locations, env)

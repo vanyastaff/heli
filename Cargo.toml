@@ -10,11 +10,22 @@ exclude = ["/experiments", "/tests/fixtures"]
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
+regex = "1.12"
+serde ={ version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+# `mkfifo`, which rustix leaves out on Apple platforms.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+# `NtQuerySemaphore`, which windows-sys does not declare.
+windows-link = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

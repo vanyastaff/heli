@@ -8,14 +8,19 @@
 //! - [`protocol`]: the versioned messages between client and daemon, over
 //!   [`ipc`], the owner-only endpoint;
 //! - [`daemon`]: the per-user daemon, its run registry
-//!   ([`daemon::registry`]) and run execution ([`daemon::execute`]);
+//!   ([`daemon::registry`]), run execution ([`daemon::execute`]) and the
+//!   result store ([`daemon::results`], keyed by [`daemon::key`]);
+//! - [`pool`]: the host pool, the jobserver every run draws from, sized by
+//!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
+//! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
 mod cli;
 mod client;
 mod clock;
+mod config;
 mod daemon;
 mod direct;
 mod environment;
@@ -23,7 +28,9 @@ mod ipc;
 mod launch;
 mod locations;
 mod nesting;
+mod pool;
 mod protocol;
+mod runlog;
 mod status;
 mod worktree;
 
@@ -49,6 +56,7 @@ fn main() {
     match action {
         cli::Action::Run(invocation) => client::run(invocation, depth),
         cli::Action::Status { json } => client::status(json),
+        cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
     }
