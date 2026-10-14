@@ -763,7 +763,9 @@ rules apply.
 
 For each passing verify or test key, heli keeps a marker
 `<state>/verified/<digest>` holding the run id, the worktree and the time. It
-keeps at most 256 markers and drops the least recently used first.
+keeps at most 256 markers and drops the least recently used first; a hit
+counts as a use. The daemon keeps the store: a run that the client executes
+directly, without a daemon, neither looks it up nor records.
 
 **The key.** These rules carry over the lessons of flui#1619, where each one
 was found by a failing test.
@@ -774,21 +776,28 @@ was found by a failing test.
 - **Tree.** The worktree with every change staged: `git add -A` into a
   scratch copy of the index (`GIT_INDEX_FILE`), then `git write-tree`. The real
   index is never written (`GIT_OPTIONAL_LOCKS=0`).
-- **Base.** For a command that diffs against a base, the merge base too.
+- **Base.** For a command that diffs against a base, the merge base too. No
+  verify or test subcommand does; `exec`, which can run such a command, does
+  not use the store yet.
 - **Machine.** Host name, OS and architecture, because a state directory in a
   shared home must not certify another machine.
-- **Toolchain.** `rustc -vV`, and the versions of cargo and of the tools the
-  run uses (clippy, nextest), each asked in the worktree, so that the pinned
+- **Toolchain.** `rustc -vV` (`RUSTC` when set), and the versions of cargo
+  and of the tool the run uses (clippy, rustfmt, nextest), each asked in the
+  client's working directory with its environment, so that the pinned
   toolchain answers. A missing tool is keyed as absent.
 - **Cargo configuration.** The content of every `config.toml` and `config` on
-  cargo's discovery path: `.cargo/` in the worktree and every directory above
-  it, then the Cargo home.
-- **Argv**, normalized.
+  cargo's discovery path: `.cargo/` in the working directory and every
+  directory above it, then the Cargo home. They are keyed in the order cargo
+  reads them, not by path, so worktrees in different places can share a key.
+- **Argv**, normalized: without the program, which the toolchain stands for,
+  and with the working directory relative to the worktree, which selects
+  packages and configuration as an argument would. The worktree's own path is
+  not keyed.
 - **Environment.** Every variable except a neutral list:
   - Names are case-folded on Windows only.
   - `PATH`, `LD_LIBRARY_PATH` and the `DYLD_*` search paths are keyed without
     their entries inside the worktree, which cargo prepends for the programs
-    it runs.
+    it runs; one left without entries counts as unset.
   - Neutral, and so not keyed:
     - job and thread counts holding a value the tool accepts (an invalid one
       fails the run, so it is keyed);
@@ -804,16 +813,20 @@ was found by a failing test.
   - Any variable not on the list, a test control such as `PROPTEST_CASES`
     among them, is keyed, so it misses the cache instead of reusing a result.
 - **The plan**, when the command has one, rendered, including the steps it
-  skips on this host.
+  skips on this host. No verify or test subcommand has one yet.
 
 **When the key is computed.** It is checked twice: before the run waits for
 anything, and again once admitted, because another run may have recorded it
-meanwhile. The tree is snapshotted before planning and again after the steps.
-A marker is written only when the run passed and both snapshots match.
+meanwhile. A hit is never admitted as a run: it takes no run id. The key is
+computed afresh once admitted, and that snapshot of the tree, taken before
+the steps, is compared with one taken after them. A marker is written only
+when the run passed and both snapshots match. A run that fails drops the
+marker of its key, so a flaky pass is reused only until a run of the same key
+fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key.
+the key. `--no-cache` skips both lookups, not the recording.
 
 Compile runs are never recorded, because their product is the artifact, not
 the verdict.

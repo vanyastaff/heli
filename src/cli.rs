@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::protocol::Cache;
 use crate::runlog;
 use crate::runlog::select::Select;
 
@@ -34,6 +35,8 @@ pub enum Action {
 pub struct Invocation {
     pub program: OsString,
     pub args: Vec<OsString>,
+    /// How the run uses the result store.
+    pub cache: Cache,
 }
 
 #[derive(Debug, Parser)]
@@ -46,6 +49,10 @@ pub struct Invocation {
     arg_required_else_help = true
 )]
 struct Cli {
+    /// Run even when the same inputs already passed; the run is recorded
+    /// when it passes.
+    #[arg(long)]
+    no_cache: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -134,6 +141,7 @@ pub fn parse(
             Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
+                cache: Cache::Off,
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -151,9 +159,39 @@ pub fn parse(
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,
+            cache: match (verifies(&args), cli.no_cache) {
+                (false, _) => Cache::Off,
+                (true, false) => Cache::On,
+                (true, true) => Cache::Refresh,
+            },
             args,
         }),
     })
+}
+
+/// Whether the cargo subcommand `args` is a verify or a test run, the runs
+/// whose verdict the result store keeps: `check`, `clippy` (not `--fix`),
+/// `fmt --check` (also after `--`, as rustfmt's), `test` and `nextest run`.
+/// A request for help is not.
+///
+/// A stand-in until the run classes (DESIGN.md §5, "Classes") exist: they
+/// replace this function.
+fn verifies(args: &[OsString]) -> bool {
+    let tool_args: Vec<&OsString> = args.iter().skip(1).take_while(|arg| *arg != "--").collect();
+    let has = |flag: &str| tool_args.iter().any(|arg| *arg == flag);
+    if has("-h") || has("--help") {
+        return false;
+    }
+    let Some(subcommand) = args.first().and_then(|first| first.to_str()) else {
+        return false;
+    };
+    match subcommand {
+        "check" | "c" | "test" | "t" => true,
+        "clippy" => !has("--fix"),
+        "fmt" => args.iter().any(|arg| arg == "--check"),
+        "nextest" => tool_args.first().is_some_and(|arg| *arg == "run"),
+        _ => false,
+    }
 }
 
 /// A run id as the user gives it, `r17` or `17`, as heli writes it: `r17`.

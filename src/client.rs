@@ -9,6 +9,9 @@
 //!   stderr to the same streams as they arrive; exit with the run's code
 //!   (on Unix, die of the run's signal). A command that cannot be started
 //!   is reported as direct execution reports it (exit 127 or 126).
+//! - **A hit.** When the daemon answers that the run's key already passed
+//!   (`crate::daemon::results`), say which run passed and when, with the
+//!   caveats of reusing a verdict, and exit 0 without running anything.
 //! - **Fallback.** Whenever the daemon cannot take the run (it does not
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
@@ -291,11 +294,13 @@ fn submit(
             .into_iter()
             .map(|(name, value)| (Text(name), Text(value)))
             .collect(),
+        cache: invocation.cache,
     };
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
     match protocol::read_message::<Reply>(&mut stream) {
         Ok(Reply::Started { run }) => follow(stream, invocation, &run, Instant::now()),
+        Ok(Reply::Passed { run, worktree, at }) => already_passed(&run, &worktree, at),
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
@@ -336,11 +341,45 @@ fn follow(mut stream: Stream, invocation: &Invocation, run: &str, started: Insta
                 drop((stdout, stderr));
                 direct::report_spawn_failure(&invocation.program, not_found, &message)
             }
+            Ok(Frame::Message(Reply::Passed {
+                run: passed,
+                worktree,
+                at,
+            })) => {
+                let _ = stdout.flush();
+                drop((stdout, stderr));
+                already_passed(&passed, &worktree, at)
+            }
             Ok(Frame::Message(other)) => {
                 lost(run, &format!("unexpected message {other:?}"), stdout)
             }
             Err(error) => lost(run, &error.to_string(), stdout),
         }
+    }
+}
+
+/// Reports a hit of the result store: run `run` in `worktree` passed with
+/// the same key at `at`. Exits 0.
+fn already_passed(run: &str, worktree: &Text, at: u64) -> ! {
+    eprintln!(
+        "cargo-heli: already passed: {run}, {} ({}); nothing to run",
+        ago(clock::now().saturating_sub(at)),
+        worktree.0.to_string_lossy()
+    );
+    eprintln!(
+        "cargo-heli: caveats: a flaky pass is reused (--no-cache runs it again), \
+         and ignored files are not part of the key"
+    );
+    std::process::exit(0)
+}
+
+/// `seconds` as a short age: `12 s ago`, `3 min ago`, `5 h ago`, `2 d ago`.
+fn ago(seconds: u64) -> String {
+    match seconds {
+        0..120 => format!("{seconds} s ago"),
+        120..7_200 => format!("{} min ago", seconds / 60),
+        7_200..172_800 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
     }
 }
 

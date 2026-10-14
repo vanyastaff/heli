@@ -8,7 +8,8 @@
 //! - [`protocol`]: the versioned messages between client and daemon, over
 //!   [`ipc`], the owner-only endpoint;
 //! - [`daemon`]: the per-user daemon, its run registry
-//!   ([`daemon::registry`]), run execution ([`daemon::execute`]) and, on
+//!   ([`daemon::registry`]), run execution ([`daemon::execute`]), the
+//!   result store ([`daemon::results`], keyed by [`daemon::key`]) and, on
 //!   Unix, its pool's warden ([`daemon::warden`]);
 //! - [`pool`]: the host pool, the jobserver every run draws from, sized by
 //!   the per-user [`config`];
