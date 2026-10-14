@@ -172,7 +172,9 @@ pub struct Run {
     pub worktree: String,
     /// The command, program first.
     pub argv: Vec<String>,
-    #[serde(default)]
+    /// `None` from a daemon older than run classes, and for a class this
+    /// build does not know (a newer daemon's).
+    #[serde(default, deserialize_with = "known_class")]
     pub class: Option<Class>,
     pub phase: Phase,
     pub started_at: u64,
@@ -230,7 +232,17 @@ impl Exit {
     }
 }
 
-/// Where a run is in its lifecycle.
+/// A run's class as `status` reads it: `None` for a class this build does
+/// not know, which a newer daemon may send.
+fn known_class<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Class>, D::Error> {
+    let class = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(class.and_then(|class| serde_json::from_value(class).ok()))
+}
+
+/// Where a run is in its lifecycle. A newer daemon may add phases, so a
+/// phase this build does not know reads as [`Phase::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
@@ -242,6 +254,9 @@ pub enum Phase {
     Testing,
     /// Ended.
     Done,
+    /// A phase of a newer daemon's, which this build does not know.
+    #[serde(other)]
+    Unknown,
 }
 
 impl Phase {
@@ -252,6 +267,7 @@ impl Phase {
             Self::Building => "building",
             Self::Testing => "testing",
             Self::Done => "done",
+            Self::Unknown => "unknown",
         }
     }
 }

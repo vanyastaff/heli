@@ -425,6 +425,9 @@ fn follow(
             Ok(Frame::Message(Reply::Waiting { runs })) => {
                 printer.note(&format!("cargo-heli: {}", waiting_for(&runs)));
             }
+            // A newer daemon's word about the run, which this client cannot
+            // read: the run goes on all the same.
+            Ok(Frame::Message(Reply::Unknown(_))) => {}
             Ok(Frame::Message(Reply::Exited {
                 code,
                 signal,

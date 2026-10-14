@@ -47,8 +47,11 @@
 //! **Changes.** The version stays 1 until the first release. Until then a
 //! new request needs no new version: older daemons answer it with
 //! `Unsupported`. Fields are only added, with defaults, so that both sides
-//! read each other's messages. A change that breaks that raises
-//! [`VERSION`].
+//! read each other's messages, and a value a newer side adds to an enum
+//! reads as unknown on an older one: a reply ([`Reply::Unknown`], which a
+//! client following a run skips), a run's phase or class in a status
+//! (`crate::status`). A daemon sends a new reply only to a client that
+//! says it reads it. A change that breaks that raises [`VERSION`].
 //!
 //! JSON (serde, serde_json) keeps messages readable and easy to extend for
 //! the requests later tickets add; output stays raw bytes in frames of its
@@ -227,6 +230,12 @@ pub enum Reply {
     CancelFailed {
         message: String,
     },
+    /// A message of a newer daemon's that this build does not know (a
+    /// variant it lacks, or one whose fields it cannot read). Never sent.
+    /// A client following a run skips it; elsewhere it is an answer the
+    /// client did not expect.
+    #[serde(untagged, skip_serializing)]
+    Unknown(serde::de::IgnoredAny),
 }
 
 impl Reply {

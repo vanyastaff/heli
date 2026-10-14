@@ -32,6 +32,13 @@ pub enum Answer {
     /// whatever it is, with a message frame holding this JSON: what a daemon
     /// of another build of the same protocol would answer.
     Reply(&'static str),
+    /// `HELI` and [`PROTOCOL`]; then it answers the client's request with a
+    /// message frame for each of these JSON texts, in order, and keeps the
+    /// connection open until the client closes it.
+    Replies(&'static [&'static str]),
+    /// As [`Answer::Replies`], then it hangs up at once: a daemon lost
+    /// there.
+    LostAfter(&'static [&'static str]),
 }
 
 /// The protocol version of this build of heli.
@@ -66,7 +73,10 @@ impl FakeDaemon {
                     let _ = stream.read_to_end(&mut Vec::new());
                     return Vec::new();
                 }
-                Answer::Unsupported | Answer::Reply(_) => {
+                Answer::Unsupported
+                | Answer::Reply(_)
+                | Answer::Replies(_)
+                | Answer::LostAfter(_) => {
                     let mut bytes = *b"HELI\0\0\0\0";
                     bytes[4..].copy_from_slice(&PROTOCOL.to_le_bytes());
                     bytes
@@ -75,12 +85,13 @@ impl FakeDaemon {
             if stream.write_all(&bytes).is_err() {
                 return Vec::new();
             }
-            let reply = match answer {
-                Answer::Unsupported => Some("\"Unsupported\""),
-                Answer::Reply(json) => Some(json),
-                _ => None,
+            let replies: &[&str] = match &answer {
+                Answer::Unsupported => &["\"Unsupported\""],
+                Answer::Reply(json) => std::slice::from_ref(json),
+                Answer::Replies(replies) | Answer::LostAfter(replies) => replies,
+                _ => &[],
             };
-            if let Some(reply) = reply {
+            if !replies.is_empty() {
                 let mut header = [0u8; 5];
                 stream
                     .read_exact(&mut header)
@@ -90,6 +101,8 @@ impl FakeDaemon {
                 stream
                     .read_exact(&mut request)
                     .expect("the client's request");
+            }
+            for reply in replies {
                 let reply = reply.as_bytes();
                 let mut frame = vec![0u8];
                 frame.extend((reply.len() as u32).to_le_bytes());
@@ -97,6 +110,9 @@ impl FakeDaemon {
                 if stream.write_all(&frame).is_err() {
                     return Vec::new();
                 }
+            }
+            if matches!(answer, Answer::LostAfter(_)) {
+                return Vec::new();
             }
             let mut rest = Vec::new();
             let _ = stream.read_to_end(&mut rest);
