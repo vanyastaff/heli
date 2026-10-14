@@ -7,6 +7,7 @@
 //! ```json
 //! {"schema":1,
 //!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
+//!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
 //!           "class":"compile","phase":"running","started_at":1791911112,
 //!           "waiting_since":null,"waiting_for":[]},
@@ -15,9 +16,10 @@
 //!           "waiting_since":1791911120,"waiting_for":["r17"]}]}
 //! ```
 //!
-//! `daemon` is `null` when no daemon answers. A run waiting for its
-//! worktree's lock has `waiting_since` and, in `waiting_for`, the runs it
-//! waits for; otherwise they are `null` and empty.
+//! `daemon` and `pool` are `null` when no daemon answers. A run waiting for
+//! its worktree's lock has `waiting_since` and, in `waiting_for`, the runs
+//! it waits for; otherwise they are `null` and empty. `class` is `null` only
+//! from a daemon older than run classes.
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +32,23 @@ pub const SCHEMA: u32 = 1;
 pub struct Status {
     pub schema: u32,
     pub daemon: Option<Daemon>,
+    /// Absent from a daemon older than the pool.
+    #[serde(default)]
+    pub pool: Option<Pool>,
     pub runs: Vec<Run>,
+}
+
+/// The host pool's slots (`crate::pool`), counted as the status was taken.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Pool {
+    /// N: the jobs the pool admits beyond each process's own first one.
+    pub slots: u32,
+    /// Slots that no process holds.
+    pub free: u32,
+    /// Slots the daemon holds back while memory is low.
+    pub withheld: u32,
+    /// Slots that builds hold: `slots - free - withheld`, never below 0.
+    pub in_use: u32,
 }
 
 /// The daemon that answered.
@@ -51,12 +69,15 @@ pub struct Run {
     pub worktree: String,
     /// The command, program first.
     pub argv: Vec<String>,
-    pub class: Class,
+    #[serde(default)]
+    pub class: Option<Class>,
     pub phase: Phase,
     pub started_at: u64,
     /// Since when the run waits for its worktree's lock, if it does.
+    #[serde(default)]
     pub waiting_since: Option<u64>,
     /// The runs it waits for, by id.
+    #[serde(default)]
     pub waiting_for: Vec<String>,
 }
 
@@ -83,11 +104,13 @@ impl Status {
         Self {
             schema: SCHEMA,
             daemon: None,
+            pool: None,
             runs: Vec::new(),
         }
     }
 
-    /// The text form, one line per daemon and run, with ages as of `now`.
+    /// The text form, one line for the daemon, its pool and each run, with
+    /// ages as of `now`.
     pub fn to_text(&self, now: u64) -> String {
         let age = |since: u64| now.saturating_sub(since);
         let mut text = match &self.daemon {
@@ -99,6 +122,12 @@ impl Status {
                 age(daemon.started_at)
             ),
         };
+        if let Some(pool) = &self.pool {
+            text.push_str(&format!(
+                "pool    {} slots: {} in use, {} free, {} withheld\n",
+                pool.slots, pool.in_use, pool.free, pool.withheld
+            ));
+        }
         if self.runs.is_empty() {
             text.push_str("runs    none\n");
         }
@@ -114,7 +143,7 @@ impl Status {
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
-                run.class.name(),
+                run.class.map_or("-", Class::name),
                 age(run.started_at)
             ));
         }

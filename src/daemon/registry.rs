@@ -188,7 +188,7 @@ impl Inner {
                 .iter()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
-            class: entry.class,
+            class: Some(entry.class),
             phase: entry.phase,
             started_at: clock::unix_seconds(entry.started_at),
             waiting_since: (!waiting_for.is_empty()).then(|| clock::unix_seconds(entry.started_at)),

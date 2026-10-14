@@ -23,9 +23,23 @@
 //!   has to wait for its worktree's lock, then output frames in the order
 //!   the run wrote them, then [`Reply::Exited`] or [`Reply::SpawnFailed`].
 //!   The daemon sends `Started` before it starts anything, so a client that
-//!   never sees it can safely run the command itself.
+//!   never sees it can safely run the command itself. A client that sends
+//!   no [`RunRequest::class`] predates the worktree lock and is never sent
+//!   `Waiting`, which it could not read.
+//! - [`Request::Log`]: output frames holding the part of the run's record
+//!   asked for (`crate::runlog`), each on the channel the run wrote it to,
+//!   then [`Reply::LogEnd`]; or [`Reply::LogFailed`].
+//! - A request the daemon does not know (it is older than the client):
+//!   [`Reply::Unsupported`]. The client treats it like a version mismatch:
+//!   it sends [`RETIRE`], and the daemon retires as above; then the client
+//!   does without the daemon (it runs the command, or reads the run log,
+//!   itself).
 //!
-//! Adding a message or a field is a protocol change: raise [`VERSION`].
+//! **Changes.** The version stays 1 until the first release. Until then a
+//! new request needs no new version: older daemons answer it with
+//! `Unsupported`. Fields are only added, with defaults, so that both sides
+//! read each other's messages. A change that breaks that raises
+//! [`VERSION`].
 //!
 //! JSON (serde, serde_json) keeps messages readable and easy to extend for
 //! the requests later tickets add; output stays raw bytes in frames of its
@@ -38,6 +52,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::runlog::select::Select;
 use crate::status::{self, Status};
 
 /// This build's protocol version.
@@ -87,6 +102,16 @@ pub enum Request {
     Run(RunRequest),
     /// Describe the daemon and its runs.
     Status,
+    /// Send part of a run's record (`crate::runlog`).
+    Log(LogRequest),
+}
+
+/// The run whose record to send, and which part of it.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogRequest {
+    /// `r<number>`.
+    pub run: String,
+    pub select: Select,
 }
 
 /// A command to execute as the client would have: in its working directory,
@@ -97,8 +122,10 @@ pub struct RunRequest {
     /// The program, then its arguments.
     pub argv: Vec<Text>,
     pub env: Vec<(Text, Text)>,
-    /// What kind of run it is, as the client read its command line.
-    pub class: Class,
+    /// What kind of run it is, as the client read its command line; `None`
+    /// from a client older than run classes.
+    #[serde(default)]
+    pub class: Option<Class>,
 }
 
 /// What the daemon answers.
@@ -129,6 +156,14 @@ pub enum Reply {
         signal: Option<i32>,
     },
     Status(Status),
+    /// The daemon does not know the request: it is older than the client.
+    Unsupported,
+    /// The part of the record asked for has been sent.
+    LogEnd,
+    /// The record cannot be read; `message` says why.
+    LogFailed {
+        message: String,
+    },
 }
 
 /// An output stream of a run.
