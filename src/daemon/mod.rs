@@ -228,7 +228,9 @@ fn open_pool(locations: &Locations, config: &Config, log: &Log) -> Pool {
 fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter> {
     match warden::start(locations) {
         Ok((alive, pid)) => {
-            log.write(&format!("pool warden: pid {pid}"));
+            // Not a `pool ` line: each of those says how a daemon found its
+            // pool.
+            log.write(&format!("warden: pid {pid}"));
             Some(alive)
         }
         Err(error) => {

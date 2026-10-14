@@ -6,9 +6,13 @@
 //!   gets one from the host pool, the waiting run with the fewest slots in
 //!   use first.
 //! - **Return.** Free slots in a run pool beyond one go back to the host
-//!   pool. The one left goes back too when the host pool has none free and
-//!   a run that waits uses fewer slots than this one; an idle run (using
-//!   none) keeps it, for the next process that asks.
+//!   pool once they have stayed free for a [`TICK`]: until then, they may
+//!   be slots that a run with work pending gave back and that its processes
+//!   waiting on the pool have not yet woken to take (a process blocked on a
+//!   FIFO takes a byte only once the scheduler runs it). The one left goes
+//!   back too when the host pool has none free and a run that waits uses
+//!   fewer slots than this one; an idle run (using none) keeps it, for the
+//!   next process that asks.
 //! - **Share.** A run's share is the capacity (the host pool's free slots
 //!   plus those the active runs hold) divided by the active runs. While
 //!   another run waits, a run using its share or more gets no new slot. A
@@ -82,6 +86,9 @@ struct Run {
     lent: u32,
     /// The run pool's free slots, as last counted.
     free: u32,
+    /// Since when every count has seen more than one free slot in the run
+    /// pool: a surplus that has lasted a [`TICK`] goes back (Return).
+    surplus_since: Option<Instant>,
     /// When the run pool was last seen with a free slot: a wait for a lent
     /// slot began no earlier.
     last_free: Instant,
@@ -163,6 +170,7 @@ impl Broker {
                 pool,
                 lent: 0,
                 free: 0,
+                surplus_since: None,
                 last_free: Instant::now(),
                 test_wanted: 0,
                 test_held: 0,
@@ -299,7 +307,7 @@ impl Broker {
             while run.test_held < run.test_wanted && run.take_free() {
                 run.test_held += 1;
             }
-            while run.free > 1 && run.lent > 0 && run.take_free() {
+            while run.free > 1 && run.lent > 0 && run.surplus_lasted(now) && run.take_free() {
                 self.give_host();
             }
         }
@@ -503,7 +511,19 @@ impl Run {
         if self.free > 0 {
             self.last_free = now;
         }
+        if self.free > 1 {
+            self.surplus_since.get_or_insert(now);
+        } else {
+            self.surplus_since = None;
+        }
         self.loans.most = self.loans.most.max(self.in_use());
+    }
+
+    /// Whether the run pool's surplus (free slots beyond one) has lasted a
+    /// [`TICK`] by `now`, and is no slot on its way to a waiting process.
+    fn surplus_lasted(&self, now: Instant) -> bool {
+        self.surplus_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= TICK)
     }
 
     /// Takes a free slot out of the run pool, if it has one.

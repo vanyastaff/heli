@@ -245,8 +245,11 @@ a name with a space, or a semaphore name that is not ASCII.
 
 The daemon reads the free count with `NtQuerySemaphore` (ntdll; the handle
 needs `SEMAPHORE_QUERY_STATE`, which the one `CreateSemaphoreW` returns has,
-and the ones cargo opens do not) or `FIONREAD` on its own nonblocking file
-description of the FIFO. Counts are snapshots.
+and the ones cargo opens do not) or `FIONREAD` on a nonblocking file
+description of the FIFO open for reading only: on one open for reading and
+writing, macOS answers for the FIFO's write side, which never holds a byte
+(its `fifo_ioctl` asks the read socket, then the write socket, and the last
+answer wins). Counts are snapshots.
 
 **Adoption.** A restarted daemon adopts a pool that some process still holds,
 as it is: the slots that process holds come back to the same pool, so a
@@ -314,10 +317,16 @@ runs; withheld slots and slots bare cargo holds are not in it.
   already using its share or more gets none. A run alone can borrow every
   slot. A process waiting on a semaphore takes a slot as it is put in, so in
   the same pass the broker lends again to a run that still waits.
-- **Return.** Free slots in a run pool beyond one go back to the host pool.
-  An idle run keeps one, for the next process that asks. That one goes back
-  too when the host pool has none free and a run that waits uses fewer slots
-  than this one.
+- **Return.** Free slots in a run pool beyond one go back to the host pool
+  once they have stayed free for a tick. Sooner, they may be slots that a
+  run with work pending just gave back, which its processes waiting on the
+  pool have not yet woken to take: a process blocked on a FIFO takes a
+  byte only once the scheduler runs it, which on a busy host can be after
+  the next count. Returned, such a slot would go to another run and then be
+  taken back (seen on a macOS CI runner: a third slot taken back where two
+  balance the runs). An idle run keeps one, for the next process that asks.
+  That one goes back too when the host pool has none free and a run that
+  waits uses fewer slots than this one.
 - **Take back.** A run with work pending never shows a free slot: each slot
   one of its processes gives back is taken at once by another waiting on the
   same pool. So while the host pool has no free slot and a run waits, a run

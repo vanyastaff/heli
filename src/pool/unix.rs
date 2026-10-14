@@ -4,7 +4,12 @@
 //!   belong to the user.
 //! - The daemon holds it open for reading and writing, nonblocking: its own
 //!   open file description, so the cargos that open the FIFO by path keep
-//!   blocking reads. `FIONREAD` counts the free slots.
+//!   blocking reads.
+//! - `FIONREAD` counts the free slots, on a second description the daemon
+//!   holds open for reading only. On one open for reading and writing,
+//!   macOS answers for the FIFO's write side, which never holds a byte: its
+//!   `fifo_ioctl` asks the read socket, then lets the write socket overwrite
+//!   the answer.
 //! - A FIFO's bytes live in the kernel only while some process holds it
 //!   open. Before opening it, the daemon asks whether anyone does: opening
 //!   it write-only and nonblocking fails with `ENXIO` when nobody has it
@@ -55,6 +60,9 @@ const WARDEN_POLL: Duration = Duration::from_millis(250);
 pub struct Jobserver {
     /// The daemon's own open file description: nonblocking.
     fifo: File,
+    /// Another, for reading only and nonblocking, on which `FIONREAD`
+    /// counts the bytes (see the module docs).
+    count: File,
     path: PathBuf,
     /// The pool's lock, held while the daemon lives; a run pool has none.
     _owner: Option<File>,
@@ -85,6 +93,7 @@ impl Jobserver {
             Err(error) => return Err(error),
         };
         let fifo = open_nonblocking(&path)?;
+        let count = open_count(&path)?;
         let opened = if held {
             Opened::Adopted
         } else {
@@ -93,6 +102,7 @@ impl Jobserver {
         };
         let jobserver = Self {
             fifo,
+            count,
             path,
             _owner: Some(owner),
             auth,
@@ -116,8 +126,10 @@ impl Jobserver {
         }
         make_fifo(&path)?;
         let fifo = open_nonblocking(&path)?;
+        let count = open_count(&path)?;
         Ok(Self {
             fifo,
+            count,
             path,
             _owner: None,
             auth,
@@ -142,7 +154,7 @@ impl Jobserver {
 
     /// The free slots: the bytes in the FIFO.
     pub fn free(&self) -> io::Result<u32> {
-        let bytes = rustix::io::ioctl_fionread(&self.fifo)?;
+        let bytes = rustix::io::ioctl_fionread(&self.count)?;
         Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
     }
 
@@ -386,6 +398,15 @@ fn open_nonblocking(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(OFlags::NONBLOCK.bits() as i32)
+        .open(path)
+}
+
+/// Opens the FIFO at `path` for reading only, nonblocking, so that the open
+/// never waits for a writer: the description that counts its bytes.
+fn open_count(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
         .custom_flags(OFlags::NONBLOCK.bits() as i32)
         .open(path)
 }
