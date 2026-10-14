@@ -1,10 +1,17 @@
 //! The command line: heli's own flags come before the subcommand, and
-//! everything after it belongs to the tool, passed through verbatim.
+//! everything after it belongs to the tool, passed through verbatim. The
+//! subcommand and its arguments also give the run its class
+//! (`crate::class`).
 
 use std::ffi::OsString;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
+
+use crate::class::Class;
+use crate::protocol::Cache;
+use crate::runlog;
+use crate::runlog::select::Select;
 
 /// What heli was asked to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -13,15 +20,27 @@ pub enum Action {
     Run(Invocation),
     /// Show the daemon and its runs.
     Status { json: bool },
+    /// Start the daemon unless one runs.
+    Ensure,
+    /// Offer the environment that lets a bare cargo draw from the pool;
+    /// with `print`, only show it.
+    Setup { print: bool },
+    /// Print the recorded output of run `run` (`r<number>`), or a part of it.
+    Log { run: String, select: Select },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
+    /// Be the daemon's pool warden.
+    Warden,
 }
 
-/// The program heli runs, and its arguments.
+/// The program heli runs, its arguments, and the class of the run.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub class: Class,
+    /// How the run uses the result store.
+    pub cache: Cache,
 }
 
 #[derive(Debug, Parser)]
@@ -34,6 +53,10 @@ pub struct Invocation {
     arg_required_else_help = true
 )]
 struct Cli {
+    /// Run even when the same inputs already passed; the run is recorded
+    /// when it passes.
+    #[arg(long)]
+    no_cache: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -52,6 +75,28 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start heli's daemon unless one is running; for a session-start hook.
+    Ensure,
+    /// Offer to set `CARGO_MAKEFLAGS` for agents and shells, so that a bare
+    /// cargo draws from heli's pool; each file is written only on a yes.
+    Setup {
+        /// Only show what would be written; ask nothing, write nothing.
+        #[arg(long)]
+        print: bool,
+    },
+    /// Print a run's recorded output: stdout on stdout, stderr on stderr.
+    Log {
+        /// The run, as the footer after it and `status` name it: `r17` (or
+        /// `17`).
+        #[arg(value_parser = parse_run)]
+        run: String,
+        /// Only the last N lines, of both streams together.
+        #[arg(long, value_name = "N", group = "select")]
+        tail: Option<usize>,
+        /// Only the lines that match this regular expression.
+        #[arg(long, value_name = "RE", group = "select", value_parser = parse_pattern)]
+        grep: Option<String>,
+    },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -59,6 +104,11 @@ enum Command {
         /// and exit once it listens.
         #[arg(long)]
         detach: bool,
+        /// Be the pool's warden, which the daemon starts: once the daemon at
+        /// the other end of stdin is gone, remove its pool when nobody holds
+        /// it.
+        #[arg(long, hide = true, conflicts_with = "detach")]
+        warden: bool,
     },
     /// Any cargo subcommand, e.g. `cargo heli build -p foo`: run as
     /// `cargo build -p foo`.
@@ -95,13 +145,74 @@ pub fn parse(
             Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
+                class: Class::Exec,
+                cache: Cache::Off,
             })
         }
         Command::Status { json } => Action::Status { json },
-        Command::Daemon { detach } => Action::Daemon { detach },
+        Command::Ensure => Action::Ensure,
+        Command::Setup { print } => Action::Setup { print },
+        Command::Log { run, tail, grep } => Action::Log {
+            run,
+            select: match (tail, grep) {
+                (Some(count), _) => Select::Tail(count),
+                (None, Some(pattern)) => Select::Grep(pattern),
+                (None, None) => Select::All,
+            },
+        },
+        Command::Daemon { warden: true, .. } => Action::Warden,
+        Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,
+            class: Class::of_cargo(&args),
+            cache: match (verifies(&args), cli.no_cache) {
+                (false, _) => Cache::Off,
+                (true, false) => Cache::On,
+                (true, true) => Cache::Refresh,
+            },
             args,
         }),
     })
+}
+
+/// Whether the cargo subcommand `args` is a verify or a test run, the runs
+/// whose verdict the result store keeps: `check`, `clippy` (not `--fix`),
+/// `fmt --check` (also after `--`, as rustfmt's), `test` and `nextest run`.
+/// A request for help is not.
+///
+/// A stand-in until the run classes (DESIGN.md §5, "Classes") exist: they
+/// replace this function.
+fn verifies(args: &[OsString]) -> bool {
+    let tool_args: Vec<&OsString> = args.iter().skip(1).take_while(|arg| *arg != "--").collect();
+    let has = |flag: &str| tool_args.iter().any(|arg| *arg == flag);
+    if has("-h") || has("--help") {
+        return false;
+    }
+    let Some(subcommand) = args.first().and_then(|first| first.to_str()) else {
+        return false;
+    };
+    match subcommand {
+        "check" | "c" | "test" | "t" => true,
+        "clippy" => !has("--fix"),
+        "fmt" => args.iter().any(|arg| arg == "--check"),
+        "nextest" => tool_args.first().is_some_and(|arg| *arg == "run"),
+        _ => false,
+    }
+}
+
+/// A run id as the user gives it, `r17` or `17`, as heli writes it: `r17`.
+fn parse_run(text: &str) -> Result<String, String> {
+    let run = if text.starts_with('r') {
+        text.to_owned()
+    } else {
+        format!("r{text}")
+    };
+    runlog::run_number(&run)
+        .map(|number| format!("r{number}"))
+        .ok_or_else(|| "a run id is r<number>, as the footer after a run names it".to_owned())
+}
+
+/// A regular expression, checked here so that a bad one is a usage error.
+fn parse_pattern(text: &str) -> Result<String, regex::Error> {
+    regex::bytes::Regex::new(text).map(|_| text.to_owned())
 }

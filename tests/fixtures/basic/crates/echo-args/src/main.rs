@@ -11,13 +11,44 @@
 //! - `ECHO_WAIT_FOR` names a file: waits until it exists (60 s at most).
 //!
 //! Then it prints `echo-args: stderr` on stderr, and exits with `ECHO_EXIT`
-//! (default 0).
+//! (default 0), or with the code in the file `ECHO_EXIT_FILE` names when
+//! that file exists.
+//!
+//! Copied under a tool's name (`cargo`, `rustc`), it stands in for that tool
+//! and answers version requests: with `ECHO_VERSION` naming a directory and
+//! `-V`, `-vV` or `--version` as its last argument, it only prints the file
+//! in that directory named after the request (its own name, then the
+//! arguments before the flag, joined by spaces: `cargo`, `cargo clippy`,
+//! `rustc`) and exits 0, or exits 1 when there is no such file.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn main() {
-    for arg in std::env::args_os().skip(1) {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(versions) = std::env::var_os("ECHO_VERSION")
+        && let Some((flag, before)) = args.split_last()
+        && (flag == "-V" || flag == "-vV" || flag == "--version")
+    {
+        let program = std::env::current_exe().expect("own path");
+        let mut request = program
+            .file_stem()
+            .expect("a file name")
+            .to_string_lossy()
+            .into_owned();
+        for arg in before {
+            request.push(' ');
+            request.push_str(&arg.to_string_lossy());
+        }
+        match std::fs::read(Path::new(&versions).join(request)) {
+            Ok(text) => {
+                std::io::Write::write_all(&mut std::io::stdout(), &text).expect("print");
+                std::process::exit(0);
+            }
+            Err(_) => std::process::exit(1),
+        }
+    }
+    for arg in args {
         println!("arg: {arg:?}");
     }
     if let Some(name) = std::env::var_os("ECHO_ENV") {
@@ -56,9 +87,11 @@ fn main() {
         }
     }
     eprintln!("echo-args: stderr");
-    let code = std::env::var("ECHO_EXIT")
-        .ok()
-        .and_then(|code| code.parse().ok())
+    let from_file = std::env::var_os("ECHO_EXIT_FILE")
+        .and_then(|file| std::fs::read_to_string(file).ok());
+    let code = from_file
+        .or_else(|| std::env::var("ECHO_EXIT").ok())
+        .and_then(|code| code.trim().parse().ok())
         .unwrap_or(0);
     std::process::exit(code);
 }

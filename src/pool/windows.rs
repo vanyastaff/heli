@@ -81,13 +81,7 @@ pub struct Jobserver {
 
 impl Jobserver {
     pub fn open(name: &OsStr, slots: u32) -> io::Result<(Self, Opened)> {
-        let name = check_name(name)?;
-        if !name.is_ascii() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
-            ));
-        }
+        let name = auth(name)?;
         let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let count = i32::try_from(slots).map_err(io::Error::other)?;
         // SAFETY: `wide` is NUL-terminated; no security attributes, so the
@@ -112,7 +106,7 @@ impl Jobserver {
         let maximum = query(&semaphore)?.maximum_count;
         let jobserver = Self {
             semaphore,
-            name: name.to_owned(),
+            name,
             slots: u32::try_from(maximum).unwrap_or(0),
         };
         Ok((jobserver, opened))
@@ -200,6 +194,19 @@ impl Jobserver {
             Err(error)
         }
     }
+}
+
+/// What `--jobserver-auth=` names for the semaphore `name`: the name, which
+/// must be ASCII.
+pub fn auth(name: &OsStr) -> io::Result<String> {
+    let name = check_name(name)?;
+    if !name.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 /// The counts of `semaphore`, a handle with `SEMAPHORE_QUERY_STATE`.

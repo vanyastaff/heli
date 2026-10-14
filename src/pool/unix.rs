@@ -11,6 +11,15 @@
 //!   open for reading, and every jobserver client opens it for reading and
 //!   writing. Held, it is adopted as it is; not held, it is empty, and the
 //!   daemon writes N bytes into it.
+//! - **Its path outlives its daemon**, and once nobody holds it, it is empty:
+//!   a bare cargo given its path would build one job at a time, without a
+//!   warning. So once the daemon is gone, its warden
+//!   ([`remove_when_released`]) removes the FIFO as soon as no process holds
+//!   it; a bare cargo then cannot open it, warns, and builds on its own.
+//! - **The pool's lock**, `<fifo>.lock` beside it, keeps the two apart: a
+//!   daemon holds it for its whole life, from before it opens the FIFO, and
+//!   a warden only while it looks, so it never removes a FIFO that a daemon
+//!   owns.
 //! - Whether another process holds it open, later: a descriptor of it among
 //!   the user's processes (Linux: `/proc/<pid>/fd`; macOS: `proc_pidinfo`);
 //!   elsewhere unknown.
@@ -18,10 +27,11 @@
 //!   description, and gives them by writing; a FIFO has no maximum count.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rustix::fs::OFlags;
 use rustix::io::Errno;
@@ -31,15 +41,24 @@ use super::{Opened, check_name};
 /// The byte of a free slot, as cargo's jobserver writes it.
 const TOKEN: u8 = b'|';
 
+/// How long a daemon tries to take the pool's lock: a warden holds it for a
+/// moment, another daemon for good.
+const OWNER_PATIENCE: Duration = Duration::from_secs(1);
+
+/// How often a warden looks again at a FIFO that some process still holds.
+const WARDEN_POLL: Duration = Duration::from_millis(250);
+
 pub struct Jobserver {
     fifo: File,
+    /// The pool's lock, held while the daemon lives.
+    _owner: File,
     auth: String,
     slots: u32,
 }
 
 impl Jobserver {
     pub fn open(path: &OsStr, slots: u32) -> io::Result<(Self, Opened)> {
-        let auth = format!("fifo:{}", check_name(path)?);
+        let auth = auth(path)?;
         let path = PathBuf::from(path);
         if let Some(dir) = path.parent() {
             fs::DirBuilder::new()
@@ -47,6 +66,7 @@ impl Jobserver {
                 .mode(0o700)
                 .create(dir)?;
         }
+        let owner = own(&path)?;
         let held = match fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_fifo()
@@ -78,7 +98,13 @@ impl Jobserver {
             (&fifo).write_all(&vec![TOKEN; slots as usize])?;
             Opened::Created
         };
-        Ok((Self { fifo, auth, slots }, opened))
+        let jobserver = Self {
+            fifo,
+            _owner: owner,
+            auth,
+            slots,
+        };
+        Ok((jobserver, opened))
     }
 
     /// What `--jobserver-auth=` names: `fifo:<path>`.
@@ -250,6 +276,78 @@ impl Jobserver {
             io::ErrorKind::Unsupported,
             "cannot tell who holds a FIFO here",
         ))
+    }
+}
+
+/// What `--jobserver-auth=` names for the FIFO at `path`: `fifo:<path>`.
+pub fn auth(path: &OsStr) -> io::Result<String> {
+    Ok(format!("fifo:{}", check_name(path)?))
+}
+
+/// Takes the lock of the pool at `path` for a daemon.
+fn own(path: &Path) -> io::Result<File> {
+    let lock = open_lock(path, true)?;
+    let deadline = Instant::now() + OWNER_PATIENCE;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!("another heli daemon owns the pool {}", path.display()),
+                ));
+            }
+            Err(TryLockError::Error(error)) => return Err(error),
+        }
+    }
+}
+
+/// Opens the lock of the pool at `path`, `<path>.lock`; with `create`,
+/// creates it if need be.
+fn open_lock(path: &Path, create: bool) -> io::Result<File> {
+    let mut lock = path.as_os_str().to_owned();
+    lock.push(".lock");
+    OpenOptions::new()
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .mode(0o600)
+        .open(lock)
+}
+
+/// The warden's work, once the daemon that owned the FIFO at `path` is gone:
+/// removes the FIFO as soon as no process holds it, looking again every
+/// [`WARDEN_POLL`] while one does. Returns without removing it once a daemon
+/// owns the pool again, or when the FIFO is gone or not this user's.
+pub fn remove_when_released(path: &Path) {
+    loop {
+        // The daemon made the lock. Without it there is nothing to remove,
+        // and a warden never creates files.
+        let Ok(lock) = open_lock(path, false) else {
+            return;
+        };
+        if lock.try_lock().is_err() {
+            return;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_fifo()
+                    && metadata.uid() == rustix::process::geteuid().as_raw() => {}
+            _ => return,
+        }
+        match is_held(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(path);
+                return;
+            }
+            Err(_) => return,
+        }
+        drop(lock);
+        std::thread::sleep(WARDEN_POLL);
     }
 }
 

@@ -12,13 +12,22 @@
 //!            "commit_available":42521726976,
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
-//!           "phase":"running","started_at":1791911112}]}
+//!           "class":"compile","phase":"running","started_at":1791911112,
+//!           "waiting_since":null,"waiting_for":[]},
+//!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
+//!           "class":"mutate","phase":"running","started_at":1791911120,
+//!           "waiting_since":1791911120,"waiting_for":["r17"]}]}
 //! ```
 //!
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
-//! is also `null` while the daemon cannot read the machine's memory.
+//! is also `null` while the daemon cannot read the machine's memory. A run
+//! waiting for its worktree's lock has `waiting_since` and, in
+//! `waiting_for`, the runs it waits for; otherwise they are `null` and
+//! empty. `class` is `null` only from a daemon older than run classes.
 
 use serde::{Deserialize, Serialize};
+
+use crate::class::Class;
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -81,8 +90,16 @@ pub struct Run {
     pub worktree: String,
     /// The command, program first.
     pub argv: Vec<String>,
+    #[serde(default)]
+    pub class: Option<Class>,
     pub phase: Phase,
     pub started_at: u64,
+    /// Since when the run waits for its worktree's lock, if it does.
+    #[serde(default)]
+    pub waiting_since: Option<u64>,
+    /// The runs it waits for, by id.
+    #[serde(default)]
+    pub waiting_for: Vec<String>,
 }
 
 /// Where a run is in its lifecycle.
@@ -153,12 +170,17 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
+            let state = if run.waiting_for.is_empty() {
+                run.phase.name().to_owned()
+            } else {
+                format!("waiting for {}", run.waiting_for.join(", "))
+            };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {}s\n",
+                "{label:<6}  {}  {}  {}  {}  {state}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
-                run.phase.name(),
+                run.class.map_or("-", Class::name),
                 age(run.started_at)
             ));
         }

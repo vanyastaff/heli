@@ -99,7 +99,10 @@ fn stdout_and_stderr_stay_separate() {
         .output()
         .expect("run heli");
     assert_eq!(text(&output.stdout), echoed(&["out"]));
-    assert_eq!(text(&output.stderr).trim(), "echo-args: stderr");
+    assert_eq!(
+        support::without_footer(&output.stderr).trim(),
+        "echo-args: stderr"
+    );
 }
 
 #[test]
@@ -141,7 +144,7 @@ fn a_flag_before_the_subcommand_is_heli_s_and_after_it_the_tool_s() {
         .expect("run cargo");
     assert_eq!(heli.status.code(), cargo.status.code());
     assert_eq!(
-        text(&heli.stderr),
+        support::without_footer(&heli.stderr),
         text(&cargo.stderr),
         "cargo itself rejects it"
     );

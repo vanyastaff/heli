@@ -33,7 +33,12 @@
 //! - `nested`: a test that runs a nested cargo build;
 //! - `echo-args`: prints its arguments, and on request a variable, its
 //!   working directory or its session; waits for a file, leaves an orphan
-//!   behind; exits with `ECHO_EXIT` (see its `main.rs`).
+//!   behind; exits with `ECHO_EXIT` (see its `main.rs`);
+//! - `chatter`: numbered lines on stdout and stderr, and on request bytes
+//!   that test a run log's fidelity (see its `main.rs`).
+//!
+//! After every run the daemon executes, heli prints a footer line on stderr
+//! ([`split_footer`], [`without_footer`]).
 
 #![allow(dead_code, reason = "each test binary uses a different part")]
 
@@ -76,6 +81,18 @@ const HELI_VARS: [&str; 5] = [
     "HELI_DEPTH",
     "HELI_POOL",
     "HELI_CONFIG",
+];
+
+/// Variables that locate the user's own configuration files, which
+/// `cargo heli setup` edits: [`Fixture::setup`] points them at the fixture's
+/// temporary home, or removes them, so that no test edits the real ones.
+const USER_FILE_VARS: [&str; 6] = [
+    "HOME",
+    "USERPROFILE",
+    "CLAUDE_CONFIG_DIR",
+    "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "SHELL",
 ];
 
 /// A fixture workspace copied into a temporary directory, with a target
@@ -241,6 +258,14 @@ impl Fixture {
     /// The copied workspace.
     pub fn workspace(&self) -> PathBuf {
         self.root.path().join("ws")
+    }
+
+    /// A copy of the workspace as it is now, at `name` in the fixture's
+    /// temporary directory: a second workspace for the same daemon.
+    pub fn copy_workspace(&self, name: &str) -> PathBuf {
+        let copy = self.path(name);
+        copy_dir(&self.workspace(), &copy);
+        copy
     }
 
     /// The target directory every command of this fixture uses.
@@ -463,6 +488,31 @@ impl Fixture {
         command
     }
 
+    /// `cargo-heli setup` with `args`, run as a user whose home is
+    /// [`Fixture::home`] (`HOME` and `USERPROFILE`; created if missing) and
+    /// whose shell is `shell` (`SHELL`, unset when `None`).
+    /// `CLAUDE_CONFIG_DIR`, `ZDOTDIR` and `XDG_CONFIG_HOME` are unset, so
+    /// every file setup can edit is in that home. The pool it offers is the
+    /// fixture's own.
+    pub fn setup<I, S>(&self, shell: Option<&str>, args: I) -> Command
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        let home = self.home();
+        std::fs::create_dir_all(&home).expect("create the temporary home");
+        let mut command = self.heli(["setup"]);
+        command.args(args.into_iter().map(Into::into));
+        for var in USER_FILE_VARS {
+            command.env_remove(var);
+        }
+        command.env("HOME", &home).env("USERPROFILE", &home);
+        if let Some(shell) = shell {
+            command.env("SHELL", shell);
+        }
+        command
+    }
+
     /// `cargo heli status --json`, parsed.
     pub fn status(&self) -> Value {
         let output = self
@@ -531,6 +581,18 @@ impl Fixture {
         self.target_dir()
             .join("debug")
             .join(format!("echo-args{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// Builds the binary of fixture package `package` and returns its path.
+    pub fn binary(&self, package: &str) -> PathBuf {
+        let output = self
+            .cargo(["build", "--quiet", "-p", package])
+            .output()
+            .expect("run cargo");
+        assert_success(&output, &format!("building {package}"));
+        self.target_dir()
+            .join("debug")
+            .join(format!("{package}{}", std::env::consts::EXE_SUFFIX))
     }
 
     /// A concurrency log in this fixture's temporary directory.
@@ -641,6 +703,47 @@ pub fn lines(bytes: &[u8]) -> Vec<String> {
         .lines()
         .map(str::to_owned)
         .collect()
+}
+
+/// heli's footer after a run the daemon executed: the last line of the
+/// client's stderr, `cargo-heli: <run> … (output: cargo heli log <run>)`.
+#[derive(Debug)]
+pub struct Footer {
+    /// The run it names, `r<number>`.
+    pub run: String,
+    /// The whole line, without its line end.
+    pub line: String,
+}
+
+/// Splits a client's stderr into what the run wrote and heli's footer;
+/// panics when the last line is not a footer.
+pub fn split_footer(stderr: &[u8]) -> (Vec<u8>, Footer) {
+    let body = stderr
+        .strip_suffix(b"\n")
+        .unwrap_or_else(|| panic!("stderr does not end a line: {stderr:?}"));
+    let start = body
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |end| end + 1);
+    let line = String::from_utf8_lossy(&body[start..]).into_owned();
+    let run = line
+        .strip_prefix("cargo-heli: ")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|rest| rest.rsplit_once("(output: cargo heli log "))
+        .map(|(_, run)| run.to_owned())
+        .unwrap_or_else(|| {
+            panic!(
+                "no footer at the end of stderr: {}",
+                String::from_utf8_lossy(stderr)
+            )
+        });
+    (stderr[..start].to_vec(), Footer { run, line })
+}
+
+/// A client's stderr without heli's footer, lossily decoded; panics when it
+/// has no footer.
+pub fn without_footer(stderr: &[u8]) -> String {
+    String::from_utf8_lossy(&split_footer(stderr).0).into_owned()
 }
 
 /// The `cargo-heli` binary under test.
