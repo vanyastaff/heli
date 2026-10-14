@@ -19,6 +19,12 @@
 //! is open, and a FIFO keeps its bytes only while some process holds it
 //! open; one that nobody held has none, and the daemon fills it again.
 //!
+//! **Lifetime.** A pool lives while some process holds it, and no longer:
+//! once its daemon is gone and nobody holds it, a bare cargo pointed at it
+//! cannot open it, warns, and builds with a pool of its own. A semaphore
+//! goes with its last handle; a FIFO's path stays, so the daemon's warden
+//! removes it ([`remove_when_released`]).
+//!
 //! The counts are snapshots: other processes take and return slots at any
 //! moment.
 
@@ -79,7 +85,7 @@ impl Pool {
 
     /// The value of `CARGO_MAKEFLAGS` that points a cargo at this pool.
     pub fn makeflags(&self) -> OsString {
-        format!("-j --jobserver-auth={}", self.jobserver.auth()).into()
+        makeflags_for(self.jobserver.auth()).into()
     }
 
     /// The slots, as counted now.
@@ -96,6 +102,27 @@ impl Pool {
             in_use: slots.saturating_sub(free).saturating_sub(withheld),
         }
     }
+}
+
+/// Once the daemon that owned the pool `name` is gone, removes the pool as
+/// soon as no process holds it, unless a daemon owns it again by then: the
+/// work of the pool's warden (`crate::daemon::warden`). Only a FIFO needs
+/// it; a semaphore goes with its last handle.
+#[cfg(unix)]
+pub fn remove_when_released(name: &OsStr) {
+    platform::remove_when_released(std::path::Path::new(name));
+}
+
+/// The value of `CARGO_MAKEFLAGS` that points a cargo at the pool `name`
+/// (as [`Pool::open`] takes it), whether or not the pool exists now; the
+/// error says why no cargo could find a pool of that name.
+pub fn makeflags(name: &OsStr) -> io::Result<String> {
+    Ok(makeflags_for(&platform::auth(name)?))
+}
+
+/// `CARGO_MAKEFLAGS` for the jobserver that `--jobserver-auth=` names `auth`.
+fn makeflags_for(auth: &str) -> String {
+    format!("-j --jobserver-auth={auth}")
 }
 
 /// Whether `name` can travel in `CARGO_MAKEFLAGS`: the jobserver protocol

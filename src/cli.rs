@@ -13,8 +13,15 @@ pub enum Action {
     Run(Invocation),
     /// Show the daemon and its runs.
     Status { json: bool },
+    /// Start the daemon unless one runs.
+    Ensure,
+    /// Offer the environment that lets a bare cargo draw from the pool;
+    /// with `print`, only show it.
+    Setup { print: bool },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
+    /// Be the daemon's pool warden.
+    Warden,
 }
 
 /// The program heli runs, and its arguments.
@@ -52,6 +59,15 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Start heli's daemon unless one is running; for a session-start hook.
+    Ensure,
+    /// Offer to set `CARGO_MAKEFLAGS` for agents and shells, so that a bare
+    /// cargo draws from heli's pool; each file is written only on a yes.
+    Setup {
+        /// Only show what would be written; ask nothing, write nothing.
+        #[arg(long)]
+        print: bool,
+    },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -59,6 +75,11 @@ enum Command {
         /// and exit once it listens.
         #[arg(long)]
         detach: bool,
+        /// Be the pool's warden, which the daemon starts: once the daemon at
+        /// the other end of stdin is gone, remove its pool when nobody holds
+        /// it.
+        #[arg(long, hide = true, conflicts_with = "detach")]
+        warden: bool,
     },
     /// Any cargo subcommand, e.g. `cargo heli build -p foo`: run as
     /// `cargo build -p foo`.
@@ -98,7 +119,10 @@ pub fn parse(
             })
         }
         Command::Status { json } => Action::Status { json },
-        Command::Daemon { detach } => Action::Daemon { detach },
+        Command::Ensure => Action::Ensure,
+        Command::Setup { print } => Action::Setup { print },
+        Command::Daemon { warden: true, .. } => Action::Warden,
+        Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,
             args,
