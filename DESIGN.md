@@ -423,6 +423,14 @@ Bare cargo, started without heli, still draws from the host pool directly.
     top-up then would make the pool exceed N once it gives the slot back
     (#26). The price: while some process holds the pool, any live cargo
     (`cargo watch`, a `cargo run` of a server) delays the top-up.
+  - The top-up counts the free slots first, and only then confirms the
+    quiescence once more, before it gives any: a cargo that takes a slot
+    after the count is alive at the confirmation, and the top-up waits for
+    it; one that takes a slot later takes one the count had as free, which
+    the top-up does not replace. Looked at the other way round, a cargo
+    that started between the look and the count would have taken slots the
+    top-up then replaced (a stress test of killed cargos on a macOS runner
+    held 6 slots of 3 at once).
     - Who holds the pool: on Windows, the semaphore's handle count
       (`NtQueryObject`) above the daemon's one; on Linux, a descriptor of
       the FIFO under `/proc/<pid>/fd` of the user's processes; on macOS, the
