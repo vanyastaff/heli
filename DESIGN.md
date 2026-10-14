@@ -882,10 +882,11 @@ was found by a failing test.
   skips on this host. No verify or test subcommand has one yet.
 
 **When the key is computed.** It is checked twice: before the run waits for
-anything, and again once admitted, because another run may have recorded it
-meanwhile. A hit is never admitted as a run: it takes no run id. The key is
-computed afresh once admitted, and that snapshot of the tree, taken before
-the steps, is compared with one taken after them. A marker is written only
+anything, and again once admitted and past the worktree lock, because another
+run may have recorded it meanwhile. A hit before the wait is never admitted
+as a run: it takes no run id. The key is computed afresh after the wait, and
+that snapshot of the tree, taken before the steps, is compared with one taken
+after them. A marker is written only
 when the run passed and both snapshots match. A run that fails drops the
 marker of its key, so a flaky pass is reused only until a run of the same key
 fails.
@@ -895,7 +896,8 @@ for that key (`--no-cache` runs it again), and ignored files are not part of
 the key. `--no-cache` skips both lookups, not the recording.
 
 Compile runs are never recorded, because their product is the artifact, not
-the verdict.
+the verdict; nor is a request for help (`-h` or `--help`, also the test
+runner's after `--`) of a verify or test subcommand.
 
 ## 8. Observability
 

@@ -580,7 +580,7 @@ fn the_tool_a_run_uses_is_keyed() {
 #[test]
 fn verify_and_test_runs_use_the_store() {
     let verifier = Verifier::new();
-    let cached: [&[&str]; 8] = [
+    let cached: [&[&str]; 10] = [
         &["check"],
         &["c"],
         &["clippy", "--", "-Dwarnings"],
@@ -589,8 +589,10 @@ fn verify_and_test_runs_use_the_store() {
         &["test"],
         &["t"],
         &["nextest", "run"],
+        &["nextest", "r"],
+        &["+results-test", "check"],
     ];
-    let uncached: [&[&str]; 8] = [
+    let uncached: [&[&str]; 9] = [
         &["build"],
         &["run"],
         &["doc"],
@@ -599,6 +601,7 @@ fn verify_and_test_runs_use_the_store() {
         &["fix"],
         &["nextest", "list"],
         &["check", "--help"],
+        &["test", "--", "--help"],
     ];
     let twice = |args: &[&str]| {
         outcome(&mut verifier.heli(args));
@@ -614,6 +617,23 @@ fn verify_and_test_runs_use_the_store() {
         .filter(|args| twice(args) == Outcome::Hit)
         .collect();
     assert!(hit.is_empty(), "cached: {hit:?}");
+}
+
+/// A toolchain given as `+toolchain` before the subcommand is the one asked
+/// for its versions: rustc's, cargo's and the tool's.
+#[test]
+fn a_toolchain_given_with_plus_is_the_one_asked() {
+    let verifier = Verifier::new();
+    for request in ["cargo +pinned", "rustc +pinned", "cargo +pinned clippy"] {
+        verifier.set_version(request, Some("1.0.0-pinned"));
+    }
+    let run = || outcome(&mut verifier.heli(&["+pinned", "clippy"]));
+    assert_eq!(run(), Outcome::Ran);
+    assert_eq!(run(), Outcome::Hit);
+    for request in ["cargo +pinned", "rustc +pinned", "cargo +pinned clippy"] {
+        verifier.set_version(request, Some("2.0.0-pinned"));
+        assert_eq!(run(), Outcome::Ran, "{request} changed");
+    }
 }
 
 /// `rustc` is the one cargo would run: `RUSTC` when it is set.
@@ -664,16 +684,13 @@ fn the_directory_within_the_worktree_is_keyed() {
     assert_eq!(check_in("crates/slow-b"), Outcome::Ran);
 }
 
-/// The worktree's own path is not keyed: a pass in one worktree is a hit in
-/// another with the same content, wherever it lies.
-#[test]
-fn a_pass_in_one_worktree_is_a_hit_in_another() {
-    let verifier = Verifier::new();
-    // A fake rustc outside both worktrees, so the search path keys the same
-    // in each.
+/// A second worktree of the verifier's repository with the same content, at
+/// another depth, and the search path both must use: its fake rustc lies
+/// outside both worktrees, so the search path keys the same in each.
+fn twin_worktree(verifier: &Verifier) -> (std::path::PathBuf, std::ffi::OsString) {
     let bin = verifier.fixture.path("shared-bin");
     verifier.tool(&bin, "rustc");
-    let path = std::env::join_paths(std::iter::once(bin.clone()).chain(std::env::split_paths(
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("a search path");
@@ -689,6 +706,80 @@ fn a_pass_in_one_worktree_is_a_hit_in_another() {
             "HEAD",
         ],
     );
+    (other, path)
+}
+
+/// Waits for `child` to exit, at most a minute: a wait that is never
+/// released fails the test instead of hanging it.
+fn finish(child: std::process::Child) -> Output {
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || sender.send(child.wait_with_output()));
+    match receiver.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(output) => output.expect("wait for heli"),
+        Err(_) => {
+            support::kill_tree(pid);
+            panic!("heli (pid {pid}) did not finish within a minute");
+        }
+    }
+}
+
+/// Starts `command` with its output captured.
+fn start(command: &mut Command) -> std::process::Child {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start heli")
+}
+
+/// The run `status` lists with `subcommand` after its program.
+fn listed<'a>(status: &'a serde_json::Value, subcommand: &str) -> Option<&'a serde_json::Value> {
+    support::runs(status)
+        .iter()
+        .position(|run| run["argv"][1] == subcommand)
+        .map(|index| &status["runs"][index])
+}
+
+/// A run waiting for its worktree's lock looks its key up again once it is
+/// admitted: a pass recorded meanwhile, here by the same check in a twin
+/// worktree (which does not wait), makes it a hit, and it runs nothing.
+#[test]
+fn a_run_recorded_while_this_one_waited_is_a_hit() {
+    let verifier = Verifier::new();
+    let (other, path) = twin_worktree(&verifier);
+    let gate = verifier.fixture.path("gate");
+    let fmt = start(verifier.heli(&["fmt"]).env("ECHO_WAIT_FOR", &gate));
+    verifier
+        .fixture
+        .wait_for_status("fmt to hold the worktree's lock", |status| {
+            listed(status, "fmt").is_some_and(|run| run["waiting_since"].is_null())
+        });
+    let waiting = start(verifier.check().env("PATH", &path));
+    verifier
+        .fixture
+        .wait_for_status("the check to wait for fmt", |status| {
+            listed(status, "check").is_some_and(|run| run["waiting_since"].is_u64())
+        });
+
+    let mut twin = verifier.check();
+    twin.env("PATH", &path).current_dir(&other);
+    assert_eq!(outcome(&mut twin), Outcome::Ran, "r3, in the twin worktree");
+
+    std::fs::write(&gate, "").expect("open the gate");
+    assert_success(&finish(fmt), "cargo heli fmt");
+    let output = finish(waiting);
+    let hit = hit_line(&output).unwrap_or_else(|| panic!("not a hit: {}", text(&output.stderr)));
+    assert!(hit.starts_with("cargo-heli: already passed: r3, "), "{hit}");
+}
+
+/// The worktree's own path is not keyed: a pass in one worktree is a hit in
+/// another with the same content, wherever it lies.
+#[test]
+fn a_pass_in_one_worktree_is_a_hit_in_another() {
+    let verifier = Verifier::new();
+    let (other, path) = twin_worktree(&verifier);
     let check_in = |dir: &std::path::Path| {
         verifier
             .check()
