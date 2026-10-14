@@ -1339,6 +1339,7 @@ fn an_orphan_of_another_repository_keeps_no_first_run_waiting() {
     std::fs::create_dir_all(&bin).expect("create a bin directory");
     let cargo = bin.join(exe("cargo"));
     std::fs::copy(fixture.echo_args(), &cargo).expect("copy echo-args as cargo");
+    support::ready_to_run(&cargo, &[]);
     let gate = fixture.path("gate");
 
     let mut command = heli_in(&fixture, &workspace, &["--output", "full", "exec", "--"]);

@@ -912,3 +912,31 @@ fn copy_dir(from: &Path, to: &Path) {
         }
     }
 }
+
+/// Waits until the program `copy`, just copied, can be started: on Linux a
+/// process that another test's thread forked while the copy was open for
+/// writing holds it open until that process starts its own program, and
+/// until then starting the copy fails with "text file busy" (ETXTBSY). It
+/// starts `copy` with `args`, its output dropped, until it starts; panics
+/// after 10 s.
+pub fn ready_to_run(copy: &Path, args: &[&str]) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let started = Command::new(copy)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match started {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("start {}: {error}", copy.display()),
+            Ok(_) => return,
+        }
+    }
+}
