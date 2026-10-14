@@ -1,11 +1,14 @@
 //! The command line: heli's own flags come before the subcommand, and
-//! everything after it belongs to the tool, passed through verbatim.
+//! everything after it belongs to the tool, passed through verbatim. The
+//! subcommand and its arguments also give the run its class
+//! (`crate::class`).
 
 use std::ffi::OsString;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser, Subcommand};
 
+use crate::class::Class;
 use crate::protocol::Cache;
 use crate::runlog;
 use crate::runlog::select::Select;
@@ -30,11 +33,12 @@ pub enum Action {
     Warden,
 }
 
-/// The program heli runs, and its arguments.
+/// The program heli runs, its arguments, and the class of the run.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub program: OsString,
     pub args: Vec<OsString>,
+    pub class: Class,
     /// How the run uses the result store.
     pub cache: Cache,
 }
@@ -141,6 +145,7 @@ pub fn parse(
             Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
+                class: Class::Exec,
                 cache: Cache::Off,
             })
         }
@@ -159,6 +164,7 @@ pub fn parse(
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => Action::Run(Invocation {
             program: cargo,
+            class: Class::of_cargo(&args),
             cache: match (verifies(&args), cli.no_cache) {
                 (false, _) => Cache::Off,
                 (true, false) => Cache::On,

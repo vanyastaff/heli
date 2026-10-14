@@ -9,10 +9,11 @@
 //! - **run**: look its key up in the result store ([`results`], keyed by
 //!   [`key`]), admit it to the registry ([`registry`]), tell the client it
 //!   started, look its key up again, start its record in the run log
-//!   (`crate::runlog`), execute it ([`execute`]), record it in the result
-//!   store if it passed, take it out of the registry, report its exit.
-//!   `Daemon::run` is the one sequence every run goes through, and the
-//!   place for what happens around a run (admission, waits, recording);
+//!   (`crate::runlog`), wait for its turn at the worktree lock (telling the
+//!   client for which runs), execute it ([`execute`]), record it in the
+//!   result store if it passed, take it out of the registry, report its
+//!   exit. `Daemon::run` is the one sequence every run goes through, and
+//!   the place for what happens around a run (admission, waits, recording);
 //! - **status**: describe the daemon and the registry's runs;
 //! - **log**: send part of a run's record;
 //! - a request it does not know: answer that it is unsupported;
@@ -39,6 +40,7 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
+use crate::class::Class;
 use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
@@ -46,7 +48,7 @@ use crate::pool::{self, Pool};
 use crate::protocol::{self, Channel, LogRequest, Reply, Request, RunRequest};
 use crate::runlog::{self, Limits, RunLog};
 use crate::status::{self, Status};
-use crate::{clock, worktree};
+use crate::{clock, nesting, worktree};
 
 use registry::Registry;
 use results::Admitted;
@@ -272,6 +274,8 @@ impl Daemon {
         let id = self.registry.admit(
             worktree::of(&execute::cwd(&request)),
             execute::argv(&request),
+            request.class.unwrap_or(Class::Exec),
+            nested(&request),
         );
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
@@ -298,6 +302,14 @@ impl Daemon {
             }
         };
         let mut record = self.runlog.record(&id.to_string());
+        // The worktree lock: tell the client which runs this one waits for,
+        // if any (a client older than run classes could not read it). A
+        // client gone meanwhile does not stop the run.
+        self.registry.wait_for_worktree(id, |runs| {
+            if request.class.is_some() {
+                let _ = protocol::write_message(&mut stream, &Reply::Waiting { runs });
+            }
+        });
         let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
@@ -397,6 +409,18 @@ impl Drop for Serving<'_> {
         lifecycle.serving -= 1;
         self.0.exit_if_retired(&lifecycle);
     }
+}
+
+/// Whether `request` comes from inside another heli run: its client runs
+/// under heli, so the run's depth (`HELI_DEPTH`, the client's plus one) is
+/// above 1.
+fn nested(request: &RunRequest) -> bool {
+    request
+        .env
+        .iter()
+        .find(|(name, _)| name.0 == nesting::VAR)
+        .and_then(|(_, depth)| depth.0.to_str()?.trim().parse::<u32>().ok())
+        .is_some_and(|depth| depth > 1)
 }
 
 /// The reply for a run that ended with `status`.

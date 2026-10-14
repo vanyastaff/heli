@@ -1,7 +1,7 @@
 //! `cargo heli`: cargo for machines shared by many agents (`DESIGN.md`).
 //!
 //! Modules, from the command line inward:
-//! - [`cli`]: heli's command line;
+//! - [`cli`]: heli's command line, which gives each run its [`class`];
 //! - [`client`]: hands runs to the daemon, or runs them [`direct`]ly when it
 //!   cannot; asks it for its status; makes sure one runs (`ensure`);
 //! - [`launch`]: starts the daemon in the background;
@@ -20,6 +20,7 @@
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
+mod class;
 mod cli;
 mod client;
 mod clock;
