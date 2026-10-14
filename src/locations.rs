@@ -22,7 +22,7 @@
 //! Tests set these variables to temporary paths and names, so their daemons
 //! and pools never meet each other or the user's real ones.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// Selects the state directory.
@@ -35,6 +35,10 @@ pub const POOL_VAR: &str = "HELI_POOL";
 /// Selects the configuration file.
 pub const CONFIG_VAR: &str = "HELI_CONFIG";
 
+/// The variables that select the locations, in the order of
+/// [`Locations::vars`].
+pub const VARS: [&str; 4] = [STATE_DIR_VAR, ENDPOINT_VAR, POOL_VAR, CONFIG_VAR];
+
 /// The resolved locations; paths are absolute.
 #[derive(Debug, Clone)]
 pub struct Locations {
@@ -46,6 +50,18 @@ pub struct Locations {
 }
 
 impl Locations {
+    /// Each variable of [`VARS`] with the value that selects these
+    /// locations, for a process that must find the same ones: the daemon
+    /// a client starts, the unit or agent setup registers.
+    pub fn vars(&self) -> [(&'static str, &OsStr); 4] {
+        [
+            (STATE_DIR_VAR, self.state_dir.as_os_str()),
+            (ENDPOINT_VAR, self.endpoint.as_os_str()),
+            (POOL_VAR, self.pool.as_os_str()),
+            (CONFIG_VAR, self.config.as_os_str()),
+        ]
+    }
+
     /// Resolves the locations from this process's environment; the error
     /// says what is missing.
     pub fn resolve() -> Result<Self, String> {

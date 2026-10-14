@@ -46,7 +46,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crate::ipc::{self, Stream};
-use crate::locations::{CONFIG_VAR, ENDPOINT_VAR, Locations, POOL_VAR, STATE_DIR_VAR};
+use crate::locations::Locations;
 use crate::{autostart, daemon, environment, nesting};
 
 /// How long a starting daemon may take to listen.
@@ -165,13 +165,13 @@ impl StartError {
 /// Starts `cargo-heli <args>` detached from this process.
 fn spawn_stage(locations: &Locations, depth: u32, args: &[&str]) -> io::Result<Launched> {
     let program = std::env::current_exe()?;
-    let env = environment::current_with(&[
-        (STATE_DIR_VAR, OsString::from(&locations.state_dir)),
-        (ENDPOINT_VAR, OsString::from(&locations.endpoint)),
-        (POOL_VAR, locations.pool.clone()),
-        (CONFIG_VAR, OsString::from(&locations.config)),
-        (nesting::VAR, OsString::from((depth + 1).to_string())),
-    ]);
+    let mut overrides: Vec<(&str, OsString)> = locations
+        .vars()
+        .into_iter()
+        .map(|(name, value)| (name, value.to_os_string()))
+        .collect();
+    overrides.push((nesting::VAR, OsString::from((depth + 1).to_string())));
+    let env = environment::current_with(&overrides);
     spawn(&program, args, locations, env)
 }
 

@@ -128,12 +128,7 @@ fn link_target() -> PathBuf {
 fn definition(locations: &Locations, program: &str) -> Result<String, String> {
     let program = quoted(program, true)?;
     let mut environment = Vec::new();
-    for (name, value) in [
-        ("HELI_STATE_DIR", locations.state_dir.as_os_str()),
-        ("HELI_ENDPOINT", locations.endpoint.as_os_str()),
-        ("HELI_POOL", locations.pool.as_os_str()),
-        ("HELI_CONFIG", locations.config.as_os_str()),
-    ] {
+    for (name, value) in locations.vars() {
         let value = value
             .to_str()
             .ok_or_else(|| format!("{name} {} is not valid Unicode", value.display()))?;
