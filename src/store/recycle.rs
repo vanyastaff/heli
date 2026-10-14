@@ -36,7 +36,10 @@
 //!
 //! Two recyclers need no lock between them: a rename never replaces a
 //! directory that has files, and each scans the donor under its old name,
-//! which a rename by the other takes away.
+//! which a rename by the other takes away. Each checks again, before each
+//! donor, that the build directory does not exist: one the other renamed
+//! into place looks like the donor's orphan until step 5, and renaming it
+//! onto itself would succeed.
 //!
 //! [`for_worktree`] is the way in for the `post-checkout` hook
 //! (`crate::recycle`) and the daemon's look at a repository's worktrees
@@ -125,6 +128,12 @@ pub fn claim(
     }
     let mut failure = None;
     for donor in orphans(&store, repository) {
+        // Another recycler may have renamed its donor into place since:
+        // until it names the new workspace in the owner manifest, that
+        // directory still looks like the donor's orphan, here in the list.
+        if exists(build_dir) {
+            return Ok(None);
+        }
         let Some(owner) = &donor.owner else {
             continue;
         };
