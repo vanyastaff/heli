@@ -226,10 +226,10 @@ mod platform {
     /// the user running the tests: in their session, only while they are
     /// logged on, never stopped, on battery too, at normal priority. A
     /// program whose path has a space is quoted, as Task Scheduler's own
-    /// editor writes it.
+    /// editor writes it, and an `&` in it is XML's `&amp;`.
     pub fn expected(program: &Path, _home: &Path) -> String {
         let sid = user_sid();
-        let program = program.display().to_string();
+        let program = program.display().to_string().replace('&', "&amp;");
         let program = if program.contains(' ') {
             format!("\"{program}\"")
         } else {
@@ -583,8 +583,9 @@ mod platform {
 
     /// The agent that starts `program` in the foreground at login, in the
     /// GUI session, without resource limits, with heli's default locations
-    /// in `home`.
+    /// in `home`. An `&` in the program's path is XML's `&amp;`.
     pub fn expected(program: &Path, home: &Path) -> String {
+        let program = program.display().to_string().replace('&', "&amp;");
         let state = home.join(".local").join("state").join("heli");
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -620,7 +621,7 @@ mod platform {
 </dict>
 </plist>
 "#,
-            program.display(),
+            program,
             state.display(),
             state.join("daemon.sock").display(),
             home.join(".cache").join("heli").join("jobserver").display(),
@@ -760,12 +761,12 @@ fn setup_no_autostart_removes_the_registration() {
 }
 
 /// A registration made for another program (heli installed elsewhere, here
-/// in a directory whose name has a space) is replaced by one for this
-/// program.
+/// in a directory whose name has a space and an `&`, which the definition
+/// must carry as they are) is replaced by one for this program.
 #[test]
 fn setup_replaces_a_registration_of_another_program() {
     let user = User::new();
-    let elsewhere = heli_copy(&user.fixture, "else where");
+    let elsewhere = heli_copy(&user.fixture, "else & where");
     let output = with_program(&user.setup_command(&["--autostart"]), &elsewhere)
         .output()
         .expect("run the other heli's setup");
