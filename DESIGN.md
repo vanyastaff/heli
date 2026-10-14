@@ -1290,8 +1290,10 @@ and what depends on them. This applies in both modes below.
 - **Values.** rustc escapes `\`, line feed and carriage return as `\\`, `\n`
   and `\r` (on Windows, `# env-dep:CARGO_MANIFEST_DIR=E:\\heli`). A value is
   under a path when its components start with the path's: on Windows
-  without case, with either separator, and without `\\?\`. Each old path
-  counts as given and as it resolves on disk. A value that lists paths
+  without case, with either separator, and without `\\?\`. The old paths
+  are spelled as cargo spelled them: the workspace as `cargo metadata`
+  named it (the owner manifest), and the build directory as cargo's
+  `build-dir` places it in a store heli manages. A value that lists paths
   (`PATH`-like) is also looked at path by path. Any variable counts, not
   only cargo's.
 - **Where cargo keeps them** (cargo 1.99, checked by experiment), in each
@@ -1303,9 +1305,10 @@ and what depends on them. This applies in both modes below.
   has `-`, so only the hash ties the two. Units whose files have no hash (on
   Windows MSVC a path package's executables, and dylibs and cdylibs of path
   packages) write `deps/<crate>.d`; their fingerprint directory still has a
-  hash and holds `dep-<kind>-<target>`, so such a file stands for every
-  fingerprint directory whose `dep-…` file names its target, `-` read as
-  `_`.
+  hash, and its files are named after the target (`dep-<kind>-<target>`,
+  `<kind>-<target>`), so such a file stands for every fingerprint directory
+  with a file whose name ends in its crate's name, `-` read as `_`.
+  Invalidating a unit too many costs only its rebuild.
 - The number of units it invalidated is in the `recycle` event.
 
 There are two modes:
