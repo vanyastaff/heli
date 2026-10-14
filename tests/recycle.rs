@@ -1189,12 +1189,18 @@ impl Repo {
 /// record, and git shows heli's line. A checkout in a worktree that exists
 /// already recycles nothing, though an orphan waits. Run again, setup finds
 /// the hook in place.
+///
+/// The hook needs no daemon. The one that built a is stopped before a is
+/// removed: its look at the repository's worktrees, as the build ended,
+/// could otherwise come late enough to recycle for b first, and the hook
+/// would find b's build directory there.
 #[test]
 fn setup_installs_a_hook_that_recycles_as_a_worktree_is_added() {
     let repo = Repo::new();
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    repo.fixture.kill_daemon();
     repo.remove_worktree("a");
     let gone = repo.fixture.workspace().join("gone");
     let spare = repo.craft(
@@ -1356,16 +1362,21 @@ fn a_hook_never_fails_a_checkout_and_follows_heli() {
 /// its first build, which is then warm, and precise with a's record: only
 /// what the path scan invalidated compiles. The main worktree, which is
 /// never new, is left to its own first run.
+///
+/// The daemon that built a is stopped before a is removed: its look as the
+/// build ended could otherwise come late enough to find b, and be stopped
+/// halfway through recycling for it, leaving a's build directory claimed
+/// for b and no recycle event.
 #[test]
 fn the_daemon_recycles_for_a_worktree_it_finds() {
     let repo = Repo::new();
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    repo.fixture.kill_daemon();
     repo.remove_worktree("a");
     let b = repo.add_worktree("b");
 
-    repo.fixture.kill_daemon();
     let output = repo
         .heli(&repo.main(), &["ensure"])
         .output()
