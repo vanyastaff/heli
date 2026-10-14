@@ -116,7 +116,9 @@ fn a_failing_nextest_test_shows_its_name_panic_and_output() {
     let stderr = support::without_footer(&output.stderr);
     for shown in [
         "FAIL [",
-        "] (1/3) tests-mixed tests::fails\n",
+        // nextest counts finished tests, and with two threads the failing
+        // one may finish first or second: match the total, not the position.
+        "/3) tests-mixed tests::fails\n",
         "captured output of the failing test\n",
         "fixture failure: expected to fail\n",
         " tests run: 2 passed, 1 failed, 0 skipped\n",
