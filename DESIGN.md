@@ -1434,10 +1434,11 @@ There are two modes:
   - The daemon writes a record after every run it executes, before the
     run's clients hear its end, so that a worktree removed right after its
     last run leaves one; and when it sees a build lock released: held at one
-    look of its accountant (§6.2), free at the next. Never while one of
-    cargo's locks in the build directory is held, and not for a build the
-    daemon did not see. A run the client executes without a daemon writes
-    none.
+    look of its accountant (§6.2), free at the next, unless a run in flight
+    there will write one as it ends, or the record still counts. Never while
+    one of cargo's locks in the build directory is held, and not for a build
+    the daemon did not see. A run the client executes without a daemon
+    writes none.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
     recorded. Cargo rebuilds when one is missing; one that is present keeps
     the current time and also triggers a rebuild.

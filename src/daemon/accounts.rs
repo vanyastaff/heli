@@ -44,7 +44,10 @@
 //! each pass of the accountant writes one for each build directory in which
 //! one of cargo's locks was held at the pass before and none is now
 //! (`Accounts::released`): a build without heli, which the accountant saw.
-//! None is written while one of cargo's locks there is held.
+//! It leaves alone a build directory where a run in flight will write one
+//! as it ends, and one whose record still counts, so that the worktree is
+//! not read again just after a run. None is written while one of cargo's
+//! locks there is held.
 //!
 //! **Sizes** ([`Accounts::disk`]). The accountant, a thread of the daemon's,
 //! keeps the sizes of every directory `crate::store::survey` finds, by
@@ -123,6 +126,10 @@ pub struct Accounts {
     /// The directories a run was learnt from, its build directory recycled
     /// if it could be: later runs from there never wait.
     prepared: Mutex<BTreeSet<PathBuf>>,
+    /// The build directories of the runs in flight that write a
+    /// source-state record as they end, once for each run: the accountant
+    /// writes none there meanwhile.
+    recording: Mutex<Vec<PathBuf>>,
 }
 
 /// What the accountant knows.
@@ -211,6 +218,7 @@ impl Accounts {
             log,
             events,
             prepared: Mutex::new(BTreeSet::new()),
+            recording: Mutex::new(Vec::new()),
         });
         let accountant = Arc::clone(&accounts);
         std::thread::spawn(move || accountant.keep());
@@ -243,10 +251,17 @@ impl Accounts {
             let Some(learnt) = accounts.discover(&probe, at, prepared) else {
                 return;
             };
+            if let Some((build, _)) = &learnt.recorded {
+                accounts.recording().push(build.clone());
+            }
             // An error: the run has ended too.
             let _ = end.recv();
             if let Some((build, worktree)) = &learnt.recorded {
                 accounts.record(build, worktree, &probe);
+                let mut recording = accounts.recording();
+                if let Some(index) = recording.iter().position(|dir| dir == build) {
+                    recording.swap_remove(index);
+                }
             }
             drop(recorded);
             let mut ledger = accounts.ledger();
@@ -490,8 +505,10 @@ impl Accounts {
 
     /// Writes the source-state record of each build directory among `dirs`
     /// in which one of cargo's locks was held at the last look (`held`) and
-    /// none is now, if its workspace exists in a repository; then `held`
-    /// becomes those whose locks are held now.
+    /// none is now, if its workspace exists in a repository. Not where a run
+    /// in flight writes one as it ends, nor where the record still counts:
+    /// nothing was built since. Then `held` becomes those whose locks are
+    /// held now.
     fn released(&self, dirs: &[Dir], held: &mut BTreeSet<PathBuf>) {
         let mut now = BTreeSet::new();
         for dir in dirs.iter().filter(|dir| dir.kind == Kind::Build) {
@@ -502,6 +519,13 @@ impl Accounts {
             let Some(owner) = dir.owner.as_ref().filter(|_| held.contains(&dir.path)) else {
                 continue;
             };
+            let recording = self
+                .recording()
+                .iter()
+                .any(|build| store::same_path(build, &dir.path));
+            if recording || record::valid(&dir.path).is_some() {
+                continue;
+            }
             if owner.repository.is_some() && owner.workspace.join("Cargo.toml").is_file() {
                 let worktree = worktree::of(&owner.workspace);
                 let probe = Probe::here(worktree.clone());
@@ -672,5 +696,11 @@ impl Accounts {
 
     fn ledger(&self) -> MutexGuard<'_, Ledger> {
         self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn recording(&self) -> MutexGuard<'_, Vec<PathBuf>> {
+        self.recording
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }

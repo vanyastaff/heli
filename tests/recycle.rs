@@ -1822,3 +1822,46 @@ fn the_daemon_writes_a_record_when_a_build_lock_is_released() {
         "{built:?}"
     );
 }
+
+/// A lock released over a record that still counts, nothing built since
+/// it was taken, gets no new one: the worktree is left alone, as after a
+/// heli run, whose end wrote the record already.
+#[test]
+fn a_record_that_counts_is_not_written_again() {
+    let repo = Repo::new();
+    let a = repo.add_worktree("a");
+    repo.build(&a);
+    let a_dir = repo.build_dir_of(&a);
+    let record = || std::fs::read_to_string(record_file(&a_dir)).expect("a's record");
+    let counting = record();
+    repo.fixture.kill_daemon();
+    let lock = std::fs::File::options()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(a_dir.join("debug").join(".cargo-build-lock"))
+        .expect("open cargo's lock");
+    lock.lock().expect("hold cargo's lock");
+    let ensure = repo
+        .heli(&repo.main(), &["ensure"])
+        .output()
+        .expect("run heli ensure");
+    assert_success(&ensure, "cargo heli ensure");
+    repo.wait_for_first_look();
+    drop(lock);
+    let used = |status: &Value| status["disk"]["stores"][0]["used"].as_u64();
+    let before = used(&repo.fixture.status());
+
+    // A run in the main worktree ends, and the accountant looks again: it
+    // counts what the run left in its build directory once it is done
+    // with the locks.
+    let metadata = ["metadata", "--format-version", "1", "--no-deps"];
+    let output = repo
+        .heli(&repo.main(), &metadata)
+        .output()
+        .expect("run heli metadata");
+    assert_success(&output, "cargo heli metadata");
+    repo.fixture
+        .wait_for_status("the look after the run", |status| used(status) != before);
+    assert_eq!(record(), counting);
+}
