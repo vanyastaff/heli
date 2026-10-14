@@ -2,8 +2,8 @@
 //!
 //! - **State directory**: [`STATE_DIR_VAR`] if set, else
 //!   `%LOCALAPPDATA%\heli` on Windows and `$XDG_STATE_HOME/heli` (else
-//!   `~/.local/state/heli`) elsewhere. It holds the daemon's lock, its log
-//!   and the run counter. On Unix heli creates it with mode 0700.
+//!   `~/.local/state/heli`) elsewhere. It holds the daemon's lock, its log,
+//!   the run counter and the run log. On Unix heli creates it with mode 0700.
 //! - **Endpoint**: [`ENDPOINT_VAR`] if set, else derived from the state
 //!   directory. On Windows it is the named pipe
 //!   `\\.\pipe\heli-<hash of the state directory>-<logon session>`, so each
@@ -88,6 +88,11 @@ impl Locations {
     /// unique.
     pub fn run_counter(&self) -> PathBuf {
         self.state_dir.join("next-run")
+    }
+
+    /// The run log: one record of output per run (`crate::runlog`).
+    pub fn run_logs(&self) -> PathBuf {
+        self.state_dir.join("runs")
     }
 
     /// Creates the state directory, owner-only on Unix.

@@ -6,7 +6,8 @@
 //! daemon's), and with no stdin; what heli adds to every run's environment
 //! belongs in [`spawn`]: the pool it draws from ([`MAKEFLAGS_VAR`]) and its
 //! id ([`RUN_VAR`]). Its stdout and stderr are pipes the daemon forwards
-//! frame by frame ([`pump`]), the one place all of a run's output passes.
+//! frame by frame ([`pump`]), the one place all of a run's output passes;
+//! there it is also recorded in the run log (`crate::runlog`).
 //!
 //! **When a run is over** is when its process has exited, as for a command
 //! the client waited for itself: processes it left behind may keep its
@@ -15,7 +16,7 @@
 //! void until they close.
 //!
 //! A client that goes away does not stop the run: the output it misses is
-//! drained and dropped.
+//! still recorded.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use super::registry::RunId;
 use crate::protocol::{self, Channel, RunRequest};
+use crate::runlog::Recorder;
 
 /// How long output may still arrive after the run's process has exited.
 const GRACE: Duration = Duration::from_millis(500);
@@ -88,9 +90,13 @@ enum Event {
     Exited(io::Result<ExitStatus>),
 }
 
-/// Forwards the run's output to `client` until the run is over (see the
-/// module docs), and returns how it ended.
-pub fn pump(mut child: Child, client: &mut impl Write) -> io::Result<ExitStatus> {
+/// Records the run's output in `record` and forwards it to `client` until
+/// the run is over (see the module docs), and returns how it ended.
+pub fn pump(
+    mut child: Child,
+    client: &mut impl Write,
+    record: &mut Recorder<'_>,
+) -> io::Result<ExitStatus> {
     let (events, received) = mpsc::sync_channel(16);
     let mut open = 0;
     for (channel, pipe) in [
@@ -132,6 +138,9 @@ pub fn pump(mut child: Child, client: &mut impl Write) -> io::Result<ExitStatus>
         };
         match event {
             Some(Event::Output(channel, bytes)) => {
+                // Recorded first, so the record is complete when the client
+                // hears of the exit, and whether or not a client listens.
+                record.output(channel, &bytes);
                 if connected && protocol::write_output(client, channel, &bytes).is_err() {
                     connected = false;
                 }
