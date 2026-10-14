@@ -1,0 +1,9 @@
+# The repository the recycling tests (tests/recycle.rs) make worktrees of.
+# Its members depend on two packages outside it, in ../vendor: path
+# dependencies that stand in for third-party crates, the same files for
+# every worktree, so they stay fresh when a build directory moves from one
+# worktree to another. Inside it, `leaf` depends on `root`: a changed root
+# crate rebuilds its dependents, a changed leaf crate only itself.
+[workspace]
+resolver = "3"
+members = ["app", "leaf", "manifest-dir", "root"]

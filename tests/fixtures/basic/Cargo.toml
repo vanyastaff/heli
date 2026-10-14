@@ -1,0 +1,6 @@
+# A tiny workspace heli's tests build. No dependencies, so it builds offline.
+# `broken` and `many-errors` do not compile: select members with `-p`, or
+# exclude them.
+[workspace]
+resolver = "3"
+members = ["crates/*"]

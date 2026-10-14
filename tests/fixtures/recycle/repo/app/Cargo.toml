@@ -1,0 +1,9 @@
+[package]
+name = "recycle-app"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+outdir-dep = { path = "../../vendor/outdir-dep" }
+plain-dep = { path = "../../vendor/plain-dep" }

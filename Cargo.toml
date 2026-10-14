@@ -1,0 +1,53 @@
+[package]
+name = "cargo-heli"
+version = "0.0.0"
+edition = "2024"
+description = "Host-level scheduling for cargo on machines shared by many agents"
+repository = "https://github.com/vanyastaff/heli"
+# Not published until the first release decides the name and the license.
+publish = false
+exclude = ["/experiments", "/tests/fixtures"]
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+regex = "1.12"
+serde = { version = "1.0", features = ["derive"] }
+# `preserve_order`: `setup` rewrites the user's JSON settings in their order.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "net", "process"] }
+
+# `mkfifo`, which rustix leaves out on Apple platforms; memory figures and the
+# process list on macOS.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `NtQuerySemaphore`, which windows-sys does not declare.
+windows-link = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+# Pseudo-terminals, for the tests of output on a terminal.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["pty"] }
