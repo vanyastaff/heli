@@ -11,6 +11,7 @@
 
 mod support;
 
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -462,4 +463,90 @@ fn a_worktree_in_another_case_is_the_same_worktree() {
     open(&gate);
     assert_success(&finish(build), "the build");
     assert_success(&finish(fmt), "fmt");
+}
+
+/// One frame from the daemon: its kind (0 a message, 1 stdout, 2 stderr)
+/// and its payload.
+fn read_frame(stream: &mut impl Read) -> (u8, Vec<u8>) {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).expect("a frame");
+    let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+    let mut payload = vec![0u8; length as usize];
+    stream.read_exact(&mut payload).expect("a frame's payload");
+    (header[0], payload)
+}
+
+/// A client older than run classes sends no class: its run counts as exec,
+/// and the daemon does not tell it that it waits, in a message it could not
+/// read.
+#[test]
+fn a_client_older_than_classes_is_served_as_exec() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    let fmt = stand_in(&fixture, &echo, &["fmt"], Some(&gate));
+    let fmt_run = wait_until_listed(&fixture, &["fmt"], false);
+
+    // The handshake, then a run request as such a client sends it.
+    let mut older = support::endpoint::connect(&fixture.endpoint());
+    let mut hello = b"HELI".to_vec();
+    hello.extend(support::fake_daemon::PROTOCOL.to_le_bytes());
+    older.write_all(&hello).expect("send the hello");
+    let mut answer = [0u8; 8];
+    older.read_exact(&mut answer).expect("the daemon's hello");
+    let env: Vec<(String, String)> = std::env::vars()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("SystemRoot"))
+        .collect();
+    let request = json!({"Run": {
+        "cwd": fixture.workspace().to_str().expect("a UTF-8 path"),
+        "argv": [echo.to_str().expect("a UTF-8 path"), "older"],
+        "env": env,
+    }})
+    .to_string();
+    let mut frame = vec![0u8];
+    frame.extend((request.len() as u32).to_le_bytes());
+    frame.extend(request.as_bytes());
+    older.write_all(&frame).expect("send the request");
+    let (kind, started) = read_frame(&mut older);
+    assert!(
+        kind == 0 && text(&started).starts_with(r#"{"Started""#),
+        "{}",
+        text(&started)
+    );
+    let older_run = wait_until_listed(&fixture, &["older"], true);
+    assert_eq!(older_run["class"], "exec", "{older_run}");
+    assert_eq!(older_run["waiting_for"], json!([id(&fmt_run)]));
+
+    open(&gate);
+    assert_success(&finish(fmt), "fmt");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut frames = Vec::new();
+        loop {
+            let (kind, payload) = read_frame(&mut older);
+            let exited = kind == 0 && text(&payload).contains("Exited");
+            frames.push((kind, payload));
+            if exited {
+                break sender.send(frames);
+            }
+        }
+    });
+    let frames = receiver
+        .recv_timeout(FINISH_WITHIN)
+        .expect("the run's frames up to its exit");
+    let messages: Vec<String> = frames
+        .iter()
+        .filter(|(kind, _)| *kind == 0)
+        .map(|(_, payload)| text(payload))
+        .collect();
+    assert!(
+        messages.iter().all(|message| !message.contains("Waiting")),
+        "{messages:?}"
+    );
+    let stdout: Vec<u8> = frames
+        .iter()
+        .filter(|(kind, _)| *kind == 1)
+        .flat_map(|(_, payload)| payload.clone())
+        .collect();
+    assert_eq!(text(&stdout), "arg: \"older\"\n");
 }

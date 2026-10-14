@@ -6,7 +6,42 @@ mod support;
 use std::collections::BTreeMap;
 use std::process::{Child, Stdio};
 
+use serde_json::{Value, json};
+use support::fake_daemon::{Answer, FakeDaemon};
 use support::{Fixture, assert_success, runs};
+
+/// The status a daemon older than run classes answers: its runs have no
+/// class and no wait.
+const OLDER_STATUS: &str = r#"{"Status":{"schema":1,
+    "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
+    "runs":[{"id":"r7","worktree":"/w","argv":["cargo","build"],
+             "phase":"running","started_at":1791911112}]}}"#;
+
+/// `status` still reads a daemon older than run classes: its runs show no
+/// class (`null`, and `-` in the text form) and no wait.
+#[test]
+fn status_reads_a_daemon_older_than_classes() {
+    let fixture = Fixture::new("basic");
+    let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Reply(OLDER_STATUS));
+    let status = fixture.status();
+    fake.received();
+    let run = &runs(&status)[0];
+    assert_eq!(run["id"], "r7", "{status}");
+    assert_eq!(run["class"], Value::Null, "{status}");
+    assert_eq!(run["waiting_since"], Value::Null, "{status}");
+    assert_eq!(run["waiting_for"], json!([]), "{status}");
+
+    let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Reply(OLDER_STATUS));
+    let output = fixture.heli(["status"]).output().expect("run heli status");
+    fake.received();
+    assert_success(&output, "cargo heli status");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("r7") && line.contains("cargo build  -  running")),
+        "{text}"
+    );
+}
 
 /// Every reading of a command line the classes depend on, run by heli with
 /// `echo-args` as its cargo, and listed by `status` with the class it got.

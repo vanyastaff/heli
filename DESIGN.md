@@ -143,7 +143,11 @@ daemon. The version stays 1 until the first release: until then a daemon
 answers a request it does not know (one a newer client added, such as `log`)
 with "unsupported", and the client treats that like a mismatch from an older
 daemon. It asks the daemon to retire and does without it, after one warning
-line: it runs the command, or reads the run log, itself.
+line: it runs the command, or reads the run log, itself. Fields added to a
+message are optional, so both sides still read each other's: a run request
+without a class (§5) comes from a client older than run classes, its run
+counts as exec, and the daemon does not send it the "waiting" message, which
+it could not read.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
