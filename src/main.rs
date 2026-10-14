@@ -16,6 +16,7 @@
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
+//! - [`output`]: what the client prints of a run, in the chosen output mode;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
 //!   draw from the pool, and the [`autostart`] registration that starts the
 //!   daemon at logon;
@@ -34,8 +35,11 @@ mod environment;
 mod ipc;
 mod launch;
 mod locations;
+mod memory;
 mod nesting;
+mod output;
 mod pool;
+mod processes;
 mod protocol;
 mod runlog;
 mod setup;

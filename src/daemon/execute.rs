@@ -53,10 +53,17 @@ pub const MAKEFLAGS_VAR: &str = "CARGO_MAKEFLAGS";
 /// heli.
 pub const RUN_VAR: &str = "HELI_RUN";
 
-/// Starts run `id`'s process, drawing from the jobserver `makeflags` names.
-pub fn spawn(request: &RunRequest, id: RunId, makeflags: &OsStr) -> io::Result<Child> {
+/// Starts run `id`'s process with the command line `argv` (the request's,
+/// or one a phase of the run derives from it), drawing from the jobserver
+/// `makeflags` names.
+pub fn spawn(
+    request: &RunRequest,
+    argv: &[OsString],
+    id: RunId,
+    makeflags: &OsStr,
+) -> io::Result<Child> {
     let cwd = cwd(request);
-    let mut argv = argv(request).into_iter();
+    let mut argv = argv.iter().cloned();
     let program = argv.next().unwrap_or_default();
     Command::new(resolve(&cwd, program))
         .args(argv)

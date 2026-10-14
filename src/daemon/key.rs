@@ -157,18 +157,24 @@ fn host_name() -> Vec<u8> {
 
 /// Keys the toolchain as the client's worktree selects it: `rustc -vV`
 /// (`RUSTC` if set), `cargo -V` (the run's own cargo), and the version of
-/// the tool the subcommand runs (clippy, rustfmt, nextest). A tool that does
-/// not answer is keyed as absent.
+/// the tool the subcommand runs (clippy, rustfmt, nextest), each asked of
+/// the `+toolchain` the run names, if any. A tool that does not answer is
+/// keyed as absent.
 fn toolchain(request: &RunRequest, fields: &mut Fields) {
     let cargo = request
         .argv
         .first()
         .map_or(OsStr::new("cargo"), |program| &program.0);
     let rustc = var(request, "RUSTC").unwrap_or(OsStr::new("rustc"));
+    let mut args = request.argv.iter().skip(1).map(|arg| arg.0.as_os_str());
+    let mut subcommand = args.next();
+    let pinned = subcommand.filter(|first| first.as_encoded_bytes().starts_with(b"+"));
+    if pinned.is_some() {
+        subcommand = args.next();
+    }
     let mut probes: Vec<(&str, &OsStr, &[&str])> =
         vec![("rustc -vV", rustc, &["-vV"]), ("cargo -V", cargo, &["-V"])];
-    let subcommand = request.argv.get(1).and_then(|arg| arg.0.to_str());
-    match subcommand {
+    match subcommand.and_then(OsStr::to_str) {
         Some("clippy") => probes.push(("cargo clippy -V", cargo, &["clippy", "-V"])),
         Some("fmt") => probes.push(("cargo fmt --version", cargo, &["fmt", "--version"])),
         Some("nextest") => {
@@ -177,7 +183,12 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
         _ => {}
     }
     for (name, program, args) in probes {
-        let output = tool(request, program, args).output();
+        let output = tool(
+            request,
+            program,
+            pinned.into_iter().chain(args.iter().map(OsStr::new)),
+        )
+        .output();
         match output {
             Ok(output) if output.status.success() => {
                 fields.push(format!("version {name}").as_bytes(), &output.stdout);
@@ -431,7 +442,11 @@ fn git(request: &RunRequest, args: &[&str], index: Option<&Path>) -> Result<Vec<
 
 /// `program args` in the client's working directory with exactly the
 /// client's environment, with no input and its stdout captured.
-fn tool(request: &RunRequest, program: &OsStr, args: &[&str]) -> Command {
+fn tool<A: AsRef<OsStr>>(
+    request: &RunRequest,
+    program: &OsStr,
+    args: impl IntoIterator<Item = A>,
+) -> Command {
     let mut command = Command::new(program);
     command
         .args(args)
