@@ -161,7 +161,8 @@ not start, listen or answer within 5 s.
 
 - The client starts `cargo heli daemon --detach`, which starts the daemon and
   exits once it listens. The daemon's parent is then gone, so no tree walk
-  from the client reaches it. Agent harnesses stop a command by killing its
+  from the client reaches it; the client goes on only once that stage has
+  exited, within the same 5 s. Agent harnesses stop a command by killing its
   process tree found through parent processes: observed with Claude Code on
   Windows, where stopping a command killed the client, the daemon it had
   started directly, and that daemon's run.
@@ -971,7 +972,9 @@ log r17 has them all)`. An output of 80 lines or fewer shows whole. Quiet
 mode's fact is the count of lines: `1314 lines`.
 
 Some things never change: the exit code, the stdout/stderr split, and output
-heli does not recognize, which passes through.
+heli does not recognize, which passes through. Beside lines heli renders on
+stderr, the tool's own stderr passes through a whole line at a time, so that
+a line the tool writes in pieces is not cut by one of heli's.
 
 **Colours.** A run writes to pipes, so cargo would print no colours even for
 a client on a terminal. When a run's output passes through to a client whose

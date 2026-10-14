@@ -570,6 +570,27 @@ impl Fixture {
         }
     }
 
+    /// Waits until run `run` has printed something, as `cargo heli log`
+    /// shows: its command has started, so its client heard that it started.
+    /// A run is listed from its admission, a moment before its client is
+    /// told; a client gone in that moment means the run never starts (it is
+    /// the client's to run). Panics after 60 s.
+    pub fn wait_for_run_output(&self, run: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let logged = self.heli(["log", run]).output().expect("run heli log");
+            assert_success(&logged, "cargo heli log");
+            if !logged.stdout.is_empty() || !logged.stderr.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the output of {run}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The runs `status --json` lists.
     pub fn runs(&self) -> Vec<Value> {
         runs(&self.status())
@@ -583,8 +604,10 @@ impl Fixture {
     }
 
     /// Kills this fixture's daemon and every process it started, and waits
-    /// until it no longer answers. Never panics: it also runs while a failed
-    /// test unwinds.
+    /// until it no longer answers and its process is gone, with its files:
+    /// a daemon started next takes the state directory's lock, which a
+    /// killed process may hold a while after `status` stops reaching it.
+    /// Never panics: it also runs while a failed test unwinds.
     pub fn kill_daemon(&self) {
         let Some(pid) = self.daemon_pid() else {
             return;
@@ -593,6 +616,9 @@ impl Fixture {
         let deadline = Instant::now() + Duration::from_secs(10);
         while self.daemon_pid() == Some(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
+        }
+        while process_runs(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -700,6 +726,40 @@ pub fn kill_tree(pid: u32) {
     }
 }
 
+/// Whether process `pid` still runs. A process that has exited, even if
+/// nobody has reaped it yet (a zombie, on Unix), has closed its files.
+pub fn process_runs(pid: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+        };
+
+        // SAFETY: opens a handle that only waits, closed below.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        // SAFETY: a process handle with synchronize access; no wait.
+        let runs = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+        // SAFETY: the handle is ours.
+        unsafe { CloseHandle(process) };
+        runs
+    }
+    #[cfg(unix)]
+    {
+        let state = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+            .unwrap_or_default();
+        !state.is_empty() && !state.starts_with('Z')
+    }
+}
+
 /// Kills process `pid` alone, as a crash would end it: its children live
 /// on. Only for processes the tests started themselves.
 pub fn kill_process(pid: u32) {
@@ -783,6 +843,28 @@ pub fn split_footer(stderr: &[u8]) -> (Vec<u8>, Footer) {
 /// has no footer.
 pub fn without_footer(stderr: &[u8]) -> String {
     String::from_utf8_lossy(&split_footer(stderr).0).into_owned()
+}
+
+/// Copies the program at `from` to `to`, to run it from there.
+///
+/// On Unix another process (`cp`) writes the copy. Written here, the copy
+/// would be open for writing in this process for a moment, and a child
+/// that another test's thread forks in that moment holds it open until it
+/// executes its own program: running the copy then fails with "Text file
+/// busy" (`ETXTBSY`).
+pub fn copy_program(from: &Path, to: &Path) {
+    if cfg!(unix) {
+        let copied = Command::new("cp")
+            .arg("--")
+            .arg(from)
+            .arg(to)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run cp");
+        assert_success(&copied, &format!("cp {} {}", from.display(), to.display()));
+    } else {
+        std::fs::copy(from, to).unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
+    }
 }
 
 /// The `cargo-heli` binary under test.

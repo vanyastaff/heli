@@ -12,7 +12,9 @@
 //!   does not start the daemon itself: it starts `cargo-heli daemon
 //!   --detach`, which starts the daemon, waits until it listens (or relays
 //!   the exit code with which it failed), and exits. The daemon's parent is
-//!   then gone, and no tree walk from the client reaches it.
+//!   then gone, and no tree walk from the client reaches it. The client,
+//!   which connects as soon as the daemon listens too, goes on only once the
+//!   stage has exited.
 //! - **Handles.** A daemon that inherited the client's stdout or stderr
 //!   would keep the pipe of whoever reads the client (an agent's tool call)
 //!   open until the daemon exits. On Windows it is started with
@@ -109,7 +111,8 @@ pub fn detach(depth: u32) -> ! {
     let Ok(mut daemon) = spawn_stage(&locations, depth, &["daemon"]) else {
         std::process::exit(1)
     };
-    std::process::exit(match wait(&locations, &mut daemon) {
+    let deadline = Instant::now() + START_TIMEOUT;
+    std::process::exit(match listening(&locations, &mut daemon, deadline) {
         Ok(_probe) => 0,
         Err(StartError::Exited(code)) => code,
         Err(StartError::TimedOut) => DETACH_TIMED_OUT,
@@ -117,13 +120,32 @@ pub fn detach(depth: u32) -> ! {
     })
 }
 
-/// Waits until a daemon listens at the endpoint, while `launched` (the
-/// detaching stage, or the daemon itself) has not failed, and connects.
-/// Exiting with 0 or [`daemon::ALREADY_RUNNING`] is no failure: a daemon
-/// listens, or will. A daemon the autostart registration starts is not
-/// this process's to watch, so only the deadline ends that wait.
+/// Waits until a daemon listens at the endpoint, while `launched` (from
+/// [`start`]) has not failed, and connects; then, within the same deadline,
+/// until the stage it started has exited. Until the stage has, it is the
+/// daemon's parent and this client's child: a harness that stops this
+/// client by killing its process tree would kill the daemon and its runs
+/// too. The stage exits as soon as it sees the daemon listen.
 pub fn wait(locations: &Locations, launched: &mut Launched) -> Result<Stream, StartError> {
     let deadline = Instant::now() + START_TIMEOUT;
+    let stream = listening(locations, launched, deadline)?;
+    while launched.running() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(stream)
+}
+
+/// Waits until a daemon listens at the endpoint, while `launched` (the
+/// detaching stage, or the daemon itself) has not failed, and connects;
+/// gives up at `deadline`. Exiting with 0 or [`daemon::ALREADY_RUNNING`] is
+/// no failure: a daemon listens, or will. A daemon the autostart
+/// registration starts is not this process's to watch, so only the
+/// deadline ends that wait.
+fn listening(
+    locations: &Locations,
+    launched: &mut Launched,
+    deadline: Instant,
+) -> Result<Stream, StartError> {
     loop {
         match ipc::connect(&locations.endpoint) {
             Ok(stream) => return Ok(stream),
@@ -176,6 +198,15 @@ fn spawn_stage(locations: &Locations, depth: u32, args: &[&str]) -> io::Result<L
 }
 
 impl Launched {
+    /// Whether the process it watches still runs; false when there is none.
+    fn running(&mut self) -> bool {
+        #[cfg(unix)]
+        let watched = self.child.is_some();
+        #[cfg(windows)]
+        let watched = self.process.is_some();
+        watched && self.exit_code().is_none()
+    }
+
     /// The exit code once the process has exited; `None` while it runs, or
     /// when there is no process to watch.
     #[cfg(unix)]

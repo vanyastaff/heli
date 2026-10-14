@@ -219,9 +219,13 @@ fn a_cancelled_run_is_listed_as_cancelled() {
     let echo = fixture.echo_args();
     let _gate = Gate(fixture.path("gate"));
     let mut call = fixture.heli(["exec", "--"]);
-    call.arg(&echo).env("ECHO_WAIT_FOR", fixture.path("gate"));
+    // It prints its process id before it waits: the sign it has started.
+    call.arg(&echo)
+        .env("ECHO_WAIT_FOR", fixture.path("gate"))
+        .env("ECHO_PID", "1");
     let call = start(&mut call);
     let id = only_run(&fixture);
+    fixture.wait_for_run_output(&id);
     support::kill_tree(call.id());
     let _ = finish(call);
     fixture.wait_for_status("the client to be gone", |status| {

@@ -110,7 +110,10 @@ pub fn main() -> ! {
     };
     match lock.try_lock() {
         Ok(()) => {}
-        Err(TryLockError::WouldBlock) => std::process::exit(ALREADY_RUNNING),
+        Err(TryLockError::WouldBlock) => {
+            log.write("another daemon holds the lock; exiting");
+            std::process::exit(ALREADY_RUNNING)
+        }
         Err(TryLockError::Error(error)) => {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }

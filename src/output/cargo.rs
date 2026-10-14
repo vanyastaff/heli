@@ -24,7 +24,9 @@
 //!   own human output does the same). Notes are dropped.
 //! - Cargo's other JSON messages (artifacts, build scripts, the build's
 //!   end) are dropped. A line on stdout that is not cargo's JSON, and all of
-//!   stderr (cargo's own errors and warnings), pass through.
+//!   stderr (cargo's own errors and warnings), pass through; stderr a whole
+//!   line at a time ([`Sink::pass`]), so that a rendered error never cuts a
+//!   line cargo writes in pieces.
 //!
 //! [`Message`] and [`Diagnostic`] also serve `cargo heli log --errors`
 //! (`crate::runlog::select`), which reads the same JSON from a record.
@@ -414,7 +416,7 @@ fn count_of(count: usize, noun: &str) -> String {
 impl Render for Diagnostics {
     fn output(&mut self, channel: Channel, bytes: &[u8], out: &mut Sink) {
         if channel == Channel::Stderr {
-            out.write(channel, bytes);
+            out.pass(bytes);
             return;
         }
         let mut from = self.pending.len();

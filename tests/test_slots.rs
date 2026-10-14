@@ -22,7 +22,7 @@ fn fake_cargo(fixture: &Fixture) -> PathBuf {
     let dir = fixture.path("fake");
     std::fs::create_dir_all(&dir).expect("create the fake cargo's directory");
     let cargo = dir.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(&echo, &cargo).expect("copy echo-args as cargo");
+    support::copy_program(&echo, &cargo);
     cargo
 }
 

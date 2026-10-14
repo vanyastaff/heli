@@ -108,7 +108,7 @@ fn a_run_matches_direct_execution() {
     let name = echo.file_name().expect("a file name");
     let dir = fixture.workspace().join("crates");
     std::fs::create_dir_all(dir.join("bin")).expect("create bin");
-    std::fs::copy(&echo, dir.join("bin").join(name)).expect("copy echo-args");
+    support::copy_program(&echo, &dir.join("bin").join(name));
     let relative = std::path::Path::new("bin").join(name);
     let configure = |command: &mut Command| {
         command
@@ -226,18 +226,30 @@ fn the_daemon_outlives_the_call_that_started_it() {
     let echo = fixture.echo_args();
     let gate = fixture.path("gate");
     let mut call = fixture.heli(["exec", "--"]);
-    call.arg(&echo).env("ECHO_WAIT_FOR", &gate);
+    // It prints its process id before it waits: the sign it has started.
+    call.arg(&echo)
+        .env("ECHO_WAIT_FOR", &gate)
+        .env("ECHO_PID", "1");
     let call = start(&mut call);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let daemon = support::daemon_pid(&status).expect("a daemon");
+    // Killed before it heard that its run started, the call would leave
+    // the run to itself: it would never start.
+    fixture.wait_for_run_output(runs(&status)[0]["id"].as_str().expect("an id"));
 
     support::kill_tree(call.id());
     let _ = finish(call);
-    let status = fixture.status();
+    let output = fixture
+        .heli(["status", "--json"])
+        .output()
+        .expect("run heli status");
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status as JSON");
     assert_eq!(
         support::daemon_pid(&status),
         Some(daemon),
-        "the daemon survived: {status}"
+        "the daemon survived: {status}\nstatus said: {}\nthe daemon's log:\n{}",
+        text(&output.stderr),
+        fixture.daemon_log()
     );
     assert_eq!(runs(&status).len(), 1, "its run goes on: {status}");
     open(&gate);
