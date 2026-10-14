@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "leaf"
+version = "0.0.0"
+dependencies = [
+ "root",
+]
+
+[[package]]
 name = "manifest-dir"
 version = "0.0.0"
 
@@ -21,3 +28,7 @@ dependencies = [
  "outdir-dep",
  "plain-dep",
 ]
+
+[[package]]
+name = "root"
+version = "0.0.0"

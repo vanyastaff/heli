@@ -519,6 +519,12 @@ impl Daemon {
         if let Some(loans) = self.broker.close(id) {
             self.events.record("loans", loans_event(id, &loans));
         }
+        // Its build directory's source-state record (DESIGN.md §6.4), before
+        // its clients hear it ended: a worktree removed right after its last
+        // run leaves a record of it.
+        if let Some(learning) = learning {
+            learning.ended();
+        }
         if let Some(error) = record.take_error() {
             self.log.write(&format!("cannot record {id}: {error}"));
         }

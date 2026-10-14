@@ -26,6 +26,7 @@ pub mod ladder;
 pub mod orphan;
 pub mod owner;
 pub mod probe;
+pub mod record;
 pub mod recycle;
 pub mod registry;
 pub mod scan;
