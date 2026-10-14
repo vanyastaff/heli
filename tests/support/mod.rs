@@ -280,8 +280,9 @@ impl Fixture {
     /// [`Fixture::home`] (`HOME` and `USERPROFILE`; created if missing) and
     /// whose shell is `shell` (`SHELL`, unset when `None`).
     /// `CLAUDE_CONFIG_DIR`, `ZDOTDIR` and `XDG_CONFIG_HOME` are unset, so
-    /// every file setup can edit is in that home. The pool it offers is the
-    /// fixture's own.
+    /// every file setup can edit is in that home; its Cargo home
+    /// (`CARGO_HOME`, which rustup sets for the tests) is `.cargo` there. The
+    /// pool it offers is the fixture's own.
     pub fn setup<I, S>(&self, shell: Option<&str>, args: I) -> Command
     where
         I: IntoIterator<Item = S>,
@@ -294,7 +295,10 @@ impl Fixture {
         for var in USER_FILE_VARS {
             command.env_remove(var);
         }
-        command.env("HOME", &home).env("USERPROFILE", &home);
+        command
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("CARGO_HOME", home.join(".cargo"));
         if let Some(shell) = shell {
             command.env("SHELL", shell);
         }

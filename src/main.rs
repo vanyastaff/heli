@@ -16,7 +16,7 @@
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
-//!   draw from the pool;
+//!   draw from the pool, and cargo's `build-dir` in the build [`store`];
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
@@ -37,6 +37,7 @@ mod protocol;
 mod runlog;
 mod setup;
 mod status;
+mod store;
 mod worktree;
 
 use std::ffi::OsString;
