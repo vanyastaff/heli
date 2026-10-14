@@ -385,6 +385,15 @@ fn slots_a_killed_build_held_come_back_once_nothing_compiles() {
     let status = fixture.wait_for_status("the full pool", |status| status["pool"]["in_use"] == 0);
     assert_eq!(status["pool"], pool(2, 2, 0, 0));
     let top_ups = fixture.events_named("top-up");
+    // TEMPORARY (fix/after-stale-link): whether the top-up's event comes
+    // after the status that shows the full pool.
+    if top_ups.is_empty() {
+        std::thread::sleep(Duration::from_secs(2));
+        panic!(
+            "no top-up event once the pool was full; 2 s later: {:?}",
+            fixture.events_named("top-up")
+        );
+    }
     assert_eq!(top_ups.len(), 1, "{top_ups:?}");
     assert_eq!(
         (
