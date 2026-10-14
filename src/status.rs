@@ -79,6 +79,10 @@ pub struct Run {
 pub enum Phase {
     /// Executing, as one phase (no build and test phases of its own).
     Running,
+    /// A test run building its tests.
+    Building,
+    /// A test run waiting for its test slots, then running its tests.
+    Testing,
 }
 
 impl Phase {
@@ -86,6 +90,8 @@ impl Phase {
     pub fn name(self) -> &'static str {
         match self {
             Self::Running => "running",
+            Self::Building => "building",
+            Self::Testing => "testing",
         }
     }
 }

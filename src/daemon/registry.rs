@@ -78,6 +78,13 @@ impl Registry {
         id
     }
 
+    /// Run `id` moves to `phase`.
+    pub fn set_phase(&self, id: RunId, phase: Phase) {
+        if let Some(entry) = self.lock().runs.get_mut(&id) {
+            entry.phase = phase;
+        }
+    }
+
     /// Removes a finished run.
     pub fn finish(&self, id: RunId) {
         self.lock().runs.remove(&id);

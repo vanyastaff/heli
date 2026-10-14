@@ -22,12 +22,18 @@
 //!   [`Waiter`] in a thread of its own) and returns it to the host pool,
 //!   which lends it on. Nothing running is interrupted.
 //! - **Exact accounting.** A run uses the slots lent to it less those free
-//!   in its pool. When it ends, everything lent to it goes back to the host
-//!   pool, whatever its processes still held ([`Broker::close`]).
+//!   in its pool, plus its test slots. When it ends, everything lent to it
+//!   goes back to the host pool, whatever its processes still held
+//!   ([`Broker::close`]).
+//! - **Test slots.** Before its test phase, a test run asks for K slots
+//!   ([`Broker::take_test_slots`]) and waits for them at most a few
+//!   seconds. Free slots in its own pool count first; it then waits like
+//!   any run that waits, the fewest in use first. The daemon holds the
+//!   slots it got for the test threads until the phase ends.
 //!
-//! A run is *waiting* when its pool has no free slot: the broker cannot see
-//! the processes blocked on it, so an empty pool counts as a run asking for
-//! more. A run is *active* when it uses a slot or waits; a run that only
+//! A run is *waiting* when its pool has no free slot, or it waits for test
+//! slots: the broker cannot see the processes blocked on a pool, so an empty
+//! pool counts as a run asking for more. A run is *active* when it uses a slot or waits; a run that only
 //! keeps a free slot in its pool is idle and does not count for shares.
 
 use std::collections::BTreeMap;
@@ -70,6 +76,10 @@ struct Run {
     /// When the run pool was last seen with a free slot: a wait for a lent
     /// slot began no earlier.
     last_free: Instant,
+    /// Test slots asked for, and held: taken from the host pool, kept by
+    /// the daemon for the run's test threads.
+    test_wanted: u32,
+    test_held: u32,
     /// The waiter that takes slots back, once one was wanted.
     reclaim: Option<Reclaim>,
     /// A waiter could not be made: slots are not taken back.
@@ -144,6 +154,8 @@ impl Broker {
                 lent: 0,
                 free: 0,
                 last_free: Instant::now(),
+                test_wanted: 0,
+                test_held: 0,
                 reclaim: None,
                 unreclaimable: false,
                 loans: Loans::default(),
@@ -160,7 +172,7 @@ impl Broker {
     pub fn close(self: &Arc<Self>, id: RunId) -> Option<Loans> {
         let mut state = self.lock();
         let run = state.runs.remove(&id)?;
-        for _ in 0..run.lent {
+        for _ in 0..run.holdings() {
             self.give_host();
         }
         // The waiter, if it waits, finds the run gone.
@@ -173,6 +185,57 @@ impl Broker {
         drop(state);
         self.changed.notify_all();
         Some(run.loans)
+    }
+
+    /// Run `id`'s share of the capacity, counted now.
+    pub fn share(&self, id: RunId) -> f64 {
+        let mut state = self.lock();
+        state.observe(Instant::now());
+        let shares = self.shares(&state);
+        state.runs.get(&id).map_or(0.0, |run| shares.of(run))
+    }
+
+    /// Takes up to `wanted` test slots for run `id`, waiting for them at
+    /// most `within`, and returns how many it got. The daemon holds them
+    /// until [`Broker::release_test_slots`].
+    pub fn take_test_slots(self: &Arc<Self>, id: RunId, wanted: u32, within: Duration) -> u32 {
+        let deadline = Instant::now() + within;
+        let mut state = self.lock();
+        if let Some(run) = state.runs.get_mut(&id) {
+            run.test_wanted = wanted;
+        }
+        self.balance(&mut state);
+        loop {
+            let Some(run) = state.runs.get_mut(&id) else {
+                return 0;
+            };
+            let now = Instant::now();
+            if run.test_held >= wanted || now >= deadline {
+                run.test_wanted = run.test_held;
+                return run.test_held;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    /// Gives run `id`'s test slots back to the host pool.
+    pub fn release_test_slots(self: &Arc<Self>, id: RunId) {
+        let mut state = self.lock();
+        let Some(run) = state.runs.get_mut(&id) else {
+            return;
+        };
+        let held = std::mem::take(&mut run.test_held);
+        run.test_wanted = 0;
+        for _ in 0..held {
+            self.give_host();
+        }
+        self.balance(&mut state);
+        drop(state);
+        self.changed.notify_all();
     }
 
     /// Each run's slots and share, counted now.
@@ -194,8 +257,9 @@ impl Broker {
     }
 
     /// Slots the broker has taken out of the host pool and not yet given
-    /// back: those lent to run pools. The host pool's top-up target leaves
-    /// them out (DESIGN.md §4, "Bounded top-up").
+    /// back: those lent to run pools, and the test slots held for runs. The
+    /// host pool's top-up target leaves them out (DESIGN.md §4, "Bounded
+    /// top-up").
     #[allow(dead_code, reason = "the top-up target (#6) reads it")]
     pub fn lent(&self) -> u32 {
         self.lock().runs.values().map(Run::holdings).sum()
@@ -223,6 +287,9 @@ impl Broker {
         let now = Instant::now();
         state.observe(now);
         for run in state.runs.values_mut() {
+            while run.test_held < run.test_wanted && run.take_free() {
+                run.test_held += 1;
+            }
             while run.free > 1 && run.lent > 0 && run.take_free() {
                 self.give_host();
             }
@@ -262,7 +329,9 @@ impl Broker {
             .map(|(&id, run)| {
                 let in_use = run.in_use();
                 let wanted = fewest.is_some_and(|fewest| {
-                    in_use > 0 && in_use >= fewest + 2 && f64::from(in_use) > shares.of(run)
+                    run.lent > run.free
+                        && in_use >= fewest + 2
+                        && f64::from(in_use) > shares.of(run)
                 });
                 (id, wanted)
             })
@@ -428,8 +497,11 @@ impl Run {
         self.loans.most = self.loans.most.max(self.in_use());
     }
 
-    /// Takes a free slot out of the run pool.
+    /// Takes a free slot out of the run pool, if it has one.
     fn take_free(&mut self) -> bool {
+        if self.free == 0 {
+            return false;
+        }
         let taken = self
             .pool
             .as_ref()
@@ -441,9 +513,14 @@ impl Run {
         taken
     }
 
-    /// Puts a slot taken from the host pool in the run pool; `false` when it
-    /// could not, and the slot is still the caller's.
+    /// Gives the run a slot taken from the host pool: a test slot when it
+    /// waits for one, else a slot in its pool. `false` when it could not,
+    /// and the slot is still the caller's.
     fn lend(&mut self, now: Instant) -> bool {
+        if self.test_held < self.test_wanted {
+            self.test_held += 1;
+            return true;
+        }
         let Some(pool) = &self.pool else {
             return false;
         };
@@ -459,19 +536,20 @@ impl Run {
         true
     }
 
-    /// The slots the run uses: lent, and not free in its pool.
+    /// The slots the run uses: lent and not free in its pool, and its test
+    /// slots.
     fn in_use(&self) -> u32 {
-        self.lent.saturating_sub(self.free)
+        self.lent.saturating_sub(self.free) + self.test_held
     }
 
     /// The slots taken from the host pool for the run.
     fn holdings(&self) -> u32 {
-        self.lent
+        self.lent + self.test_held
     }
 
     /// Whether the run may be waiting for a slot.
     fn waiting(&self) -> bool {
-        self.pool.is_some() && self.free == 0
+        self.test_held < self.test_wanted || (self.pool.is_some() && self.free == 0)
     }
 
     /// Whether the run uses or wants slots.
@@ -488,10 +566,14 @@ struct Shares {
 
 impl Shares {
     /// The share of `run`: the capacity divided by the active runs, `run`
-    /// among them.
+    /// and what it holds among them.
     fn of(&self, run: &Run) -> f64 {
-        let runs = self.active + u32::from(!run.active());
-        f64::from(self.capacity) / f64::from(runs.max(1))
+        let (capacity, runs) = if run.active() {
+            (self.capacity, self.active)
+        } else {
+            (self.capacity + run.holdings(), self.active + 1)
+        };
+        f64::from(capacity) / f64::from(runs.max(1))
     }
 }
 
