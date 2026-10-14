@@ -74,27 +74,10 @@ pub fn repository(dir: &Path) -> Result<PathBuf, String> {
     // git writes `/` between components on Windows too.
     let native = |path: &str| Path::new(path).components().collect::<PathBuf>();
     let common = native(common);
-    let main = match common.parent() {
+    Ok(match common.parent() {
         Some(main) if common.file_name().is_some_and(|name| name == ".git") => main.to_path_buf(),
         _ => native(toplevel),
-    };
-    Ok(spelled_as(&main, dir))
-}
-
-/// `path` as `dir` spells it when `dir` is inside it (git resolves links,
-/// such as macOS's `/var` to `/private/var`, which people do not write).
-fn spelled_as(path: &Path, dir: &Path) -> PathBuf {
-    let (Ok(real_path), Ok(real_dir)) = (std::fs::canonicalize(path), std::fs::canonicalize(dir))
-    else {
-        return path.to_path_buf();
-    };
-    let Ok(below) = real_dir.strip_prefix(&real_path) else {
-        return path.to_path_buf();
-    };
-    let up = below.components().count();
-    dir.ancestors()
-        .nth(up)
-        .map_or_else(|| path.to_path_buf(), Path::to_path_buf)
+    })
 }
 
 /// The user's Cargo home: `CARGO_HOME` (relative to `cwd`), else `.cargo`
@@ -132,27 +115,32 @@ pub fn edit(path: &Path, value: &str) -> Edit {
     if build_dir(&table) == Some(&toml::Value::String(value.to_owned())) {
         return Edit::Done;
     }
-    let kept = without_ours(&text);
-    let Ok(kept_table) = parse(&kept) else {
-        return Edit::Refused("it is not TOML without heli's lines".to_owned());
-    };
-    if let Some(theirs) = build_dir(&kept_table) {
-        let theirs = match theirs {
-            toml::Value::String(theirs) => basic_string(theirs),
-            other => format!("{other:?}"),
-        };
-        return Edit::Refused(format!("it sets {SETTING} itself, to {theirs}"));
-    }
-    let content = insert(&kept, value);
-    let sound = parse(&content).is_ok_and(|table| {
-        build_dir(&table) == Some(&toml::Value::String(value.to_owned()))
-            && without_build_dir(table) == without_build_dir(kept_table)
-    });
-    if !sound {
-        return Edit::Refused(format!(
+    let unsafe_edit = || {
+        Edit::Refused(format!(
             "setup cannot add {SETTING} to it safely; add `{KEY} = {}` under [build] by hand",
             basic_string(value)
-        ));
+        ))
+    };
+    let kept = without_ours(&text);
+    let Ok(kept_table) = parse(&kept) else {
+        return unsafe_edit();
+    };
+    if let Some(theirs) = build_dir(&kept_table) {
+        return Edit::Refused(match theirs {
+            toml::Value::String(theirs) => {
+                format!("it sets {SETTING} itself, to {}", basic_string(theirs))
+            }
+            _ => format!("it sets {SETTING} itself"),
+        });
+    }
+    let content = insert(&kept, value);
+    // The new content must say what the file said, plus heli's value.
+    let sound = parse(&content).is_ok_and(|new| {
+        build_dir(&new) == Some(&toml::Value::String(value.to_owned()))
+            && without_build_dir(new) == without_build_dir(table)
+    });
+    if !sound {
+        return unsafe_edit();
     }
     Edit::Write {
         content,

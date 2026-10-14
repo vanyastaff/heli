@@ -186,23 +186,24 @@ impl Accounts {
     /// there that started `at`. Returns the directories the run builds in.
     fn discover(&self, probe: &Probe, at: u64) -> Option<Vec<PathBuf>> {
         let workspace = probe.workspace()?;
+        let build = workspace.build.clone().unwrap_or(workspace.target.clone());
+        if store::store_of(&self.config, &build).is_some() {
+            let repository = probe.repository(&workspace.root);
+            let recorded = owner::record_run(&build, &workspace.root, repository.as_deref(), at);
+            if let Err(error) = recorded {
+                self.log.write(&format!(
+                    "cannot write the owner manifest of {}: {error}",
+                    build.display()
+                ));
+            }
+        }
+        // Last, so that a registered target directory says that all of this
+        // is done.
         self.register(Target {
             path: workspace.target.clone(),
             workspace: workspace.root.clone(),
         });
-        let build = workspace.build.clone().unwrap_or(workspace.target.clone());
-        let dirs = vec![workspace.target.clone(), build.clone()];
-        if store::store_of(&self.config, &build).is_none() {
-            return Some(dirs);
-        }
-        let repository = probe.repository(&workspace.root);
-        if let Err(error) = owner::record_run(&build, &workspace.root, repository.as_deref(), at) {
-            self.log.write(&format!(
-                "cannot write the owner manifest of {}: {error}",
-                build.display()
-            ));
-        }
-        Some(dirs)
+        Some(vec![workspace.target, build])
     }
 
     /// Registers `target`.

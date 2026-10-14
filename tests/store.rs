@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use support::{Fixture, assert_success};
 
 fn text(bytes: &[u8]) -> String {
@@ -127,6 +127,19 @@ fn answered(mut command: Command, answers: &str) -> Output {
     child.wait_with_output().expect("wait for heli setup")
 }
 
+/// The files setup asked to write (`Write <path>? [y/N]`), in order. Paths
+/// setup finds from its working directory are spelled as the system
+/// resolves them (on macOS `/private/var`), so compare those canonically.
+fn asked(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (path, _) = line.strip_prefix("Write ")?.split_once("? [y/N]")?;
+            Some(PathBuf::from(path))
+        })
+        .collect()
+}
+
 /// The `build-dir` setup writes for `store`, as a TOML basic string.
 fn build_dir_value(store: &Path) -> String {
     let value = store.join("{workspace-path-hash}");
@@ -191,17 +204,14 @@ fn a_repository_set_up_builds_into_the_store() {
     let stdout = text(&output.stdout);
     let repository_config = workspace.join(".cargo").join("config.toml");
     let user_config = fixture.home().join(".cargo").join("config.toml");
-    for path in [&repository_config, &user_config] {
-        assert!(
-            stdout.contains(&format!("Write {}? [y/N] ", path.display())),
-            "setup offers {}: {stdout}",
-            path.display()
-        );
-    }
+    let asked = asked(&stdout);
+    assert_eq!(asked.len(), 2, "two questions: {stdout}");
+    assert_eq!(asked[1], user_config, "{stdout}");
     assert_eq!(
         std::fs::read_to_string(&repository_config).expect("the repository's configuration"),
         fresh_config(&store)
     );
+    assert_eq!(canonical(&asked[0]), canonical(&repository_config));
     assert!(
         !user_config.exists(),
         "the user's configuration is untouched"
@@ -257,23 +267,26 @@ fn every_project_set_up_builds_into_the_store() {
     let user_config = cargo_home.join("config.toml");
     std::fs::write(
         &user_config,
-        "# the user's own\n[build]\njobs = 2\n\n[env]\nFOO = \"bar\"\n",
+        "# the user's own\n[build]  # theirs too\njobs = 2\n\n[env]\nFOO = \"bar\"\n",
     )
     .expect("write the user's configuration");
 
     let output = answered(fixture.setup(None, Vec::<String>::new()), "y\n");
     assert_success(&output, "cargo heli setup");
     let stdout = text(&output.stdout);
-    let none = format!(
-        "Cargo configuration for this repository: none ({} is not in a git repository).",
-        workspace.display()
-    );
-    assert!(stdout.lines().any(|line| line == none), "{stdout}");
-    assert_eq!(stdout.matches("[y/N]").count(), 1, "{stdout}");
+    let none = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Cargo configuration for this repository: none (")?
+                .strip_suffix(" is not in a git repository).")
+        })
+        .unwrap_or_else(|| panic!("no repository to offer: {stdout}"));
+    assert_eq!(canonical(none), canonical(&workspace));
+    assert_eq!(asked(&stdout), std::slice::from_ref(&user_config), "{stdout}");
     assert_eq!(
         std::fs::read_to_string(&user_config).expect("the user's configuration"),
         format!(
-            "# the user's own\n[build]\n{MARKER}\nbuild-dir = {}\njobs = 2\n\n\
+            "# the user's own\n[build]  # theirs too\n{MARKER}\nbuild-dir = {}\njobs = 2\n\n\
              [env]\nFOO = \"bar\"\n",
             build_dir_value(&store)
         )
@@ -375,6 +388,14 @@ fn each_build_directory_names_its_owner() {
     for (dir, repo) in [(&main, &main), (&linked, &main), (&other, &other)] {
         let owner = find(dir);
         assert_eq!(repository(&owner), canonical(repo.join(".git")), "{owner}");
+        // As people write paths: on Windows without `\\?\`, and with `\`.
+        let spelled = owner["repository"].as_str().expect("a repository");
+        if cfg!(windows) {
+            assert!(
+                !spelled.starts_with(r"\\?\") && !spelled.contains('/'),
+                "{owner}"
+            );
+        }
         let (created, last) = (seconds(&owner, "created_at"), seconds(&owner, "last_run"));
         assert!(
             before <= created && created <= last && last <= after,
@@ -469,13 +490,52 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
         &main,
         &["worktree", "remove", "--force", &linked.to_string_lossy()],
     );
-    let orphans: Vec<Value> = gc(&fixture)
-        .into_iter()
+    let listing = gc(&fixture);
+    let orphans: Vec<&Value> = listing
+        .iter()
         .filter(|dir| dir["path"] == live["path"])
         .collect();
     assert_eq!(orphans.len(), 1, "{orphans:?}");
     assert_eq!(orphans[0]["state"], "orphan", "{orphans:?}");
     assert!(path.is_dir(), "gc --dry-run deletes nothing");
+    assert!(
+        !listing.iter().any(|dir| dir["kind"] == "target"),
+        "a target directory that is gone is not listed: {listing:?}"
+    );
+
+    // What a removed worktree leaves behind does not bring it back.
+    let stray = linked.join("target").join("debug");
+    std::fs::create_dir_all(&stray).expect("leave a target directory behind");
+    std::fs::write(stray.join("stray.bin"), "x").expect("and a file in it");
+    let listing = gc(&fixture);
+    let states: Vec<(&Value, &Value)> = listing
+        .iter()
+        .map(|dir| (&dir["kind"], &dir["state"]))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (&json!("build"), &json!("orphan")),
+            (&json!("target"), &json!("orphan"))
+        ],
+        "{listing:?}"
+    );
+
+    // A build directory only a bare cargo built in has no manifest.
+    let output = fixture
+        .cargo(["build", "--quiet", "-p", "echo-args"])
+        .current_dir(&main)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run cargo build");
+    assert_success(&output, "cargo build");
+    let unknown: Vec<Value> = gc(&fixture)
+        .into_iter()
+        .filter(|dir| dir["kind"] == "build" && dir["path"] != live["path"])
+        .collect();
+    assert_eq!(unknown.len(), 1, "{unknown:?}");
+    assert_eq!(unknown[0]["state"], "unknown", "{unknown:?}");
+    assert_eq!(unknown[0]["workspace"], Value::Null, "{unknown:?}");
 
     let output = fixture
         .heli(["gc", "--dry-run"])
@@ -551,9 +611,27 @@ fn build_dir_sizes(dir: &Path) -> [(&'static str, u64); 6] {
     ]
 }
 
+/// Links `link` to the directory `to`: a junction on Windows, which needs
+/// no privilege, a symlink elsewhere.
+fn link_dir(to: &Path, link: &Path) {
+    #[cfg(windows)]
+    {
+        let output = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(to)
+            .output()
+            .expect("run mklink");
+        assert_success(&output, "mklink /J");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(to, link).expect("make a symlink");
+}
+
 /// `gc --dry-run` gives each directory's size, by category, as the files
-/// in it add up: a build directory's intermediates by kind, and a `target/`
-/// directory's tool caches, which only the configuration's patterns name.
+/// in it add up: a build directory's intermediates by kind, also below a
+/// target triple, and a `target/` directory's tool caches, which only the
+/// configuration's patterns name. A link is never followed.
 #[test]
 fn sizes_by_category_match_the_files() {
     let fixture = Fixture::new("basic");
@@ -576,15 +654,11 @@ fn sizes_by_category_match_the_files() {
     let check = target.join("cli-template-check");
     std::fs::create_dir_all(&check).expect("create another tool cache");
     std::fs::write(check.join("out.bin"), vec![0u8; 300]).expect("fill it");
+    let outside = fixture.path("outside");
+    std::fs::create_dir_all(&outside).expect("create a directory outside");
+    std::fs::write(outside.join("big.bin"), vec![0u8; 500]).expect("fill it");
+    link_dir(&outside, &target.join("link"));
 
-    let listed_target = |fixture: &Fixture| {
-        let target = canonical(&target);
-        gc(fixture).into_iter().find(|dir| {
-            dir["kind"] == "target"
-                && std::fs::canonicalize(dir["path"].as_str().expect("a path")).ok()
-                    == Some(target.clone())
-        })
-    };
     let build = wait_for("the build directory", || listed_build_dir(&fixture, &main));
     let path = PathBuf::from(build["path"].as_str().expect("a path"));
     let expected = build_dir_sizes(&path);
@@ -597,10 +671,27 @@ fn sizes_by_category_match_the_files() {
     assert_eq!(categories(&build), expected, "{build}");
     assert_eq!(build["size"].as_u64(), Some(du(&path)), "{build}");
 
-    let listed = wait_for("the target directory", || listed_target(&fixture));
+    // A target triple holds a `-`; a directory without one is no triple.
+    let triple = path.join("x86_64-unknown-test").join("debug").join("deps");
+    std::fs::create_dir_all(&triple).expect("create a triple's deps/");
+    std::fs::write(triple.join("unit.bin"), vec![0u8; 700]).expect("fill it");
+    let no_triple = path.join("notriple").join("debug").join("deps");
+    std::fs::create_dir_all(&no_triple).expect("create another deps/");
+    std::fs::write(no_triple.join("unit.bin"), vec![0u8; 50]).expect("fill it");
+    let mut expected = build_dir_sizes(&path);
+    expected[1].1 += 700;
+    expected[5].1 -= 700;
+    let build = listed_build_dir(&fixture, &main).expect("the build directory");
+    assert_eq!(categories(&build), expected, "{build}");
+
+    let listed = wait_for("the target directory", || listed_target(&fixture, &target));
     assert_eq!(listed["state"], "live", "{listed}");
     let total = du(&target);
-    assert_eq!(listed["size"].as_u64(), Some(total), "{listed}");
+    assert_eq!(
+        listed["size"].as_u64(),
+        Some(total),
+        "links count nothing: {listed}"
+    );
     let only_other = [
         ("incremental", 0),
         ("deps", 0),
@@ -613,9 +704,10 @@ fn sizes_by_category_match_the_files() {
 
     configure_store(
         &fixture,
-        "tool-caches = [\"tests/trybuild\", \"cli-*-check\"]\n",
+        "tool-caches = [\"tests/tr?build/project/*\", \"cli-*-check\"]
+",
     );
-    let listed = listed_target(&fixture).expect("the target directory");
+    let listed = listed_target(&fixture, &target).expect("the target directory");
     let with_caches = [
         ("incremental", 0),
         ("deps", 0),
@@ -727,6 +819,288 @@ fn status_shows_disk_use_per_store() {
         line.contains(&store.display().to_string()) && line.contains("incremental"),
         "{line}"
     );
+
+    // A directory that is gone leaves the figures once the daemon looks
+    // again, as the next run ends; that one builds into the harness's
+    // target directory.
+    std::fs::remove_dir_all(&target).expect("remove the target directory");
+    let output = fixture
+        .heli(["build", "--quiet", "-p", "echo-args"])
+        .current_dir(&main)
+        .output()
+        .expect("run heli build");
+    assert_success(&output, "cargo heli build");
+    wait_for("the removed target directory to leave", || {
+        let status = fixture.status();
+        let targets = status["disk"]["targets"].as_array().cloned()?;
+        let shown = |entry: &Value| PathBuf::from(entry["path"].as_str().unwrap_or_default());
+        let main = canonical(&main);
+        let gone = !targets.iter().any(|entry| {
+            let path = shown(entry);
+            path.file_name().is_some_and(|name| name == "target")
+                && path
+                    .parent()
+                    .and_then(|dir| std::fs::canonicalize(dir).ok())
+                    == Some(main.clone())
+        });
+        let harness = canonical(fixture.target_dir());
+        let other = targets
+            .iter()
+            .any(|entry| std::fs::canonicalize(shown(entry)).ok() == Some(harness.clone()));
+        (gone && other).then_some(())
+    });
+}
+
+/// A `target/` directory several workspaces build into belongs to the last
+/// one heli ran in: it lives as long as that one does.
+#[test]
+fn a_shared_target_directory_belongs_to_its_last_workspace() {
+    let fixture = Fixture::new("basic");
+    let first = fixture.copy_workspace("first");
+    let second = fixture.copy_workspace("second");
+    let shared = fixture.target_dir();
+    for workspace in [&first, &second] {
+        let output = fixture
+            .heli(["build", "--quiet", "-p", "echo-args"])
+            .current_dir(workspace)
+            .output()
+            .expect("run heli build");
+        assert_success(&output, "cargo heli build");
+        wait_for("the target directory to be the workspace's", || {
+            listed_target(&fixture, &shared).filter(|dir| {
+                dir["workspace"]
+                    .as_str()
+                    .is_some_and(|path| canonical(path) == canonical(workspace))
+            })
+        });
+    }
+    std::fs::remove_dir_all(&first).expect("remove the first workspace");
+    let listed = listed_target(&fixture, &shared).expect("the shared target directory");
+    assert_eq!(listed["state"], "live", "{listed}");
+}
+
+/// Only a run of cargo is asked where it builds: an `exec` of a program
+/// named `cargo` is, and an `exec` of any other program, even one that
+/// builds, is not.
+#[test]
+fn only_a_run_of_cargo_is_asked_about_its_workspace() {
+    let fixture = Fixture::new("basic");
+    let bin = fixture.path("bin");
+    std::fs::create_dir_all(&bin).expect("create a bin directory");
+    let not_cargo = bin.join(exe("not-cargo"));
+    std::fs::copy(support::cargo_binary(), &not_cargo).expect("copy cargo");
+    let first = fixture.copy_workspace("first");
+    let second = fixture.copy_workspace("second");
+
+    let mut command = heli_in(&fixture, &first, &["exec", "--"]);
+    command
+        .arg(&not_cargo)
+        .args(["build", "--quiet", "-p", "echo-args"]);
+    let output = command.output().expect("run heli exec");
+    assert_success(&output, "cargo heli exec -- not-cargo build");
+    assert!(first.join("target").is_dir(), "it built");
+
+    let output = heli_in(
+        &fixture,
+        &second,
+        &["exec", "--", "cargo", "build", "--quiet", "-p", "echo-args"],
+    )
+    .output()
+    .expect("run heli exec");
+    assert_success(&output, "cargo heli exec -- cargo build");
+    wait_for("the second target directory", || {
+        listed_target(&fixture, &second.join("target"))
+    });
+    assert!(
+        listed_target(&fixture, &first.join("target")).is_none(),
+        "not-cargo was not asked"
+    );
+}
+
+/// The target directory `gc --dry-run` lists at `target`, if any.
+fn listed_target(fixture: &Fixture, target: &Path) -> Option<Value> {
+    let target = canonical(target);
+    gc(fixture).into_iter().find(|dir| {
+        dir["kind"] == "target"
+            && std::fs::canonicalize(dir["path"].as_str().expect("a path")).ok()
+                == Some(target.clone())
+    })
+}
+
+/// Builds `echo-args` with heli in a copy of the workspace whose Cargo
+/// configuration sets `build-dir` to `build_dir`, and returns the copy once
+/// the daemon has learned its directories (its target directory is
+/// registered, which comes last).
+fn build_with_build_dir(fixture: &Fixture, name: &str, build_dir: &Path) -> PathBuf {
+    let workspace = fixture.copy_workspace(name);
+    let config = workspace.join(".cargo");
+    std::fs::create_dir_all(&config).expect("create .cargo");
+    let value = build_dir
+        .to_str()
+        .expect("a Unicode path")
+        .replace('\\', "\\\\");
+    std::fs::write(
+        config.join("config.toml"),
+        format!("[build]\nbuild-dir = \"{value}\"\n"),
+    )
+    .expect("write the configuration");
+    build_in(fixture, &workspace);
+    wait_for("the target directory", || {
+        listed_target(fixture, &workspace.join("target"))
+    });
+    workspace
+}
+
+/// heli writes owner manifests only into build directories of a store it
+/// manages, `<store>/<2 hex digits>/<hex digits>`: not into one elsewhere,
+/// and not into another directory of a store. On Windows a store's path
+/// may be written in another case.
+#[test]
+fn manifests_go_only_into_a_stores_build_directories() {
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let elsewhere = fixture.path("elsewhere");
+
+    build_with_build_dir(&fixture, "a", &elsewhere.join("{workspace-path-hash}"));
+    let dirs = build_dirs(&elsewhere);
+    assert_eq!(dirs.len(), 1, "{dirs:?}");
+    assert!(owner(&dirs[0]).is_none(), "no manifest outside a store");
+
+    let plain = store.join("ab").join("not-a-hash");
+    build_with_build_dir(&fixture, "b", &plain);
+    assert!(plain.join("debug").is_dir(), "cargo built there");
+    assert!(
+        owner(&plain).is_none(),
+        "no manifest beside the store's layout"
+    );
+
+    if cfg!(windows) {
+        let shouted = PathBuf::from(store.to_string_lossy().to_uppercase());
+        let workspace = build_with_build_dir(&fixture, "c", &shouted.join("{workspace-path-hash}"));
+        find_owner(&store, &workspace);
+    }
+}
+
+/// Holds `path` so that nobody else can open it, until dropped: opened
+/// without sharing on Windows, made unreadable elsewhere.
+struct Unopenable {
+    #[cfg(windows)]
+    _file: std::fs::File,
+    #[cfg(unix)]
+    path: PathBuf,
+}
+
+impl Unopenable {
+    fn new(path: &Path) -> Self {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let file = std::fs::File::options()
+                .read(true)
+                .share_mode(0)
+                .open(path)
+                .expect("open the lock without sharing");
+            Self { _file: file }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                .expect("make the lock unreadable");
+            Self {
+                path: path.to_path_buf(),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unopenable {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o644));
+    }
+}
+
+/// Each of cargo's three lock files makes a directory busy while it is held,
+/// in a profile directory and in a target triple's: heli tries them and
+/// lets go. A lock heli cannot even open counts as held. A build directory
+/// without a manifest is unknown otherwise.
+#[test]
+fn any_of_cargos_locks_held_makes_a_directory_busy() {
+    let fixture = Fixture::new("basic");
+    let store = configure_store(&fixture, "");
+    let dir = store.join("ab").join("0123456789abcd");
+    let state = || {
+        let listing = gc(&fixture);
+        assert_eq!(listing.len(), 1, "{listing:?}");
+        listing[0]["state"].as_str().expect("a state").to_owned()
+    };
+    for place in ["debug", "x86_64-unknown-test/debug"] {
+        let profile = dir.join(place);
+        std::fs::create_dir_all(&profile).expect("create a profile directory");
+        for name in [".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock"] {
+            let lock = profile.join(name);
+            let file = std::fs::File::create(&lock).expect("create a lock");
+            assert_eq!(state(), "unknown", "{place}/{name} free");
+            file.lock().expect("take the lock");
+            assert_eq!(state(), "busy", "{place}/{name} held");
+            file.unlock().expect("let go of the lock");
+            drop(file);
+            assert_eq!(state(), "unknown", "{place}/{name} free again");
+            let unopenable = Unopenable::new(&lock);
+            assert_eq!(state(), "busy", "{place}/{name} cannot be opened");
+            drop(unopenable);
+            std::fs::remove_file(&lock).expect("remove the lock");
+        }
+    }
+}
+
+/// The files setup offers are the ones cargo reads: run in a linked
+/// worktree, the repository's is the main worktree's `.cargo/config.toml`;
+/// the user's is in `CARGO_HOME`, and there the older `config` when only
+/// that exists.
+#[test]
+fn setup_offers_the_configuration_cargo_reads() {
+    let fixture = Fixture::new("basic");
+    configure_store(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    let linked = main.join(".claude").join("worktrees").join("linked");
+    git(
+        &main,
+        &["worktree", "add", "--quiet", &linked.to_string_lossy()],
+    );
+    let cargo_home = fixture.home().join("elsewhere");
+    std::fs::create_dir_all(&cargo_home).expect("create the Cargo home");
+    std::fs::write(cargo_home.join("config"), "[build]\njobs = 2\n")
+        .expect("write the user's configuration");
+
+    let mut setup = fixture.setup(None, ["--print"]);
+    setup.current_dir(&linked).env("CARGO_HOME", &cargo_home);
+    let output = setup.output().expect("run heli setup --print");
+    assert_success(&output, "cargo heli setup --print");
+    let stdout = text(&output.stdout);
+    let offered = |what: &str| -> PathBuf {
+        stdout
+            .lines()
+            .find_map(|line| {
+                let path = line.strip_prefix(what)?.strip_suffix(" would become:")?;
+                Some(PathBuf::from(path))
+            })
+            .unwrap_or_else(|| panic!("no offer of {what}: {stdout}"))
+    };
+    let repository = offered("Cargo configuration for this repository ");
+    assert!(repository.ends_with(Path::new(".cargo").join("config.toml")));
+    let dir = repository
+        .parent()
+        .and_then(Path::parent)
+        .expect("a worktree");
+    assert_eq!(canonical(dir), canonical(&main), "{stdout}");
+    assert_eq!(
+        offered("Cargo configuration for every project "),
+        cargo_home.join("config")
+    );
 }
 
 /// A store that is not an absolute path, or a tool-cache pattern that does
@@ -802,12 +1176,36 @@ fn setup_replaces_only_its_own_build_dir() {
         )
     );
 
+    // heli's comment alone, without its line after it, is not heli's line.
+    std::fs::write(&user_config, format!("[build]\n{MARKER}\njobs = 2\n"))
+        .expect("write the user's configuration");
+    let output = answered(fixture.setup(None, Vec::<String>::new()), "y\n");
+    assert_success(&output, "cargo heli setup");
+    assert_eq!(
+        std::fs::read_to_string(&user_config).expect("the user's configuration"),
+        format!(
+            "[build]\n{MARKER}\nbuild-dir = {}\n{MARKER}\njobs = 2\n",
+            build_dir_value(&store)
+        )
+    );
+
+    let unsafe_edit = format!(
+        "setup cannot add build.build-dir to it safely; add `build-dir = {}` under [build] by hand",
+        build_dir_value(&store)
+    );
+    // heli's lines inside a string are the string's: taking them out would
+    // change it, and here would leave no TOML at all.
+    let in_a_string = format!("notes = \"\"\"\n{MARKER}\nbuild-dir = \"x\"\n\"\"\"\n");
+    let in_a_value = format!("[build]\n{MARKER}\nbuild-dir = \"\"\"\nx\n\"\"\"\n");
     for (content, reason) in [
         (
             "[build]\nbuild-dir = \"mine\"\n",
             "it sets build.build-dir itself, to \"mine\"",
         ),
+        ("[build]\nbuild-dir = 3\n", "it sets build.build-dir itself"),
         ("[build\n", "it is not TOML"),
+        (&in_a_string, &unsafe_edit),
+        (&in_a_value, &unsafe_edit),
     ] {
         std::fs::write(&user_config, content).expect("write the user's configuration");
         let output = answered(fixture.setup(None, Vec::<String>::new()), "y\n");
