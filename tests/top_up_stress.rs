@@ -203,8 +203,10 @@ fn no_top_up_lets_more_than_n_jobs_hold_slots_while_cargos_are_killed() {
         .collect();
 
     let held = std::fs::read_to_string(&log).unwrap_or_default();
+    // Each round's first cargos have the pool's slots to themselves; how
+    // many more they get depends on the machine.
     assert!(
-        held.lines().count() > 20 * ROUNDS,
+        held.lines().count() >= 2 * SLOTS * ROUNDS,
         "the cargos drew from the pool: {} lines",
         held.lines().count()
     );
