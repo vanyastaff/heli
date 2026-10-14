@@ -268,43 +268,21 @@ fn test_threads_one_means_one_slot() {
     );
 }
 
-/// Builds the `jobs` fixture and returns its path.
-fn jobs_binary(fixture: &Fixture) -> PathBuf {
-    let output = fixture
-        .cargo(["build", "--quiet", "-p", "jobs"])
-        .output()
-        .expect("run cargo");
-    assert_success(&output, "building jobs");
-    fixture
-        .target_dir()
-        .join("debug")
-        .join(format!("jobs{}", std::env::consts::EXE_SUFFIX))
-}
-
 /// A process that holds every slot of the fixture's host pool, as bare
 /// cargo would, until it is dropped.
 struct Saturated(Child);
 
 impl Saturated {
     /// Starts the fixture's daemon, then a `jobs` that takes all `slots`
-    /// slots of its pool directly, and waits until none is free.
+    /// slots of its pool directly, and waits until none is free. The
+    /// governor's clock stands still, so no top-up counts the slots `jobs`
+    /// holds as lost (it is no process the top-up's scan sees).
     fn pool(fixture: &Fixture, slots: u32) -> Self {
-        let echo = fixture.echo_args();
-        let output = fixture
-            .heli(["exec", "--"])
-            .arg(&echo)
-            .output()
-            .expect("run heli");
-        assert_success(&output, "a run that starts the daemon");
-        let pool = fixture.pool().into_string().expect("a Unicode pool name");
-        let auth = if cfg!(windows) {
-            pool
-        } else {
-            format!("fifo:{pool}")
-        };
+        fixture.set_clock(0);
+        fixture.start_daemon();
         let holder = fixture
-            .command(jobs_binary(fixture), Vec::<String>::new())
-            .env("CARGO_MAKEFLAGS", format!("-j --jobserver-auth={auth}"))
+            .command(fixture.binary("jobs"), Vec::<String>::new())
+            .env("CARGO_MAKEFLAGS", fixture.makeflags())
             .env("JOBS_WORKERS", slots.to_string())
             .env("JOBS_HOLD_MS", "600000")
             .stdin(Stdio::null())
@@ -442,7 +420,8 @@ fn a_test_run_shows_its_build_and_stops_when_it_fails() {
     );
 }
 
-/// Only cargo's `test` and `nextest run` are test runs, and only when they
+/// Only runs of class test (`cargo heli test`, `cargo heli nextest run`)
+/// are test runs, not `cargo heli exec -- cargo test`, and only when they
 /// can build first: `--no-run` is a build, and `cargo test --doc` (which
 /// cargo cannot build apart) runs its tests at once, on its test slots. A
 /// `+toolchain` before the subcommand stays where it is.
@@ -480,15 +459,15 @@ fn what_is_a_test_run() {
             "arg: \"2\"",
         ]
     );
-    let echo = fixture.echo_args();
+    let cargo = fake_cargo(&fixture);
     let output = fixture
         .heli(["exec", "--"])
-        .arg(&echo)
+        .arg(&cargo)
         .arg("test")
         .output()
         .expect("run heli");
-    assert_success(&output, "cargo heli exec -- echo-args test");
-    assert_eq!(printed_args(&output), ["arg: \"test\""], "not cargo");
+    assert_success(&output, "cargo heli exec -- cargo test");
+    assert_eq!(printed_args(&output), ["arg: \"test\""], "class exec");
 }
 
 /// The threads asked for come from every place the tools read them:
@@ -546,7 +525,7 @@ fn the_threads_asked_for_come_from_flags_and_the_environment() {
 fn a_test_run_asks_for_its_share() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 4\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let stop = fixture.path("busy.stop");
     let busy = fixture
         .heli(["exec", "--"])

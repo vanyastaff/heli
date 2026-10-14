@@ -1,11 +1,12 @@
 //! A stand-in for the daemon at a fixture's endpoint, for what a real daemon
 //! of this build cannot produce: a daemon that speaks another protocol
-//! version, one that hangs up or never answers, or something that is not
-//! heli at all.
+//! version, one that hangs up or never answers, one that is older and does
+//! not know a request, or something that is not heli at all.
 //!
-//! It speaks only the handshake every version of heli shares: `HELI` and the
+//! It speaks the handshake every version of heli shares: `HELI` and the
 //! protocol version as a little-endian u32, first from the client, then from
-//! the daemon.
+//! the daemon. Only [`Answer::Unsupported`] and [`Answer::Reply`] go
+//! further.
 
 use std::ffi::OsStr;
 use std::io::{Read, Write};
@@ -22,7 +23,19 @@ pub enum Answer {
     HangUp,
     /// Nothing: it keeps the connection open until the client closes it.
     Never,
+    /// `HELI` and this build's protocol version, [`PROTOCOL`]; then it
+    /// answers the client's request, whatever it is, as an older daemon
+    /// answers a request it does not know: a message frame (kind 0, a
+    /// little-endian u32 length) holding the JSON `"Unsupported"`.
+    Unsupported,
+    /// `HELI` and [`PROTOCOL`]; then it answers the client's request,
+    /// whatever it is, with a message frame holding this JSON: what a daemon
+    /// of another build of the same protocol would answer.
+    Reply(&'static str),
 }
+
+/// The protocol version of this build of heli.
+pub const PROTOCOL: u32 = 1;
 
 /// A fake daemon serving one client.
 pub struct FakeDaemon {
@@ -53,9 +66,37 @@ impl FakeDaemon {
                     let _ = stream.read_to_end(&mut Vec::new());
                     return Vec::new();
                 }
+                Answer::Unsupported | Answer::Reply(_) => {
+                    let mut bytes = *b"HELI\0\0\0\0";
+                    bytes[4..].copy_from_slice(&PROTOCOL.to_le_bytes());
+                    bytes
+                }
             };
             if stream.write_all(&bytes).is_err() {
                 return Vec::new();
+            }
+            let reply = match answer {
+                Answer::Unsupported => Some("\"Unsupported\""),
+                Answer::Reply(json) => Some(json),
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                let mut header = [0u8; 5];
+                stream
+                    .read_exact(&mut header)
+                    .expect("the client's request");
+                let length = u32::from_le_bytes([header[1], header[2], header[3], header[4]]);
+                let mut request = vec![0u8; length as usize];
+                stream
+                    .read_exact(&mut request)
+                    .expect("the client's request");
+                let reply = reply.as_bytes();
+                let mut frame = vec![0u8];
+                frame.extend((reply.len() as u32).to_le_bytes());
+                frame.extend(reply);
+                if stream.write_all(&frame).is_err() {
+                    return Vec::new();
+                }
             }
             let mut rest = Vec::new();
             let _ = stream.read_to_end(&mut rest);

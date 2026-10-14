@@ -1,5 +1,6 @@
-//! Test runs (DESIGN.md §5, lifecycle step 6): `cargo heli test …` and
-//! `cargo heli nextest run …` run in two phases.
+//! Test runs (DESIGN.md §5, lifecycle step 6): runs of class test
+//! (`crate::class`: `cargo heli test …` and `cargo heli nextest run …`) run
+//! in two phases.
 //!
 //! 1. **Build**: the same command with `--no-run`, right after the
 //!    subcommand.
@@ -17,8 +18,8 @@
 //! has `--no-run` is a build, not a test run.
 
 use std::ffi::{OsStr, OsString};
-use std::path::Path;
 
+use crate::class::Class;
 use crate::protocol::RunRequest;
 
 /// The tool that runs the tests.
@@ -42,8 +43,12 @@ pub struct TestRun {
     asked: Option<u32>,
 }
 
-/// The test run `request` asks for, or `None` for any other command.
+/// The test run `request` asks for, or `None` for a run of another class
+/// (or of none: from a client older than run classes).
 pub fn plan(request: &RunRequest) -> Option<TestRun> {
+    if request.class != Some(Class::Test) {
+        return None;
+    }
     let argv: Vec<OsString> = request.argv.iter().map(|arg| arg.0.clone()).collect();
     let (runner, at) = runner(&argv)?;
     let (tool, _) = split_at_separator(&argv[at..]);
@@ -81,21 +86,10 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
 }
 
 /// Where a test run's flags go (right after `test`, or after `nextest
-/// run`) and which tool runs its tests; `None` for any other command.
-///
-/// This reads the command line: cargo (a program named `cargo`) with the
-/// subcommand `test` (`t`) or `nextest run` (`nextest r`), after an
-/// optional `+toolchain`. It is the one place that decides that a run is a
-/// test run, until run classes (#12) say so: then a run of class test, with
-/// the tool and the position still read here.
+/// run`) and which tool runs its tests, read as `Class::of_cargo` reads
+/// the subcommand: `test` (`t`) or `nextest run` (`nextest r`), after an
+/// optional `+toolchain`, the program first.
 fn runner(argv: &[OsString]) -> Option<(Runner, usize)> {
-    let program = Path::new(argv.first()?);
-    if !program
-        .file_stem()
-        .is_some_and(|stem| stem.eq_ignore_ascii_case("cargo"))
-    {
-        return None;
-    }
     let mut at = 1;
     if argv
         .get(at)

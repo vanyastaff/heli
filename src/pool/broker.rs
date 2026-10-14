@@ -33,12 +33,19 @@
 //!
 //! A run is *waiting* when its pool has no free slot, or it waits for test
 //! slots: the broker cannot see the processes blocked on a pool, so an empty
-//! pool counts as a run asking for more. A run is *active* when it uses a slot or waits; a run that only
-//! keeps a free slot in its pool is idle and does not count for shares.
+//! pool counts as a run asking for more. A run is *active* when it uses a
+//! slot or waits; a run that only keeps a free slot in its pool is idle and
+//! does not count for shares.
+//!
+//! The broker counts every slot it takes out of the host pool, and stops
+//! counting it as it gives it back, each as one step under the host pool's
+//! lock ([`Pool::lend`], [`Pool::repay`]): [`Broker::lent`], which the host
+//! pool's top-up and drain read under that lock, is always exact.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -53,6 +60,8 @@ const KEPT_WAITS: usize = 1 << 16;
 
 pub struct Broker {
     host: Arc<Pool>,
+    /// The slots taken out of the host pool: every run's holdings.
+    lent: AtomicU32,
     state: Mutex<State>,
     /// Signalled whenever the broker has moved slots, or a run came.
     changed: Condvar,
@@ -127,6 +136,7 @@ impl Broker {
     pub fn start(host: Arc<Pool>) -> Arc<Self> {
         let broker = Arc::new(Self {
             host,
+            lent: AtomicU32::new(0),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
         });
@@ -260,9 +270,8 @@ impl Broker {
     /// back: those lent to run pools, and the test slots held for runs. The
     /// host pool's top-up target leaves them out (DESIGN.md §4, "Bounded
     /// top-up").
-    #[allow(dead_code, reason = "the top-up target (#6) reads it")]
     pub fn lent(&self) -> u32 {
-        self.lock().runs.values().map(Run::holdings).sum()
+        self.lent.load(Ordering::SeqCst)
     }
 
     /// Balances the pools every [`TICK`] while there are runs.
@@ -305,7 +314,7 @@ impl Broker {
         }
         let shares = self.shares(state);
         while let Some(id) = state.next_loan(&shares) {
-            if !self.host.try_take().unwrap_or(false) {
+            if !self.host.lend(&self.lent).unwrap_or(false) {
                 break;
             }
             let run = state.runs.get_mut(&id).expect("BUG: a run just chosen");
@@ -437,10 +446,10 @@ impl Broker {
         }
     }
 
-    /// Gives a slot back to the host pool. A pool already full drops it: it
-    /// never grows beyond N.
+    /// Gives a slot taken out of the host pool back to it. A pool already
+    /// full drops it: it never grows beyond N.
     fn give_host(&self) {
-        let _ = self.host.give();
+        let _ = self.host.repay(&self.lent);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

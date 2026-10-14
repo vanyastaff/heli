@@ -6,25 +6,41 @@
 //! (`crate::ipc`). Each connection gets a thread, which speaks
 //! `crate::protocol`:
 //!
-//! - **run**: admit it to the registry ([`registry`]), tell the client it
-//!   started, give it a run pool (`crate::pool::broker`), execute it
-//!   ([`execute`]; a test run in two phases, [`test_run`]), return its run
-//!   pool's loans, take it out of the registry, report its exit.
-//!   `Daemon::run` is the one sequence every run goes through, and the
-//!   place for what happens around a run (admission, waits, recording);
+//! - **run**: look its key up in the result store ([`results`], keyed by
+//!   [`key`]), admit it to the registry ([`registry`]) and the event log
+//!   ([`events`]), tell the client it
+//!   started, look its key up again, start its record in the run log
+//!   (`crate::runlog`), wait for its turn at the worktree lock (telling the
+//!   client for which runs), give it a run pool (`crate::pool::broker`),
+//!   execute it ([`execute`]; a test run in two phases, [`test_run`]),
+//!   record it in the result store if it passed, return its run pool's
+//!   loans, take it out of the registry, report its exit. `Daemon::run` is
+//!   the one sequence every run goes through, and the place for what happens
+//!   around a run (admission, waits, recording);
 //! - **status**: describe the daemon and the registry's runs;
-//! - **retire**, from a newer client: accept no more runs and exit once the
-//!   runs in flight have reported their exits.
+//! - **log**: send part of a run's record;
+//! - a request it does not know: answer that it is unsupported;
+//! - **retire**, from a newer client (of another protocol version, or with a
+//!   request this daemon does not know): accept no more runs and exit once
+//!   the runs in flight have reported their exits.
 //!
 //! What the daemon owns for its whole life (the lock, then the host pool,
-//! `crate::pool`, sized by the configuration) is set up in [`main`]. The
-//! daemon runs until it is killed or retired. Its own log (start, end,
-//! errors) is `daemon.log` in the state directory (`daemon-<session>.log` on
+//! `crate::pool`, and its broker, its memory [`governor`], the event log
+//! and the run log,
+//! `crate::runlog`, all as configured, and on Unix the pool's [`warden`])
+//! is set up in [`main`]. The daemon
+//! runs until it is killed or retired. Its own log (start, end, errors)
+//! is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
+pub mod events;
 pub mod execute;
+pub mod governor;
+pub mod key;
 pub mod registry;
+pub mod results;
 pub mod test_run;
+pub mod warden;
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, TryLockError};
@@ -33,16 +49,21 @@ use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::class::Class;
 use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::pool::broker::{Broker, Loans};
 use crate::pool::{self, Pool};
-use crate::protocol::{self, Channel, Reply, Request, RunRequest};
+use crate::protocol::{self, Channel, LogRequest, Reply, Request, RunRequest};
+use crate::runlog::{self, Limits, Recorder, RunLog};
 use crate::status::{self, Phase, Status};
-use crate::{clock, worktree};
+use crate::{clock, nesting, worktree};
 
+use events::Events;
+use governor::Governor;
 use registry::{Registry, RunId};
+use results::Admitted;
 use test_run::TestRun;
 
 /// The daemon's exit code when another daemon already holds the lock: the
@@ -82,7 +103,19 @@ pub fn main() -> ! {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }
     }
-    let pool = Arc::new(open_pool(&locations, &log));
+    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
+    let pool = Arc::new(open_pool(&locations, &config, &log));
+    let governor = Governor::new(&config, locations.config.clone())
+        .unwrap_or_else(|error| fail(Some(&log), &error));
+    let events = Events::new(
+        locations.event_log(),
+        config
+            .event_log
+            .max_kb
+            .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
+    );
+    #[cfg(unix)]
+    let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
         Ok(listener) => listener,
         Err(error) => fail(
@@ -101,11 +134,29 @@ pub fn main() -> ! {
         registry: Registry::new(&locations.run_counter()),
         broker: Broker::start(Arc::clone(&pool)),
         pool,
+        governor,
+        events,
+        runlog: RunLog::new(locations.run_logs(), Limits::configured(&config.log)),
+        results: results::Store::new(&locations.state_dir),
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
         log,
         _lock: lock,
     });
+    {
+        let daemon = Arc::clone(&daemon);
+        let broker = Arc::clone(&daemon.broker);
+        let lent = move || broker.lent();
+        std::thread::spawn(move || {
+            daemon.governor.run(
+                &daemon.pool,
+                &daemon.registry,
+                &daemon.events,
+                &daemon.log,
+                lent,
+            )
+        });
+    }
     loop {
         match listener.accept() {
             Ok(stream) => {
@@ -130,8 +181,7 @@ fn fail(log: Option<&Log>, error: &str) -> ! {
 }
 
 /// Opens the host pool, of the size configured, or exits with failure.
-fn open_pool(locations: &Locations, log: &Log) -> Pool {
-    let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(log), &error));
+fn open_pool(locations: &Locations, config: &Config, log: &Log) -> Pool {
     let slots = config
         .pool
         .slots
@@ -155,11 +205,31 @@ fn open_pool(locations: &Locations, log: &Log) -> Pool {
     }
 }
 
+/// Starts the pool's warden ([`warden`]); what it returns must live as
+/// long as the daemon. A daemon without a warden still serves.
+#[cfg(unix)]
+fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter> {
+    match warden::start(locations) {
+        Ok((alive, pid)) => {
+            log.write(&format!("pool warden: pid {pid}"));
+            Some(alive)
+        }
+        Err(error) => {
+            log.write(&format!("cannot start the pool's warden: {error}"));
+            None
+        }
+    }
+}
+
 struct Daemon {
     registry: Registry,
     pool: Arc<Pool>,
     /// Lends the host pool's slots to the runs' own pools.
     broker: Arc<Broker>,
+    governor: Governor,
+    events: Events,
+    runlog: RunLog,
+    results: results::Store,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -186,24 +256,54 @@ impl Daemon {
             return;
         }
         if version != protocol::VERSION {
-            let mut byte = [0u8];
-            if matches!(std::io::Read::read(&mut stream, &mut byte), Ok(1))
-                && byte[0] == protocol::RETIRE
-            {
-                self.log.write(&format!(
-                    "a client of protocol {version} asked this daemon to retire"
-                ));
-                self.retire();
-            }
+            self.retire_if_asked(&mut stream, &format!("a client of protocol {version}"));
             return;
         }
-        match protocol::read_message::<Request>(&mut stream) {
+        // JSON first, so that a request this daemon does not know (from a
+        // newer client) is told apart from a garbled one.
+        let Ok(message) = protocol::read_message::<serde_json::Value>(&mut stream) else {
+            return;
+        };
+        match serde_json::from_value::<Request>(message) {
             Ok(Request::Status) => {
                 let _ = protocol::write_message(&mut stream, &Reply::Status(self.status()));
             }
             Ok(Request::Run(request)) => self.run(stream, request),
-            Err(_) => {}
+            Ok(Request::Log(request)) => self.log(stream, &request),
+            Err(_) => {
+                if protocol::write_message(&mut stream, &Reply::Unsupported).is_ok() {
+                    self.retire_if_asked(&mut stream, "a client with a request this daemon lacks");
+                }
+            }
         }
+    }
+
+    /// Retires when the client's next byte asks for it; `client` says who
+    /// it is, for the log.
+    fn retire_if_asked(&self, stream: &mut Stream, client: &str) {
+        let mut byte = [0u8];
+        if matches!(std::io::Read::read(stream, &mut byte), Ok(1)) && byte[0] == protocol::RETIRE {
+            self.log
+                .write(&format!("{client} asked this daemon to retire"));
+            self.retire();
+        }
+    }
+
+    /// Sends the part of a run's record that `request` asks for.
+    fn log(&self, mut stream: Stream, request: &LogRequest) {
+        let read = runlog::read(
+            self.runlog.dir(),
+            &request.run,
+            &request.select,
+            &mut |channel, bytes| protocol::write_output(&mut stream, channel, bytes),
+        );
+        let reply = match read {
+            Ok(()) => Reply::LogEnd,
+            Err(error) => Reply::LogFailed {
+                message: error.to_string(),
+            },
+        };
+        let _ = protocol::write_message(&mut stream, &reply);
     }
 
     /// Executes `request` for the client on `stream`.
@@ -213,10 +313,24 @@ impl Daemon {
             let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
             return;
         };
+        // Before the run waits for anything.
+        if let Some(passed) = self.results.before(&request) {
+            let _ = protocol::write_message(&mut stream, &passed.reply());
+            return;
+        }
+        let worktree = worktree::of(&execute::cwd(&request));
+        let argv = execute::argv(&request);
+        let admission = serde_json::json!({
+            "worktree": worktree.to_string_lossy(),
+            "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+        });
         let id = self.registry.admit(
-            worktree::of(&execute::cwd(&request)),
-            execute::argv(&request),
+            worktree,
+            argv,
+            request.class.unwrap_or(Class::Exec),
+            nested(&request),
         );
+        self.events.admit(id, admission);
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself.
         let started = Reply::Started {
@@ -226,26 +340,68 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
+        // The worktree lock: tell the client which runs this one waits for,
+        // if any (a client older than run classes could not read it). A
+        // client gone meanwhile does not stop the run.
+        self.registry.wait_for_worktree(id, |runs| {
+            if request.class.is_some() {
+                let _ = protocol::write_message(&mut stream, &Reply::Waiting { runs });
+            }
+        });
+        // Admitted, and done waiting: another run may have passed with the
+        // same key meanwhile, and the worktree may have changed, so the key
+        // is computed and looked up again. Its snapshot of the tree is the
+        // one the run starts on.
+        let key = match self.results.admitted(&request) {
+            Admitted::Passed(passed) => {
+                self.registry.finish(id);
+                let _ = protocol::write_message(&mut stream, &passed.reply());
+                return;
+            }
+            Admitted::Run { key, note } => {
+                if let Some(note) = note {
+                    self.note(&mut stream, &note);
+                }
+                key
+            }
+        };
+        let mut record = self.runlog.record(&id.to_string());
         let (makeflags, error) = self.broker.open(id);
         if let Some(error) = error {
             self.log.write(&format!(
                 "{id}: no run pool ({error}); it draws from the host pool"
             ));
         }
+        let mut run = Execution {
+            request: &request,
+            id,
+            makeflags: &makeflags,
+            stream: &mut stream,
+            record: &mut record,
+        };
         let reply = match test_run::plan(&request) {
-            None => self.execute(
-                &request,
-                &execute::argv(&request),
-                id,
-                &makeflags,
-                &mut stream,
-            ),
-            Some(plan) => self.test(&request, &plan, id, &makeflags, &mut stream),
+            None => self.execute(&mut run, &execute::argv(&request)),
+            Some(plan) => self.test(&mut run, &plan),
         };
         if let Some(loans) = self.broker.close(id) {
-            self.log
-                .write(&format!("{id}: run pool: {}", describe(&loans)));
+            self.events.record("loans", loans_event(id, &loans));
         }
+        if let Some(key) = &key {
+            let passed = matches!(
+                reply,
+                Reply::Exited {
+                    code: 0,
+                    signal: None
+                }
+            );
+            if let Some(note) = self.results.after(&request, key, id, passed) {
+                self.note(&mut stream, &note);
+            }
+        }
+        if let Some(error) = record.take_error() {
+            self.log.write(&format!("cannot record {id}: {error}"));
+        }
+        drop(record);
         self.registry.finish(id);
         let _ = protocol::write_message(&mut stream, &reply);
         // The reply is out before a retiring daemon may exit.
@@ -253,26 +409,18 @@ impl Daemon {
         drop(serving);
     }
 
-    /// Runs `argv` as run `id`, its processes drawing from the jobserver
-    /// `makeflags`, and forwards its output to `stream`; the reply tells how
-    /// it ended.
-    fn execute(
-        &self,
-        request: &RunRequest,
-        argv: &[OsString],
-        id: RunId,
-        makeflags: &OsStr,
-        stream: &mut Stream,
-    ) -> Reply {
-        match execute::spawn(request, argv, id, makeflags) {
+    /// Runs `argv` as `run`, and returns the reply that tells how it ended.
+    fn execute(&self, run: &mut Execution<'_, '_>, argv: &[OsString]) -> Reply {
+        match execute::spawn(run.request, argv, run.id, run.makeflags) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
                 message: error.to_string(),
             },
-            Ok(child) => match execute::pump(child, stream) {
+            Ok(child) => match execute::pump(child, run.stream, run.record) {
                 Ok(status) => exited(status),
                 Err(error) => {
-                    self.log.write(&format!("cannot wait for {id}: {error}"));
+                    self.log
+                        .write(&format!("cannot wait for {}: {error}", run.id));
                     Reply::Exited {
                         code: 1,
                         signal: None,
@@ -282,35 +430,36 @@ impl Daemon {
         }
     }
 
-    /// Runs test run `id` in its two phases (`test_run`): the build, then,
+    /// Runs test run `run` in its two phases (`test_run`): the build, then,
     /// if it passed, the tests on as many threads as it got test slots. A
     /// header line on its stderr says how many, its share, and how long it
     /// waited for them.
-    fn test(
-        &self,
-        request: &RunRequest,
-        plan: &TestRun,
-        id: RunId,
-        makeflags: &OsStr,
-        stream: &mut Stream,
-    ) -> Reply {
+    fn test(&self, run: &mut Execution<'_, '_>, plan: &TestRun) -> Reply {
         if let Some(build) = plan.build() {
-            self.registry.set_phase(id, Phase::Building);
-            let built = self.execute(request, &build, id, makeflags, stream);
+            self.registry.set_phase(run.id, Phase::Building);
+            let built = self.execute(run, &build);
             if !matches!(built, Reply::Exited { code: 0, .. }) {
                 return built;
             }
         }
-        self.registry.set_phase(id, Phase::Testing);
+        self.registry.set_phase(run.id, Phase::Testing);
         let waiting = Instant::now();
-        let share = self.broker.share(id);
+        let share = self.broker.share(run.id);
         let wanted = test_slots_wanted(plan.asked(), share);
-        let slots = self.broker.take_test_slots(id, wanted, TEST_SLOT_WAIT);
-        let header = test_header(id, slots, share, waiting.elapsed());
-        let _ = protocol::write_output(stream, Channel::Stderr, header.as_bytes());
-        let reply = self.execute(request, &plan.test(slots.max(1)), id, makeflags, stream);
-        self.broker.release_test_slots(id);
+        let slots = self.broker.take_test_slots(run.id, wanted, TEST_SLOT_WAIT);
+        let header = test_header(run.id, slots, share, waiting.elapsed());
+        run.record.output(Channel::Stderr, header.as_bytes());
+        let _ = protocol::write_output(run.stream, Channel::Stderr, header.as_bytes());
+        let reply = self.execute(run, &plan.test(slots.max(1)));
+        self.broker.release_test_slots(run.id);
         reply
+    }
+
+    /// Tells the client of a run why the result store did not do its part,
+    /// on the run's stderr.
+    fn note(&self, stream: &mut Stream, note: &str) {
+        let line = format!("cargo-heli: note: {note}\n");
+        let _ = protocol::write_output(stream, Channel::Stderr, line.as_bytes());
     }
 
     fn status(&self) -> Status {
@@ -322,6 +471,7 @@ impl Daemon {
                 started_at: clock::unix_seconds(self.started_at),
             }),
             pool: Some(self.pool.status()),
+            memory: self.governor.memory(),
             runs: self.runs(),
         }
     }
@@ -331,9 +481,9 @@ impl Daemon {
         let usage = self.broker.usage();
         let mut runs = self.registry.snapshot();
         for run in &mut runs {
-            if let Some(usage) = usage.iter().find(|(id, _)| id.to_string() == run.id) {
-                run.slots = usage.1.slots;
-                run.share = usage.1.share;
+            if let Some((_, usage)) = usage.iter().find(|(id, _)| id.to_string() == run.id) {
+                run.slots = usage.slots;
+                run.share = usage.share;
             }
         }
         runs
@@ -381,6 +531,16 @@ impl Drop for Serving<'_> {
     }
 }
 
+/// A run being executed: what it runs as, and where its output goes.
+struct Execution<'a, 'r> {
+    request: &'a RunRequest,
+    id: RunId,
+    /// `CARGO_MAKEFLAGS` for its processes: its run pool.
+    makeflags: &'a OsStr,
+    stream: &'a mut Stream,
+    record: &'a mut Recorder<'r>,
+}
+
 /// The test slots a test run asks for: as many as the threads asked for,
 /// at most its share (whole slots, at least one).
 fn test_slots_wanted(asked: Option<u32>, share: f64) -> u32 {
@@ -409,23 +569,35 @@ fn test_header(id: RunId, slots: u32, share: f64, waited: Duration) -> String {
     }
 }
 
-/// How a run's loans went, for the log: how many, the most slots it used,
-/// and how long it waited for a lent slot (at most: from when its pool was
-/// last seen with a free slot).
-fn describe(loans: &Loans) -> String {
-    let millis = |wait: Duration| wait.as_secs_f64() * 1000.0;
-    match loans.waits() {
-        None => "no loans".to_owned(),
-        Some((median, longest)) => format!(
-            "{} loans, {} taken back, at most {} slots in use; \
-             wait for a lent slot: median {:.1} ms, longest {:.1} ms",
-            loans.count,
-            loans.reclaimed,
-            loans.most,
-            millis(median),
-            millis(longest)
-        ),
-    }
+/// The event that tells how run `id`'s loans went: how many slots were lent
+/// to its pool and taken back, the most it used, and how long it waited for
+/// a lent slot (at most: from when its pool was last seen with a free
+/// slot), in milliseconds.
+fn loans_event(id: RunId, loans: &Loans) -> serde_json::Value {
+    let millis = |wait: Duration| (wait.as_secs_f64() * 10_000.0).round() / 10.0;
+    let (median, longest) = loans.waits().map_or((None, None), |(median, longest)| {
+        (Some(millis(median)), Some(millis(longest)))
+    });
+    serde_json::json!({
+        "run": id.to_string(),
+        "loans": loans.count,
+        "taken_back": loans.reclaimed,
+        "most": loans.most,
+        "wait_median_ms": median,
+        "wait_longest_ms": longest,
+    })
+}
+
+/// Whether `request` comes from inside another heli run: its client runs
+/// under heli, so the run's depth (`HELI_DEPTH`, the client's plus one) is
+/// above 1.
+fn nested(request: &RunRequest) -> bool {
+    request
+        .env
+        .iter()
+        .find(|(name, _)| name.0 == nesting::VAR)
+        .and_then(|(_, depth)| depth.0.to_str()?.trim().parse::<u32>().ok())
+        .is_some_and(|depth| depth > 1)
 }
 
 /// The reply for a run that ended with `status`.

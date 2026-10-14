@@ -13,9 +13,10 @@
 //!   returns has every access right.
 //! - Cargo's jobserver opens the semaphore with `OpenSemaphoreA`, so the
 //!   name must be ASCII.
-//! - A slot is taken with a wait on the semaphore and given back with
-//!   `ReleaseSemaphore`, one at a time: a release past the maximum count
-//!   fails as a whole.
+//! - Whether another process holds it: the object's handle count
+//!   (`NtQueryObject`, `ObjectBasicInformation`) is above the daemon's one.
+//! - A release past the maximum count is all or nothing, and fails with
+//!   `ERROR_TOO_MANY_POSTS`.
 //! - A run pool is a semaphore like the host pool, created with no free
 //!   slot. A name that already exists belongs to some other process, and is
 //!   refused rather than adopted.
@@ -48,6 +49,28 @@ const SEMAPHORE_BASIC_INFORMATION: i32 = 0;
 
 windows_link::link!("ntdll.dll" "system" fn NtQuerySemaphore(
     semaphore: HANDLE,
+    information_class: i32,
+    information: *mut c_void,
+    information_length: u32,
+    return_length: *mut u32
+) -> NTSTATUS);
+
+/// `PUBLIC_OBJECT_BASIC_INFORMATION` (winternl.h).
+#[repr(C)]
+#[derive(Default)]
+struct PublicObjectBasicInformation {
+    attributes: u32,
+    granted_access: u32,
+    handle_count: u32,
+    pointer_count: u32,
+    reserved: [u32; 10],
+}
+
+/// `ObjectBasicInformation`, the information class.
+const OBJECT_BASIC_INFORMATION: i32 = 0;
+
+windows_link::link!("ntdll.dll" "system" fn NtQueryObject(
+    handle: HANDLE,
     information_class: i32,
     information: *mut c_void,
     information_length: u32,
@@ -111,29 +134,54 @@ impl Jobserver {
         Ok(u32::try_from(count).unwrap_or(0))
     }
 
-    /// Takes a free slot if there is one, without waiting.
-    pub fn try_take(&self) -> io::Result<bool> {
-        // SAFETY: a semaphore handle with every access right.
-        match unsafe { WaitForSingleObject(self.semaphore.as_raw_handle(), 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            _ => Err(io::Error::last_os_error()),
+    /// Takes up to `slots` free slots, never waiting; returns how many.
+    pub fn take(&self, slots: u32) -> io::Result<u32> {
+        let mut taken = 0;
+        while taken < slots {
+            // SAFETY: a semaphore handle with every access; a zero timeout
+            // never waits.
+            match unsafe { WaitForSingleObject(self.semaphore.as_raw_handle(), 0) } {
+                WAIT_OBJECT_0 => taken += 1,
+                WAIT_TIMEOUT => break,
+                _ => return Err(io::Error::last_os_error()),
+            }
         }
+        Ok(taken)
     }
 
-    /// Gives one slot back; `false` when the semaphore is already at its
-    /// maximum count, and the slot is dropped.
-    pub fn give(&self) -> io::Result<bool> {
-        // SAFETY: a semaphore handle with every access right.
-        if unsafe { ReleaseSemaphore(self.semaphore.as_raw_handle(), 1, std::ptr::null_mut()) } != 0
-        {
-            return Ok(true);
+    /// Gives `slots` slots to the pool, as many as fit below its maximum;
+    /// returns how many.
+    pub fn give(&self, slots: u32) -> io::Result<u32> {
+        // A release past the maximum changes nothing and fails, so one at a
+        // time: as many as fit.
+        let mut given = 0;
+        while given < slots && self.release_one()? {
+            given += 1;
         }
-        // SAFETY: reads this thread's last error, just set.
-        match unsafe { GetLastError() } {
-            ERROR_TOO_MANY_POSTS => Ok(false),
-            error => Err(io::Error::from_raw_os_error(error as i32)),
+        Ok(given)
+    }
+
+    /// Whether a process other than this one has the semaphore open: it has
+    /// more handles than the daemon's one.
+    pub fn held_by_others(&self) -> io::Result<bool> {
+        let mut information = PublicObjectBasicInformation::default();
+        // SAFETY: a handle, and a buffer of the size given.
+        let status = unsafe {
+            NtQueryObject(
+                self.semaphore.as_raw_handle(),
+                OBJECT_BASIC_INFORMATION,
+                (&raw mut information).cast(),
+                size_of::<PublicObjectBasicInformation>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "NtQueryObject failed: status {:#010x}",
+                status as u32
+            )));
         }
+        Ok(information.handle_count > 1)
     }
 
     /// A waiter that takes slots as the processes on this semaphore do:
@@ -173,18 +221,29 @@ impl Jobserver {
 
     /// Nothing to remove: a semaphore goes with its last handle.
     pub fn remove(&self) {}
+
+    /// Releases one slot; `false` when the semaphore is at its maximum.
+    fn release_one(&self) -> io::Result<bool> {
+        // SAFETY: a semaphore handle with every access; the previous count
+        // is not asked for.
+        let released =
+            unsafe { ReleaseSemaphore(self.semaphore.as_raw_handle(), 1, std::ptr::null_mut()) };
+        if released != 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_TOO_MANY_POSTS as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
+    }
 }
 
 /// Creates the semaphore `name` with `free` of `maximum` slots free, or
 /// opens the one that exists (then ignoring the counts).
 fn create(name: &OsStr, free: u32, maximum: u32) -> io::Result<(OwnedHandle, String, Opened)> {
-    let name = check_name(name)?;
-    if !name.is_ascii() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
-        ));
-    }
+    let name = auth(name)?;
     let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
     let free = i32::try_from(free).map_err(io::Error::other)?;
     let maximum = i32::try_from(maximum).map_err(io::Error::other)?;
@@ -206,7 +265,7 @@ fn create(name: &OsStr, free: u32, maximum: u32) -> io::Result<(OwnedHandle, Str
     } else {
         Opened::Created
     };
-    Ok((semaphore, name.to_owned(), opened))
+    Ok((semaphore, name, opened))
 }
 
 /// Takes slots in line with the other processes waiting on a semaphore,
@@ -247,6 +306,19 @@ impl Waiter {
     pub fn wake(&self) {
         self.cancel();
     }
+}
+
+/// What `--jobserver-auth=` names for the semaphore `name`: the name, which
+/// must be ASCII.
+pub fn auth(name: &OsStr) -> io::Result<String> {
+    let name = check_name(name)?;
+    if !name.is_ascii() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} cannot name a semaphore cargo opens: it must be ASCII"),
+        ));
+    }
+    Ok(name.to_owned())
 }
 
 /// The counts of `semaphore`, a handle with `SEMAPHORE_QUERY_STATE`.

@@ -15,19 +15,6 @@ use serde_json::Value;
 
 use support::{Fixture, assert_success, runs};
 
-/// Builds the `jobs` fixture and returns its path.
-fn jobs_binary(fixture: &Fixture) -> PathBuf {
-    let output = fixture
-        .cargo(["build", "--quiet", "-p", "jobs"])
-        .output()
-        .expect("run cargo");
-    assert_success(&output, "building jobs");
-    fixture
-        .target_dir()
-        .join("debug")
-        .join(format!("jobs{}", std::env::consts::EXE_SUFFIX))
-}
-
 /// A `jobs` run through heli, in the background.
 struct Jobs {
     child: Child,
@@ -94,7 +81,7 @@ fn run<'a>(status: &'a Value, id: &str) -> &'a Value {
 fn a_run_alone_borrows_every_slot() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 4\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let alone = Jobs::start(&fixture, &jobs, "alone", 6, 50);
     let status = fixture.wait_for_status("the run to use every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 4
@@ -108,37 +95,37 @@ fn a_run_alone_borrows_every_slot() {
 }
 
 /// The broker measures how long a run waits for each slot it lends, and the
-/// daemon logs it when the run ends: a run alone that borrowed all 4 slots
-/// had at least 4 loans, each within a fraction of a second.
+/// daemon writes it to the event log when the run ends: a run alone that
+/// borrowed all 4 slots had at least 4 loans, each within a fraction of a
+/// second, and used at most 4.
 #[test]
 fn the_wait_for_a_lent_slot_is_logged() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 4\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let alone = Jobs::start(&fixture, &jobs, "alone", 6, 50);
     let status = fixture.wait_for_status("the run to use every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 4
     });
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
     alone.stop();
-    let log = daemon_log(&fixture);
-    let line = run_pool_line(&log, &id);
-    let loans: u64 = line
-        .split_once(" loans")
-        .and_then(|(loans, _)| loans.parse().ok())
-        .unwrap_or_else(|| panic!("no loans: {line}"));
-    assert!(loans >= 4, "{line}");
-    let millis = |label: &str| -> f64 {
-        line.split_once(label)
-            .and_then(|(_, rest)| rest.split_once(" ms"))
-            .and_then(|(value, _)| value.parse().ok())
-            .unwrap_or_else(|| panic!("no {label:?} in {line}"))
-    };
+    let loans = loans(&fixture, &id);
+    assert!(loans["loans"].as_u64() >= Some(4), "{loans}");
+    assert_eq!(loans["most"], 4, "{loans}");
     let (median, longest) = (
-        millis("wait for a lent slot: median "),
-        millis(", longest "),
+        loans["wait_median_ms"].as_f64().expect("a median wait"),
+        loans["wait_longest_ms"].as_f64().expect("a longest wait"),
     );
-    assert!(median <= longest && longest < 1000.0, "{line}");
+    assert!(median <= longest && longest < 1000.0, "{loans}");
+}
+
+/// The `loans` event of run `id`: how its loans went, logged as it ended.
+fn loans(fixture: &Fixture, id: &str) -> Value {
+    fixture
+        .events_named("loans")
+        .into_iter()
+        .find(|event| event["run"] == id)
+        .unwrap_or_else(|| panic!("no loans event for {id}: {:?}", fixture.events()))
 }
 
 /// The slots run `id` uses, as `status --json` shows them; 0 when it is not
@@ -156,7 +143,7 @@ fn slots(status: &Value, id: &str) -> u64 {
 /// first of ten `status` samples in a row (half a second) in which they use
 /// every slot, within one of each other.
 fn balance_two_busy_runs(fixture: &Fixture, slots_n: u64) -> (Jobs, Jobs, String, String, Value) {
-    let jobs = jobs_binary(fixture);
+    let jobs = fixture.binary("jobs");
     let first = Jobs::start(fixture, &jobs, "first", 8, 50);
     let status = fixture.wait_for_status("the first run to use every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == slots_n
@@ -223,40 +210,9 @@ fn balanced_runs_keep_their_slots() {
     std::thread::sleep(Duration::from_millis(500));
     first.stop();
     second.stop();
-    let log = daemon_log(&fixture);
-    assert!(taken_back(&log, &a) <= 2, "{log}");
-    assert_eq!(taken_back(&log, &b), 0, "{log}");
-}
-
-/// How many slots run `id` gave back while it had work pending, as the
-/// daemon's log line for its run pool says.
-fn taken_back(log: &str, id: &str) -> u64 {
-    run_pool_line(log, id)
-        .split(", ")
-        .find_map(|part| part.strip_suffix(" taken back"))
-        .and_then(|count| count.parse().ok())
-        .unwrap_or_else(|| panic!("no count of slots taken back from {id}: {log}"))
-}
-
-/// The daemon's own log, whatever its session suffix.
-fn daemon_log(fixture: &Fixture) -> String {
-    std::fs::read_dir(fixture.state_dir())
-        .expect("the state directory")
-        .map(|entry| entry.expect("an entry").path())
-        .filter(|path| {
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            name.starts_with("daemon") && name.ends_with(".log")
-        })
-        .map(|path| std::fs::read_to_string(path).expect("read the daemon's log"))
-        .collect()
-}
-
-/// The daemon's log line on run `id`'s run pool, from after `run pool: `.
-fn run_pool_line<'a>(log: &'a str, id: &str) -> &'a str {
-    let marker = format!("] {id}: run pool: ");
-    log.lines()
-        .find_map(|line| line.split_once(&marker).map(|(_, rest)| rest))
-        .unwrap_or_else(|| panic!("no run pool line for {id}: {log}"))
+    let (first, second) = (loans(&fixture, &a), loans(&fixture, &b));
+    assert!(first["taken_back"].as_u64() <= Some(2), "{first}");
+    assert_eq!(second["taken_back"], 0, "{second}");
 }
 
 /// A run whose processes stop asking for slots keeps one free in its pool,
@@ -266,7 +222,7 @@ fn run_pool_line<'a>(log: &'a str, id: &str) -> &'a str {
 fn an_idle_run_keeps_one_free_slot() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 4\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let quiet = Jobs::start(&fixture, &jobs, "quiet", 6, 50);
     fixture.wait_for_status("the run to use every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 4
@@ -294,7 +250,7 @@ fn an_idle_run_keeps_one_free_slot() {
 fn a_spare_slot_goes_to_a_run_that_waits() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let holder = Jobs::start(&fixture, &jobs, "holder", 1, 600_000);
     let status = fixture.wait_for_status("the first run to hold a slot and keep one", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 1 && status["pool"]["free"] == 0
@@ -316,7 +272,7 @@ fn a_spare_slot_goes_to_a_run_that_waits() {
 fn a_killed_run_returns_all_its_loans_at_once() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 3\n");
-    let jobs = jobs_binary(&fixture);
+    let jobs = fixture.binary("jobs");
     let held = Jobs::start(&fixture, &jobs, "held", 3, 600_000);
     fixture.wait_for_status("the run to hold every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 3

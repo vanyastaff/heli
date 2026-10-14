@@ -174,17 +174,6 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
-/// The value of `CARGO_MAKEFLAGS` that points a bare cargo at the fixture's
-/// host pool.
-fn host_pool_makeflags(fixture: &Fixture) -> String {
-    let pool = fixture.pool().into_string().expect("a Unicode pool name");
-    if cfg!(windows) {
-        format!("-j --jobserver-auth={pool}")
-    } else {
-        format!("-j --jobserver-auth=fifo:{pool}")
-    }
-}
-
 /// A daemon that dies during a build is replaced by one that adopts its
 /// pool rather than making a second one. With N = 2 and the build's three
 /// build scripts running (one on its cargo's own job, two on pool slots),
@@ -204,7 +193,7 @@ fn a_restarted_daemon_adopts_the_pool() {
     build
         .args(["-p", "slow-a", "-p", "slow-b", "-p", "slow-c"])
         .env("CARGO_TARGET_DIR", fixture.path("target-slow"))
-        .env("CARGO_MAKEFLAGS", host_pool_makeflags(&fixture))
+        .env("CARGO_MAKEFLAGS", fixture.makeflags())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -358,6 +347,9 @@ impl Holder {
 fn a_held_pool_is_adopted_as_it_is() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
+    // The holder is no process the top-up's scan sees; with the governor's
+    // clock standing still, no top-up counts its slot as lost.
+    fixture.set_clock(0);
     start_daemon(&fixture);
     let holder = Holder::take(&fixture.pool());
     let daemon = fixture.daemon_pid().expect("a daemon");
