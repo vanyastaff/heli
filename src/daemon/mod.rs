@@ -326,8 +326,18 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
-        // Once admitted, after any wait (which belongs above): another run
-        // may have passed with the same key meanwhile.
+        // The worktree lock: tell the client which runs this one waits for,
+        // if any (a client older than run classes could not read it). A
+        // client gone meanwhile does not stop the run.
+        self.registry.wait_for_worktree(id, |runs| {
+            if request.class.is_some() {
+                let _ = protocol::write_message(&mut stream, &Reply::Waiting { runs });
+            }
+        });
+        // Admitted, and done waiting: another run may have passed with the
+        // same key meanwhile, and the worktree may have changed, so the key
+        // is computed and looked up again. Its snapshot of the tree is the
+        // one the run starts on.
         let key = match self.results.admitted(&request) {
             Admitted::Passed(passed) => {
                 self.registry.finish(id);
@@ -342,14 +352,6 @@ impl Daemon {
             }
         };
         let mut record = self.runlog.record(&id.to_string());
-        // The worktree lock: tell the client which runs this one waits for,
-        // if any (a client older than run classes could not read it). A
-        // client gone meanwhile does not stop the run.
-        self.registry.wait_for_worktree(id, |runs| {
-            if request.class.is_some() {
-                let _ = protocol::write_message(&mut stream, &Reply::Waiting { runs });
-            }
-        });
         let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,

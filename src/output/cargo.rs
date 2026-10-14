@@ -57,13 +57,14 @@ pub enum Warnings {
 }
 
 /// Whether cargo reports the diagnostics of `cargo <args>` (`args` from the
-/// subcommand on) as JSON messages and prints nothing else heli would drop:
-/// build, check, clippy and doc, and cargo's aliases `b`, `c` and `d`. Of
-/// the other compile and verify runs, `run` prints the program's own output
-/// and `fmt --check` is rustfmt's; `clippy --fix` is a mutate run.
+/// subcommand on, after a `+toolchain`) as JSON messages and prints nothing
+/// else heli would drop: build, check, clippy and doc, and cargo's aliases
+/// `b`, `c` and `d`. Of the other compile and verify runs, `run` prints the
+/// program's own output and `fmt --check` is rustfmt's; `clippy --fix` is a
+/// mutate run.
 pub fn reports_json(args: &[OsString]) -> bool {
-    args.first()
-        .and_then(|subcommand| subcommand.to_str())
+    subcommand(args)
+        .and_then(|(subcommand, _)| subcommand.to_str())
         .is_some_and(|subcommand| {
             matches!(
                 subcommand,
@@ -72,17 +73,20 @@ pub fn reports_json(args: &[OsString]) -> bool {
         })
 }
 
-/// Whether `cargo <args>` (`args` from the subcommand on) already chooses
-/// cargo's output: `--message-format`, `--quiet` or `-q`, `--verbose` or
-/// `-v`, before any `--`. heli then leaves its output alone, and must:
-/// cargo refuses a second `--quiet` or `--message-format`.
+/// Whether `cargo <args>` (`args` from the subcommand on, after a
+/// `+toolchain`) already chooses cargo's output: `--message-format`,
+/// `--quiet` or `-q`, `--verbose` or `-v`, before any `--`. heli then leaves
+/// its output alone, and must: cargo refuses a second `--quiet` or
+/// `--message-format`.
 ///
 /// A cluster of short flags counts when it holds a `q` or a `v` anywhere
 /// (`-vv`, `-rq`), even in a value (`-pserver`): leaving the output alone
 /// is safe, adding `--quiet` to a command that has it is not.
 pub fn sets_output(args: &[OsString]) -> bool {
-    args.iter()
-        .skip(1)
+    let Some((_, rest)) = subcommand(args) else {
+        return false;
+    };
+    rest.iter()
         .take_while(|arg| *arg != "--")
         .filter_map(|arg| arg.to_str())
         .any(|arg| match arg.strip_prefix("--") {
@@ -94,6 +98,17 @@ pub fn sets_output(args: &[OsString]) -> bool {
                 .strip_prefix('-')
                 .is_some_and(|cluster| cluster.contains(['q', 'v'])),
         })
+}
+
+/// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
+/// rustup's cargo takes it, and as the run classes read it), and the
+/// arguments after it.
+fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
+    let args = match args.first() {
+        Some(first) if first.to_string_lossy().starts_with('+') => &args[1..],
+        _ => args,
+    };
+    args.split_first()
 }
 
 /// `args` with `--quiet --message-format json` after the user's own

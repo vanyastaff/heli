@@ -313,6 +313,32 @@ fn arguments_after_the_separator_are_the_compilers() {
     );
 }
 
+/// A `+toolchain` before the subcommand is rustup's: heli reads the
+/// subcommand after it. Here `echo-args` stands in for cargo and prints the
+/// arguments heli gave it: its JSON flags for `+pinned check`, none when
+/// the user chose cargo's output.
+#[test]
+fn a_toolchain_before_the_subcommand_is_looked_past() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    for (args, given) in [
+        (
+            &["+pinned", "check"][..],
+            &["+pinned", "check", "--quiet", "--message-format", "json"][..],
+        ),
+        (&["+pinned", "check", "-q"], &["+pinned", "check", "-q"]),
+    ] {
+        let output = fixture
+            .heli(args.iter().copied())
+            .env("CARGO", &echo)
+            .output()
+            .expect("run heli");
+        support::assert_success(&output, &format!("cargo heli {args:?}"));
+        let echoed: String = given.iter().map(|arg| format!("arg: {arg:?}\n")).collect();
+        assert_eq!(text(&output.stdout), echoed, "{args:?}");
+    }
+}
+
 /// The compact output of `check` on fixture crate `warnings`: its four
 /// warnings by lint, at the places rustc reports them.
 fn warnings_by_lint() -> String {
