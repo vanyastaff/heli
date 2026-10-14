@@ -805,6 +805,15 @@ fn an_orphan_that_cannot_be_moved_is_passed_over() {
         "with none left to try, it says why: {stderr}"
     );
     assert_eq!(marker(&latest), "latest");
+    // Given up, it names its removed worktree again: an orphan still, for
+    // a recycler that can move it.
+    assert!(
+        owner(&latest).is_some_and(|owner| owner["workspace"]
+            .as_str()
+            .is_some_and(|path| Path::new(path) == gone("gone-1"))),
+        "{:?}",
+        owner(&latest)
+    );
 }
 
 /// The build directory cargo names for a worktree as heli would find it:
