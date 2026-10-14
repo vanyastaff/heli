@@ -903,8 +903,16 @@ fn deleting_a_large_victim_does_not_hold_up_cargo() {
         .expect("run cargo build");
     assert_success(&cargo, "cargo build while the victim is deleted");
     let stderr = text(&cargo.stderr);
+    // The package cache's lock, in CARGO_HOME, is every cargo's on the
+    // host: the tests that run beside this one, other agents. Waiting for
+    // it says nothing of gc. Any other lock is the build directory's or the
+    // artifact directory's (`Blocking waiting for file lock on build
+    // directory`, `… on artifact directory`, with cargo 1.99).
     assert!(
-        !stderr.contains("Blocking waiting for file lock"),
+        !stderr.lines().any(|line| {
+            line.contains("waiting for file lock")
+                && line.trim() != "Blocking waiting for file lock on package cache"
+        }),
         "cargo waited for gc: {stderr}"
     );
 

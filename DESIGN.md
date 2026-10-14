@@ -1343,7 +1343,10 @@ belongs to one live worktree.
 - Each recycling is a `recycle` event in the event log (§8). Two recyclers
   need no lock between them: a rename never replaces a directory that has
   files, and each scans the donor under its old name, which a rename by the
-  other takes away.
+  other takes away. Before each donor, a recycler checks again that the
+  build directory does not exist. Until the other recycler names the new
+  workspace in it, the directory it renamed into place still looks like
+  the donor's orphan, and renaming it onto itself would succeed.
 
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,
