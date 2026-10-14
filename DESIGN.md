@@ -317,10 +317,16 @@ runs; withheld slots and slots bare cargo holds are not in it.
   already using its share or more gets none. A run alone can borrow every
   slot. A process waiting on a semaphore takes a slot as it is put in, so in
   the same pass the broker lends again to a run that still waits.
-- **Return.** Free slots in a run pool beyond one go back to the host pool.
-  An idle run keeps one, for the next process that asks. That one goes back
-  too when the host pool has none free and a run that waits uses fewer slots
-  than this one.
+- **Return.** Free slots in a run pool beyond one go back to the host pool
+  once they have stayed free for a tick. Sooner, they may be slots that a
+  run with work pending just gave back, which its processes waiting on the
+  pool have not yet woken to take: a process blocked on a FIFO takes a
+  byte only once the scheduler runs it, which on a busy host can be after
+  the next count. Returned, such a slot would go to another run and then be
+  taken back (seen on a macOS CI runner: a third slot taken back where two
+  balance the runs). An idle run keeps one, for the next process that asks.
+  That one goes back too when the host pool has none free and a run that
+  waits uses fewer slots than this one.
 - **Take back.** A run with work pending never shows a free slot: each slot
   one of its processes gives back is taken at once by another waiting on the
   same pool. So while the host pool has no free slot and a run waits, a run
