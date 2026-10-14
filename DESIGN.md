@@ -274,22 +274,58 @@ its own, as without heli.
 
 Each heli run gets a **run pool** of its own: a second semaphore or FIFO,
 which the run's processes see through `CARGO_MAKEFLAGS` instead of the host
-pool. A broker in the daemon moves slots between the host pool and the run
-pools, every 20 ms:
+pool. It is named after the host pool and the run, `<pool>-r17` (on Unix a
+FIFO beside the host pool's, which the daemon removes when the run ends), and
+starts with no free slot. A run pool is never adopted: a semaphore of that
+name that some process holds is refused, and a FIFO left at the path by an
+earlier daemon is replaced. A run whose run pool cannot be made draws from
+the host pool, and the daemon's log says why.
 
-- **Lend.** A run whose pool has no free slot may be waiting for one. The
-  broker lends it one from the host pool, preferring the waiting run with the
-  fewest slots in use.
+A broker in the daemon moves slots between the host pool and the run pools,
+every 20 ms. It cannot see the processes blocked on a pool, so a run whose
+pool has no free slot counts as **waiting** for one; a run is **active**
+while it uses a slot or waits. A run's **share** is the capacity (the host
+pool's free slots, plus the slots the active runs hold) divided by the active
+runs; withheld slots and slots bare cargo holds are not in it.
+
+- **Lend.** A free slot of the host pool goes to the waiting run with the
+  fewest slots in use, the oldest first. While another run waits, a run
+  already using its share or more gets none. A run alone can borrow every
+  slot. A process waiting on a semaphore takes a slot as it is put in, so in
+  the same pass the broker lends again to a run that still waits.
 - **Return.** Free slots in a run pool beyond one go back to the host pool.
-- **Share.** While other runs wait, a run already using more than its share
-  (the host pool's capacity divided by the number of active runs) gets no new
-  slots, and its slots return as its jobs finish. Nothing running is
-  interrupted. A run alone can borrow every slot.
-- **Exact accounting.** A run uses `lent − free(run pool)` slots. When a run
-  ends, or is cancelled or killed, all of `lent` goes back to the host pool,
-  whatever its processes held. Leaks are impossible for heli runs.
-- **Latency.** A waiting cargo gets a slot within one broker tick, which is
-  small next to a rustc job. To be measured.
+  An idle run keeps one, for the next process that asks. That one goes back
+  too when the host pool has none free and a run that waits uses fewer slots
+  than this one.
+- **Take back.** A run with work pending never shows a free slot: each slot
+  one of its processes gives back is taken at once by another waiting on the
+  same pool. So while the host pool has no free slot and a run waits, a run
+  using more than its share, and at least two slots more than the waiting run
+  with the fewest, gives slots back as its processes finish with them. The
+  broker waits on that run's pool in line with its processes (a thread
+  blocked on the semaphore and a cancel event, or in a blocking read of the
+  FIFO), and the slot it gets goes to the host pool and on to the poorer run.
+  Nothing running is interrupted. The margin of two keeps an odd split (3
+  and 2) from moving back and forth. Cargo keeps its tokens from one job to
+  the next while it has jobs ready (`job_queue`, `spawn_work_if_possible`),
+  so a cargo's slots come back when it has no job ready and as rustc's
+  codegen and build scripts' own jobs end; clients that take a token per job,
+  as make and cc-rs do, give them back at every job.
+- **Exact accounting.** A run uses `lent − free(run pool)` slots, plus its
+  test slots (§5). When a run ends, or is cancelled or killed, everything lent
+  to it goes back to the host pool at once, whatever its processes held.
+  Leaks are impossible for heli runs; slots lent by a daemon that died come
+  back through the top-up.
+- **Latency.** For every slot it lends, the broker records how long the run
+  may have waited for it: from when its pool was last seen with a free slot
+  (an upper bound). The `loans` event gives each run's median and longest
+  wait when it ends (§8). A waiting process gets a slot within one broker
+  tick while the host pool has one free. Measured on the example host
+  (Windows, N = 8, `cargo heli build` of heli itself, 7.3 s): 49 loans, at
+  most 8 slots in use, every wait at most 20.6 ms, one tick. Cargo's
+  jobserver helper asks for one token at a time and is not yet waiting
+  again when the broker counts once more, so a run gains about one slot
+  per tick: 32 slots take some 0.65 s, short next to a rustc job.
 
 Bare cargo, started without heli, still draws from the host pool directly.
 
@@ -328,7 +364,8 @@ Bare cargo, started without heli, still draws from the host pool directly.
     slots withheld (§8).
 - **Bounded top-up.** Only bare cargo can leak a slot: a process killed while
   holding one, and semaphores and FIFOs have no owner. The host pool's target
-  of free slots is `N − withheld − Σ lent`.
+  of free slots is `N − withheld − Σ lent`, where Σ lent counts the test
+  slots held for runs (§5) too.
   - The daemon raises the free count to the target only at quiescence,
     observed at its samples for 2 s: no heli run active, and either no
     process but the daemon holds the pool open, or no rustc, rustdoc,
@@ -352,9 +389,11 @@ Bare cargo, started without heli, still draws from the host pool directly.
     lent. A token that a cargo still held during a top-up (between taking it
     and starting the job, or held by a jobserver client the process scan
     does not see) then comes back as surplus and is removed.
-  - A run pool broker counts a loan after taking its slot from the host
-    pool, and stops counting it before giving the slot back, so the free
-    count never stands above the target meanwhile.
+  - The broker counts a loan as it takes the slot from the host pool, and
+    stops counting it as it gives the slot back, each as one step under the
+    host pool's lock; the top-up and the drain read Σ lent under that lock
+    too. Read apart, a slot on its way back between the two reads would look
+    like a surplus, and the drain would remove it.
 
 ### Reach
 
@@ -451,13 +490,28 @@ How a command line is read:
    `HELI_RUN=<run id>`. heli sets no `-j`: under a jobserver, cargo ignores it.
 6. **Test phase** (test class only).
    - heli first builds under the run pool, with `nextest run --no-run <args>`
-     or `cargo test --no-run <args>`.
-   - It then takes K slots for the test threads. K is the smallest of the
-     thread count asked for, the run's share, and the slots free within 5 s.
-     With no slot free after 5 s, the tests run with one thread on the run's
-     implicit slot and hold no pool slot (G1).
-   - It runs the tests with `--test-threads K` (nextest) or
-     `-- --test-threads=K` (libtest) and holds the K slots until they finish.
+     or `cargo test --no-run <args>` (`--no-run` right after the
+     subcommand); `status` shows the run `building`. A build that fails ends
+     the run with its exit code. `cargo test --doc`, which cargo cannot build
+     apart, goes straight to its test slots, and a command that has
+     `--no-run` already is a build, run once.
+   - It then takes K slots for the test threads (`status`: `testing`). K is
+     the smallest of the thread count asked for, the run's share (whole
+     slots, at least one), and the slots it gets within 5 s; it stops waiting
+     once it has them all. The threads asked for are nextest's `-j`,
+     `--test-threads` or `--jobs`, else `NEXTEST_TEST_THREADS` (a number below
+     1 counts down from the logical CPUs, as in nextest), or libtest's
+     `--test-threads`, else `RUST_TEST_THREADS`. Free slots in its own run
+     pool count first; then it waits like any waiting run (§4), and the
+     broker takes slots back for it as for any. With no slot after 5 s, the
+     tests run with one thread on the run's implicit slot and hold no pool
+     slot (G1).
+   - It runs the tests with `--test-threads K` (nextest, in place of the
+     user's own) or `-- --test-threads=K` (libtest, after the user's test
+     arguments, in place of theirs) and holds the K slots until they finish.
+     A header line on stderr says so before the tests start:
+     `cargo-heli: r17: testing on 4 threads, 4 slots (share 8), waited 0.2 s`,
+     or `… testing on 1 thread, no pool slot free (share 2), waited 5.0 s`.
    - The wait happens before nextest starts, so it never counts toward
      `slow-timeout`. nextest's test groups and per-test overrides still apply
      within K.
@@ -471,9 +525,10 @@ How a command line is read:
    output in the chosen output mode (see "Output" below), then a footer line
    (duration, peak memory of the process tree, slots held, and the run id for
    `cargo heli log`). Header and footer go to stderr, so stdout stays the
-   tool's own, and the footer starts a line of its own. So far there is no
-   header, and the footer holds the run id, the exit (`exit <code>`, or on
-   Unix `signal <n>`) and the duration:
+   tool's own, and the footer starts a line of its own. So far only a test
+   run has a header: its test phase's line (step 6). The footer holds the
+   run id, the exit (`exit <code>`, or on Unix `signal <n>`) and the
+   duration:
    `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. Peak
    memory and slots join it once heli measures them. After a quiet run that
    succeeded, quiet's one line takes its place ("Output" below). A run heli
@@ -990,8 +1045,11 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `phase`
-  (running for a run of one phase; building, testing, done), `slots`,
-  `share`, `waiting_since` (`null` unless the run waits), `waiting_for`
+  (running for a run of one phase; building, testing, done), `slots` (the
+  host pool's slots it uses: lent to its run pool and not free there, plus
+  its test slots), `share` (its share of the capacity, §4, a number that
+  need not be whole), `waiting_since` (`null` unless the run waits),
+  `waiting_for`
   (the ids of the runs it waits for at the worktree lock),
   `attached_clients` and `started_at`;
 - `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
@@ -1009,7 +1067,12 @@ drains and evictions, and `cargo heli gc --dry-run`.
 - `withhold`: `withheld` (after it), `available`, `commit_available` and
   `low_watermark`;
 - `return`: `slots`, `available`, `commit_available` and `high_watermark`;
-- `top-up` and `drain`: `slots`, `free` (after it) and `target`.
+- `top-up` and `drain`: `slots`, `free` (after it) and `target`;
+- `loans`, when a run ends: `run`, `loans` (slots lent to its run pool),
+  `taken_back` (slots the broker took back while it had work pending),
+  `most` (the most slots it was seen using), `wait_median_ms` and
+  `wait_longest_ms` (how long it waited for a lent slot, at most; `null`
+  without loans).
 
 Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
 the one before, and the next event starts a new file.

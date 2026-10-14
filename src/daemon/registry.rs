@@ -118,6 +118,13 @@ impl Registry {
         id
     }
 
+    /// Run `id` moves to `phase`.
+    pub fn set_phase(&self, id: RunId, phase: Phase) {
+        if let Some(entry) = self.lock().runs.get_mut(&id) {
+            entry.phase = phase;
+        }
+    }
+
     /// Waits for run `id`'s turn at its worktree's lock (see the module
     /// docs). When it has to wait, `waiting` first gets the runs it waits
     /// for, called with the registry unlocked.
@@ -193,6 +200,9 @@ impl Inner {
             started_at: clock::unix_seconds(entry.started_at),
             waiting_since: (!waiting_for.is_empty()).then(|| clock::unix_seconds(entry.started_at)),
             waiting_for,
+            // The broker's to tell (`crate::pool::broker`).
+            slots: 0,
+            share: 0.0,
         }
     }
 }
