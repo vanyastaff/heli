@@ -176,7 +176,7 @@ impl Render for Nextest {
             self.diagnostics.output(channel, bytes, out);
             return;
         }
-        out.write(channel, bytes);
+        out.pass(bytes);
         for line in self.stderr.push(bytes) {
             self.scan(&line);
         }

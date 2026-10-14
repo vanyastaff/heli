@@ -499,6 +499,44 @@ fn a_quiet_run_that_succeeds_prints_one_line() {
     quiet_line(&output, "build -p warnings", "4 warnings, ");
 }
 
+/// Cargo's own stderr passes through compact output a whole line at a
+/// time: a line cargo writes in pieces (its verdict, whose `error` it
+/// writes apart from the rest on Windows) is not cut in two by an error
+/// heli renders from cargo's JSON meanwhile. `echo-args` stands in for
+/// cargo, and makes those writes in that order.
+#[test]
+fn a_line_cargo_writes_in_pieces_stays_whole() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    // Rendered without its line end, which heli adds.
+    let diagnostic = r#"{"reason":"compiler-message","message":{"level":"error","message":"m","rendered":"error: m"}}"#;
+    let writes = fixture.path("writes");
+    std::fs::write(
+        &writes,
+        format!(
+            "err error\n\
+             out {diagnostic}\\n\n\
+             err : could not compile `x` (lib) due to 1 previous error\\n\n"
+        ),
+    )
+    .expect("write the script");
+    let output = fixture
+        .heli(["build"])
+        .env("CARGO", &echo)
+        .env("ECHO_WRITES", &writes)
+        .env("ECHO_EXIT", "101")
+        .output()
+        .expect("run heli");
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stderr = support::without_footer(&output.stderr);
+    assert_eq!(
+        stderr,
+        "error: m\n\
+         error: could not compile `x` (lib) due to 1 previous error\n\
+         echo-args: stderr\n"
+    );
+}
+
 /// A quiet run that fails prints what compact mode prints, and the footer.
 #[test]
 fn a_quiet_run_that_fails_prints_compact_output() {

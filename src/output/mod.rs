@@ -322,6 +322,9 @@ pub struct Sink {
     held: Option<Vec<(Channel, Vec<u8>)>>,
     /// Whether what was written to stderr so far ends a line.
     line_ended: bool,
+    /// The start of a line of the tool's stderr that [`Sink::pass`] holds
+    /// until its end comes.
+    passing: LineBuffer,
 }
 
 impl Sink {
@@ -329,6 +332,24 @@ impl Sink {
         Self {
             held: hold.then(Vec::new),
             line_ended: true,
+            passing: LineBuffer::default(),
+        }
+    }
+
+    /// Writes the tool's own stderr, `bytes`, a whole line at a time: a
+    /// renderer's lines on stderr (rendered diagnostics, counts) never cut
+    /// one of the tool's lines in two, which the tool may write in pieces
+    /// (cargo writes the `error` of its verdict apart from the rest).
+    pub fn pass(&mut self, bytes: &[u8]) {
+        for line in self.passing.push(bytes) {
+            self.write(Channel::Stderr, &line);
+        }
+    }
+
+    /// Writes what [`Sink::pass`] holds: the tool's stderr is over.
+    fn end_pass(&mut self) {
+        if let Some(rest) = self.passing.rest() {
+            self.write(Channel::Stderr, &rest);
         }
     }
 
@@ -400,6 +421,7 @@ impl Printer {
     /// Run `run` ended as `exit` says after `elapsed`: prints the rest of
     /// its output and the closing line.
     pub fn exited(mut self, run: &str, exit: Exit, elapsed: Duration) {
+        self.sink.end_pass();
         let facts = self.render.finish(run, &mut self.sink);
         let seconds = elapsed.as_secs_f64();
         if self.quiet && exit.code == 0 && exit.signal.is_none() && !exit.cancelled {
@@ -424,6 +446,7 @@ impl Printer {
     /// The run's end will not be known (the daemon is lost): prints what
     /// was held back.
     pub fn abandon(mut self, run: &str) {
+        self.sink.end_pass();
         self.render.finish(run, &mut self.sink);
         self.sink.release();
     }

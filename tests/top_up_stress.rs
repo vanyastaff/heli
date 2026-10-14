@@ -124,7 +124,7 @@ fn no_top_up_lets_more_than_n_jobs_hold_slots_while_cargos_are_killed() {
     let bin = fixture.path("bin");
     std::fs::create_dir_all(&bin).expect("create a bin directory");
     let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
-    std::fs::copy(fixture.binary("jobs"), &cargo).expect("copy jobs as cargo");
+    support::copy_program(&fixture.binary("jobs"), &cargo);
     let log = fixture.path("held.log");
     let start = |random: &mut Random, index: usize| {
         let stderr = std::fs::File::create(fixture.path(&format!("cargo-{index}.stderr")))

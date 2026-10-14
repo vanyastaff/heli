@@ -118,7 +118,7 @@ impl Verifier {
     fn tool(&self, dir: &std::path::Path, name: &str) -> std::path::PathBuf {
         std::fs::create_dir_all(dir).expect("create a fake tool's directory");
         let path = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::copy(&self.echo, &path).expect("copy echo-args");
+        support::copy_program(&self.echo, &path);
         path
     }
 

@@ -45,15 +45,24 @@ fn the_footer_names_the_run() {
         .arg("x")
         .env("ECHO_WAIT_FOR", &gate)
         .env("ECHO_EXIT", "3");
-    let call = start(&mut call);
+    let mut call = start(&mut call);
     let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
     let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    // The client counts from when it hears that the run started, a moment
+    // after the run is listed; once it has printed the run's first line, it
+    // has.
+    let mut stdout = std::io::BufReader::new(call.stdout.take().expect("a stdout"));
+    let mut printed = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut printed).expect("read the client's stdout");
     std::thread::sleep(Duration::from_secs(1));
     open(&gate);
+    stdout
+        .read_to_string(&mut printed)
+        .expect("read the client's stdout");
     let output = finish(call);
 
     assert_eq!(output.status.code(), Some(3));
-    assert_eq!(text(&output.stdout), "arg: \"x\"\n");
+    assert_eq!(printed, "arg: \"x\"\n");
     let (stderr, footer) = support::split_footer(&output.stderr);
     assert_eq!(text(&stderr), "echo-args: stderr\n");
     assert_eq!(footer.run, id);
