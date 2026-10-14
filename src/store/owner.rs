@@ -26,6 +26,11 @@ pub struct Owner {
     pub repository: Option<PathBuf>,
     pub created_at: u64,
     pub last_run: u64,
+    /// Set by a recycler that claimed the directory for `workspace` and has
+    /// not yet renamed it into place (`crate::store::recycle`); absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claimed: bool,
 }
 
 /// The manifest's path in `build_dir`.
@@ -53,6 +58,7 @@ pub fn record_run(
         repository: repository.map(Path::to_path_buf),
         created_at,
         last_run: at,
+        claimed: false,
     };
     let dir = path(build_dir);
     let dir = dir.parent().expect("BUG: the manifest is in .heli/");

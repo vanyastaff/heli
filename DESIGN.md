@@ -1355,10 +1355,15 @@ belongs to one live worktree.
   claimed the same donor after this one. A recycler that gives the donor up
   (it cannot be moved, its worktree is older than its last build) writes
   its manifest back, unless another recycler claimed it since or it moved.
-  A donor whose manifest cannot be written is not taken. A recycler that
-  dies between the claim and the rename leaves the donor named after a
-  live workspace, where it is: recycling never takes it, and eviction does
-  (§6.3).
+  A donor whose manifest cannot be written is not taken. The claim marks
+  the manifest (`"claimed":true`, which the rewrite after the rename
+  drops): a recycler that finds a donor claimed for its own workspace in
+  the last minute (the run's and the look's, or the hook's, racing for one
+  worktree) waits, at most 25 s, until the build directory appears or the
+  claim is given up, so that cargo does not make an empty build directory
+  first. A recycler that dies between the claim and the rename leaves the
+  donor named after a live workspace, where it is: recycling never takes
+  it, and eviction does (§6.3).
 
 **Orphans and eviction** (§6.3), one rule for both. An orphan is unclaimed
 from the first eviction pass that finds its workspace gone: the daemon's,

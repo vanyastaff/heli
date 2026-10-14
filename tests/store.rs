@@ -1325,8 +1325,7 @@ fn an_orphan_of_another_repository_keeps_no_first_run_waiting() {
     let workspace = fixture.workspace();
     init_repo(&workspace);
     let orphan = store.join("ab").join("cdef0123456789");
-    std::fs::create_dir_all(orphan.join("debug").join(".fingerprint"))
-        .expect("create an orphan");
+    std::fs::create_dir_all(orphan.join("debug").join(".fingerprint")).expect("create an orphan");
     std::fs::create_dir_all(orphan.join(".heli")).expect("create its .heli/");
     let manifest = json!({
         "workspace": fixture.path("gone"),
