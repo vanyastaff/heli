@@ -742,7 +742,11 @@ These are the only waits; nothing else makes a heli run wait for another run.
 4. **Recycling:** the first run from a directory, while a store holds an
    orphan, waits until its worktree's build directory has been recycled or
    will not be (§6.4): for its `cargo metadata`, and with a donor for a scan
-   and a rename. At most 30 s; later runs from there never wait for it.
+   and a rename, and with a donor's source-state record for setting times
+   in the worktree. At most 30 s; later runs from there never wait for it.
+5. **The source-state record:** as a run ends, its clients hear the end
+   once the record of its build directory is written (§6.4), at most 10 s
+   later. This waits for no other run.
 
 ### Command line and contracts
 
@@ -1229,7 +1233,9 @@ belongs to one live worktree.
   from a directory waits for it while a store holds an orphan (§5, "Where a
   run can wait"). The run's clients get a note:
   `cargo-heli: note: recycled the build directory of <donor>, a removed
-  worktree; the path scan invalidated 2 units`.
+  worktree; the path scan invalidated 2 units`, or after `worktree` for
+  precise recycling (below) `, precisely (412 files got their recorded
+  times)`.
 - **The hook.** setup offers the repository's `post-checkout` hook (the file
   in its hooks directory, as `git rev-parse --git-path hooks` names it, so
   `core.hooksPath` counts; one file serves every worktree), with its own
@@ -1313,30 +1319,58 @@ and what depends on them. This applies in both modes below.
 
 There are two modes:
 
-- **Conservative**, always available. The new worktree's files are newer than
-  every artifact, so every workspace member rebuilds. Third-party packages stay
-  fresh, except those invalidated by the scan above (a crate that compiles an
-  `OUT_DIR` path in, including through `include!`). This is correct by cargo's
-  own rules plus the scan. The cost of the `OUT_DIR` invalidations is to be
-  measured.
-- **Precise.** The donor has a *source-state record*: the blob id and mtime of
-  every tracked or untracked file.
+- **Conservative**, always available, and what heli does when the donor has
+  no record that counts, or git cannot stage the new worktree. The new
+  worktree's files are newer than every artifact, so every workspace member
+  rebuilds. Third-party packages stay fresh, except those invalidated by the
+  scan above (a crate that compiles an `OUT_DIR` path in, including through
+  `include!`). This is correct by cargo's own rules plus the scan. The cost
+  of the `OUT_DIR` invalidations is to be measured.
+- **Precise.** The donor has a *source-state record*: the blob id, size and
+  mtime of every tracked or untracked file.
   - The record counts only if it was taken after the donor's last build: its
-    time is at least the newest mtime in the build directory. Otherwise heli
-    ignores it.
-  - For each file in the new worktree whose blob matches the record, heli sets
-    the recorded mtime. Every other file keeps the current time.
+    time is at least the newest mtime of a file in the build directory,
+    leaving out heli's own `.heli/` and rustc's `incremental/` caches, which
+    no freshness decision reads (a build that changes what cargo decides
+    writes a fingerprint). Otherwise heli ignores it. It is read before the
+    path scan, which changes the directory.
+  - For each file in the new worktree whose blob and size match the record,
+    heli sets the recorded mtime. Every other file keeps the current time.
+    The size counts because a blob id is of the content after git's filters:
+    two files that differ only in line endings share one, and
+    `include_str!` compiles in bytes.
   - Every file with the donor's content then looks to cargo exactly as it did
     in the donor, and every changed file is newer than any artifact. Only the
     changed crates, their dependents and the units the scan invalidated
     rebuild.
-  - heli writes records after every run it executes, and the daemon writes one
-    when it sees a build lock released.
+  - Only the recycler whose rename succeeded sets times, with the record of
+    the directory it moved, after the owner manifest names the new
+    workspace. It sets a file's time only if the file was last written
+    before heli staged the new worktree, through a handle that on Windows
+    lets nobody write to the file meanwhile: a file an agent writes while
+    heli looks keeps its time.
+  - The daemon writes a record after every run it executes, before the
+    run's clients hear its end, so that a worktree removed right after its
+    last run leaves one; and when it sees a build lock released: held at one
+    look of its accountant (§6.2), free at the next. Never while one of
+    cargo's locks in the build directory is held, and not for a build the
+    daemon did not see. A run the client executes without a daemon writes
+    none.
   - Ignored inputs, such as an `include_str!` of an ignored file, are not
     recorded. Cargo rebuilds when one is missing; one that is present keeps
     the current time and also triggers a rebuild.
   - With `-Zchecksum-freshness` (cargo#14136), cargo compares content itself,
     and precise mode becomes unnecessary. The path scan does not.
+
+  The record is `.heli/sources` in the build directory, JSON, replaced
+  whole: `{"taken_at":…,"files":{"<path>":{"blob":…,"size":…,"mtime":…}}}`,
+  each path from the top of the worktree as git writes it, times in
+  nanoseconds since 1970. `taken_at` is read before anything else, so a
+  build that starts meanwhile makes the record stale. The blob ids come from
+  the result store's snapshot (§7): `git add -A` into a scratch copy of the
+  index, then `git ls-files --stage`; sizes and mtimes are read afterwards,
+  so a file changed in between looks newer, never older. Symbolic links and
+  submodules are left out.
 
 **Later: cloning.** On volumes with block cloning (Windows Dev Drive on ReFS,
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
@@ -1486,9 +1520,11 @@ drains and evictions, and `cargo heli gc --dry-run`.
 - `recycle`, when a worktree got an orphan's build directory (§6.4):
   `trigger` (`run`, `hook` or `look`), `workspace` and `to` (the new
   workspace, and the build directory's path now), `donor` and `from` (the
-  removed workspace, and the path the directory had), and `invalidated`
-  (the units whose fingerprints the path scan deleted). The hook writes it
-  itself, to the log of its logon session's daemon.
+  removed workspace, and the path the directory had), `invalidated`
+  (the units whose fingerprints the path scan deleted), `mode` (`precise`
+  or `conservative`) and `restored` (for precise recycling, the files that
+  got their recorded times, else `null`). The hook writes it itself, to the
+  log of its logon session's daemon.
 
 Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
 the one before, and the next event starts a new file.
