@@ -37,6 +37,7 @@
 //! is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
+pub mod accounts;
 pub mod events;
 pub mod execute;
 pub mod governor;
@@ -139,6 +140,11 @@ pub fn main() -> ! {
     ));
 
     let daemon = Arc::new(Daemon {
+        accounts: accounts::Accounts::start(
+            config.store.clone(),
+            locations.state_dir.clone(),
+            log.clone(),
+        ),
         registry: Registry::new(RunIds::new(
             locations.run_counter(),
             locations.run_counter_lock(),
@@ -234,6 +240,7 @@ fn start_warden(locations: &Locations, log: &Log) -> Option<std::io::PipeWriter>
 }
 
 struct Daemon {
+    accounts: Arc<accounts::Accounts>,
     registry: Registry,
     pool: Arc<Pool>,
     /// Lends the host pool's slots to the runs' own pools.
@@ -278,7 +285,8 @@ impl Daemon {
         };
         match serde_json::from_value::<Request>(message) {
             Ok(Request::Status) => {
-                let _ = protocol::write_message(&mut stream, &Reply::Status(self.status()));
+                let _ =
+                    protocol::write_message(&mut stream, &Reply::Status(Box::new(self.status())));
             }
             Ok(Request::Run(request)) => self.run(stream, request),
             Ok(Request::Log(request)) => self.log(stream, &request),
@@ -408,6 +416,9 @@ impl Daemon {
             self.registry.abandon(id);
             return;
         }
+        // Kept until the run has ended (the scope below waits for it), when
+        // its directories are counted again.
+        let _learning = self.accounts.learn(request);
         let _pin = self.runlog.pin(&id.to_string());
         let live = Arc::new(Live::new(self.runlog.dir().to_path_buf(), id.to_string()));
         self.registry.told(id, Arc::clone(&live));
@@ -574,6 +585,7 @@ impl Daemon {
             pool: Some(self.pool.status()),
             memory: self.governor.memory(),
             runs: self.runs(),
+            disk: Some(self.accounts.disk()),
         }
     }
 
@@ -717,9 +729,10 @@ fn exited(status: std::process::ExitStatus) -> (i32, Option<i32>) {
     (status.code().unwrap_or(1), None)
 }
 
-/// The daemon's own log file.
+/// The daemon's own log file; clones write to the same file.
+#[derive(Clone)]
 struct Log {
-    file: Option<Mutex<File>>,
+    file: Option<Arc<Mutex<File>>>,
 }
 
 impl Log {
@@ -730,7 +743,7 @@ impl Log {
             .open(locations.log_file())
             .ok();
         Self {
-            file: file.map(Mutex::new),
+            file: file.map(|file| Arc::new(Mutex::new(file))),
         }
     }
 

@@ -38,6 +38,8 @@ pub enum Action {
     Log { run: String, select: Select },
     /// Kill run `run` (`r<number>`) with every process it started.
     Cancel { run: String },
+    /// List the build store's directories (`dry_run`), as JSON with `json`.
+    Gc { dry_run: bool, json: bool },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
@@ -158,6 +160,16 @@ enum Command {
         #[arg(value_parser = parse_run)]
         run: String,
     },
+    /// List every directory of the build store, with its state; nothing is
+    /// deleted yet.
+    Gc {
+        /// Only list what gc would look at, and delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print the versioned JSON document instead of text.
+        #[arg(long, requires = "dry_run")]
+        json: bool,
+    },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -217,6 +229,7 @@ pub fn parse(
         }
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
+        Command::Gc { dry_run, json } => Action::Gc { dry_run, json },
         Command::Setup {
             print,
             autostart,

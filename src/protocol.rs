@@ -205,7 +205,7 @@ pub enum Reply {
         #[serde(default)]
         cancelled: bool,
     },
-    Status(Status),
+    Status(Box<Status>),
     /// The daemon does not know the request: it is older than the client.
     Unsupported,
     /// The part of the record asked for has been sent.

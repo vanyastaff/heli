@@ -218,8 +218,8 @@ fn setup_print_shows_what_it_would_write() {
 
 /// Answered yes, `setup` writes exactly what `--print` showed. It shows the
 /// answers it read, which no terminal echoed, and ignores the byte order
-/// mark PowerShell can put before them. Run again, it finds both files set,
-/// and asks nothing.
+/// mark PowerShell can put before them. Run again, it finds both files set
+/// (and the Cargo configuration, also answered yes), and asks nothing.
 #[test]
 fn setup_writes_what_it_showed_once_the_user_agrees() {
     let fixture = Fixture::new("basic");
@@ -234,9 +234,10 @@ fn setup_writes_what_it_showed_once_the_user_agrees() {
     let settings = shown(&printed, &home.settings_header());
     let profile_end = shown(&printed, &home.profile_header());
 
+    // The third answer is for the Cargo configuration (`tests/store.rs`).
     let output = answered(
         fixture.setup(Some("/bin/bash"), Vec::<String>::new()),
-        "\u{feff}y\nyes\n",
+        "\u{feff}y\nyes\ny\n",
     );
     assert_success(&output, "cargo heli setup");
     let stdout = text(&output.stdout);
@@ -285,7 +286,8 @@ fn setup_writes_nothing_without_consent() {
         "n\n",
     );
     assert_success(&output, "cargo heli setup, answered no");
-    assert_eq!(text(&output.stdout).matches("[y/N]").count(), 2);
+    // The settings, the profile and the Cargo configuration.
+    assert_eq!(text(&output.stdout).matches("[y/N]").count(), 3);
     let output = fixture
         .setup(Some("/bin/bash"), Vec::<String>::new())
         .output()
@@ -294,6 +296,10 @@ fn setup_writes_nothing_without_consent() {
 
     assert!(!home.settings.exists(), "no settings file was created");
     assert_eq!(read(&home.profile), profile);
+    assert!(
+        !fixture.home().join(".cargo").exists(),
+        "no Cargo configuration was created"
+    );
 }
 
 /// The profile is the one of the shell `SHELL` names, in its syntax:
@@ -484,7 +490,8 @@ fn setup_leaves_settings_it_cannot_edit_alone() {
             home.settings.display()
         );
         assert!(stdout.contains(&left), "{settings}: {stdout}");
-        assert_eq!(stdout.matches("[y/N]").count(), 1, "{stdout}");
+        // The profile and the Cargo configuration.
+        assert_eq!(stdout.matches("[y/N]").count(), 2, "{stdout}");
         assert_eq!(read(&home.settings), settings);
     }
 }

@@ -717,7 +717,7 @@ cargo heli exec [heli flags] -- <command…>
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
 cargo heli cancel <run>
-cargo heli gc [--dry-run]
+cargo heli gc [--dry-run [--json]]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli daemon [--detach | --warden]            (internal)
@@ -757,8 +757,10 @@ cargo heli daemon [--detach | --warden]            (internal)
     §4);
   - the event log's size (`[event_log] max_kb`, §8);
   - disk budget and free-space floor;
-  - the store per volume;
-  - tool-cache patterns (§6.3);
+  - the store per volume (`[store] paths`: absolute paths; on each volume
+    the first one there serves it, §6.1);
+  - tool-cache patterns (`[store] tool_caches`: paths below `target/`, `/`
+    between components, `*` and `?` within one; §6.2, §6.3);
   - eviction ages;
   - the default output mode (`[output] mode`, "Output" below; the client
     reads it too, and ignores a file it cannot use);
@@ -958,7 +960,35 @@ trybuild, and whatever a project's own tests build there.
 `<store>` must be on the same volume as the worktrees. Cargo hardlinks final
 artifacts out of the build directory, and across volumes it copies them
 instead. The default is `<volume>/.heli/build`, one store per volume that
-holds worktrees.
+holds worktrees. On Unix the root of a volume is rarely writable, so there
+the default is the user's cache, `$XDG_CACHE_HOME/heli/build` (else
+`~/.cache/heli/build`), when it is on the worktree's volume, and
+`<volume>/.heli/build` otherwise. A volume is known by its root:
+`GetVolumePathNameW` on Windows, elsewhere the highest directory above the
+path on the same device.
+
+**Where setup writes it.** Each file is offered with its own question, as
+for the pool's variable (§4, "Reach"):
+
+- **This repository**: `.cargo/config.toml` in the repository's main
+  worktree (the one holding the git common directory). Cargo reads the
+  `.cargo/` of every directory above the one it runs in, so this covers the
+  main worktree and every worktree inside it (Claude Code puts them in
+  `.claude/worktrees/`), and nothing else: not worktrees elsewhere, and not
+  the nested cargos of tests that build projects in temporary directories.
+  Its store is the one on that worktree's volume. If the file is tracked,
+  the line is a local change, this machine's, not to be committed.
+- **Every project**: the user's Cargo configuration (`config.toml` in
+  `CARGO_HOME`, else in `~/.cargo`). One value serves every volume, so its
+  store is the one on the volume setup runs in. Every cargo reads it,
+  nested ones included.
+
+setup adds two lines under the file's `[build]` table (or in a new one at
+its end): a comment that marks them as heli's, and
+`build-dir = "<store>/{workspace-path-hash}"`. It replaces lines an earlier
+setup wrote, and leaves alone, with the reason, a file that is not TOML,
+that sets `build-dir` itself, or whose new content would not parse to the
+same configuration plus `build.build-dir`.
 
 **Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
 move, anything that searches `target/<profile>/deps` for rlibs, test binaries
@@ -977,12 +1007,66 @@ sizes by category (incremental, deps, build scripts, fingerprints, other), for
 build directories and for registered `target/` directories. It rescans a
 directory after cargo releases its lock there.
 
+**Learning a workspace.** heli does not compute `{workspace-path-hash}`
+(cargo's hash of the canonical manifest path, which changes with cargo's
+hasher); cargo names the directories. A run whose program is named `cargo`
+(a cargo subcommand, or an `exec` of cargo) starts, beside it in the
+background, `cargo metadata --format-version 1 --no-deps` as the run would:
+its program, directory and environment. No other program is started with
+those arguments, not even one standing in for cargo under another name. Its
+`workspace_root`,
+`target_directory` and `build_directory` (cargo 1.91 and later) say where
+the run builds. It takes no lock (verified: it answers while a build holds
+the build directory's), and it neither delays nor fails the run.
+
+- The `target/` directory is **registered**, with its workspace, in
+  `store.json` in the state directory, which outlives the daemon.
+- A build directory at `<store>/<2 hex digits>/<hex digits>` in a store
+  heli manages (configured, or its volume's default) gets its manifest,
+  JSON: `{"workspace":…,"repository":…,"created_at":…,"last_run":…}`, times
+  in seconds since 1970, `repository` `null` outside a repository. The
+  daemon rewrites it whole as each run starts, keeping `created_at`.
+
+The stores heli manages are the configured ones and the default store of
+each registered workspace's volume, where it exists.
+
+**Sizes.** A file's category follows from its path in a profile directory
+(`<profile>/`, or `<triple>/<profile>/`, a triple always holding a `-`):
+`incremental/`, `deps/`, `build/` (build scripts) and `.fingerprint/`. In a
+registered `target/` directory, what a `[store] tool_caches` pattern names
+counts as tool caches; nothing is a tool cache by default. The rest is
+other. Sizes are file lengths; links are never followed, and a final
+artifact cargo hardlinked into `target/` counts in both directories. The
+daemon's accountant scans a directory it has no figures for, those a heli
+run built in once the run has ended (cargo has let go of its locks), and any
+whose figures are an hour old, which catches what bare cargo built. It
+never takes cargo's locks; `status` shows its figures, and
+`gc --dry-run` scans afresh.
+
 A build directory is in one of three states:
 
-- **Busy.** `<build-dir>/<profile>/.cargo-build-lock` cannot be locked; cargo
-  holds it exclusively for a build (`src/compiler/layout.rs`).
-- **Live.** Its workspace path exists.
+- **Busy.** One of cargo's locks in a profile directory cannot be locked:
+  `<build-dir>/<profile>/.cargo-build-lock`, which cargo holds for a build
+  (`src/compiler/layout.rs`), or in the artifact directory (`target/`)
+  `.cargo-lock` and `.cargo-artifact-lock`. Where the build directory is the
+  target directory, all three are in one place (verified with cargo 1.99).
+  heli only tries the locks, and lets go at once. A lock it cannot even
+  open, it counts as held.
+- **Live.** Its workspace path exists: its `Cargo.toml`, since a removed
+  worktree can leave files behind.
 - **Orphan.** Its workspace is gone, because the worktree was removed.
+
+A build directory without a manifest, which only bare cargo has built in, is
+**unknown**: heli cannot tell whose it is. Registered `target/` directories
+have the same states, from the same locks and their registered workspace.
+
+`cargo heli gc --dry-run` lists every directory, build and target, with its
+state, size, workspace and repository, and deletes nothing; until eviction
+exists (§6.3), `gc` without `--dry-run` is refused. It reads the store
+itself and needs no daemon. `--json` prints a versioned document
+(`schema`, now 1): `dirs`, one entry per directory, with `kind` (`build` or
+`target`), `path`, `store`, `state`, `workspace`, `repository`,
+`created_at`, `last_run`, `size` and `by_category`.
 
 ### 6.3 Budget and eviction
 
@@ -1005,8 +1089,9 @@ evicts down to 85 % of B, cheapest to regenerate first:
 Safety rules:
 
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
-  directory) or `.cargo-lock` (artifact directory) exclusively. If the lock is
-  held, the directory is busy and skipped.
+  directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
+  directory) exclusively. If the lock is held, the directory is busy and
+  skipped.
 - **Rename, then delete.** Under the lock, heli only renames the victim into
   `<store>/.trash/`, which on one volume takes constant time, and releases the
   lock. It deletes the trash in the background at low I/O priority. A cargo
@@ -1203,8 +1288,11 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   was told how they ended. A run whose clients heard its end leaves the
   list; a done run holds no worktree lock and counts as no run in flight
   (for the top-up's quiescence, §4);
-- `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
-  `by_category`;
+- `disk`: `stores`, one entry per store, with `path`, `budget` (`null` until
+  budgets exist), `used` and `by_category` (`incremental`, `deps`,
+  `build_scripts`, `fingerprints`, `tool_caches`, `other`, in bytes); and
+  `targets`, one entry per registered `target/` directory, with `path`,
+  `used` and `by_category`. `null` when no daemon answers;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,

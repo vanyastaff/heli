@@ -17,9 +17,10 @@
 //! - [`status`]: the `status --json` schema;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
+//! - [`store`]: the build store, and [`gc`], which lists its directories;
 //! - [`setup`]: `cargo heli setup`, the environment that lets a bare cargo
-//!   draw from the pool, and the [`autostart`] registration that starts the
-//!   daemon at logon;
+//!   draw from the pool, cargo's `build-dir` in the build [`store`], and the
+//!   [`autostart`] registration that starts the daemon at logon;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`]:
 //!   what both sides share.
 
@@ -32,6 +33,7 @@ mod config;
 mod daemon;
 mod direct;
 mod environment;
+mod gc;
 mod ipc;
 mod launch;
 mod locations;
@@ -44,6 +46,7 @@ mod protocol;
 mod runlog;
 mod setup;
 mod status;
+mod store;
 mod worktree;
 
 use std::ffi::OsString;
@@ -72,6 +75,7 @@ fn main() {
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(&run, &select),
         cli::Action::Cancel { run } => client::cancel(&run),
+        cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),
