@@ -50,11 +50,13 @@ fn printed_args(output: &Output) -> Vec<String> {
 
 /// heli adds no job count: a build passes the user's `-j` and
 /// `CARGO_BUILD_JOBS` through unchanged, and adds neither when the user
-/// gives none.
+/// gives none. In full output the arguments are exactly the user's; in
+/// compact output (the default without a terminal) heli adds only its
+/// output flags.
 #[test]
 fn heli_adds_no_job_count() {
     let fixture = Fixture::new("basic");
-    let output = with_fake_cargo(&fixture, &["build", "-j", "3"], |heli| {
+    let output = with_fake_cargo(&fixture, &["--output=full", "build", "-j", "3"], |heli| {
         heli.env("ECHO_ENV", "CARGO_BUILD_JOBS")
             .env("CARGO_BUILD_JOBS", "5");
     });
@@ -67,12 +69,23 @@ fn heli_adds_no_job_count() {
             "env CARGO_BUILD_JOBS=Some(\"5\")"
         ]
     );
-    let output = with_fake_cargo(&fixture, &["build"], |heli| {
+    let output = with_fake_cargo(&fixture, &["--output=full", "build"], |heli| {
         heli.env("ECHO_ENV", "CARGO_BUILD_JOBS");
     });
     assert_eq!(
         printed_args(&output),
         ["arg: \"build\"", "env CARGO_BUILD_JOBS=None"]
+    );
+    let output = with_fake_cargo(&fixture, &["build"], |heli| {
+        heli.env("ECHO_ENV", "CARGO_BUILD_JOBS");
+    });
+    let printed = printed_args(&output);
+    assert!(
+        printed.contains(&"env CARGO_BUILD_JOBS=None".to_owned())
+            && !printed
+                .iter()
+                .any(|arg| arg.starts_with("arg: \"-j") || arg.starts_with("arg: \"--jobs")),
+        "{printed:?}"
     );
 }
 

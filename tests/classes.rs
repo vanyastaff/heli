@@ -89,10 +89,13 @@ fn status_shows_each_runs_class() {
         } else {
             fixture.heli(Vec::<String>::new())
         };
+        // Full output, so that heli adds nothing to the arguments `status`
+        // lists (compact output adds cargo's JSON flags; `tests/output.rs`).
         command
             .args(args)
             .env("CARGO", &echo)
             .env("ECHO_WAIT_FOR", &gate)
+            .env("HELI_OUTPUT", "full")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

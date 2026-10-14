@@ -15,11 +15,19 @@
 //!
 //! [event_log]
 //! max_kb = 1024   # the event log's size before it rotates
+//!
+//! [output]
+//! mode = "compact"     # full, compact or quiet; default: full on a
+//!                      # terminal, compact without
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
 //! this build does not know are ignored, so a file written for a newer heli
 //! still works with an older one.
+//!
+//! The client reads `[output]` too, as it chooses a run's output mode
+//! (`crate::output`). It ignores a file it cannot use: the daemon does not
+//! start with it, and its log says why.
 //!
 //! **The test seam.** Debug builds also read a `[test]` table ([`Seam`]):
 //! memory figures and a clock for the memory governor, which tests set
@@ -33,11 +41,14 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::output::Mode;
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub pool: PoolConfig,
     pub log: LogConfig,
+    pub output: OutputConfig,
     pub memory: MemoryConfig,
     pub event_log: EventLogConfig,
     #[cfg(debug_assertions)]
@@ -60,6 +71,14 @@ pub struct LogConfig {
     pub runs: Option<usize>,
     /// How many bytes of records.
     pub bytes: Option<u64>,
+}
+
+/// `[output]`: what the client prints of a run (`crate::output`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct OutputConfig {
+    /// The output mode when neither a flag nor `HELI_OUTPUT` chooses one.
+    pub mode: Option<Mode>,
 }
 
 /// `[memory]`: the memory governor's watermarks (`crate::daemon::governor`),

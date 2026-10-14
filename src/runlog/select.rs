@@ -3,7 +3,7 @@
 //! Without one, `log` prints every output event as it was recorded, each on
 //! its own stream, so stdout and stderr come out byte for byte.
 //!
-//! **Adding a selector** (`--errors`, `--test <name>`):
+//! **Adding a selector** (`--test <name>`):
 //!
 //! 1. A variant of [`Select`]. It travels in the `log` request
 //!    (`crate::protocol`); a daemon that does not know it answers that it
@@ -14,13 +14,14 @@
 //! 3. Its case in [`apply`]: a function over the record's [`Event`]s, or
 //!    over its [`Lines`], that writes what it picks to `out`.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io;
 
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
 
 use super::Event;
+use crate::output::cargo::Message;
 use crate::protocol::Channel;
 
 /// Which part of a record to print.
@@ -32,6 +33,8 @@ pub enum Select {
     Tail(usize),
     /// The lines that match this regular expression (`regex` syntax).
     Grep(String),
+    /// The errors, as the compiler rendered them ([`errors`]).
+    Errors,
 }
 
 /// Where a selector writes: bytes, and the stream they go to.
@@ -58,7 +61,45 @@ pub fn apply(
             })?;
             grep(&pattern, Lines::new(events), out)
         }
+        Select::Errors => errors(Lines::new(events), out),
     }
+}
+
+/// The errors in a record, on stderr, where cargo prints them:
+///
+/// - each error cargo reported as JSON on stdout (`--message-format json`,
+///   so every compact or quiet run of build, check, clippy and doc), as
+///   rustc rendered it, once however many targets reported it;
+/// - each error in text on stderr (a run whose output passed through): from
+///   a line that starts with `error:` or `error[` to the blank line that
+///   ends it, or to the next warning or the end of the record. That covers
+///   rustc's rendering and cargo's own one-line errors.
+fn errors(lines: impl Iterator<Item = io::Result<Line>>, out: &mut Out<'_>) -> io::Result<()> {
+    let mut seen = HashSet::new();
+    let mut in_error = false;
+    for line in lines {
+        let line = line?;
+        if line.channel == Channel::Stdout {
+            if let Some(Message::Diagnostic(diagnostic)) = Message::parse(&line.bytes)
+                && diagnostic.is_error()
+                && seen.insert(diagnostic.identity().to_owned())
+            {
+                out(Channel::Stderr, diagnostic.rendered().as_bytes())?;
+            }
+            continue;
+        }
+        let text = line.bytes.trim_ascii_end();
+        if text.starts_with(b"error:") || text.starts_with(b"error[") {
+            in_error = true;
+        } else if text.starts_with(b"warning") {
+            in_error = false;
+        }
+        if in_error {
+            out(Channel::Stderr, &line.bytes)?;
+            in_error = !text.is_empty();
+        }
+    }
+    Ok(())
 }
 
 /// The lines that match `pattern`, without their line ends.
