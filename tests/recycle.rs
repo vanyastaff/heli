@@ -506,8 +506,14 @@ fn a_test_reads_its_fixture_from_the_new_worktree() {
         .expect("run heli test");
     assert_success(&output, "cargo heli test");
     let stdout = text(&output.stdout);
+    // On one thread, as heli runs it when it gets one test slot, libtest
+    // names the test before it runs, on the line the test prints on.
     assert!(
-        stdout.lines().any(|line| line == "fixture: b's copy"),
+        stdout.lines().any(|line| {
+            line.strip_prefix("test reads_its_fixture ... ")
+                .unwrap_or(line)
+                == "fixture: b's copy"
+        }),
         "{stdout}"
     );
     assert_eq!(repo.recycled().len(), 1);
@@ -1065,6 +1071,18 @@ fn asked(stdout: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether setup said, in `stdout`, that the repository's `post-checkout`
+/// hook `hook` is in the state `said` names (` is left as it is: …`).
+/// Setup spells the hook's path as git does, which can differ from the
+/// test's: on Windows without 8.3 short names, on macOS under `/private`.
+fn hook_said(stdout: &str, hook: &Path, said: &str) -> bool {
+    stdout.lines().any(|line| {
+        line.strip_prefix("Git post-checkout hook for this repository ")
+            .and_then(|rest| rest.split_once(said))
+            .is_some_and(|(path, _)| same_place(path, hook))
+    })
+}
+
 impl Repo {
     /// `cargo heli setup` in the main worktree, answered with `answers`:
     /// its questions are this repository's Cargo configuration, the user's
@@ -1171,10 +1189,11 @@ fn setup_installs_a_hook_that_recycles_as_a_worktree_is_added() {
     let stdout = text(&repo.setup("n\nn\n").stdout);
     assert_eq!(asked(&stdout).len(), 2, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            " {} already sets build directory recycling to this.",
-            repo.hook().display()
-        )),
+        hook_said(
+            &stdout,
+            &repo.hook(),
+            " already sets build directory recycling to this."
+        ),
         "{stdout}"
     );
 }
@@ -1191,10 +1210,11 @@ fn setup_leaves_another_post_checkout_hook_alone() {
     let stdout = text(&repo.setup("n\nn\ny\n").stdout);
     assert_eq!(asked(&stdout).len(), 2, "{stdout}");
     assert!(
-        stdout.contains(&format!(
-            " {} is left as it is: it is not heli's;",
-            repo.hook().display()
-        )),
+        hook_said(
+            &stdout,
+            &repo.hook(),
+            " is left as it is: it is not heli's;"
+        ),
         "{stdout}"
     );
     assert_eq!(
