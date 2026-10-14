@@ -101,6 +101,13 @@ impl Locations {
         self.state_dir.join("runs")
     }
 
+    /// The hash of the state directory that names what belongs to it: the
+    /// default endpoint and pool, and the logon task (`crate::autostart`).
+    #[cfg(windows)]
+    pub fn state_dir_hash(&self) -> u64 {
+        path_hash(&self.state_dir)
+    }
+
     /// Creates the state directory, owner-only on Unix.
     pub fn create_state_dir(&self) -> std::io::Result<()> {
         let mut builder = std::fs::DirBuilder::new();
