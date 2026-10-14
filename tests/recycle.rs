@@ -187,12 +187,36 @@ impl Repo {
     /// that `status` shows); its next look is a minute away, or after the
     /// next run's end.
     fn replace_worktree(&self, removed: &str, added: &str) -> PathBuf {
+        let before = self.fixture.daemon_pid(); // DIAGNOSTIC
+        let killed_at = std::time::Instant::now(); // DIAGNOSTIC
         self.fixture.kill_daemon();
+        let after = self.fixture.daemon_pid(); // DIAGNOSTIC
+        let kill_took = killed_at.elapsed(); // DIAGNOSTIC
         self.remove_worktree(removed);
+        let ensure_at = std::time::Instant::now(); // DIAGNOSTIC
         let output = self
             .heli(&self.main(), &["ensure"])
             .output()
             .expect("run heli ensure");
+        if !output.status.success() {
+            // DIAGNOSTIC
+            let ps = Command::new("ps")
+                .args(["-eo", "pid,ppid,pgid,sid,stat,etime,args"])
+                .output()
+                .map(|ps| text(&ps.stdout))
+                .unwrap_or_default();
+            let mine: Vec<&str> = ps
+                .lines()
+                .filter(|line| line.contains("cargo-heli") || line.contains("PID"))
+                .collect();
+            panic!(
+                "DIAGNOSTIC ensure failed after {:?}: {}\nbefore kill {before:?}, after kill {after:?}, kill took {kill_took:?}\n--- daemon log:\n{}\n--- ps:\n{}",
+                ensure_at.elapsed(),
+                text(&output.stderr),
+                self.fixture.daemon_log(),
+                mine.join("\n")
+            );
+        }
         assert_success(&output, "cargo heli ensure");
         self.wait_for_first_look();
         self.add_worktree(added)
