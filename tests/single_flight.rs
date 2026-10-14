@@ -29,10 +29,12 @@ fn git(dir: &Path, args: &[&str]) {
 
 /// A fixture repository with a second worktree of the same commit, and a
 /// fake toolchain outside both, so that the same check in either has the
-/// same key. Its `cargo` is a copy of `echo-args` (it prints its arguments,
+/// same key. Its cargo is a copy of `echo-args` (it prints its arguments,
 /// counts its starts, waits for the gate, and exits 0 unless told
-/// otherwise), and so is its `rustc`; both answer version requests as
-/// [`Twins::set_version`] sets them.
+/// otherwise), named `fake-cargo` so that the build store does not ask it
+/// for metadata (DESIGN.md §6.2), which would count as a start; its `rustc`
+/// is another copy. Both answer version requests as [`Twins::set_version`]
+/// sets them.
 struct Twins {
     fixture: Fixture,
     /// The second worktree.
@@ -84,7 +86,7 @@ impl Twins {
             std::fs::copy(&echo, &path).expect("copy echo-args");
             path
         };
-        let cargo = tool("cargo");
+        let cargo = tool("fake-cargo");
         tool("rustc");
         let path = std::env::join_paths(std::iter::once(tools).chain(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
@@ -98,7 +100,7 @@ impl Twins {
             cargo,
             path,
         };
-        twins.set_version("cargo", "cargo 1.0.0");
+        twins.set_version("fake-cargo", "cargo 1.0.0");
         twins.set_version("rustc", "rustc 1.0.0");
         twins
     }
@@ -108,7 +110,7 @@ impl Twins {
         self.fixture.workspace()
     }
 
-    /// Sets the version the fake tools report for `request` (`cargo`,
+    /// Sets the version the fake tools report for `request` (`fake-cargo`,
     /// `rustc`).
     fn set_version(&self, request: &str, version: &str) {
         std::fs::write(self.fixture.path("versions").join(request), version)
