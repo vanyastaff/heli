@@ -370,6 +370,14 @@ runs; withheld slots and slots bare cargo holds are not in it.
   broker waits on that run's pool in line with its processes (a thread
   blocked on the semaphore and a cancel event, or in a blocking read of the
   FIFO), and the slot it gets goes to the host pool and on to the poorer run.
+  That wait can be long after the decision, so the broker counts the pools
+  again as it gets the slot, and decides again: if no poorer run waits at
+  that moment (its process is between two slots, or has not yet taken a
+  slot just lent to it), the slot goes back to the run it came from. Sent
+  to the host pool, it would be lent straight back to that run, the one
+  run waiting, and count as taken back (what still took a third slot back
+  on macOS once Return waited a tick). Where it goes then follows
+  from that same count, so a slot taken back always goes to another run.
   Nothing running is interrupted. The margin of two keeps an odd split (3
   and 2) from moving back and forth. Cargo keeps its tokens from one job to
   the next while it has jobs ready (`job_queue`, `spawn_work_if_possible`),

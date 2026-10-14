@@ -24,7 +24,9 @@
 //!   one its run gives back, so the slots of a run with work pending are
 //!   never free there: the broker waits for one in line with them (a
 //!   [`Waiter`] in a thread of its own) and returns it to the host pool,
-//!   which lends it on. Nothing running is interrupted.
+//!   which lends it on, if a slot is still wanted back by the count made
+//!   as it gets one; else it goes back to the run's pool (see
+//!   [`Broker::take_back`]). Nothing running is interrupted.
 //! - **Exact accounting.** A run uses the slots lent to it less those free
 //!   in its pool, plus its test slots. When it ends, everything lent to it
 //!   goes back to the host pool, whatever its processes still held
@@ -303,6 +305,11 @@ impl Broker {
     fn balance(self: &Arc<Self>, state: &mut State) {
         let now = Instant::now();
         state.observe(now);
+        self.settle(state, now);
+    }
+
+    /// Moves slots as the module docs say, by the pools as counted at `now`.
+    fn settle(self: &Arc<Self>, state: &mut State, now: Instant) {
         for run in state.runs.values_mut() {
             while run.test_held < run.test_wanted && run.take_free() {
                 run.test_held += 1;
@@ -337,21 +344,10 @@ impl Broker {
     /// Decides which runs give slots back (see the module docs), and starts
     /// or stops their waiters.
     fn reclaim(self: &Arc<Self>, state: &mut State) {
-        let shares = self.shares(state);
-        let saturated = self.host.free().unwrap_or(0) == 0;
-        let fewest = state.fewest_waiting().filter(|_| saturated);
         let wanted: Vec<(RunId, bool)> = state
             .runs
             .iter()
-            .map(|(&id, run)| {
-                let in_use = run.in_use();
-                let wanted = fewest.is_some_and(|fewest| {
-                    run.lent > run.free
-                        && in_use >= fewest + 2
-                        && f64::from(in_use) > shares.of(run)
-                });
-                (id, wanted)
-            })
+            .map(|(&id, run)| (id, self.wants_back(state, run)))
             .collect();
         for (id, wanted) in wanted {
             let run = state.runs.get_mut(&id).expect("BUG: a run just listed");
@@ -382,10 +378,30 @@ impl Broker {
         }
     }
 
+    /// Whether `run` gives slots back now (Take back, in the module docs):
+    /// the host pool has no free slot, and another run waits using at least
+    /// two slots fewer, while `run` uses more than its share.
+    fn wants_back(&self, state: &State, run: &Run) -> bool {
+        if self.host.free().unwrap_or(0) != 0 {
+            return false;
+        }
+        let Some(fewest) = state.fewest_waiting() else {
+            return false;
+        };
+        let in_use = run.in_use();
+        run.lent > run.free
+            && in_use >= fewest + 2
+            && f64::from(in_use) > self.shares(state).of(run)
+    }
+
     /// Takes slots back from run `id` with `waiter` whenever the broker
     /// wants one, until the run ends. A slot it takes goes back to the host
-    /// pool and is lent on at once; one taken when none is wanted any more
-    /// goes back to the run pool.
+    /// pool and is lent on at once, if a slot is still wanted back as it
+    /// takes one; otherwise it goes back to the run pool. The waiter waits
+    /// a while (in line with the run's processes) after the broker decided:
+    /// the run that waited may no longer wait by then (its process between
+    /// two slots, or a slot lent to it not yet taken), and the slot would
+    /// be lent straight back to the run it was taken from.
     fn take_back(self: Arc<Self>, id: RunId, waiter: &Waiter) {
         let mut state = self.lock();
         loop {
@@ -408,6 +424,14 @@ impl Broker {
             drop(state);
             let taken = waiter.take();
             state = self.lock();
+            // Counted again as the slot is taken: the decision to take it
+            // back, and where it goes, follow from this one count.
+            let now = Instant::now();
+            state.observe(now);
+            let still_wanted = state
+                .runs
+                .get(&id)
+                .is_some_and(|run| self.wants_back(&state, run));
             // Gone, the run took its pool with it, and the slot.
             let Some(run) = state.runs.get_mut(&id) else {
                 return;
@@ -416,13 +440,14 @@ impl Broker {
                 return;
             };
             reclaim.blocked = false;
+            reclaim.wanted &= still_wanted;
             match taken {
                 Ok(false) => {}
                 Ok(true) if reclaim.wanted => {
                     run.lent = run.lent.saturating_sub(1);
                     run.loans.reclaimed += 1;
                     self.give_host();
-                    self.balance(&mut state);
+                    self.settle(&mut state, now);
                     self.changed.notify_all();
                 }
                 Ok(true) => {
