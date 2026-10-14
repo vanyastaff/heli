@@ -330,7 +330,7 @@ pub fn open(dir: &Path, run: &str) -> Result<Events, ReadError> {
 /// each piece on the channel it was written to.
 pub fn read(dir: &Path, run: &str, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
     let events = open(dir, run)?;
-    select::apply(select, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
+    select::apply(select, run, events, out).map_err(|error| ReadError::Io(run.to_owned(), error))
 }
 
 /// The number of run id `run` (`r<number>`).

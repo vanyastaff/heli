@@ -3,7 +3,11 @@
 //! in two phases.
 //!
 //! 1. **Build**: the same command with `--no-run`, right after the
-//!    subcommand.
+//!    subcommand. For nextest, without what only the test phase reads
+//!    ([`RUN_ONLY`], [`RUN_ONLY_SWITCHES`], [`RUN_ONLY_VARS`]): under
+//!    `--no-run` nextest ignores those with a warning, or refuses them
+//!    (`--no-fail-fast`), and compact output adds some of them
+//!    (`crate::output::nextest`).
 //! 2. **Test**: the daemon takes K test slots from the pool, then runs the
 //!    command again with K threads: `--test-threads K` for nextest (in place
 //!    of the user's own), `--test-threads=K` after `--` for libtest.
@@ -20,7 +24,44 @@
 use std::ffi::{OsStr, OsString};
 
 use crate::class::Class;
-use crate::protocol::RunRequest;
+use crate::protocol::{RunRequest, Text};
+
+/// nextest's flags with a value that only the test phase reads (checked
+/// against nextest 0.9.146).
+const RUN_ONLY: [&str; 11] = [
+    "-j",
+    "--test-threads",
+    "--jobs",
+    "--retries",
+    "--flaky-result",
+    "--no-tests",
+    "--max-fail",
+    "--status-level",
+    "--final-status-level",
+    "--success-output",
+    "--failure-output",
+];
+
+/// nextest's switches that only the test phase reads; the last two also
+/// after `--`.
+const RUN_ONLY_SWITCHES: [&str; 4] = [
+    "--no-fail-fast",
+    "--fail-fast",
+    "--no-capture",
+    "--nocapture",
+];
+
+/// The variables that set [`RUN_ONLY`] flags.
+const RUN_ONLY_VARS: [&str; 8] = [
+    "NEXTEST_TEST_THREADS",
+    "NEXTEST_RETRIES",
+    "NEXTEST_FLAKY_RESULT",
+    "NEXTEST_NO_TESTS",
+    "NEXTEST_STATUS_LEVEL",
+    "NEXTEST_FINAL_STATUS_LEVEL",
+    "NEXTEST_SUCCESS_OUTPUT",
+    "NEXTEST_FAILURE_OUTPUT",
+];
 
 /// The tool that runs the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,16 +153,35 @@ impl TestRun {
         self.asked
     }
 
-    /// The build phase's command line, or `None` when the tests cannot be
-    /// built apart (`cargo test --doc`).
-    pub fn build(&self) -> Option<Vec<OsString>> {
-        let (tool, _) = split_at_separator(&self.argv[self.at..]);
-        if self.runner == Runner::Libtest && tool.iter().any(|arg| arg == "--doc") {
-            return None;
+    /// The build phase of the run `request` asks for: a request of its own,
+    /// with the build's command line and environment (see the module
+    /// docs). `None` when the tests cannot be built apart
+    /// (`cargo test --doc`).
+    pub fn build(&self, request: &RunRequest) -> Option<RunRequest> {
+        let (tool, test_args) = split_at_separator(&self.argv[self.at..]);
+        let mut argv = self.argv[..self.at].to_vec();
+        argv.push("--no-run".into());
+        let mut env = request.env.clone();
+        match self.runner {
+            Runner::Libtest if tool.iter().any(|arg| arg == "--doc") => return None,
+            Runner::Libtest => argv.extend(self.argv[self.at..].iter().cloned()),
+            Runner::Nextest => {
+                let tool = without_flags(tool, &RUN_ONLY);
+                argv.extend(without_switches(&tool, &RUN_ONLY_SWITCHES));
+                if let Some(test_args) = test_args {
+                    argv.push("--".into());
+                    argv.extend(without_switches(test_args, &RUN_ONLY_SWITCHES[2..]));
+                }
+                env.retain(|(name, _)| !RUN_ONLY_VARS.iter().any(|var| same_name(&name.0, var)));
+            }
         }
-        let mut argv = self.argv.clone();
-        argv.insert(self.at, "--no-run".into());
-        Some(argv)
+        Some(RunRequest {
+            cwd: request.cwd.clone(),
+            argv: argv.into_iter().map(Text).collect(),
+            env,
+            class: request.class,
+            cache: request.cache,
+        })
     }
 
     /// The test phase's command line, with `threads` test threads.
@@ -131,10 +191,7 @@ impl TestRun {
         match self.runner {
             Runner::Nextest => {
                 argv.extend(["--test-threads".into(), threads.to_string().into()]);
-                argv.extend(without_thread_flags(
-                    tool,
-                    &["-j", "--test-threads", "--jobs"],
-                ));
+                argv.extend(without_flags(tool, &["-j", "--test-threads", "--jobs"]));
                 if let Some(test_args) = test_args {
                     argv.push("--".into());
                     argv.extend(test_args.iter().cloned());
@@ -143,7 +200,7 @@ impl TestRun {
             Runner::Libtest => {
                 argv.extend(tool.iter().cloned());
                 argv.push("--".into());
-                argv.extend(without_thread_flags(
+                argv.extend(without_flags(
                     test_args.unwrap_or_default(),
                     &["--test-threads"],
                 ));
@@ -209,8 +266,8 @@ fn thread_flags(args: &[OsString], names: &[&str]) -> Vec<String> {
     values
 }
 
-/// `args` without the thread flags `names` and their values.
-fn without_thread_flags(args: &[OsString], names: &[&str]) -> Vec<OsString> {
+/// `args` without the flags `names` and their values.
+fn without_flags(args: &[OsString], names: &[&str]) -> Vec<OsString> {
     let mut kept = Vec::new();
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -223,6 +280,14 @@ fn without_thread_flags(args: &[OsString], names: &[&str]) -> Vec<OsString> {
         }
     }
     kept
+}
+
+/// `args` without the switches `names`.
+fn without_switches(args: &[OsString], names: &[&str]) -> Vec<OsString> {
+    args.iter()
+        .filter(|arg| !names.iter().any(|name| *arg == name))
+        .cloned()
+        .collect()
 }
 
 /// The threads a nextest value asks for: a positive number, or the logical

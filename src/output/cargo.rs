@@ -103,7 +103,7 @@ pub fn sets_output(args: &[OsString]) -> bool {
 /// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
 /// rustup's cargo takes it, and as the run classes read it), and the
 /// arguments after it.
-fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
+pub(super) fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
     let args = match args.first() {
         Some(first) if first.to_string_lossy().starts_with('+') => &args[1..],
         _ => args,
@@ -280,11 +280,21 @@ impl Diagnostics {
 
     /// One line of cargo's stdout.
     fn line(&mut self, line: &[u8], out: &mut Sink) {
+        if !self.json_line(line, out) {
+            out.write(Channel::Stdout, line);
+        }
+    }
+
+    /// Takes `line` of the run's stdout when it is one of cargo's JSON
+    /// messages, and returns whether it was: a view that shows more than
+    /// cargo's diagnostics (`super::libtest`) handles the other lines.
+    pub fn json_line(&mut self, line: &[u8], out: &mut Sink) -> bool {
         match Message::parse(line) {
-            None => out.write(Channel::Stdout, line),
+            None => return false,
             Some(Message::Other) => {}
             Some(Message::Diagnostic(diagnostic)) => self.diagnostic(&diagnostic, out),
         }
+        true
     }
 
     fn diagnostic(&mut self, diagnostic: &Diagnostic, out: &mut Sink) {

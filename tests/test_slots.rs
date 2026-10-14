@@ -26,7 +26,10 @@ fn fake_cargo(fixture: &Fixture) -> PathBuf {
     cargo
 }
 
-/// `cargo heli <args>` run with the fake cargo; it must succeed.
+/// `cargo heli <args>` run with the fake cargo; it must succeed. In full
+/// output, unless `configure` chooses another mode, so that heli adds
+/// nothing to the arguments the fake cargo prints (compact output adds the
+/// flags of its views; `tests/output.rs`, `tests/test_output.rs`).
 fn with_fake_cargo(
     fixture: &Fixture,
     args: &[&str],
@@ -35,6 +38,7 @@ fn with_fake_cargo(
     let cargo = fake_cargo(fixture);
     let mut heli = fixture.heli(args);
     heli.env("CARGO", &cargo)
+        .env("HELI_OUTPUT", "full")
         .env_remove("RUST_TEST_THREADS")
         .env_remove("NEXTEST_TEST_THREADS");
     configure(&mut heli);
@@ -77,7 +81,8 @@ fn heli_adds_no_job_count() {
         ["arg: \"build\"", "env CARGO_BUILD_JOBS=None"]
     );
     let output = with_fake_cargo(&fixture, &["build"], |heli| {
-        heli.env("ECHO_ENV", "CARGO_BUILD_JOBS");
+        heli.env("ECHO_ENV", "CARGO_BUILD_JOBS")
+            .env_remove("HELI_OUTPUT");
     });
     let printed = printed_args(&output);
     assert!(
@@ -118,7 +123,8 @@ fn a_test_run_builds_then_tests() {
 
 /// A user's `--test-threads` bounds K: `cargo heli nextest run -j 1` tests
 /// with `--test-threads 1` in place of the user's flag, though the pool has
-/// 2 slots free. The build keeps the user's arguments.
+/// 2 slots free. The build keeps the user's other arguments (nextest
+/// ignores a thread count while it builds, with a warning).
 #[test]
 fn the_threads_asked_for_bound_the_test_slots() {
     let fixture = Fixture::new("basic");
@@ -134,8 +140,6 @@ fn the_threads_asked_for_bound_the_test_slots() {
             "arg: \"nextest\"",
             "arg: \"run\"",
             "arg: \"--no-run\"",
-            "arg: \"-j\"",
-            "arg: \"1\"",
             "arg: \"-p\"",
             "arg: \"tests-mixed\"",
             "arg: \"nextest\"",
@@ -413,7 +417,7 @@ fn a_test_run_shows_its_build_and_stops_when_it_fails() {
     let cargo = fake_cargo(&fixture);
     let gate = fixture.path("gate");
     let building = fixture
-        .heli(["test"])
+        .heli(["--output=full", "test"])
         .env("CARGO", &cargo)
         .env("ECHO_WAIT_FOR", &gate)
         .env("ECHO_EXIT", "3")
