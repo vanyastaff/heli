@@ -140,6 +140,7 @@ pub fn main() -> ! {
         accounts: accounts::Accounts::start(
             config.store.clone(),
             locations.state_dir.clone(),
+            locations.config.clone(),
             log.clone(),
             Arc::clone(&events),
         ),
@@ -638,6 +639,7 @@ impl Daemon {
             memory: self.governor.memory(),
             runs: self.runs(),
             disk: Some(self.accounts.disk()),
+            last_gc: self.accounts.last_gc(),
         }
     }
 

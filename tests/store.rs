@@ -556,11 +556,12 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
             && line.contains(&shown)),
         "{stdout}"
     );
+    // Without a budget or a floor, nothing is evicted.
     let output = fixture.heli(["gc"]).output().expect("run heli gc");
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "gc evicts nothing yet: {output:?}"
+    assert_success(&output, "cargo heli gc");
+    assert!(
+        text(&output.stdout).contains("no budget or floor"),
+        "{output:?}"
     );
     assert!(path.is_dir(), "gc deletes nothing");
 }
