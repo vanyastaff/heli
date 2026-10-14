@@ -212,8 +212,7 @@ impl Governor {
 /// a quiet pool can only be one a process took with it when it died.
 fn quiet(pool: &Pool, registry: &Registry) -> bool {
     // Cheapest first; a scan that fails counts as compiling.
-    registry.snapshot().is_empty()
-        && (!pool.held_by_others() || !processes::compiling().unwrap_or(true))
+    !registry.busy() && (!pool.held_by_others() || !processes::compiling().unwrap_or(true))
 }
 
 /// An adjustment of the pool, as the event log has it.

@@ -36,6 +36,8 @@ pub enum Action {
     },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
     Log { run: String, select: Select },
+    /// Kill run `run` (`r<number>`) with every process it started.
+    Cancel { run: String },
     /// Be the daemon, or with `detach`, start it outside this process tree.
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
@@ -148,6 +150,14 @@ enum Command {
         #[arg(long, group = "select")]
         errors: bool,
     },
+    /// Kill a run in flight with every process it started; its clients
+    /// report it as cancelled.
+    Cancel {
+        /// The run, as the footer after it and `status` name it: `r17` (or
+        /// `17`).
+        #[arg(value_parser = parse_run)]
+        run: String,
+    },
     /// Run heli's daemon in the foreground (`cargo heli` starts it itself).
     #[command(hide = true)]
     Daemon {
@@ -233,6 +243,7 @@ pub fn parse(
                 (None, None) => Select::All,
             },
         },
+        Command::Cancel { run } => Action::Cancel { run },
         Command::Daemon { warden: true, .. } => Action::Warden,
         Command::Daemon { detach, .. } => Action::Daemon { detach },
         Command::Cargo(args) => {

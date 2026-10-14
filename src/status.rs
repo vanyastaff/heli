@@ -13,10 +13,17 @@
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
 //!           "class":"compile","phase":"running","started_at":1791911112,
-//!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0},
+//!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0,
+//!           "attached_clients":1,"ended_at":null,"exit":null},
 //!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
 //!           "class":"mutate","phase":"running","started_at":1791911120,
-//!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0}]}
+//!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0,
+//!           "attached_clients":2,"ended_at":null,"exit":null},
+//!          {"id":"r16","worktree":"D:\\work\\agent-f1c0","argv":["cargo","test"],
+//!           "class":"test","phase":"done","started_at":1791910990,
+//!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
+//!           "attached_clients":0,"ended_at":1791911050,
+//!           "exit":{"code":101,"signal":null,"cancelled":false}}]}
 //! ```
 //!
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
@@ -25,7 +32,9 @@
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
 //! empty. `class` is `null` only from a daemon older than run classes. A
 //! run's `slots` are the host pool's slots it uses, and `share` its share of
-//! them (`crate::pool::broker`).
+//! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
+//! last runs that ended while no client followed them (`daemon::registry`),
+//! so whoever started them can still learn how they ended.
 
 use serde::{Deserialize, Serialize};
 
@@ -83,10 +92,10 @@ pub struct Daemon {
     pub started_at: u64,
 }
 
-/// A run in flight.
+/// A run in flight, or one that ended while no client followed it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Run {
-    /// `r<number>`, unique on this machine across daemon restarts.
+    /// `r<number>`, unique for the life of the state directory.
     pub id: String,
     /// The worktree the run works in (`crate::worktree`).
     pub worktree: String,
@@ -110,6 +119,44 @@ pub struct Run {
     /// other run waits.
     #[serde(default)]
     pub share: f64,
+    /// The clients following the run now: the call that started it and
+    /// those that attached to it.
+    #[serde(default)]
+    pub attached_clients: u32,
+    /// When it ended; `null` while it runs.
+    #[serde(default)]
+    pub ended_at: Option<u64>,
+    /// How it ended; `null` while it runs.
+    #[serde(default)]
+    pub exit: Option<Exit>,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exit {
+    /// The code its clients exit with: the command's own, or on Unix 128
+    /// plus the signal that killed it.
+    pub code: i32,
+    /// On Unix, the signal that killed it.
+    pub signal: Option<i32>,
+    /// Whether `cargo heli cancel` ended it.
+    pub cancelled: bool,
+}
+
+impl Exit {
+    /// `exit <code>` or `signal <n>`, after `cancelled, ` for a cancelled
+    /// run.
+    pub fn describe(&self) -> String {
+        let ending = match self.signal {
+            Some(signal) => format!("signal {signal}"),
+            None => format!("exit {}", self.code),
+        };
+        if self.cancelled {
+            format!("cancelled, {ending}")
+        } else {
+            ending
+        }
+    }
 }
 
 /// Where a run is in its lifecycle.
@@ -122,6 +169,8 @@ pub enum Phase {
     Building,
     /// A test run waiting for its test slots, then running its tests.
     Testing,
+    /// Ended.
+    Done,
 }
 
 impl Phase {
@@ -131,6 +180,7 @@ impl Phase {
             Self::Running => "running",
             Self::Building => "building",
             Self::Testing => "testing",
+            Self::Done => "done",
         }
     }
 }
@@ -186,10 +236,16 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
-            let state = if run.waiting_for.is_empty() {
-                run.phase.name().to_owned()
-            } else {
-                format!("waiting for {}", run.waiting_for.join(", "))
+            let state = match &run.exit {
+                Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
+                None if run.waiting_for.is_empty() => {
+                    format!("{}, {} attached", run.phase.name(), run.attached_clients)
+                }
+                None => format!(
+                    "waiting for {}, {} attached",
+                    run.waiting_for.join(", "),
+                    run.attached_clients
+                ),
             };
             text.push_str(&format!(
                 "{label:<6}  {}  {}  {}  {}  {state}  {} slot{}, share {}  {}s\n",

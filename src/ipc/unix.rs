@@ -52,6 +52,25 @@ impl Listener {
 /// was written before.
 pub struct Stream(UnixStream);
 
+impl Stream {
+    /// Whether the other side still has the connection open; asks without
+    /// reading or blocking.
+    pub fn connected(&self) -> bool {
+        use rustix::net::{RecvFlags, recv};
+        let mut byte = [0u8];
+        match recv(
+            &self.0,
+            &mut byte[..],
+            RecvFlags::PEEK | RecvFlags::DONTWAIT,
+        ) {
+            // End of file: the other side has closed.
+            Ok((0, _)) => false,
+            Ok(_) => true,
+            Err(error) => error == rustix::io::Errno::AGAIN || error == rustix::io::Errno::INTR,
+        }
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)

@@ -241,7 +241,9 @@ fn the_daemon_outlives_the_call_that_started_it() {
     );
     assert_eq!(runs(&status).len(), 1, "its run goes on: {status}");
     open(&gate);
-    fixture.wait_for_status("the run to finish", |status| runs(status).is_empty());
+    fixture.wait_for_status("the run to finish", |status| {
+        runs(status).iter().all(|run| run["phase"] == "done")
+    });
 }
 
 /// `echo-args` with `args`, run by `heli` and directly: `heli` printed
@@ -418,8 +420,10 @@ fn only_the_user_can_open_the_endpoint() {
     }
 }
 
-/// A run is in the client's logon session, window station and desktop (on
-/// Unix: its session), so it can reach the user's desktop.
+/// On Windows, a run is in the client's logon session, window station and
+/// desktop, so it can reach the user's desktop. On Unix it leads a session
+/// of its own (the user's login session reaches it through the
+/// environment), so that `cancel` finds every process it started.
 #[test]
 fn a_run_is_in_the_clients_session() {
     let fixture = Fixture::new("basic");
@@ -433,11 +437,19 @@ fn a_run_is_in_the_clients_session() {
         .heli(["exec", "--"])
         .arg(&echo)
         .env("ECHO_SESSION", "1")
+        .env("ECHO_PID", "1")
         .output()
         .expect("run heli");
     assert_success(&heli, "cargo heli exec");
     assert!(text(&direct.stdout).starts_with("session "));
-    assert_eq!(text(&heli.stdout), text(&direct.stdout));
+    let lines = lines(&heli.stdout);
+    #[cfg(windows)]
+    assert_eq!(lines[0], text(&direct.stdout).trim_end());
+    #[cfg(unix)]
+    {
+        let pid = lines[1].strip_prefix("pid ").expect("a pid line");
+        assert_eq!(lines[0], format!("session {pid}"), "it leads its session");
+    }
 }
 
 /// The self-run guards hold through the daemon: each nested call sees
@@ -802,16 +814,21 @@ fn a_daemon_lost_during_a_run_is_an_error() {
     let gate = fixture.path("gate");
     let mut call = fixture.heli(["exec", "--"]);
     call.arg(&echo).arg("once").env("ECHO_WAIT_FOR", &gate);
-    let call = start(&mut call);
-    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
-    support::kill_tree(support::daemon_pid(&status).expect("a daemon"));
+    let mut call = start(&mut call);
+    // Once the client has printed the run's first line, the run is under
+    // way.
+    let mut stdout = std::io::BufReader::new(call.stdout.take().expect("a stdout"));
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut first).expect("read the client's stdout");
+    assert_eq!(first, "arg: \"once\"\n", "what the run printed before");
+    support::kill_tree(fixture.daemon_pid().expect("a daemon"));
+    let mut rest = String::new();
+    stdout
+        .read_to_string(&mut rest)
+        .expect("read the client's stdout");
     let output = finish(call);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        text(&output.stdout),
-        "arg: \"once\"\n",
-        "what the run printed before, and no second run"
-    );
+    assert_eq!(rest, "", "no second run");
     let stderr = lines(&output.stderr);
     assert_eq!(stderr.len(), 1, "{stderr:?}");
     assert!(

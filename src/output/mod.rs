@@ -61,6 +61,7 @@ use serde::Deserialize;
 use crate::class::Class;
 use crate::cli::Invocation;
 use crate::protocol::Channel;
+use crate::status::Exit;
 
 /// Selects the output mode, below `--output` and `-q`.
 pub const VAR: &str = "HELI_OUTPUT";
@@ -334,12 +335,12 @@ impl Printer {
         self.sink.line(text);
     }
 
-    /// Run `run` exited with `code` (or on Unix of `signal`) after
-    /// `elapsed`: prints the rest of its output and the closing line.
-    pub fn exited(mut self, run: &str, code: i32, signal: Option<i32>, elapsed: Duration) {
+    /// Run `run` ended as `exit` says after `elapsed`: prints the rest of
+    /// its output and the closing line.
+    pub fn exited(mut self, run: &str, exit: Exit, elapsed: Duration) {
         let facts = self.render.finish(run, &mut self.sink);
         let seconds = elapsed.as_secs_f64();
-        if self.quiet && code == 0 && signal.is_none() {
+        if self.quiet && exit.code == 0 && exit.signal.is_none() && !exit.cancelled {
             self.sink.discard();
             let mut facts = facts.join(", ");
             if !facts.is_empty() {
@@ -352,10 +353,7 @@ impl Printer {
             return;
         }
         self.sink.release();
-        let ending = match signal {
-            Some(signal) => format!("signal {signal}"),
-            None => format!("exit {code}"),
-        };
+        let ending = exit.describe();
         self.sink.line(&format!(
             "cargo-heli: {run} {ending} in {seconds:.1} s (output: cargo heli log {run})"
         ));

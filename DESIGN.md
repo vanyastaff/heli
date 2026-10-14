@@ -194,13 +194,15 @@ not start, listen or answer within 5 s.
   heli's back), the client starts the daemon itself, as above.
 
 **A run** is a child of the daemon, started in the client's working
-directory with exactly the client's environment and no stdin. Its stdout and
-stderr stream back to the client, which exits with the run's code (on Unix,
-of its signal). A run is over when its process exits: output still arriving
-within 500 ms is forwarded, and processes it left behind holding its pipes do
-not hold the client. Once the daemon has told the client that the run
-started, the client never runs the command itself: if the daemon is lost
-mid-run, it exits 1.
+directory with exactly the client's environment and no stdin, as the first
+process of a process tree of its own (§5, lifecycle step 4). Its stdout and
+stderr stream back to the client through the run's record, and the client
+exits with the run's code (on Unix, of its signal). The run belongs to the
+daemon: a client that goes away does not stop it. A run is over when its
+process exits: output still arriving within 500 ms is forwarded, and
+processes it left behind holding its pipes do not hold the client. Once the
+daemon has told the client that the run started, the client never runs the
+command itself: if the daemon is lost mid-run, it exits 1.
 
 ## 4. Host pool
 
@@ -575,11 +577,45 @@ How a command line is read:
 3. **Single-flight.** If a run with the same key is in flight anywhere on the
    machine, the client attaches to it: it streams that run's output and
    returns its exit code.
-4. **Detach.** The daemon spawns the command, inside a Job Object on Windows
-   or a process group on Unix, and the client streams its output.
-   - A killed client leaves the run going, and re-running the same command in
-     the same worktree attaches to it.
-   - `cargo heli cancel <run>` kills the whole process tree.
+4. **Detach.** The daemon spawns the command as the first process of a
+   process tree of its own, and the client follows its output.
+   - **The tree.** On Windows, a Job Object per run: the process starts
+     suspended, joins the job, then runs, so nothing it starts escapes (the
+     job allows no breakaway, and cargo's and nextest's own jobs nest in
+     it). The job does not kill on close, so runs outlive a daemon that
+     dies. On Unix, a session of its own (`setsid`): a process group would
+     not do, since nextest puts each test in a group of its own. Each phase
+     of a test run (step 6) is a tree of its own, and cancel kills the one
+     that runs.
+   - **Following.** The run writes its output only to its record (see
+     "Output" below), and every client follows the record from its first
+     byte, each in a thread of its own. A client that stops reading or is
+     killed holds up nothing; a killed client is noticed within 200 ms, even
+     while the run is silent. Output that cannot be recorded is kept in
+     memory, so clients still get all of it.
+   - **Attach.** Re-running the same command attaches to the run in flight:
+     the client prints one notice line (the run, how long it has been going,
+     and `cargo heli cancel <run>` to run it anew), then the run's output
+     from its first byte, and exits with its code. The same command is the
+     same working directory, argv and environment, apart from what a shell
+     keeps for itself (`PWD`, `OLDPWD`, `SHLVL`, `_`); on Windows variable
+     names ignore case. The environment counts because it holds the target
+     directory, flags and tool settings. A run still waiting for its turn
+     at the worktree lock takes clients too, which hear what it waits for.
+     Every client gets the run's whole story: heli's notes, and its end
+     (its exit, a pass found in the result store meanwhile, or a command
+     that could not start). A retiring daemon starts no run but still
+     attaches. Single-flight (step 3) widens this to the key, across
+     worktrees.
+   - **Cancel.** `cargo heli cancel <run>` kills the whole tree and answers
+     once none of its processes is left. On Windows, `TerminateJobObject`,
+     waiting on the processes themselves too (a job stops counting a
+     process a moment before it has ended). On Unix, SIGTERM to every
+     process of the session, so cargo and nextest can stop their children,
+     then SIGKILL to those left after 2 s. Its clients report the run as
+     cancelled, and it takes no new clients. A run cancelled while it waits
+     for its worktree never starts, and its clients exit 1. A process that
+     starts a session of its own (on Unix) is not the run's any more.
 5. **Compile phase.** The environment gets the run pool (§4) and
    `HELI_RUN=<run id>`. heli sets no `-j`: under a jobserver, cargo ignores it.
 6. **Test phase** (test class only).
@@ -623,11 +659,20 @@ How a command line is read:
    run has a header: its test phase's line (step 6). The footer holds the
    run id, the exit (`exit <code>`, or on Unix `signal <n>`) and the
    duration:
-   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`. Peak
-   memory and slots join it once heli measures them. After a quiet run that
-   succeeded, quiet's one line takes its place ("Output" below). A run heli
-   executes directly, without the daemon, has no footer and no record, and
-   its output is the tool's own, untouched.
+   `cargo-heli: r17 exit 0 in 41.2 s (output: cargo heli log r17)`, or for
+   a cancelled run `r17 cancelled, exit 1 in …`. Peak memory and slots
+   join it once heli measures them. After a quiet run that succeeded,
+   quiet's one line takes its place ("Output" below); never after a
+   cancelled one. A run heli executes directly, without the daemon, has no
+   footer and no record, and its output is the tool's own, untouched.
+
+**Run ids** are `r<number>`, unique for the life of the state directory:
+records, markers and `cancel` name runs by them, and on Windows every logon
+session has a daemon of its own on the same state directory. Each number is
+read from and advanced in `next-run` in the state directory under a file
+lock (`next-run.lock`), and is never below one past the highest record in
+the run log, so a lost or stale counter costs no record. A number that
+cannot be written back is not given: the client runs the command directly.
 
 **Worktree lock.** heli runs that read a worktree's sources hold its lock
 shared, and mutate runs hold it exclusive, so `cargo heli fmt` never rewrites
@@ -689,6 +734,12 @@ cargo heli daemon [--detach | --warden]            (internal)
     expression, or two selectors at once.
   - 1 when the daemon is lost during a run (§3), and when `log` has no
     record of the run or cannot read it.
+  - For `cancel`: 0 once the run's processes are gone; 1 when the run is
+    not in flight (it ended, or never was), when no daemon runs (`cancel`
+    starts none), or when the daemon cannot cancel it (too old: it is asked
+    to retire); 2 for a run id that is not one. The client of a cancelled
+    run exits as its process did: on Windows 1, on Unix of SIGTERM (or
+    SIGKILL).
 - **Environment given to runs:**
   - `CARGO_MAKEFLAGS`: the run pool;
   - `HELI_RUN`: the run id, for tools that skip their own host lock under
@@ -1145,7 +1196,13 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   need not be whole), `waiting_since` (`null` unless the run waits),
   `waiting_for`
   (the ids of the runs it waits for at the worktree lock),
-  `attached_clients` and `started_at`;
+  `attached_clients` (the clients following it now), `started_at`, and
+  once it has ended `ended_at` and `exit` (`code`, `signal` on Unix,
+  `cancelled`), else `null`. The runs in flight are listed, and the last
+  32 runs that ended while no client followed them, as done: nobody else
+  was told how they ended. A run whose clients heard its end leaves the
+  list; a done run holds no worktree lock and counts as no run in flight
+  (for the top-up's quiescence, §4);
 - `disk`: `stores`, one entry per store, with `path`, `budget`, `used` and
   `by_category`;
 - `last_gc`: `at`, and `evicted`, one entry per path with its tier and bytes.
@@ -1191,6 +1248,8 @@ the one before, and the next event starts a new file.
 | Daemon and its warden both gone (Unix: a kill of both, a power loss) | The FIFO stays, with no bytes: a bare cargo runs one job at a time, without a warning | The next daemon fills it again (§4); `cargo heli ensure` as a session-start hook, or the logon task, starts one early |
 | Daemon unreachable, silent for 5 s, of another protocol version, or older and without a request the client sends | `cargo heli` cannot hand over the run, or the request | The command runs directly (`log` reads the record itself) after one warning line; a newer client asks an older daemon to exit once idle (§3) |
 | Daemon lost during a run | The client cannot tell whether the command finished | The client exits 1 and does not run the command again |
+| A client is killed, or stops reading, during a run | none | The run goes on and its record is complete; `status` lists it as done if no client heard its end; the same command attaches to it while it runs (§5) |
+| Two daemons on one state directory (Windows logon sessions) | They could give the same run id, and write one record over another | Ids come from the state directory's counter under a lock, above every record (§5) |
 | An agent harness stops the command that started the daemon | Observed (Claude Code, Windows): it kills the command's process tree, found through parent processes | The daemon is started through a short-lived intermediate, so it descends from no client (§3) |
 | An agent harness terminates its whole job object | On Windows, a daemon started on demand inside a job that refuses breakaway (Claude Code's) dies with it, and every run with it | Not seen in normal operation: that job holds the whole app and has no kill-on-close limit. Once `setup --autostart` registered the logon task, the daemon starts outside any agent's job: at logon, and when a client needs one, through `schtasks /Run` (§3) |
 | Daemon started outside the user's interactive session (a service, or a task that runs while the user is logged off) | Runs lose the desktop: tests that drive real windows fail | The daemon runs only in the interactive session: started by a client, or by a logon registration restricted to the logged-on user (`InteractiveToken`, a systemd user unit, a launchd agent in the Aqua session; §4, "Autostart") |

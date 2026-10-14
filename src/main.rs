@@ -71,6 +71,7 @@ fn main() {
         cli::Action::Ensure => client::ensure(depth),
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(&run, &select),
+        cli::Action::Cancel { run } => client::cancel(&run),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),
