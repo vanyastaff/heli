@@ -27,7 +27,12 @@
 //!   `Started` or in place of the output, [`Reply::Passed`] ends the run
 //!   without starting it: the result store holds a pass for its key. A
 //!   client that sends no [`RunRequest::class`] predates the worktree lock
-//!   and is never sent `Waiting`, which it could not read.
+//!   and is never sent `Waiting`, which it could not read. When the same
+//!   command is already in flight, the client attaches to it instead
+//!   (`Started` says so): the output frames then hold the run's output from
+//!   its first byte, and the end is the run's.
+//! - [`Request::Cancel`]: [`Reply::Cancelled`] once every process of the run
+//!   is gone, or [`Reply::CancelFailed`].
 //! - [`Request::Log`]: output frames holding the part of the run's record
 //!   asked for (`crate::runlog`), each on the channel the run wrote it to,
 //!   then [`Reply::LogEnd`]; or [`Reply::LogFailed`].
@@ -106,6 +111,15 @@ pub enum Request {
     Status,
     /// Send part of a run's record (`crate::runlog`).
     Log(LogRequest),
+    /// Kill a run in flight, with every process it started.
+    Cancel(CancelRequest),
+}
+
+/// The run to cancel.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CancelRequest {
+    /// `r<number>`.
+    pub run: String,
 }
 
 /// The run whose record to send, and which part of it.
@@ -150,9 +164,15 @@ pub enum Cache {
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
-    /// The daemon accepted the run, and starts it now or once its wait ends.
+    /// The daemon accepted the run, and starts it now or once its wait
+    /// ends; or, with `attached`, the same command was already in flight as
+    /// `run`, and the client follows that run from its start.
     Started {
         run: String,
+        /// For an attached client: how long the run had been going, in
+        /// milliseconds.
+        #[serde(default)]
+        attached: Option<u64>,
     },
     /// The run waits for these runs, which use its worktree, before it
     /// starts (the worktree lock).
@@ -177,12 +197,15 @@ pub enum Reply {
         message: String,
     },
     /// The command exited. On Unix, `signal` is the signal that killed it,
-    /// and `code` is then 128 plus that signal.
+    /// and `code` is then 128 plus that signal. `cancelled`: `cargo heli
+    /// cancel` ended it.
     Exited {
         code: i32,
         signal: Option<i32>,
+        #[serde(default)]
+        cancelled: bool,
     },
-    Status(Status),
+    Status(Box<Status>),
     /// The daemon does not know the request: it is older than the client.
     Unsupported,
     /// The part of the record asked for has been sent.
@@ -191,6 +214,23 @@ pub enum Reply {
     LogFailed {
         message: String,
     },
+    /// The run was cancelled: none of its processes is left.
+    Cancelled,
+    /// The run was not cancelled; `message` says why.
+    CancelFailed {
+        message: String,
+    },
+}
+
+impl Reply {
+    /// The reply that tells a client how its run ended.
+    pub fn exited(exit: crate::status::Exit) -> Self {
+        Self::Exited {
+            code: exit.code,
+            signal: exit.signal,
+            cancelled: exit.cancelled,
+        }
+    }
 }
 
 /// An output stream of a run.

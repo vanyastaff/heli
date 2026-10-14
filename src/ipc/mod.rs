@@ -28,7 +28,7 @@ pub use unix::{Listener, Stream, connect};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{Listener, Stream, connect};
+pub use windows::{Listener, Stream, connect, user_sid};
 
 /// True when `error` from [`connect`] means no daemon is listening (as
 /// opposed to one that is there but cannot be used).

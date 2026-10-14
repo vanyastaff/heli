@@ -8,7 +8,16 @@
 //! - `ECHO_ORPHAN` names a file: starts a copy of itself that keeps this
 //!   process's stdout and stderr and waits for that file, and does not wait
 //!   for it;
+//! - `ECHO_PID`: `pid <its process id>`;
+//! - `ECHO_TREE` names a directory: starts a copy of itself in a process
+//!   group of its own (as nextest starts each test), with no output, which
+//!   waits for `ECHO_WAIT_FOR` too, and does not wait for it; each of the
+//!   two writes an empty file named after its process id in that directory;
 //! - `ECHO_WAIT_FOR` names a file: waits until it exists (60 s at most).
+//!
+//! First of all (after a version request, below), with `ECHO_STARTS` naming
+//! a file, it appends a line there, so a test can count how many times it
+//! started.
 //!
 //! Then it prints `echo-args: stderr` on stderr, and exits with `ECHO_EXIT`
 //! (default 0), or with the code in the file `ECHO_EXIT_FILE` names when
@@ -48,6 +57,15 @@ fn main() {
             Err(_) => std::process::exit(1),
         }
     }
+    if let Some(starts) = std::env::var_os("ECHO_STARTS") {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(starts)
+            .and_then(|mut file| file.write_all(b"started\n"))
+            .expect("append to ECHO_STARTS");
+    }
     for arg in args {
         println!("arg: {arg:?}");
     }
@@ -80,11 +98,43 @@ fn main() {
             .spawn()
             .expect("start the orphan");
     }
-    if let Some(gate) = std::env::var_os("ECHO_WAIT_FOR") {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !Path::new(&gate).exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+    if std::env::var_os("ECHO_PID").is_some() {
+        println!("pid {}", std::process::id());
+    }
+    if let Some(dir) = std::env::var_os("ECHO_TREE") {
+        if std::env::var_os("ECHO_TREE_CHILD").is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().expect("own path"));
+            child
+                .env_remove("ECHO_STARTS")
+                .env("ECHO_TREE_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut child, 0);
+            #[cfg(windows)]
+            {
+                const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
+                std::os::windows::process::CommandExt::creation_flags(
+                    &mut child,
+                    CREATE_NEW_PROCESS_GROUP,
+                );
+            }
+            #[allow(clippy::zombie_processes, reason = "the child outlives this process")]
+            let _child = child.spawn().expect("start the child");
         }
+        let file = Path::new(&dir).join(std::process::id().to_string());
+        std::fs::write(file, "").expect("write the process id");
+        if std::env::var_os("ECHO_TREE_CHILD").is_some() {
+            // The child prints nothing: it only waits.
+            if let Some(gate) = std::env::var_os("ECHO_WAIT_FOR") {
+                wait_for(Path::new(&gate));
+            }
+            return;
+        }
+    }
+    if let Some(gate) = std::env::var_os("ECHO_WAIT_FOR") {
+        wait_for(Path::new(&gate));
     }
     eprintln!("echo-args: stderr");
     let from_file = std::env::var_os("ECHO_EXIT_FILE")
@@ -94,6 +144,14 @@ fn main() {
         .and_then(|code| code.trim().parse().ok())
         .unwrap_or(0);
     std::process::exit(code);
+}
+
+/// Waits until `gate` exists, 60 s at most.
+fn wait_for(gate: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !gate.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(windows)]

@@ -4,24 +4,33 @@
 //! - **Reaching the daemon.** Connect to the endpoint; when nothing listens
 //!   there, start a daemon (`crate::launch`) and connect as soon as it
 //!   listens. Then the handshake (`crate::protocol`): versions must match.
-//! - **A run.** Send the command, the working directory and the whole
-//!   environment (`HELI_DEPTH` one deeper); print the run's stdout and
-//!   stderr to the same streams as they arrive; exit with the run's code
+//! - **A run.** Choose the output mode and plan the run for it
+//!   (`crate::output`); send the command as planned, the working directory
+//!   and the whole environment (`HELI_DEPTH` one deeper, and what the plan
+//!   sets); print the run's stdout and stderr to the same streams through
+//!   the plan's printer, then its closing line; exit with the run's code
 //!   (on Unix, die of the run's signal). A command that cannot be started
 //!   is reported as direct execution reports it (exit 127 or 126). A run
 //!   that waits for its worktree's lock says so first, on stderr: "waiting
-//!   for …", naming the runs it waits for.
+//!   for …", naming the runs it waits for (through the printer, so quiet
+//!   mode holds it back with the rest). When the same command is already
+//!   in flight, the daemon attaches this client to it: one notice line on
+//!   stderr (through the printer too), then the same as for a run of its
+//!   own, from the run's first byte.
 //! - **A hit.** When the daemon answers that the run's key already passed
 //!   (`crate::daemon::results`), say which run passed and when, with the
 //!   caveats of reusing a verdict, and exit 0 without running anything.
 //! - **Fallback.** Whenever the daemon cannot take the run (it does not
 //!   start, cannot be reached, does not answer, speaks another protocol
 //!   version, or is retiring), print one warning line and run the command
-//!   directly (`crate::direct`): a failure of heli never fails a run. Once
+//!   directly (`crate::direct`), as the user gave it, with its output
+//!   untouched: a failure of heli never fails a run. Once
 //!   the daemon has said the run started, there is no fallback: the command
 //!   may already have run, so losing the daemon is an error (exit 1).
 //! - **Status.** Ask the daemon, or report that none runs; never start one.
 //! - **Ensure.** Reach the daemon, starting it if need be, and nothing else.
+//! - **Cancel.** Ask the daemon to kill a run's process tree; without a
+//!   daemon there is no run to cancel, and none is started.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -32,11 +41,15 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::cli::Invocation;
+use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
-use crate::protocol::{self, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text};
+use crate::output::{self, Plan, Printer, print};
+use crate::protocol::{
+    self, CancelRequest, Channel, Frame, LogRequest, Reply, Request, RunRequest, Text,
+};
 use crate::runlog::{self, select::Select};
-use crate::status::{self, Status};
+use crate::status::{self, Exit, Status};
 use crate::{clock, direct, environment, launch, nesting};
 
 /// How long a daemon may take to answer the handshake.
@@ -50,17 +63,33 @@ const NO_DAEMON: i32 = 1;
 /// Exit code when `log` cannot print the record.
 const FAILED: i32 = 1;
 
+/// Exit code when heli's own settings are wrong (`HELI_OUTPUT`), as for a
+/// usage error.
+const USAGE: i32 = 2;
+
 /// Runs `invocation` through the daemon, or directly when it cannot; this
 /// process's nesting depth is `depth`.
 pub fn run(invocation: Invocation, depth: u32) -> ! {
     let child_depth = OsString::from((depth + 1).to_string());
-    let reason = match Locations::resolve() {
+    let locations = Locations::resolve();
+    let configured = || {
+        let locations = locations.as_ref().ok()?;
+        Config::load(&locations.config).ok()?.output.mode
+    };
+    let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
+        eprintln!("cargo-heli: {error}");
+        std::process::exit(USAGE)
+    });
+    let reason = match locations {
         Err(error) => error,
         Ok(locations) => match reach(&locations, Some(depth)) {
-            Ok(Some(stream)) => match submit(stream, &invocation, &child_depth) {
-                Ok(never) => match never {},
-                Err(reason) => reason,
-            },
+            Ok(Some(stream)) => {
+                let plan = output::plan(&invocation, mode);
+                match submit(stream, &invocation, &plan, &child_depth) {
+                    Ok(never) => match never {},
+                    Err(reason) => reason,
+                }
+            }
             Ok(None) => "no heli daemon answered".to_owned(),
             Err(reason) => reason,
         },
@@ -186,6 +215,38 @@ fn ask_log(mut stream: Stream, run: &str, select: &Select) -> Result<Infallible,
     }
 }
 
+/// Cancels run `run`: asks the daemon, and starts none. Exits 0 once the
+/// run's processes are gone, else 1 after one line saying why.
+pub fn cancel(run: &str) -> ! {
+    let failure = match Locations::resolve().and_then(|locations| reach(&locations, None)) {
+        Ok(None) => "no heli daemon is running, so no run is in flight".to_owned(),
+        Err(reason) => format!("cannot cancel {run}: {reason}"),
+        Ok(Some(mut stream)) => {
+            let request = Request::Cancel(CancelRequest {
+                run: run.to_owned(),
+            });
+            let asked = protocol::write_message(&mut stream, &request)
+                .and_then(|()| protocol::read_message::<Reply>(&mut stream));
+            match asked {
+                Ok(Reply::Cancelled) => {
+                    eprintln!("cargo-heli: cancelled {run}");
+                    std::process::exit(0)
+                }
+                Ok(Reply::CancelFailed { message }) => message,
+                Ok(Reply::Unsupported) => {
+                    format!("cannot cancel {run}: {}", unsupported(&mut stream))
+                }
+                Ok(other) => format!("cannot cancel {run}: the heli daemon answered {other:?}"),
+                Err(error) => {
+                    format!("cannot cancel {run}: the heli daemon did not answer: {error}")
+                }
+            }
+        }
+    };
+    eprintln!("cargo-heli: {failure}");
+    std::process::exit(FAILED)
+}
+
 fn query_status() -> Result<Status, String> {
     let locations = Locations::resolve()?;
     let Some(mut stream) = reach(&locations, None)? else {
@@ -194,7 +255,7 @@ fn query_status() -> Result<Status, String> {
     let asked = protocol::write_message(&mut stream, &Request::Status)
         .and_then(|()| protocol::read_message::<Reply>(&mut stream));
     match asked {
-        Ok(Reply::Status(status)) => Ok(status),
+        Ok(Reply::Status(status)) => Ok(*status),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to status")),
         Err(error) => Err(format!("the heli daemon did not answer: {error}")),
     }
@@ -278,22 +339,25 @@ fn unsupported(stream: &mut Stream) -> String {
         .to_owned()
 }
 
-/// Hands the run to the daemon and follows it to its end. Returns only when
-/// the daemon did not start it, with the reason.
+/// Hands the run to the daemon, as `plan` says, and follows it to its end.
+/// Returns only when the daemon did not start it, with the reason.
 fn submit(
     mut stream: Stream,
     invocation: &Invocation,
+    plan: &Plan,
     child_depth: &OsString,
 ) -> Result<std::convert::Infallible, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the working directory: {error}"))?;
+    let mut overrides = vec![(nesting::VAR, child_depth.clone())];
+    overrides.extend(plan.env.iter().cloned());
     let request = RunRequest {
         cwd: Text(cwd.into()),
         argv: std::iter::once(&invocation.program)
-            .chain(&invocation.args)
+            .chain(&plan.args)
             .map(|arg| Text(arg.clone()))
             .collect(),
-        env: environment::current_with(&[(nesting::VAR, child_depth.clone())])
+        env: environment::current_with(&overrides)
             .into_iter()
             .map(|(name, value)| (Text(name), Text(value)))
             .collect(),
@@ -303,7 +367,20 @@ fn submit(
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
     match protocol::read_message::<Reply>(&mut stream) {
-        Ok(Reply::Started { run }) => follow(stream, invocation, &run, Instant::now()),
+        Ok(Reply::Started { run, attached }) => {
+            let mut printer = plan.printer();
+            let mut started = Instant::now();
+            if let Some(milliseconds) = attached {
+                let running_for = Duration::from_millis(milliseconds);
+                started = started.checked_sub(running_for).unwrap_or(started);
+                printer.note(&format!(
+                    "cargo-heli: attached to {run}, the same command started {:.1} s ago; \
+                     to run it anew, cargo heli cancel {run} first",
+                    running_for.as_secs_f64()
+                ));
+            }
+            follow(stream, invocation, &run, started, printer)
+        }
         Ok(Reply::Passed { run, worktree, at }) => already_passed(&run, &worktree, at),
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
@@ -312,41 +389,35 @@ fn submit(
     }
 }
 
-/// Prints run `run`'s output as it arrives, then the footer, and exits as
-/// the run did; it started at `started`.
-fn follow(mut stream: Stream, invocation: &Invocation, run: &str, started: Instant) -> ! {
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
-    // Whether the run's stderr ends a line, so the footer starts one.
-    let mut line_ended = true;
+/// Prints run `run`'s output through `printer` as it arrives, then the
+/// closing line, and exits as the run did; it started at `started`.
+fn follow(
+    mut stream: Stream,
+    invocation: &Invocation,
+    run: &str,
+    started: Instant,
+    mut printer: Printer,
+) -> ! {
     loop {
         match protocol::read_frame::<Reply>(&mut stream) {
-            Ok(Frame::Output(Channel::Stdout, bytes)) => print(&mut stdout, &bytes),
-            Ok(Frame::Output(Channel::Stderr, bytes)) => {
-                print(&mut stderr, &bytes);
-                line_ended = bytes.last().is_none_or(|&byte| byte == b'\n');
-            }
+            Ok(Frame::Output(channel, bytes)) => printer.output(channel, &bytes),
             Ok(Frame::Message(Reply::Waiting { runs })) => {
-                let line = format!("cargo-heli: {}\n", waiting_for(&runs));
-                print(&mut stderr, line.as_bytes());
+                printer.note(&format!("cargo-heli: {}", waiting_for(&runs)));
             }
-            Ok(Frame::Message(Reply::Exited { code, signal })) => {
-                let _ = stdout.flush();
-                let ending = match signal {
-                    Some(signal) => format!("signal {signal}"),
-                    None => format!("exit {code}"),
+            Ok(Frame::Message(Reply::Exited {
+                code,
+                signal,
+                cancelled,
+            })) => {
+                let exit = Exit {
+                    code,
+                    signal,
+                    cancelled,
                 };
-                let _ = writeln!(
-                    stderr,
-                    "{}cargo-heli: {run} {ending} in {:.1} s (output: cargo heli log {run})",
-                    if line_ended { "" } else { "\n" },
-                    started.elapsed().as_secs_f64()
-                );
-                drop((stdout, stderr));
+                printer.exited(run, exit, started.elapsed());
                 exit_as(code, signal)
             }
             Ok(Frame::Message(Reply::SpawnFailed { not_found, message })) => {
-                drop((stdout, stderr));
                 direct::report_spawn_failure(&invocation.program, not_found, &message)
             }
             Ok(Frame::Message(Reply::Passed {
@@ -354,14 +425,13 @@ fn follow(mut stream: Stream, invocation: &Invocation, run: &str, started: Insta
                 worktree,
                 at,
             })) => {
-                let _ = stdout.flush();
-                drop((stdout, stderr));
+                drop(printer);
                 already_passed(&passed, &worktree, at)
             }
             Ok(Frame::Message(other)) => {
-                lost(run, &format!("unexpected message {other:?}"), stdout)
+                lost(run, &format!("unexpected message {other:?}"), printer)
             }
-            Err(error) => lost(run, &error.to_string(), stdout),
+            Err(error) => lost(run, &error.to_string(), printer),
         }
     }
 }
@@ -415,21 +485,10 @@ fn waiting_for(runs: &[status::Run]) -> String {
     )
 }
 
-fn lost(run: &str, error: &str, mut stdout: io::StdoutLock<'_>) -> ! {
-    let _ = stdout.flush();
+fn lost(run: &str, error: &str, printer: Printer) -> ! {
+    printer.abandon(run);
     eprintln!("cargo-heli: lost the heli daemon during run {run}: {error}");
     std::process::exit(LOST)
-}
-
-/// Writes the run's output; a reader that has gone away does not stop the
-/// run, so errors only cost the output.
-fn print(out: &mut impl Write, bytes: &[u8]) {
-    let written = out.write_all(bytes);
-    // A Windows console accepts only UTF-8: show other bytes lossily.
-    if matches!(&written, Err(error) if error.kind() == io::ErrorKind::InvalidData) {
-        let _ = out.write_all(String::from_utf8_lossy(bytes).as_bytes());
-    }
-    let _ = out.flush();
 }
 
 /// Exits as the run did: with its code, or on Unix of its signal.

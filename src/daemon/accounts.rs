@@ -2,10 +2,13 @@
 //! workspace a run builds in, writes the owner manifest of its build
 //! directory, and keeps the sizes the store's directories take.
 //!
-//! **Learning** ([`Accounts::learn`]). A run of cargo (any run but `exec`,
-//! and an `exec` of a program named `cargo`) starts, beside it in the
-//! background, `cargo metadata --format-version 1 --no-deps` as the run
-//! would: its program, in its directory, with its environment. That names
+//! **Learning** ([`Accounts::learn`]). A run of cargo, a run whose program
+//! is named `cargo` (as heli runs a cargo subcommand, and an `exec` of
+//! cargo), starts, beside it in the background,
+//! `cargo metadata --format-version 1 --no-deps` as the run would: its
+//! program, in its directory, with its environment. No other program is
+//! ever started with these arguments, not even one standing in for cargo
+//! under another name. That names
 //! the workspace root, its `target/` directory and its build directory, as
 //! the run's configuration places them. The `target/` directory is
 //! registered (`crate::store::registry`). When the build directory is in a
@@ -36,7 +39,6 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::Log;
-use crate::class::Class;
 use crate::clock;
 use crate::config::StoreConfig;
 use crate::protocol::RunRequest;
@@ -123,11 +125,12 @@ impl Accounts {
         accounts
     }
 
-    /// Learns, in the background, the workspace that run `request` of
-    /// `class` builds in (see the module docs). Once the run has ended (the
-    /// returned value is dropped), its directories are scanned again.
-    pub fn learn(self: &Arc<Self>, request: &RunRequest, class: Class) -> Option<Learning> {
-        let probe = Probe::of(request, class)?;
+    /// Learns, in the background, the workspace that run `request` builds
+    /// in, if it is a run of cargo (see the module docs). Once the run has
+    /// ended (the returned value is dropped), its directories are scanned
+    /// again.
+    pub fn learn(self: &Arc<Self>, request: &RunRequest) -> Option<Learning> {
+        let probe = Probe::of(request)?;
         let at = clock::now();
         let (ended, end) = mpsc::channel();
         let accounts = Arc::clone(self);
@@ -262,14 +265,14 @@ impl Accounts {
 }
 
 impl Probe {
-    /// The probe for run `request` of `class`, if the run is cargo's.
-    fn of(request: &RunRequest, class: Class) -> Option<Self> {
+    /// The probe for run `request`, if its program is named `cargo`.
+    fn of(request: &RunRequest) -> Option<Self> {
         let program = &request.argv.first()?.0;
         let named_cargo = Path::new(program)
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| stem.eq_ignore_ascii_case("cargo"));
-        if class == Class::Exec && !named_cargo {
+        if !named_cargo {
             return None;
         }
         Some(Self {

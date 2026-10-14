@@ -5,7 +5,8 @@
 //! (`runs/` in the state directory), written by the daemon as the output
 //! arrives: a [`Recorder`], fed by `daemon::execute::pump`, the one place
 //! all of a run's output passes. Output is recorded whether or not a client
-//! still listens. A record holds the run's stdout and stderr as they reached
+//! still listens, and clients following the run read it from the record
+//! (`daemon::live`). A record holds the run's stdout and stderr as they reached
 //! the daemon: the exact bytes, in order within each stream; across the two
 //! streams, in the order the daemon read them (two pipes have no common
 //! order finer than that). Runs heli executes directly, without a daemon,
@@ -30,13 +31,13 @@
 //! **Retention** (`[log]` in `crate::config`). When a run starts, its record
 //! is created and the oldest records are deleted first until at most
 //! [`Limits::runs`] remain, the new one included, and the others take at
-//! most [`Limits::bytes`]. Records of
-//! runs in flight are never deleted. Oldest means lowest run number: run
-//! ids only grow (`daemon::registry`).
+//! most [`Limits::bytes`]. Records of runs in flight, and records that
+//! clients following a run read ([`RunLog::pin`]), are never deleted.
+//! Oldest means lowest run number: run ids only grow (`daemon::registry`).
 
 pub mod select;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -81,12 +82,13 @@ impl Limits {
     }
 }
 
-/// The run log of a daemon: where records go, and which are being written.
+/// The run log of a daemon: where records go, and which are in use.
 pub struct RunLog {
     dir: PathBuf,
     limits: Limits,
-    /// Runs whose records are being written: retention skips them.
-    live: Mutex<BTreeSet<u64>>,
+    /// Runs whose records are being written or read by clients following
+    /// them, with how many uses each: retention skips them.
+    live: Mutex<BTreeMap<u64, usize>>,
 }
 
 impl RunLog {
@@ -94,7 +96,31 @@ impl RunLog {
         Self {
             dir,
             limits,
-            live: Mutex::new(BTreeSet::new()),
+            live: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Keeps the record of `run` (`r<number>`), whether it exists yet or
+    /// not, from being pruned until the pin drops: for a client following
+    /// the run (`daemon::live`).
+    pub fn pin(&self, run: &str) -> Pin<'_> {
+        let number = run_number(run).expect("BUG: run ids are r<number>");
+        self.hold(number);
+        Pin { log: self, number }
+    }
+
+    fn hold(&self, number: u64) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        *live.entry(number).or_default() += 1;
+    }
+
+    fn release(&self, number: u64) {
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(uses) = live.get_mut(&number) {
+            *uses -= 1;
+            if *uses == 0 {
+                live.remove(&number);
+            }
         }
     }
 
@@ -118,7 +144,8 @@ impl RunLog {
             file.write_all(&header)?;
             Ok(file)
         });
-        live.insert(number);
+        *live.entry(number).or_default() += 1;
+        drop(live);
         let (file, error) = match file {
             Ok(file) => (Some(file), None),
             Err(error) => (None, Some(error)),
@@ -131,9 +158,9 @@ impl RunLog {
         }
     }
 
-    /// Deletes the oldest records, except those of runs in flight (`live`),
-    /// until there is room for one more within the limits.
-    fn prune(&self, live: &BTreeSet<u64>) {
+    /// Deletes the oldest records, except those in use (`live`), until
+    /// there is room for one more within the limits.
+    fn prune(&self, live: &BTreeMap<u64, usize>) {
         let Ok(entries) = std::fs::read_dir(&self.dir) else {
             return;
         };
@@ -152,7 +179,7 @@ impl RunLog {
             if count < self.limits.runs && bytes <= self.limits.bytes {
                 break;
             }
-            if !live.contains(&number) && std::fs::remove_file(path).is_ok() {
+            if !live.contains_key(&number) && std::fs::remove_file(path).is_ok() {
                 count -= 1;
                 bytes -= size;
             }
@@ -170,9 +197,12 @@ pub struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
-    /// Appends what the run wrote to `channel`.
-    pub fn output(&mut self, channel: Channel, bytes: &[u8]) {
-        let Some(file) = &mut self.file else { return };
+    /// Appends what the run wrote to `channel`; `false` when it is not in
+    /// the record (recording has failed).
+    pub fn output(&mut self, channel: Channel, bytes: &[u8]) -> bool {
+        let Some(file) = &mut self.file else {
+            return false;
+        };
         let kind = match channel {
             Channel::Stdout => STDOUT,
             Channel::Stderr => STDERR,
@@ -183,9 +213,13 @@ impl Recorder<'_> {
         event.push(kind);
         event.extend(length.to_le_bytes());
         event.extend(bytes);
-        if let Err(error) = file.write_all(&event) {
-            self.file = None;
-            self.error = Some(error);
+        match file.write_all(&event) {
+            Ok(()) => true,
+            Err(error) => {
+                self.file = None;
+                self.error = Some(error);
+                false
+            }
         }
     }
 
@@ -197,11 +231,19 @@ impl Recorder<'_> {
 
 impl Drop for Recorder<'_> {
     fn drop(&mut self) {
-        self.log
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.number);
+        self.log.release(self.number);
+    }
+}
+
+/// Keeps a record from being pruned ([`RunLog::pin`]).
+pub struct Pin<'a> {
+    log: &'a RunLog,
+    number: u64,
+}
+
+impl Drop for Pin<'_> {
+    fn drop(&mut self) {
+        self.log.release(self.number);
     }
 }
 

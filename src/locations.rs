@@ -3,7 +3,8 @@
 //! - **State directory**: [`STATE_DIR_VAR`] if set, else
 //!   `%LOCALAPPDATA%\heli` on Windows and `$XDG_STATE_HOME/heli` (else
 //!   `~/.local/state/heli`) elsewhere. It holds the daemon's lock, its log,
-//!   the run counter and the run log. On Unix heli creates it with mode 0700.
+//!   its event log, the run counter and the run log. On Unix heli creates it
+//!   with mode 0700.
 //! - **Endpoint**: [`ENDPOINT_VAR`] if set, else derived from the state
 //!   directory. On Windows it is the named pipe
 //!   `\\.\pipe\heli-<hash of the state directory>-<logon session>`, so each
@@ -84,15 +85,32 @@ impl Locations {
         self.state_dir.join(session_suffixed("daemon", ".log"))
     }
 
-    /// The next run number, kept across daemon restarts so run ids stay
-    /// unique.
+    /// The daemon's event log (`crate::daemon::events`).
+    pub fn event_log(&self) -> PathBuf {
+        self.state_dir.join(session_suffixed("events", ".log"))
+    }
+
+    /// The next run number, shared by every daemon of this state directory
+    /// so run ids stay unique (`daemon::registry::RunIds`).
     pub fn run_counter(&self) -> PathBuf {
         self.state_dir.join("next-run")
+    }
+
+    /// The lock held while a run number is taken from [`Self::run_counter`].
+    pub fn run_counter_lock(&self) -> PathBuf {
+        self.state_dir.join("next-run.lock")
     }
 
     /// The run log: one record of output per run (`crate::runlog`).
     pub fn run_logs(&self) -> PathBuf {
         self.state_dir.join("runs")
+    }
+
+    /// The hash of the state directory that names what belongs to it: the
+    /// default endpoint and pool, and the logon task (`crate::autostart`).
+    #[cfg(windows)]
+    pub fn state_dir_hash(&self) -> u64 {
+        path_hash(&self.state_dir)
     }
 
     /// Creates the state directory, owner-only on Unix.
