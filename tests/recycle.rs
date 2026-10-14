@@ -1237,7 +1237,8 @@ fn setup_installs_a_hook_that_recycles_as_a_worktree_is_added() {
         stderr.contains("cargo-heli: recycled the build directory of ")
             && stderr.contains(", precisely (")
             && stderr.contains("the path scan invalidated 2 units"),
-        "{stderr}"
+        "{stderr}\n{}",
+        repo.store_diagnosis()
     );
     let b_dir = repo.build_dir_of(&b);
     assert!(!a_dir.exists() && b_dir.join("debug").is_dir(), "a's moved");
@@ -1370,10 +1371,7 @@ fn the_daemon_recycles_for_a_worktree_it_finds() {
         .output()
         .expect("run heli ensure");
     assert_success(&output, "cargo heli ensure");
-    let recycled = wait_for("the recycle event", || {
-        let recycled = repo.recycled();
-        (!recycled.is_empty()).then_some(recycled)
-    });
+    let recycled = repo.wait_for_recycling();
     let b_dir = repo.build_dir_of(&b);
     assert!(!a_dir.exists(), "a's moved");
     assert_eq!(recycled.len(), 1, "{recycled:?}");
@@ -2061,10 +2059,7 @@ fn the_look_recycles_precisely_for_an_older_worktree_without_the_donors_code() {
         .output()
         .expect("run heli ensure");
     assert_success(&ensure, "cargo heli ensure");
-    let recycled = wait_for("the recycle event", || {
-        let recycled = repo.recycled();
-        (!recycled.is_empty()).then_some(recycled)
-    });
+    let recycled = repo.wait_for_recycling();
     assert_eq!(recycled[0]["trigger"], "look", "{recycled:?}");
     assert_eq!(recycled[0]["mode"], "precise", "{recycled:?}");
     let b_dir = repo.build_dir_of(&b);
@@ -2172,6 +2167,41 @@ impl Repo {
             self.recycled(),
             self.fixture.daemon_log()
         )
+    }
+
+    /// What a failing recycling test shows of the store: each build
+    /// directory with its owner manifest, the recycle events and the
+    /// daemon's log.
+    fn store_diagnosis(&self) -> String {
+        let mut text = String::from("--- the store's build directories\n");
+        for dir in build_dirs(&self.store) {
+            let owner =
+                owner(&dir).map_or_else(|| "no owner".to_owned(), |owner| owner.to_string());
+            text.push_str(&format!("{} {owner}\n", dir.display()));
+        }
+        format!(
+            "{text}--- recycle events\n{:?}\n--- the daemon's log\n{}",
+            self.recycled(),
+            self.fixture.daemon_log()
+        )
+    }
+
+    /// The recycle events, once there is one; panics after 60 s with what
+    /// the store holds.
+    fn wait_for_recycling(&self) -> Vec<Value> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let recycled = self.recycled();
+            if !recycled.is_empty() {
+                return recycled;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the recycle event\n{}",
+                self.store_diagnosis()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
