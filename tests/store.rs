@@ -959,7 +959,7 @@ fn only_a_run_of_cargo_is_asked_about_its_workspace() {
     let bin = fixture.path("bin");
     std::fs::create_dir_all(&bin).expect("create a bin directory");
     let not_cargo = bin.join(exe("not-cargo"));
-    std::fs::copy(support::cargo_binary(), &not_cargo).expect("copy cargo");
+    support::copy_program(Path::new(&support::cargo_binary()), &not_cargo);
     let first = fixture.copy_workspace("first");
     let second = fixture.copy_workspace("second");
 

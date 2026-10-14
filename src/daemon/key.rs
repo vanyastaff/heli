@@ -114,16 +114,37 @@ pub fn staged<T>(
     ));
     let inspected = (|| {
         if real.exists() {
-            // The copy keeps the stat cache, so unchanged files are not
-            // hashed again.
-            std::fs::copy(&real, &copy)
-                .map_err(|error| format!("cannot copy the index: {error}"))?;
+            copy_index(&real, &copy)?;
         }
         git(&["add", "-A"], Some(&copy))?;
         inspect(&copy)
     })();
     let _ = std::fs::remove_file(&copy);
     inspected
+}
+
+/// Copies the index `real` to `copy`, with its own time.
+///
+/// The copy keeps the stat cache, so files unchanged since are not hashed
+/// again. git takes a file whose times and size match its entry for
+/// unchanged, unless the entry is "racily clean": no older than the index
+/// itself, so the file may have changed in the moment the index was written.
+/// Where git compares whole seconds (its Linux builds), a file changed to
+/// the same size in the second the index was written matches its entry, and
+/// only that check finds it. A copy dated later than the index (as
+/// `std::fs::copy` dates it on Linux) hides it, and git keeps the entry's
+/// old blob. The index's time is read before the copy is made: an index
+/// replaced meanwhile only makes more entries racy.
+fn copy_index(real: &Path, copy: &Path) -> Result<(), String> {
+    let written = std::fs::metadata(real)
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| format!("cannot read the index's time: {error}"))?;
+    std::fs::copy(real, copy).map_err(|error| format!("cannot copy the index: {error}"))?;
+    std::fs::File::options()
+        .write(true)
+        .open(copy)
+        .and_then(|file| file.set_modified(written))
+        .map_err(|error| format!("cannot date the copy of the index: {error}"))
 }
 
 /// This machine: its name (lower-cased), OS and architecture.
