@@ -329,10 +329,14 @@ fn a_different_command_starts_a_run_of_its_own() {
         let runs = runs(status);
         runs.len() == 5 && runs.iter().all(|run| run["attached_clients"] == 1)
     });
+    // The same directory, however it is spelled (macOS's `/var` is
+    // `/private/var`).
+    let other_worktree = std::fs::canonicalize(&other_worktree).expect("the worktree exists");
     assert!(
         runs(&status).iter().any(|run| run["worktree"]
             .as_str()
-            .is_some_and(|worktree| std::path::Path::new(worktree) == other_worktree)),
+            .and_then(|worktree| std::fs::canonicalize(worktree).ok())
+            .is_some_and(|worktree| worktree == other_worktree)),
         "{status}"
     );
     std::fs::write(&gate, "").expect("open the gate");
