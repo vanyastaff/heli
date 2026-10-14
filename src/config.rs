@@ -24,6 +24,13 @@
 //! paths = ['D:\.heli\build']        # build stores, the first on a volume
 //!                                   # serves it; default <volume>/.heli/build
 //! tool_caches = ["tests/trybuild"]  # tool caches inside target/; default none
+//! budget_mb = 153600   # B, for every build directory and registered
+//!                      # target/ directory together; default none
+//! floor_mb = 51200     # F, the free space kept on each volume; default none
+//! unit_hours = 24      # the eviction ages (crate::store::ladder), in hours;
+//! orphan_hours = 24    # these are the defaults
+//! idle_hours = 6
+//! dir_hours = 168
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -35,10 +42,10 @@
 //! start with it, and its log says why.
 //!
 //! **The test seam.** Debug builds also read a `[test]` table ([`Seam`]):
-//! memory figures and a clock for the memory governor, which tests set
-//! instead of the machine's. The daemon reads it again each time the
-//! governor looks ([`current_seam`]), so a test can change them while it
-//! runs. Release builds ignore the table.
+//! memory figures, and a clock for the memory governor and the eviction
+//! ladder, which tests set instead of the machine's. The daemon reads it
+//! again each time the governor or the ladder looks ([`current_seam`]), so a
+//! test can change them while it runs. Release builds ignore the table.
 
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -70,6 +77,20 @@ pub struct StoreConfig {
     /// The tool caches inside a `target/` directory: patterns of paths
     /// relative to it, `/` between components, `*` and `?` within one.
     pub tool_caches: Vec<String>,
+    /// B, in megabytes of 2^20 bytes: what every build directory and
+    /// registered `target/` directory may take together. `None`: no budget.
+    pub budget_mb: Option<u64>,
+    /// F, in megabytes: the free space heli keeps on each volume that holds
+    /// a store or a registered `target/` directory. `None`: no floor.
+    pub floor_mb: Option<u64>,
+    /// Tier 1: incremental units untouched this many hours; default 24.
+    pub unit_hours: Option<u64>,
+    /// Tier 2: orphans unclaimed this many hours; default 24.
+    pub orphan_hours: Option<u64>,
+    /// Tiers 3 and 4: directories idle this many hours; default 6.
+    pub idle_hours: Option<u64>,
+    /// Tier 5: whole build directories idle this many hours; default 168.
+    pub dir_hours: Option<u64>,
 }
 
 /// `[pool]`: the host pool (`crate::pool`).
@@ -117,12 +138,14 @@ pub struct EventLogConfig {
     pub max_kb: Option<NonZeroU64>,
 }
 
-/// The test seam (debug builds only): what the memory governor reads here
-/// instead of asking the machine.
+/// The test seam (debug builds only): what the memory governor and the
+/// eviction ladder read here instead of asking the machine.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct Seam {
-    /// The governor's clock, in milliseconds; `None`: the real one.
+    /// The clock, in milliseconds since 1970; `None`: the real one. The
+    /// memory governor counts only the time between its readings; the
+    /// eviction ladder takes it as the time now (`crate::store::ladder`).
     pub clock_ms: Option<u64>,
     /// `[test.memory]`: memory figures; `None`: the machine's.
     pub memory: Option<InjectedMemory>,

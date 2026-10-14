@@ -27,9 +27,21 @@
 //! [`LOOK`] otherwise; it never takes cargo's locks. `status` reads the
 //! figures: one entry per store, its build directories added up, and one
 //! per registered `target/` directory.
+//!
+//! **Eviction** (DESIGN.md §6.3). With a budget or a floor configured, the
+//! accountant also keeps the orphans' notes (`crate::store::orphan`) at
+//! each look, and when its figures are over the budget, or a volume they
+//! are on has less free than the floor, it makes an eviction pass
+//! (`crate::store::evict`), unless `gc` is making one. Each eviction goes
+//! to the event log; `status` shows the last pass that evicted anything
+//! (`last_gc`). Its clock is the test seam's in debug builds that set one.
+//! A thread of its own deletes what is in the trash, at low I/O priority:
+//! after each pass, and every [`LOOK`], which also clears what a `gc`
+//! that was stopped left there.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -39,13 +51,15 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use super::Log;
-use crate::clock;
+use super::events::Events;
 use crate::config::StoreConfig;
 use crate::protocol::RunRequest;
-use crate::status::{Disk, StoreUse, TargetUse};
+use crate::status::{Disk, Evicted, LastGc, StoreUse, TargetUse};
+use crate::store::ladder::{self, Policy};
 use crate::store::registry::{Registry, Target};
 use crate::store::sizes::Sizes;
-use crate::store::{self, Kind, owner};
+use crate::store::{self, Kind, evict, orphan, owner, trash, volume};
+use crate::{clock, config};
 
 /// How often the accountant looks for new directories when no run ends.
 const LOOK: Duration = Duration::from_secs(60);
@@ -55,14 +69,23 @@ const STALE: Duration = Duration::from_secs(3600);
 
 pub struct Accounts {
     config: StoreConfig,
+    policy: Policy,
     /// The state directory, which holds the registry of `target/`
     /// directories (`crate::store::registry`).
     state_dir: PathBuf,
+    /// The configuration file, which holds the test seam.
+    config_file: PathBuf,
     /// Held while the registry is rewritten: one writer at a time.
     registry: Mutex<()>,
     ledger: Mutex<Ledger>,
     /// Signalled when a directory needs scanning.
     wake: Condvar,
+    /// Whether the trash has something new to delete, and its signal.
+    trash: Mutex<bool>,
+    trash_wake: Condvar,
+    /// The last eviction pass that evicted anything.
+    last_gc: Mutex<Option<LastGc>>,
+    events: Arc<Events>,
     log: Log,
 }
 
@@ -110,19 +133,42 @@ pub struct Learning {
 }
 
 impl Accounts {
-    /// The accounts, with their accountant started.
-    pub(super) fn start(config: StoreConfig, state_dir: PathBuf, log: Log) -> Arc<Self> {
+    /// The accounts, with their accountant and the trash's deleter started;
+    /// `config_file` holds the test seam.
+    pub(super) fn start(
+        config: StoreConfig,
+        state_dir: PathBuf,
+        config_file: PathBuf,
+        events: Arc<Events>,
+        log: Log,
+    ) -> Arc<Self> {
         let accounts = Arc::new(Self {
+            policy: Policy::of(&config),
             config,
             state_dir,
+            config_file,
             registry: Mutex::new(()),
             ledger: Mutex::new(Ledger::default()),
             wake: Condvar::new(),
+            trash: Mutex::new(false),
+            trash_wake: Condvar::new(),
+            last_gc: Mutex::new(None),
+            events,
             log,
         });
         let accountant = Arc::clone(&accounts);
         std::thread::spawn(move || accountant.keep());
+        let deleter = Arc::clone(&accounts);
+        std::thread::spawn(move || deleter.empty_trash());
         accounts
+    }
+
+    /// The last eviction pass that evicted anything.
+    pub fn last_gc(&self) -> Option<LastGc> {
+        self.last_gc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Learns, in the background, the workspace that run `request` builds
@@ -165,7 +211,7 @@ impl Accounts {
                 }
                 StoreUse {
                     path: text(store),
-                    budget: None,
+                    budget: self.policy.budget,
                     used: sizes.total(),
                     by_category: sizes,
                 }
@@ -249,13 +295,141 @@ impl Accounts {
             ledger
                 .figures
                 .retain(|path, _| dirs.iter().any(|dir| dir.path == *path));
-            // A run that ended during this pass needs another one at once.
+            drop(ledger);
+            if self.policy.active() {
+                let now = self.now();
+                orphan::keep(&dirs, now);
+                if self.over_limits() {
+                    self.evict(&registry, now);
+                }
+            }
+            // A run that ended during this pass, or an eviction, needs
+            // another one at once.
+            let ledger = self.ledger();
             if ledger.dirty.is_empty() {
                 let _waited = self
                     .wake
                     .wait_timeout(ledger, LOOK)
                     .unwrap_or_else(PoisonError::into_inner);
             }
+        }
+    }
+
+    /// The time now for the ladder: the test seam's clock, if it has one.
+    fn now(&self) -> u64 {
+        ladder::now(config::current_seam(&self.config_file).as_ref())
+    }
+
+    /// Whether the figures are over the budget, or a volume they are on has
+    /// less free than the floor.
+    fn over_limits(&self) -> bool {
+        let ledger = self.ledger();
+        let used: u64 = ledger
+            .figures
+            .values()
+            .map(|figures| figures.sizes.total())
+            .sum();
+        if self.policy.budget.is_some_and(|budget| used > budget) {
+            return true;
+        }
+        let Some(floor) = self.policy.floor else {
+            return false;
+        };
+        let mut roots: Vec<PathBuf> = Vec::new();
+        for path in ledger.figures.keys() {
+            if let Some(root) = volume::root(path)
+                && !roots.contains(&root)
+            {
+                roots.push(root);
+            }
+        }
+        drop(ledger);
+        roots
+            .iter()
+            .any(|root| volume::free(root).is_some_and(|free| free < floor))
+    }
+
+    /// Makes an eviction pass at `now`, unless `gc` is making one: logs
+    /// each eviction, remembers the pass if it evicted anything, and has
+    /// what it evicted from counted again and the trash emptied.
+    fn evict(&self, registry: &Registry, now: u64) {
+        let lock = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(evict::lock_file(&self.state_dir));
+        let _evicting = match lock.map(|file| file.try_lock().map(|()| file)) {
+            Ok(Ok(file)) => file,
+            Ok(Err(TryLockError::WouldBlock)) => return,
+            Ok(Err(TryLockError::Error(error))) | Err(error) => {
+                self.log
+                    .write(&format!("cannot take the eviction lock: {error}"));
+                return;
+            }
+        };
+        let mut pass = evict::plan(&self.config, registry, now, false);
+        evict::execute(&mut pass, now);
+        for (victim, why) in &pass.skipped {
+            self.log.write(&format!(
+                "did not evict {} (tier {}): {why}",
+                victim.path.display(),
+                victim.tier.number()
+            ));
+        }
+        if pass.victims.is_empty() {
+            return;
+        }
+        for victim in &pass.victims {
+            self.events.record("evict", evict::event(victim));
+        }
+        *self.last_gc.lock().unwrap_or_else(PoisonError::into_inner) = Some(LastGc {
+            at: clock::now(),
+            evicted: pass
+                .victims
+                .iter()
+                .map(|victim| Evicted {
+                    path: victim.path.to_string_lossy().into_owned(),
+                    tier: victim.tier.number(),
+                    bytes: victim.bytes,
+                })
+                .collect(),
+        });
+        let mut ledger = self.ledger();
+        ledger.dirty.extend(
+            pass.victims
+                .iter()
+                .map(|victim| pass.dirs[victim.dir].dir.path.clone()),
+        );
+        drop(ledger);
+        *self.trash.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.trash_wake.notify_all();
+    }
+
+    /// The trash's deleter: deletes what is in every trash, at low I/O
+    /// priority, when a pass has put something there and every [`LOOK`].
+    fn empty_trash(&self) {
+        trash::lower_io_priority();
+        let mut last_error = String::new();
+        loop {
+            let registry = Registry::load(&self.state_dir);
+            for trash in trash::all(&self.config, &registry) {
+                if let Err(error) = trash::empty(&trash) {
+                    let error = format!("cannot empty {} yet: {error}", trash.display());
+                    if error != last_error {
+                        self.log.write(&error);
+                        last_error = error;
+                    }
+                }
+            }
+            let mut pending = self.trash.lock().unwrap_or_else(PoisonError::into_inner);
+            if !*pending {
+                pending = self
+                    .trash_wake
+                    .wait_timeout(pending, LOOK)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            *pending = false;
         }
     }
 

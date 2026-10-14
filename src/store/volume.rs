@@ -26,6 +26,42 @@ pub fn same(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// The bytes free for this user on the volume that holds `path`, if they
+/// can be read.
+pub fn free(path: &Path) -> Option<u64> {
+    platform_free(path)
+}
+
+#[cfg(windows)]
+fn platform_free(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` ends with a NUL; the totals may be null.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free)
+}
+
+#[cfg(unix)]
+fn platform_free(path: &Path) -> Option<u64> {
+    let stat = rustix::fs::statvfs(path).ok()?;
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
 /// `root` as volume roots compare: on Windows without case.
 fn spelled(root: &Path) -> String {
     let root = root.to_string_lossy();

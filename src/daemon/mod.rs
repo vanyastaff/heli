@@ -116,13 +116,13 @@ pub fn main() -> ! {
     let pool = Arc::new(open_pool(&locations, &config, &log));
     let governor = Governor::new(&config, locations.config.clone())
         .unwrap_or_else(|error| fail(Some(&log), &error));
-    let events = Events::new(
+    let events = Arc::new(Events::new(
         locations.event_log(),
         config
             .event_log
             .max_kb
             .map_or(events::DEFAULT_MAX, |kb| kb.get().saturating_mul(1024)),
-    );
+    ));
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
@@ -143,6 +143,8 @@ pub fn main() -> ! {
         accounts: accounts::Accounts::start(
             config.store.clone(),
             locations.state_dir.clone(),
+            locations.config.clone(),
+            Arc::clone(&events),
             log.clone(),
         ),
         registry: Registry::new(RunIds::new(
@@ -246,7 +248,7 @@ struct Daemon {
     /// Lends the host pool's slots to the runs' own pools.
     broker: Arc<Broker>,
     governor: Governor,
-    events: Events,
+    events: Arc<Events>,
     runlog: RunLog,
     results: results::Store,
     lifecycle: Mutex<Lifecycle>,
@@ -586,6 +588,7 @@ impl Daemon {
             memory: self.governor.memory(),
             runs: self.runs(),
             disk: Some(self.accounts.disk()),
+            last_gc: self.accounts.last_gc(),
         }
     }
 
