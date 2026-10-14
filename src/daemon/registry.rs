@@ -98,6 +98,8 @@ impl Registry {
                     .collect(),
                 phase: entry.phase,
                 started_at: clock::unix_seconds(entry.started_at),
+                slots: 0,
+                share: 0.0,
             })
             .collect()
     }

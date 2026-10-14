@@ -21,6 +21,13 @@
 //!
 //! The counts are snapshots: other processes take and return slots at any
 //! moment.
+//!
+//! **Run pools** ([`RunPool`]). Each heli run draws from a jobserver of its
+//! own, named after the host pool and the run (`<pool>-r17`), which starts
+//! with no free slot. The [`broker`] lends it slots from the host pool and
+//! takes them back.
+
+pub mod broker;
 
 #[cfg(unix)]
 mod unix;
@@ -34,6 +41,8 @@ use windows as platform;
 
 use std::ffi::{OsStr, OsString};
 use std::io;
+
+pub use platform::Waiter;
 
 use crate::status;
 
@@ -79,7 +88,37 @@ impl Pool {
 
     /// The value of `CARGO_MAKEFLAGS` that points a cargo at this pool.
     pub fn makeflags(&self) -> OsString {
-        format!("-j --jobserver-auth={}", self.jobserver.auth()).into()
+        makeflags(&self.jobserver)
+    }
+
+    /// N.
+    pub fn slots(&self) -> u32 {
+        self.jobserver.slots()
+    }
+
+    /// The free slots, as counted now.
+    pub fn free(&self) -> io::Result<u32> {
+        self.jobserver.free()
+    }
+
+    /// Takes a free slot if there is one, without waiting.
+    pub fn try_take(&self) -> io::Result<bool> {
+        self.jobserver.try_take()
+    }
+
+    /// Gives a slot back; `false` when the pool is already full (on
+    /// Windows, at its maximum count), and the slot is dropped.
+    pub fn give(&self) -> io::Result<bool> {
+        self.jobserver.give()
+    }
+
+    /// Creates the run pool of run `run`: `<this pool's name>-<run>`, with
+    /// no free slot and room for all of this pool's.
+    pub fn run_pool(&self, run: &str) -> io::Result<RunPool> {
+        let mut name = self.jobserver.name().to_owned();
+        name.push(format!("-{run}"));
+        let jobserver = platform::Jobserver::create_empty(&name, self.slots())?;
+        Ok(RunPool { jobserver })
     }
 
     /// The slots, as counted now.
@@ -96,6 +135,53 @@ impl Pool {
             in_use: slots.saturating_sub(free).saturating_sub(withheld),
         }
     }
+}
+
+/// A run's own jobserver, which only the [`broker`] fills. Dropping it
+/// removes its name (on Unix, its path); processes that still hold it keep
+/// it.
+pub struct RunPool {
+    jobserver: platform::Jobserver,
+}
+
+impl RunPool {
+    /// The value of `CARGO_MAKEFLAGS` that points the run's processes here.
+    pub fn makeflags(&self) -> OsString {
+        makeflags(&self.jobserver)
+    }
+
+    /// The free slots, as counted now.
+    pub fn free(&self) -> io::Result<u32> {
+        self.jobserver.free()
+    }
+
+    /// Takes a free slot if there is one, without waiting.
+    pub fn try_take(&self) -> io::Result<bool> {
+        self.jobserver.try_take()
+    }
+
+    /// Puts a slot in; `false` when the pool is already full, and the slot
+    /// was not put in.
+    pub fn give(&self) -> io::Result<bool> {
+        self.jobserver.give()
+    }
+
+    /// A waiter that takes slots in line with the run's processes.
+    pub fn waiter(&self) -> io::Result<Waiter> {
+        self.jobserver.waiter()
+    }
+}
+
+impl Drop for RunPool {
+    fn drop(&mut self) {
+        self.jobserver.remove();
+    }
+}
+
+/// `CARGO_MAKEFLAGS` for `jobserver`. heli sets no job count: under a
+/// jobserver, cargo ignores one.
+fn makeflags(jobserver: &platform::Jobserver) -> OsString {
+    format!("-j --jobserver-auth={}", jobserver.auth()).into()
 }
 
 /// Whether `name` can travel in `CARGO_MAKEFLAGS`: the jobserver protocol

@@ -50,10 +50,11 @@ fn seen_by_a_run(fixture: &Fixture, name: &str, configure: impl Fn(&mut Command)
         .to_owned()
 }
 
-/// Every run gets `CARGO_MAKEFLAGS` pointing at the pool (on Windows the
-/// semaphore's name, elsewhere `fifo:<path>`), in place of the client's own.
+/// Every run gets `CARGO_MAKEFLAGS` pointing at a run pool of its own, in
+/// place of the client's own: the host pool's name (on Windows a semaphore,
+/// elsewhere `fifo:<path>`) followed by `-<run id>`.
 #[test]
-fn a_run_draws_from_the_pool() {
+fn a_run_draws_from_a_run_pool_of_its_own() {
     let fixture = Fixture::new("basic");
     let pool = fixture.pool().into_string().expect("a Unicode pool name");
     let auth = if cfg!(windows) {
@@ -61,12 +62,18 @@ fn a_run_draws_from_the_pool() {
     } else {
         format!("fifo:{pool}")
     };
-    let expected = format!("env CARGO_MAKEFLAGS=Some(\"-j --jobserver-auth={auth}\")");
-    assert_eq!(seen_by_a_run(&fixture, "CARGO_MAKEFLAGS", |_| {}), expected);
-    let replaced = seen_by_a_run(&fixture, "CARGO_MAKEFLAGS", |heli| {
+    let prefix = format!("env CARGO_MAKEFLAGS=Some(\"-j --jobserver-auth={auth}-r");
+    let run_of = |seen: &str| -> u64 {
+        seen.strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix("\")"))
+            .and_then(|run| run.parse().ok())
+            .unwrap_or_else(|| panic!("not a run pool of {auth}: {seen}"))
+    };
+    let first = run_of(&seen_by_a_run(&fixture, "CARGO_MAKEFLAGS", |_| {}));
+    let replaced = run_of(&seen_by_a_run(&fixture, "CARGO_MAKEFLAGS", |heli| {
         heli.env("CARGO_MAKEFLAGS", "-j8");
-    });
-    assert_eq!(replaced, expected, "the client's own is replaced");
+    }));
+    assert_ne!(first, replaced, "each run has a pool of its own");
 }
 
 /// A run's environment holds `HELI_RUN`, its run id.
@@ -167,18 +174,42 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// The value of `CARGO_MAKEFLAGS` that points a bare cargo at the fixture's
+/// host pool.
+fn host_pool_makeflags(fixture: &Fixture) -> String {
+    let pool = fixture.pool().into_string().expect("a Unicode pool name");
+    if cfg!(windows) {
+        format!("-j --jobserver-auth={pool}")
+    } else {
+        format!("-j --jobserver-auth=fifo:{pool}")
+    }
+}
+
 /// A daemon that dies during a build is replaced by one that adopts its
 /// pool rather than making a second one. With N = 2 and the build's three
 /// build scripts running (one on its cargo's own job, two on pool slots),
 /// the new daemon's `status` agrees with the log: both slots in use. Once
 /// the build is over, both come back, and no more.
+///
+/// The build is a bare cargo on the host pool: slots lent to a heli run's
+/// own pool by a daemon that died come back only through the top-up.
 #[test]
 fn a_restarted_daemon_adopts_the_pool() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
     let echo = fixture.echo_args();
+    start_daemon(&fixture);
     let log = fixture.concurrency_log();
-    let build = start_slow_build(&fixture, "target-slow", &log, 10_000);
+    let mut build = fixture.cargo(["build", "--quiet"]);
+    build
+        .args(["-p", "slow-a", "-p", "slow-b", "-p", "slow-c"])
+        .env("CARGO_TARGET_DIR", fixture.path("target-slow"))
+        .env("CARGO_MAKEFLAGS", host_pool_makeflags(&fixture))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    log.attach(&mut build, 10_000);
+    let build = build.spawn().expect("start cargo");
     wait_until("three build scripts at once", || log.running() == 3);
 
     let daemon = fixture.daemon_pid().expect("a daemon");
@@ -203,8 +234,8 @@ fn a_restarted_daemon_adopts_the_pool() {
         "{still_running} scripts hold the pool's 2 slots"
     );
 
-    // The build's client lost its daemon; its cargo builds on.
-    let _ = build.wait_with_output().expect("wait for the client");
+    // The bare cargo never needed the daemon.
+    assert_success(&build.wait_with_output().expect("wait"), "cargo build");
     let rlibs = ["slow_a", "slow_b", "slow_c"].map(|name| {
         fixture
             .path("target-slow")
@@ -489,10 +520,13 @@ fn the_default_pool_is_the_users() {
             .expect("run heli");
         assert_success(&output, "cargo heli exec");
         let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        // The run's own pool is named after the host pool: `<pool>-r<id>`.
         text.trim_end()
             .strip_prefix("env CARGO_MAKEFLAGS=Some(\"-j --jobserver-auth=")
             .and_then(|rest| rest.strip_suffix("\")"))
-            .unwrap_or_else(|| panic!("no jobserver: {text}"))
+            .and_then(|run_pool| run_pool.rsplit_once("-r"))
+            .map(|(pool, _run)| pool)
+            .unwrap_or_else(|| panic!("no run pool: {text}"))
             .to_owned()
     };
     let homes = [

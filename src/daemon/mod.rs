@@ -33,6 +33,7 @@ use std::time::{Duration, SystemTime};
 use crate::config::Config;
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
+use crate::pool::broker::{Broker, Loans};
 use crate::pool::{self, Pool};
 use crate::protocol::{self, Reply, Request, RunRequest};
 use crate::status::{self, Status};
@@ -73,7 +74,7 @@ pub fn main() -> ! {
             fail(Some(&log), &format!("cannot take the lock: {error}"))
         }
     }
-    let pool = open_pool(&locations, &log);
+    let pool = Arc::new(open_pool(&locations, &log));
     let mut listener = match ipc::Listener::bind(&locations.endpoint) {
         Ok(listener) => listener,
         Err(error) => fail(
@@ -90,6 +91,7 @@ pub fn main() -> ! {
 
     let daemon = Arc::new(Daemon {
         registry: Registry::new(&locations.run_counter()),
+        broker: Broker::start(Arc::clone(&pool)),
         pool,
         lifecycle: Mutex::new(Lifecycle::default()),
         started_at: SystemTime::now(),
@@ -147,7 +149,9 @@ fn open_pool(locations: &Locations, log: &Log) -> Pool {
 
 struct Daemon {
     registry: Registry,
-    pool: Pool,
+    pool: Arc<Pool>,
+    /// Lends the host pool's slots to the runs' own pools.
+    broker: Arc<Broker>,
     lifecycle: Mutex<Lifecycle>,
     started_at: SystemTime,
     log: Log,
@@ -214,7 +218,13 @@ impl Daemon {
             self.registry.finish(id);
             return;
         }
-        let reply = match execute::spawn(&request, id, &self.pool.makeflags()) {
+        let (makeflags, error) = self.broker.open(id);
+        if let Some(error) = error {
+            self.log.write(&format!(
+                "{id}: no run pool ({error}); it draws from the host pool"
+            ));
+        }
+        let reply = match execute::spawn(&request, id, &makeflags) {
             Err(error) => Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
                 message: error.to_string(),
@@ -230,6 +240,10 @@ impl Daemon {
                 }
             },
         };
+        if let Some(loans) = self.broker.close(id) {
+            self.log
+                .write(&format!("{id}: run pool: {}", describe(&loans)));
+        }
         self.registry.finish(id);
         let _ = protocol::write_message(&mut stream, &reply);
         // The reply is out before a retiring daemon may exit.
@@ -246,8 +260,21 @@ impl Daemon {
                 started_at: clock::unix_seconds(self.started_at),
             }),
             pool: Some(self.pool.status()),
-            runs: self.registry.snapshot(),
+            runs: self.runs(),
         }
+    }
+
+    /// The runs in flight, with the slots each uses.
+    fn runs(&self) -> Vec<status::Run> {
+        let usage = self.broker.usage();
+        let mut runs = self.registry.snapshot();
+        for run in &mut runs {
+            if let Some(usage) = usage.iter().find(|(id, _)| id.to_string() == run.id) {
+                run.slots = usage.1.slots;
+                run.share = usage.1.share;
+            }
+        }
+        runs
     }
 
     /// Counts a run as served until the guard drops; `None` when retiring.
@@ -289,6 +316,25 @@ impl Drop for Serving<'_> {
         let mut lifecycle = self.0.lifecycle();
         lifecycle.serving -= 1;
         self.0.exit_if_retired(&lifecycle);
+    }
+}
+
+/// How a run's loans went, for the log: how many, the most slots it used,
+/// and how long it waited for a lent slot (at most: from when its pool was
+/// last seen with a free slot).
+fn describe(loans: &Loans) -> String {
+    let millis = |wait: Duration| wait.as_secs_f64() * 1000.0;
+    match loans.waits() {
+        None => "no loans".to_owned(),
+        Some((median, longest)) => format!(
+            "{} loans, {} taken back, at most {} slots in use; \
+             wait for a lent slot: median {:.1} ms, longest {:.1} ms",
+            loans.count,
+            loans.reclaimed,
+            loans.most,
+            millis(median),
+            millis(longest)
+        ),
     }
 }
 

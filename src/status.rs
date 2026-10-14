@@ -9,10 +9,12 @@
 //!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
-//!           "phase":"running","started_at":1791911112}]}
+//!           "phase":"running","started_at":1791911112,"slots":6,"share":8.0}]}
 //! ```
 //!
-//! `daemon` and `pool` are `null` when no daemon answers.
+//! `daemon` and `pool` are `null` when no daemon answers. A run's `slots`
+//! are the host pool's slots it uses, and `share` its share of them
+//! (`crate::pool::broker`).
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +64,13 @@ pub struct Run {
     pub argv: Vec<String>,
     pub phase: Phase,
     pub started_at: u64,
+    /// The slots it uses: lent to its run pool and not free there.
+    #[serde(default)]
+    pub slots: u32,
+    /// Its share of the host pool's capacity, which it may exceed while no
+    /// other run waits.
+    #[serde(default)]
+    pub share: f64,
 }
 
 /// Where a run is in its lifecycle.
@@ -117,14 +126,26 @@ impl Status {
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {}s\n",
+                "{label:<6}  {}  {}  {}  {}  {} slot{}, share {}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
                 run.phase.name(),
+                run.slots,
+                if run.slots == 1 { "" } else { "s" },
+                slots(run.share),
                 age(run.started_at)
             ));
         }
         text
+    }
+}
+
+/// A number of slots for people: whole, or with one decimal.
+pub fn slots(slots: f64) -> String {
+    if slots.fract() == 0.0 {
+        format!("{slots:.0}")
+    } else {
+        format!("{slots:.1}")
     }
 }
