@@ -69,7 +69,9 @@ use serde_json::Value;
 
 /// Variables a test command must not inherit: they would move the target
 /// directory, change the flags or job count, or hand cargo a jobserver.
-const ISOLATED_VARS: [&str; 11] = [
+/// `CI`, set on CI runners, turns cargo's incremental compilation off
+/// (verified with cargo 1.99), so a build would leave no `incremental/`.
+const ISOLATED_VARS: [&str; 12] = [
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
     "CARGO_BUILD_BUILD_DIR",
@@ -81,6 +83,7 @@ const ISOLATED_VARS: [&str; 11] = [
     "CARGO_ENCODED_RUSTFLAGS",
     "RUSTDOCFLAGS",
     "CARGO_INCREMENTAL",
+    "CI",
 ];
 
 /// heli's variables a test command must not inherit from whoever runs the
