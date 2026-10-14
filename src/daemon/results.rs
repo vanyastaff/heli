@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
 use crate::clock;
-use crate::daemon::execute;
 use crate::daemon::key::{self, Key};
 use crate::daemon::registry::RunId;
 use crate::protocol::{Cache, Reply, RunRequest, Text};
@@ -201,7 +200,7 @@ impl Store {
         }
         let record = Record {
             run: run.to_string(),
-            worktree: Text(worktree::of(&execute::cwd(request)).into_os_string()),
+            worktree: Text(worktree::of(&request.cwd()).into_os_string()),
             at: clock::now(),
         };
         self.record(key, &record)

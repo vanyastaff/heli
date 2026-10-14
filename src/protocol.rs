@@ -60,13 +60,15 @@
 //! the requests later tickets add; output stays raw bytes in frames of its
 //! own, since it need not be UTF-8.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::environment;
 use crate::runlog::select::Select;
 use crate::status::{self, Status};
 
@@ -158,6 +160,28 @@ pub struct RunRequest {
     /// older than it, which is never sent one.
     #[serde(default)]
     pub reads_spawned: bool,
+}
+
+impl RunRequest {
+    /// The command line, program first.
+    pub fn argv(&self) -> Vec<OsString> {
+        self.argv.iter().map(|arg| arg.0.clone()).collect()
+    }
+
+    /// The working directory.
+    pub fn cwd(&self) -> PathBuf {
+        PathBuf::from(&self.cwd.0)
+    }
+
+    /// The client's variable `name`, by the platform's rule for names (on
+    /// Windows without case); the last one given, should there be two.
+    pub fn var(&self, name: &str) -> Option<&OsStr> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(candidate, _)| environment::same_name(&candidate.0, name))
+            .map(|(_, value)| value.0.as_os_str())
+    }
 }
 
 /// How a run uses the result store (`crate::daemon::results`).

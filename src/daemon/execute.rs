@@ -37,16 +37,6 @@ const GRACE: Duration = Duration::from_millis(500);
 /// How much output one frame carries at most.
 const CHUNK: usize = 64 * 1024;
 
-/// The run's command line, program first.
-pub fn argv(request: &RunRequest) -> Vec<OsString> {
-    request.argv.iter().map(|arg| arg.0.clone()).collect()
-}
-
-/// The run's working directory.
-pub fn cwd(request: &RunRequest) -> PathBuf {
-    PathBuf::from(&request.cwd.0)
-}
-
 /// Points cargo, rustc and build scripts at the jobserver they draw from,
 /// replacing the client's own value.
 pub const MAKEFLAGS_VAR: &str = "CARGO_MAKEFLAGS";
@@ -65,7 +55,7 @@ pub fn spawn(
     id: RunId,
     makeflags: &OsStr,
 ) -> io::Result<(Child, Tree)> {
-    let cwd = cwd(request);
+    let cwd = request.cwd();
     let mut argv = argv.iter().cloned();
     let program = argv.next().unwrap_or_default();
     let mut command = Command::new(resolve(&cwd, program));

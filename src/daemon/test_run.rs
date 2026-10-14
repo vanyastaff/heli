@@ -24,6 +24,7 @@
 use std::ffi::{OsStr, OsString};
 
 use crate::class::{self, Class, Runner};
+use crate::environment;
 use crate::protocol::{RunRequest, Text};
 
 /// nextest's flags with a value that only the test phase reads (checked
@@ -81,20 +82,13 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
     if request.class != Some(Class::Test) {
         return None;
     }
-    let argv: Vec<OsString> = request.argv.iter().map(|arg| arg.0.clone()).collect();
+    let argv = request.argv();
     let (runner, at) = runner(&argv)?;
     let (tool, _) = split_at_separator(&argv[at..]);
     if tool.iter().any(|arg| arg == "--no-run") {
         return None;
     }
-    let env = |name: &str| {
-        request
-            .env
-            .iter()
-            .rev()
-            .find(|(key, _)| same_name(&key.0, name))
-            .and_then(|(_, value)| value.0.to_str().map(str::to_owned))
-    };
+    let env = |name: &str| request.var(name)?.to_str().map(str::to_owned);
     let asked = match runner {
         Runner::Nextest => thread_flags(tool, &["-j", "--test-threads", "--jobs"])
             .last()
@@ -150,7 +144,11 @@ impl TestRun {
                     argv.push("--".into());
                     argv.extend(without_switches(test_args, &RUN_ONLY_SWITCHES[2..]));
                 }
-                env.retain(|(name, _)| !RUN_ONLY_VARS.iter().any(|var| same_name(&name.0, var)));
+                env.retain(|(name, _)| {
+                    !RUN_ONLY_VARS
+                        .iter()
+                        .any(|var| environment::same_name(&name.0, var))
+                });
             }
         }
         Some(RunRequest {
@@ -283,14 +281,4 @@ fn nextest_threads(value: &str) -> Option<u32> {
         }
     };
     u32::try_from(threads.max(1)).ok()
-}
-
-#[cfg(windows)]
-fn same_name(name: &OsStr, other: &str) -> bool {
-    name.eq_ignore_ascii_case(other)
-}
-
-#[cfg(not(windows))]
-fn same_name(name: &OsStr, other: &str) -> bool {
-    name == other
 }

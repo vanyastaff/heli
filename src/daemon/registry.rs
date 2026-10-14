@@ -73,7 +73,7 @@ use super::tree::Tree;
 use crate::class::{Access, Class};
 use crate::protocol::{Cache, RunRequest};
 use crate::status::{self, Exit, Phase};
-use crate::{clock, runlog};
+use crate::{clock, environment, runlog};
 
 /// How many runs that ended while no client followed them stay listed.
 pub const DONE_KEPT: usize = 32;
@@ -107,29 +107,23 @@ pub struct Command {
     env: Vec<(OsString, OsString)>,
 }
 
-/// Variables a shell sets for its own bookkeeping.
-const SHELL_BOOKKEEPING: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
-
 impl Command {
     /// The command `request` asks for.
     pub fn of(request: &RunRequest) -> Self {
         let mut env: Vec<(OsString, OsString)> = request
             .env
             .iter()
-            .map(|(name, value)| {
-                let name = if cfg!(windows) {
-                    name.0.to_ascii_uppercase()
-                } else {
-                    name.0.clone()
-                };
-                (name, value.0.clone())
+            .map(|(name, value)| (environment::folded(&name.0), value.0.clone()))
+            .filter(|(name, _)| {
+                !environment::SHELL_BOOKKEEPING
+                    .iter()
+                    .any(|shell| name == shell)
             })
-            .filter(|(name, _)| !SHELL_BOOKKEEPING.iter().any(|shell| name == shell))
             .collect();
         env.sort();
         Self {
-            cwd: PathBuf::from(&request.cwd.0),
-            argv: request.argv.iter().map(|arg| arg.0.clone()).collect(),
+            cwd: request.cwd(),
+            argv: request.argv(),
             env,
         }
     }

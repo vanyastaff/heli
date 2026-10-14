@@ -367,7 +367,7 @@ impl Daemon {
             }
             Before::Miss(key) => key,
         };
-        let worktree = worktree::of(&execute::cwd(&request));
+        let worktree = worktree::of(&request.cwd());
         let admission = self.registry.admit(
             worktree.clone(),
             Command::of(&request),
@@ -424,7 +424,7 @@ impl Daemon {
         worktree: &Path,
         known: Option<Key>,
     ) {
-        let argv = execute::argv(request);
+        let argv = request.argv();
         let admission = serde_json::json!({
             "worktree": worktree.to_string_lossy(),
             "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
@@ -521,7 +521,7 @@ impl Daemon {
             record: &mut record,
         };
         let ended = match test_run::plan(request) {
-            None => self.phase(&mut run, &execute::argv(request)),
+            None => self.phase(&mut run, &request.argv()),
             Some(plan) => self.test(&mut run, &plan),
         };
         if let Some(loans) = self.broker.close(id) {
@@ -609,7 +609,7 @@ impl Daemon {
                 live: run.live,
                 record: &mut *run.record,
             };
-            let built = self.phase(&mut phase, &execute::argv(&build))?;
+            let built = self.phase(&mut phase, &build.argv())?;
             if built.0 != 0 {
                 return Ok(built);
             }
@@ -788,10 +788,8 @@ fn reads(request: &RunRequest) -> live::Reads {
 /// above 1.
 fn nested(request: &RunRequest) -> bool {
     request
-        .env
-        .iter()
-        .find(|(name, _)| name.0 == nesting::VAR)
-        .and_then(|(_, depth)| depth.0.to_str()?.trim().parse::<u32>().ok())
+        .var(nesting::VAR)
+        .and_then(|depth| depth.to_str()?.trim().parse::<u32>().ok())
         .is_some_and(|depth| depth > 1)
 }
 
