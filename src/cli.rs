@@ -27,8 +27,13 @@ pub enum Action {
     /// Start the daemon unless one runs.
     Ensure,
     /// Offer the environment that lets a bare cargo draw from the pool;
-    /// with `print`, only show it.
-    Setup { print: bool },
+    /// with `print`, only show it. `autostart` registers the daemon to start
+    /// at logon (`Some(true)`), removes that registration (`Some(false)`),
+    /// or leaves it as it is (`None`).
+    Setup {
+        print: bool,
+        autostart: Option<bool>,
+    },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
     Log { run: String, select: Select },
     /// Kill run `run` (`r<number>`) with every process it started.
@@ -120,6 +125,14 @@ enum Command {
         /// Only show what would be written; ask nothing, write nothing.
         #[arg(long)]
         print: bool,
+        /// Also register the daemon to start when you log on, in your
+        /// session: a Task Scheduler task, a systemd user unit or a launchd
+        /// agent. Clients then start it through that registration.
+        #[arg(long, conflicts_with = "no_autostart")]
+        autostart: bool,
+        /// Remove the registration `--autostart` made.
+        #[arg(long)]
+        no_autostart: bool,
     },
     /// Print a run's recorded output: stdout on stdout, stderr on stderr.
     Log {
@@ -204,7 +217,18 @@ pub fn parse(
         }
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
-        Command::Setup { print } => Action::Setup { print },
+        Command::Setup {
+            print,
+            autostart,
+            no_autostart,
+        } => Action::Setup {
+            print,
+            autostart: match (autostart, no_autostart) {
+                (true, _) => Some(true),
+                (false, true) => Some(false),
+                (false, false) => None,
+            },
+        },
         Command::Log {
             run,
             tail,

@@ -40,7 +40,9 @@
 //! - `chatter`: numbered lines on stdout and stderr, and on request bytes
 //!   that test a run log's fidelity (see its `main.rs`);
 //! - `linger`: a test that, on request, starts a child in a process group
-//!   of its own and waits for a file with it (see its `lib.rs`).
+//!   of its own and waits for a file with it (see its `lib.rs`);
+//! - `fake-manager`: stands in for `schtasks`, `systemctl` and `launchctl`
+//!   ([`fake_manager`]); no test reaches the real ones.
 //!
 //! After every run the daemon executes, heli prints a footer line on stderr
 //! ([`split_footer`], [`without_footer`]).
@@ -49,6 +51,7 @@
 
 pub mod endpoint;
 pub mod fake_daemon;
+pub mod fake_manager;
 pub mod jobserver;
 pub mod terminal;
 
@@ -491,6 +494,12 @@ impl Fixture {
                 Some(value) => command.env(var, value),
                 None => command.env_remove(var),
             };
+        }
+        // No test reaches the real Task Scheduler, systemd or launchd: heli
+        // finds a program that does not exist unless a test sets the fake
+        // (`fake_manager::FakeManager::apply`).
+        for var in fake_manager::VARS {
+            command.env(var, self.root.path().join("no-service-manager"));
         }
         command
     }

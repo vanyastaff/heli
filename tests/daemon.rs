@@ -814,16 +814,21 @@ fn a_daemon_lost_during_a_run_is_an_error() {
     let gate = fixture.path("gate");
     let mut call = fixture.heli(["exec", "--"]);
     call.arg(&echo).arg("once").env("ECHO_WAIT_FOR", &gate);
-    let call = start(&mut call);
-    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
-    support::kill_tree(support::daemon_pid(&status).expect("a daemon"));
+    let mut call = start(&mut call);
+    // Once the client has printed the run's first line, the run is under
+    // way.
+    let mut stdout = std::io::BufReader::new(call.stdout.take().expect("a stdout"));
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut stdout, &mut first).expect("read the client's stdout");
+    assert_eq!(first, "arg: \"once\"\n", "what the run printed before");
+    support::kill_tree(fixture.daemon_pid().expect("a daemon"));
+    let mut rest = String::new();
+    stdout
+        .read_to_string(&mut rest)
+        .expect("read the client's stdout");
     let output = finish(call);
     assert_eq!(output.status.code(), Some(1));
-    assert_eq!(
-        text(&output.stdout),
-        "arg: \"once\"\n",
-        "what the run printed before, and no second run"
-    );
+    assert_eq!(rest, "", "no second run");
     let stderr = lines(&output.stderr);
     assert_eq!(stderr.len(), 1, "{stderr:?}");
     assert!(
