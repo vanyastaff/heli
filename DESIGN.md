@@ -161,7 +161,8 @@ not start, listen or answer within 5 s.
 
 - The client starts `cargo heli daemon --detach`, which starts the daemon and
   exits once it listens. The daemon's parent is then gone, so no tree walk
-  from the client reaches it. Agent harnesses stop a command by killing its
+  from the client reaches it; the client goes on only once that stage has
+  exited, within the same 5 s. Agent harnesses stop a command by killing its
   process tree found through parent processes: observed with Claude Code on
   Windows, where stopping a command killed the client, the daemon it had
   started directly, and that daemon's run.
