@@ -732,7 +732,7 @@ fn input_file(root: &Path, relative: &Path) -> Result<File, String> {
         } else {
             flags | OFlags::DIRECTORY
         };
-        directory = File::from(openat(&directory, name, flags, Mode::empty()).map_err(error)?);
+        directory = File::from(openat(&directory, *name, flags, Mode::empty()).map_err(error)?);
     }
     if !directory.metadata().map_err(error)?.is_file() {
         return Err("vendor input is not a regular file".into());
