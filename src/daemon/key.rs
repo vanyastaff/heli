@@ -24,10 +24,11 @@
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::protocol::RunRequest;
@@ -36,7 +37,7 @@ use crate::{environment, source, worktree};
 
 /// Raised when what goes into the key, or how, changes, so that markers of
 /// another composition never match.
-const COMPOSITION: &[u8] = b"2";
+const COMPOSITION: &[u8] = b"3";
 
 /// The local source inventories at one moment: Git trees and raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +72,7 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }
     fields.push(b"machine", &machine());
     toolchain(request, &mut fields);
-    cargo_config(request, &mut fields);
+    cargo_config(request, &mut fields)?;
     environment(request, &worktree, &mut fields);
     Ok(Some(Key {
         digest: fields.finish(),
@@ -372,7 +373,7 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
 /// the Cargo home. Their paths are not keyed, so worktrees in different
 /// places share a key. A file that is there but cannot be read is keyed by
 /// its error, never as absent: cargo may fail on it.
-fn cargo_config(request: &RunRequest, fields: &mut Fields) {
+fn cargo_config(request: &RunRequest, fields: &mut Fields) -> Result<(), String> {
     let cwd = request.cwd();
     let dirs = cwd
         .ancestors()
@@ -380,8 +381,15 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
         .chain(cargo_home(request, &cwd).map(|home| ("cargo-home-config", home)));
     for (place, dir) in dirs {
         for file in ["config.toml", "config"] {
-            match std::fs::read(dir.join(file)) {
-                Ok(content) => fields.push(format!("{place} {file}").as_bytes(), &content),
+            let path = dir.join(file);
+            match std::fs::read(&path) {
+                Ok(content) => config_file(
+                    &path,
+                    &content,
+                    format!("{place} {file}").as_bytes(),
+                    fields,
+                    &mut Vec::new(),
+                )?,
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -408,9 +416,22 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
         };
         // Inline KEY=VALUE configuration is already in argv. A file's
         // spelling is there too, but its changing content must count.
-        if let Some(path) = value.filter(|value| !value.as_encoded_bytes().contains(&b'=')) {
-            match std::fs::read(cwd.join(path)) {
-                Ok(content) => fields.push(b"cargo-cli-config", &content),
+        if let Some(value) = value {
+            if value.as_encoded_bytes().contains(&b'=') {
+                // Cargo also accepts include=[...] through --config. Its
+                // external inputs are not covered by keying argv alone.
+                config_includes(value.as_encoded_bytes(), &cwd, fields, &mut Vec::new())?;
+                continue;
+            }
+            let path = cwd.join(value);
+            match std::fs::read(&path) {
+                Ok(content) => config_file(
+                    &path,
+                    &content,
+                    b"cargo-cli-config",
+                    fields,
+                    &mut Vec::new(),
+                )?,
                 Err(error) => fields.push(
                     b"unreadable cargo-cli-config",
                     format!("{:?} {:?}", error.kind(), error.raw_os_error()).as_bytes(),
@@ -418,6 +439,122 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
             }
         }
     }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct ConfigIncludes {
+    #[serde(default)]
+    include: Vec<ConfigInclude>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ConfigInclude {
+    Path(String),
+    Options(IncludeOptions),
+}
+
+#[derive(Deserialize)]
+struct IncludeOptions {
+    path: String,
+    #[serde(default)]
+    optional: bool,
+}
+
+/// Hash each include in Cargo's order. Cargo 1.99's per-root seen set
+/// treats repeated paths, including diamonds, as include cycles.
+fn config_file(
+    path: &Path,
+    content: &[u8],
+    label: &[u8],
+    fields: &mut Fields,
+    seen: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "cannot identify Cargo configuration {}: {error}",
+            path.display()
+        )
+    })?;
+    if seen.len() >= 64 || seen.contains(&canonical) {
+        return Err(format!(
+            "cyclic or excessively large Cargo config include graph at {}",
+            path.display()
+        ));
+    }
+    seen.push(canonical);
+    let parent = path.parent().ok_or("a Cargo configuration has no parent")?;
+    config_includes(content, parent, fields, seen)?;
+    fields.push(label, content);
+    Ok(())
+}
+
+fn config_includes(
+    content: &[u8],
+    base: &Path,
+    fields: &mut Fields,
+    seen: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let text = std::str::from_utf8(content).map_err(|_| "Cargo configuration is not UTF-8")?;
+    let config: ConfigIncludes = toml::from_str(text)
+        .map_err(|_| "cannot inspect Cargo config includes: invalid configuration")?;
+    for include in config.include {
+        let (name, optional) = match include {
+            ConfigInclude::Path(path) => (path, false),
+            ConfigInclude::Options(options) => (options.path, options.optional),
+        };
+        let joined = base.join(&name);
+        if Path::new(&name).extension() != Some(OsStr::new("toml"))
+            || name.contains(['*', '?', '[', ']', '{', '}'])
+        {
+            return Err(format!(
+                "invalid Cargo config include path: {}",
+                joined.display()
+            ));
+        }
+        // Cargo normalizes `..` lexically before accessing the file. A
+        // filesystem traversal through symlinks could read another input.
+        let path = normalized_include(&joined)?;
+        match std::fs::read(&path) {
+            Ok(content) => config_file(&path, &content, b"cargo-include", fields, seen)?,
+            Err(error)
+                if optional
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                    ) =>
+            {
+                // Missing optional files are real inputs: creation must
+                // invalidate a cached pass, removal must recover absence.
+                fields.push(b"missing cargo-include", name.as_bytes());
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot read Cargo config include {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalized_include(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("cannot establish an absolute Cargo config include path".to_owned());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
 }
 
 /// Keys the client's environment: every variable but the [`neutral`] ones,

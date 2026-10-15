@@ -1828,6 +1828,19 @@ was found by a failing test.
   there but cannot be read is keyed by its error, never as absent.
   Files explicitly selected by `--config` are keyed by content too;
   inline `KEY=VALUE` settings already contribute through argv.
+  Transitive `include` files contribute their raw bytes in Cargo's order,
+  including `--config 'include=[...]'`: file includes resolve relative to
+  their containing file, inline includes relative to the client's cwd,
+  with Cargo's lexical path normalization. String entries and tables
+  (`path`, `optional`) are supported; unknown table fields are ignored as
+  in Cargo. Missing optional files contribute an absence marker, so their
+  creation invalidates a pass and removal restores the original inputs.
+  Invalid, cyclic, unreadable required includes, or a graph exceeding 64
+  files disable result caching rather than certify incomplete inputs.
+  Repeated include paths count as cycles, matching Cargo 1.99. The whole
+  include graph is reread after the run; keys use composition 3, excluding
+  markers written before transitive configuration identity was included.
+  [Pinned Cargo include loading](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/context/mod.rs#L1386)
 - **Argv**, normalized: without the program, which the toolchain stands for,
   and with the working directory relative to the worktree, which selects
   packages and configuration as an argument would. The worktree's own path is

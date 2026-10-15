@@ -125,6 +125,9 @@ impl Twins {
         command
             .current_dir(dir)
             .env("CARGO", &self.cargo)
+            // This fixture selects its fake compiler through PATH, even
+            // when the real suite was launched with an explicit RUSTC.
+            .env_remove("RUSTC")
             .env("CARGO_HOME", self.fixture.path("cargo-home"))
             .env("ECHO_VERSION", self.fixture.path("versions"))
             .env("PATH", &self.path)
