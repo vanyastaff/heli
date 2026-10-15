@@ -298,15 +298,51 @@ target path. This demonstrates the patched FLUI consumer handshake for that
 entry point, without bypassing another user's lock or deleting existing
 caches. It does not validate every project-specific task runner.
 
-**Post-measurement repair still awaiting final-binary acceptance:** reviewing
+**Post-measurement repair:** reviewing
 the new cache-off behavior found that identical verification/test requests
 could incorrectly single-flight by command despite changed source inputs.
 The public source-change reproducer failed before a registry guard was added;
 the investigator then reported ten single-flight and 27 result-cache cases
 green. Those later registry changes are absent from the cache-off binary
 identified above. At the time this section was written, the complete suite
-was running and a new frozen-binary experiment was planned. Do not present
-the earlier PASS as validation of those later edits.
+was running and a new frozen-binary experiment was planned. The earlier PASS
+does not validate those later edits; the final repeat below does.
+
+### Final frozen implementation
+
+The repeat in `target/mps-1015-final` passed all harness checks on heli
+`e04452be9a3c121ad4e498279484af84d997f8a5` and the same FLUI commit. Binary
+SHA-256: `4a99f55370a8bf5050c9e1af9670f01313a2015a826b15a2cee24f2ce9b33576`.
+This includes the distinct `Cache::Disabled` wire contract: an older daemon
+must refuse the unsupported semantics before any command starts. A public
+fallback test verifies exactly one direct execution and a retirement request.
+
+| Agent | First compiler | Exit |
+|---|---:|---:|
+| heli check | 0.49 s | 0 |
+| heli test | 0.48 s | 0 |
+| FLUI test | 1.13 s | 0 |
+| late FLUI check | 0.74 s | 0 |
+
+Four distinct real agents had overlapping compiler subprocess intervals.
+One independently checkable witness, in Unix epoch nanoseconds:
+
+| Agent / run | Compiler starts | Compiler exits |
+|---|---:|---:|
+| heli-check / r1 | 1792097343118180500 | 1792097343712593100 |
+| heli-test / r2 | 1792097343112002400 | 1792097343680238900 |
+| flui-test / r3 | 1792097342989212300 | 1792097343651413000 |
+| flui-check / r4 | 1792097343124547500 | 1792097343686117000 |
+
+All four intervals include `[1792097343124547500, 1792097343651413000]`.
+The real xtask held-lock probe completed in 0.153 s, with its bare negative
+control still blocked. All six nested workloads exited zero. Final fresh
+post-GC survey: 1,668,322,816 bytes against 2,147,483,648 bytes; the unrelated
+unmarked sentinel survived. Minimum sampled available physical memory was
+36,550,414,336 bytes, and commit headroom 28,031,430,656 bytes. These remain
+observations rather than hard caps. The same zero-age and workload limitations
+apply. The complete local heli suite passed 346 tests on this implementation,
+with `cargo clippy --all-targets --locked -- -D warnings` also green.
 
 The reproducible harness is `experiments/multi-project-spike.py`, with
 `experiments/spike-rustc-wrapper.rs` recording compiler start/end events while

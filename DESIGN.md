@@ -2021,6 +2021,18 @@ Headstart properties. heli does not enable its flags or ship compiler patches.
 
 ## 12. Plan
 
+The Windows acceptance spike on 2026-10-15 used heli `e04452b`, FLUI
+`1800e914f`, two repositories and four detached worktrees with GC enabled.
+Four agents compiled concurrently; their first actual compiler started in
+0.48–1.13 s under `--cache off`. Six nested Cargo workloads converged to
+1,668,322,816 accounted bytes under B = 2,147,483,648 bytes. An isolated held
+FLUI host lock blocked bare xtask but not `heli exec` (0.153 s). Full heli
+suite: 346 local tests passed. See `docs/research/multi-project-resource-isolation.md`
+for exact refs, binary hash, overlapping compiler intervals and caveats.
+This focused workload does not establish every exit criterion below: it used
+zero GC ages, did not run a simultaneous full FLUI gate or measure throughput
+against the old lock, and is not a universal resource bound or multi-OS load test.
+
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned
   off. It measures whether a shared pool alone ends the queues and bounds
