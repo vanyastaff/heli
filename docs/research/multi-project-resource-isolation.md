@@ -454,3 +454,61 @@ activity can defer it indefinitely. Precise eviction during arbitrary nested
 runtime would require a complete usage/lease protocol in the subprocesses,
 which Cargo metadata cannot provide. The earlier four-client spike did not
 exercise this long-runtime case and cannot by itself establish that safety.
+
+## Repeat with runtime protection enabled
+
+`target/mps-1015-runtime` passed all harness checks with heli
+`fb5748adf8a96e2f853caf7a8d2bd3269fc61a54` and FLUI
+`2bb8689518ea68f2cc67e3d8a5c9dfabfbd971b4`. The frozen heli binary SHA-256 is
+`d13b823337eb2414821ff90ec0c492f8e0f63520bc820b038b0aedc9acfe084a`.
+The observer source hash remains the one recorded above. These four clients
+represent independent agents' Cargo workloads; this is a process-concurrency
+experiment, not four LLM agents editing source code.
+
+| Cargo client | First compiler | Exit |
+|---|---:|---:|
+| heli check | 0.353 s | 0 |
+| heli test | 0.340 s | 0 |
+| FLUI test | 8.562 s | 0 |
+| late FLUI check | 7.917 s | 0 |
+
+All four had overlapping compiler invocation intervals. A saved witness in
+`overlap-witness.json`, in epoch nanoseconds:
+
+| Client / run | Start | End |
+|---|---:|---:|
+| heli-check / r1 | 1792100877780781900 | 1792100881783301200 |
+| heli-test / r2 | 1792100875955582300 | 1792100879790339100 |
+| flui-test / r3 | 1792100879754180800 | 1792100879853921300 |
+| flui-check / r4 | 1792100879496628000 | 1792100881515971000 |
+
+These are invocation lifetimes, not CPU utilization samples. Their common
+interval is `[1792100879754180800, 1792100879790339100]`. All twelve commands
+exited zero. The real managed xtask completed in 0.155 s with the separate
+host lock still held, while its bare control waited for release. Final fresh
+idle GC usage was 1,668,335,579 bytes under B = 2,147,483,648 bytes. Minimum
+sampled available physical memory was 33,760,247,808 bytes and commit
+headroom 25,300,545,536 bytes; neither is a hard limit.
+
+The repeat recorded 24 Cargo file-lock wait messages, including package-cache
+waits before both FLUI clients' first compiler. Their 7.9–8.6 s starts are
+inside this experiment's 10 s target but are slower than the previous run;
+the evidence does not establish a causal regression or eliminate shared
+Cargo-home contention. No global compiler/task-runner queue reappeared.
+The runtime guard also intentionally delays GC until managed activity is idle.
+
+All 350 local heli tests and strict all-target Clippy passed. Separate public
+regressions prove runtime-asset preservation, independent workspace progress,
+survival after killing only the daemon, post-runtime reclamation, and invalid
+relative activity-namespace safety. The three-OS run is
+[CI 38812308421](https://github.com/vanyastaff/heli/actions/runs/38812308421).
+The companion FLUI PR's final
+[CI 38807923018](https://github.com/vanyastaff/flui/actions/runs/38807923018)
+is green, including nested Cargo and trybuild.
+
+After recording the result and removing only the experiment's clean Git
+worktrees, a separate zero-budget cleanup configuration reclaimed its owned
+store through the public GC CLI. `cleanup-survey.json` retains the evidence:
+no store build directories remain; the six generated fixtures retain just
+1,062 accounted bytes of target metadata. Logs, inputs, manifests, events
+and the original acceptance configuration remain available.

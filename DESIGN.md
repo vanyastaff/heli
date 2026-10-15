@@ -2062,6 +2062,18 @@ This focused workload does not establish every exit criterion below: it used
 zero GC ages, did not run a simultaneous full FLUI gate or measure throughput
 against the old lock, and is not a universal resource bound or multi-OS load test.
 
+The subsequent runtime-safety repeat used heli `fb5748a` and FLUI `2bb868951`:
+four independent Cargo clients still had overlapping compiler invocations,
+all twelve commands passed, and idle GC converged to 1,668,335,579 bytes
+under the same 2 GiB budget. First compiler: 0.340–8.562 s; package-cache
+waits remain. The full local heli suite passed 350 tests plus strict Clippy.
+Public regressions separately cover long-running nested tests, another
+workspace progressing while one test waits, and a daemon killed while its
+test survives. This strengthens runtime safety but conservatively defers GC
+until managed activity is idle (§6.3); continuous load has no hard disk cap.
+Exact refs, binary hash, overlapping intervals and cleanup evidence are in
+the research report. Q2 remains repository opt-in, with per-workspace paths.
+
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned
   off. It measures whether a shared pool alone ends the queues and bounds
