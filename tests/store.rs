@@ -769,12 +769,15 @@ fn store_sizes(store: &Path) -> (u64, [(&'static str, u64); 6]) {
         ("tool_caches", 0),
         ("other", 0),
     ];
+    let mut used = 0;
     for dir in build_dirs(store) {
+        used += du(&dir);
         for (sum, (_, size)) in sums.iter_mut().zip(build_dir_sizes(&dir)) {
             sum.1 += size;
         }
     }
-    (du(store), sums)
+    // Root provenance and trash are not build-directory artifacts.
+    (used, sums)
 }
 
 /// `status` shows the disk each store takes, by category, as the daemon

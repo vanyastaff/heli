@@ -74,6 +74,8 @@ struct Entry {
     path: String,
     store: Option<String>,
     state: State,
+    /// The store was created by heli as an exclusively regenerable cache.
+    managed_cache_root: bool,
     workspace: Option<String>,
     repository: Option<String>,
     created_at: Option<u64>,
@@ -99,6 +101,10 @@ impl Entry {
             path: text(&dir.path),
             store: dir.store.as_deref().map(text),
             state,
+            managed_cache_root: dir
+                .store
+                .as_deref()
+                .is_some_and(crate::store::managed::owns),
             workspace: dir.workspace.as_deref().map(text),
             repository: dir
                 .owner

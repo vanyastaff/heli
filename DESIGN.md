@@ -1417,10 +1417,21 @@ Which directories have which tiers:
 - A busy directory has none.
 - A live build directory has tiers 1, 3 and 5; an orphan 1, 2 and 3. An
   orphan is deleted whole by tier 2 only, so it always has its 24 h.
-- An **unknown** build directory, which only bare cargo built in, has tiers
-  1 and 3 only. heli cannot tell whether its workspace lives, so it is
-  never an orphan and never deleted whole: only the caches cargo
-  regenerates unit by unit go. Its first heli run gives it a manifest.
+- An **unknown** build directory, which only bare or nested cargo built in,
+  normally has tiers 1 and 3 only. Its first heli run gives it a manifest.
+  In an exclusively regenerable cache root created by heli, it also has
+  tier 5 after `dir_hours`, with a recognized Cargo lock layout and no held
+  locks. It remains unknown: ownership of a cache root does not establish
+  workspace identity, orphan status or eligibility for recycling.
+- Only an explicitly configured `store.paths` root whose final directory
+  heli successfully creates receives `.heli-cache-root.json` (schema 1,
+  bound to its canonical path). Existing roots, even empty ones, and default
+  roots are never adopted. Missing, copied, malformed or unsupported markers
+  retain the conservative policy. `gc --dry-run` creates nothing.
+  Root provenance, real child directories and the Cargo lock layout are
+  checked again before eviction. `gc --json` exposes `managed_cache_root`.
+  Configure a fresh root for nested-Cargo reclamation; there is no implicit
+  migration of an existing store.
 - A registered `target/` directory has tiers 1 and 3 where cargo keeps its
   intermediates there (no `build-dir`), and tier 4. It is in the user's
   worktree, so it is never deleted whole.
@@ -1430,7 +1441,8 @@ Safety rules:
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
   directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
   directory) exclusively, in every profile directory of the victim's
-  directory, and anywhere inside a tool cache (a nested build's). If one is
+  directory, and anywhere inside the victim (including nested Cargo caches
+  left by build scripts). If one is
   held, or cannot be opened, the directory is busy and skipped. heli checks
   as it plans, and again as it evicts.
 - **Rename, then delete.** Under the locks, heli only renames the victim

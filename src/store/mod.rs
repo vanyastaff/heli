@@ -23,6 +23,7 @@
 
 pub mod evict;
 pub mod ladder;
+pub mod managed;
 pub mod orphan;
 pub mod owner;
 pub mod probe;
@@ -234,8 +235,33 @@ pub fn busy(dir: &Path) -> bool {
 /// cargo heli does not know.
 pub fn busy_for_eviction(dir: &Path, now: u64) -> bool {
     let profiles = lock_dirs(dir);
-    profiles.iter().any(|profile| held(profile))
-        || (unknown_layout(&profiles) && recently_changed(dir, now))
+    locks_inside(dir).map_or(true, |locks| {
+        locks
+            .iter()
+            .any(|path| matches!(try_lock(path), Lock::Held))
+    }) || (unknown_layout(&profiles) && recently_changed(dir, now))
+}
+
+/// Known Cargo locks at any depth, without following links. An unreadable
+/// subtree cannot prove that a whole-directory eviction is safe.
+pub fn locks_inside(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if std::fs::symlink_metadata(dir)?.is_file() {
+        return Ok(Vec::new());
+    }
+    let mut locks = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && LOCKS.iter().any(|name| entry.file_name() == *name) {
+                locks.push(entry.path());
+            }
+        }
+    }
+    Ok(locks)
 }
 
 /// Within this many seconds, a change makes a directory of an unknown lock

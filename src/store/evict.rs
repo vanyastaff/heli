@@ -9,7 +9,7 @@
 //! and lets go:
 //!
 //! - every one of cargo's lock files ([`super::LOCKS`]) in the directory's
-//!   profile directories, and, for a tool cache, inside it, must be free;
+//!   profile directories and anywhere inside the victim must be free;
 //!   one that is not makes the directory busy, and the victim is skipped;
 //! - heli holds them while it renames, but on Windows not those inside the
 //!   victim: Windows refuses to rename a directory with a file open inside,
@@ -214,11 +214,25 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
             }
         }
     }
-    if victim.tier == Tier::ToolCache {
-        inner.extend(locks_inside(&victim.path));
-    }
+    // A whole directory may contain a build-script's nested Cargo cache.
+    // Recheck these locks after planning, including on Unix where rename
+    // does not fail just because an active descendant has an open file.
+    inner.extend(
+        super::locks_inside(&victim.path)
+            .map_err(|error| format!("cannot inspect nested Cargo locks: {error}"))?,
+    );
+    inner.sort();
+    inner.dedup();
     let _outer = hold(&outer)?;
     let inner = hold(&inner)?;
+    if victim.tier == Tier::BuildDir
+        && surveyed.state == State::Unknown
+        && !super::managed::unknown_is_reclaimable(&surveyed.dir)
+    {
+        return Err(
+            "unknown directory has no verified managed cache root or lock layout".to_owned(),
+        );
+    }
     if super::unknown_layout(&profiles) && super::recently_changed(root, now) {
         return Err("busy: changed within the hour".to_owned());
     }
@@ -244,28 +258,6 @@ fn hold(locks: &[PathBuf]) -> Result<Vec<File>, String> {
         }
     }
     Ok(held)
-}
-
-/// Cargo's lock files anywhere under `dir`, never through a link.
-fn locks_inside(dir: &Path) -> Vec<PathBuf> {
-    let mut locks = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            if kind.is_dir() {
-                pending.push(entry.path());
-            } else if kind.is_file() && super::LOCKS.iter().any(|name| entry.file_name() == *name) {
-                locks.push(entry.path());
-            }
-        }
-    }
-    locks
 }
 
 /// Whether `victim`, at or below the directory `root`, exists, is no link,
