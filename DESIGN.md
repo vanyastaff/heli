@@ -1,6 +1,6 @@
 # heli: one machine, many agents, one cargo budget
 
-Status: design draft, 2026-10-13. "heli" is a working name.
+Status: design draft, updated 2026-10-15. "heli" is a working name.
 
 This document is the single source of truth for heli's mechanisms and
 contracts. Issue #1 states the problem, the user stories and the testing
@@ -30,6 +30,13 @@ workspace that motivated it, and serve as the worked example throughout:
 Windows 11, 32 logical CPUs, 64 GB RAM; the flui workspace (39 members, 462
 third-party packages on the host platform); 14 agent worktrees. Measured
 2026-10-13.
+
+FLUI is one motivating consumer. The user's workload spans many projects
+with the same contention and disk-growth problem, currently spread over
+multiple PCs. Acceptance therefore needs simultaneous runs from different
+repositories on one host, as well as multiple worktrees of one repository.
+Repository opt-in for build placement (§6.1) does not partition the shared
+CPU/memory pool or give each repository an independent disk budget.
 
 | Symptom | Evidence | Cause |
 |---|---|---|
@@ -1136,9 +1143,13 @@ wrappers.
 
 ### 6.1 Placement
 
-`cargo heli setup` sets `build.build-dir = "<store>/{workspace-path-hash}"`,
-either in the user's Cargo configuration or for one repository (open question
-2). Verified: `build-dir` supports the templates `{workspace-root}`,
+Build placement is **opt-in per repository** (Q2, decided in #27). Enabling
+heli's host pool does not imply moving every project's intermediates.
+`cargo heli setup` offers `build.build-dir = "<store>/{workspace-path-hash}"`
+for one repository. The separate user-wide offer remains an explicit override
+for a user who has validated their other projects and tools; it is not the
+recommended scope. Both file writes default to no. Verified: `build-dir`
+supports the templates `{workspace-root}`,
 `{cargo-cache-home}` and `{workspace-path-hash}`, the last being a hash of the
 canonical manifest path (cargo `src/context/mod.rs`, `custom_build_dir`; Cargo
 Book, `build.build-dir`).
@@ -1171,7 +1182,8 @@ for the pool's variable (§4, "Reach"):
 - **Every project**: the user's Cargo configuration (`config.toml` in
   `CARGO_HOME`, else in `~/.cargo`). One value serves every volume, so its
   store is the one on the volume setup runs in. Every cargo reads it,
-  nested ones included.
+  nested ones included. Accepting the repository offer does not authorize
+  this write: it has its own question, default no.
 
 setup adds two lines under the file's `[build]` table (or in a new one at
 its end): a comment that marks them as heli's, and
@@ -1181,6 +1193,14 @@ that sets `build-dir` itself, or whose new content would not parse to the
 same configuration plus `build.build-dir`. Then, in a repository, setup
 offers its git `post-checkout` hook, for recycling (§6.4).
 
+For a run and its nested cargos, the process-scoped equivalent is
+`CARGO_BUILD_BUILD_DIR="<store>/{workspace-path-hash}"`. The two `BUILD`s
+are intentional: Cargo maps the `build.build-dir` configuration key to
+that environment variable ([Cargo Book](https://doc.rust-lang.org/cargo/reference/config.html#buildbuild-dir)).
+Unlike a repository configuration file, the inherited environment also
+reaches generated workspaces in temporary directories. It does not change
+the user's Cargo configuration.
+
 **Risk: tools that look in `target/<profile>/deps`.** Once the intermediates
 move, anything that searches `target/<profile>/deps` for rlibs, test binaries
 or `.d` files stops finding them. In flui, the candidates are the hot-reload
@@ -1189,6 +1209,96 @@ workspace's full test suite (flui's) must pass with `build-dir` set (§12).
 
 This is the direction of cargo#16147. heli turns it on and manages what
 accumulates.
+
+#### FLUI validation, 2026-10-15 (#27)
+
+The experiment used a separate, initially clean FLUI worktree at
+[`b653a7ad8ddfb17c2f43b9cec8c3b9c56e5284a0`](https://github.com/vanyastaff/flui/commit/b653a7ad8ddfb17c2f43b9cec8c3b9c56e5284a0),
+on Windows x86_64 with Rust/Cargo 1.99.0 and cargo-nextest 0.9.146. The
+final tested source is recorded in FLUI commit
+`a0dcb509ff5b8a1d0f593587c2ce710654a351f2` (the baseline above plus the
+Android lint allowance below). The worktree and store were on the same
+volume. Every Cargo invocation inherited:
+
+```text
+CARGO_INCREMENTAL=0
+CARGO_TARGET_DIR=<worktree>/target
+CARGO_BUILD_BUILD_DIR=<store>/{workspace-path-hash}
+```
+
+`cargo metadata --format-version 1 --no-deps` reported different
+`target_directory` and `build_directory` paths, with the latter under the
+store and its workspace hash expanded. Child rustc invocations also wrote
+their intermediates there, including generated nested workspaces. The
+experiment used Cargo directly; it did not measure heli's governor, GC or
+recycling. Neither the main FLUI checkout nor user-wide Cargo configuration
+was changed.
+
+```text
+cargo xtask check-changed --full --no-cache --base 1670492ddaba70e88cbcebc3bec2ac919e37aa97
+cargo xtask test --nested --nested-group native
+```
+
+The base is a root commit of FLUI's history, chosen to force whole-workspace
+scope in a clean worktree. The dry-run explicitly reported
+`packages: <whole workspace>`; `--full` alone would still use change scope.
+The CLI name `native` selects nextest's `group(nested-cargo)` (generated CLI
+projects, external facade consumers and iOS Cargo-artifact fixtures).
+Its prescribed test feature graph also enables `flui-devtools/agent`, beyond
+the full check-changed workspace test graph.
+The host lock stayed enabled, with 28 build jobs and 16 nextest threads;
+heavy commands ran sequentially.
+
+**Failure inventory.** The first full invocation passed fmt, both strict
+Clippy steps, 59 xtask tests, 981 workspace tests, strict rustdoc and
+814 doctests, then stopped at the macOS cross-check: `cargo-zigbuild` was
+installed but Zig was missing (`Failed to find zig`). Installing Zig 0.16.0
+in an experiment-local tools directory and adding it only to that process's
+`PATH` made `cargo xtask cross-typecheck --target aarch64-apple-darwin` pass.
+No FLUI source fix was needed for that prerequisite failure. Long-running
+trybuild cases were reported as slow, not failed tests; they passed without
+changing timeouts.
+
+The next full invocation reached Android Clippy and failed in
+`crates/flui-testing/tests/a11y_query.rs`: `missing_const_for_thread_local`
+reported an initializer that already used `const { ... }`. A standalone
+`RefCell<Option<String>>` thread-local reproduced the same error with
+`clippy-driver --target aarch64-linux-android -D warnings`, after unsetting
+`CARGO_BUILD_BUILD_DIR`; this is independent of artifact placement and matches
+[Clippy #13422](https://github.com/rust-lang/rust-clippy/issues/13422).
+The fix applies the existing FLUI Android-only lint allowance to that one
+declaration, retaining the const initializer and the accessibility regression
+test. The original Android cross-typecheck then passed. Its strict Clippy
+invocation is the regression check for this compiler-lint compatibility fix.
+
+**Final full-gate result: exit 0**, with that Android-only allowance:
+
+| Check | Result |
+|---|---|
+| Workspace fmt and both strict Clippy steps | Passed |
+| xtask nextest | 59 passed |
+| Workspace nextest | 981 passed, 29 skipped; 13 slow, none failed |
+| Hot-reload fixture and lifecycle tests | Built; load/unload/reload tests passed within the workspace run |
+| Strict rustdoc | Passed with `-D warnings` |
+| Doctests | 814 passed, 264 ignored, none failed |
+| Required native cross-typechecks | macOS ARM64, Android ARM64 and Windows x86_64 passed |
+| wasm32 workspace Clippy and facade hot-reload check | Passed |
+| `flui-platform` compiler guards | 1 passed |
+
+**Separate nested-cargo result: exit 0.** All 11 selected tests passed
+(1 slow); 1001 tests were skipped by the configured selection. The Windows
+xtask prelude had no member of this group (0 run, 59 skipped); the 11 tests
+ran in the workspace stage. Generated basic, empty, widget and counter
+projects, facade consumers and iOS Cargo-artifact fixtures passed with the
+inherited build directory setting.
+
+**Limits.** This is a Windows-host compatibility experiment, not Linux or
+macOS runtime evidence. The full plan omits iOS typechecking without a genuine
+Apple SDK and the native `flui-platform` suite that needs Linux/Xvfb.
+Ignored tests remain ignored. Coverage instrumentation and an exhaustive
+optional-feature matrix are not part of these commands. This evidence does
+not justify changing every project's build placement globally: the Q2
+decision is repository opt-in, with a scoped environment for nested cargos.
 
 ### 6.2 Accounting
 
@@ -1863,6 +1973,23 @@ the one before, and the next event starts a new file.
 | cargo#14774, feature unification | Out of scope (cargo-hakari) | Fewer duplicate units for §6.3 |
 | rust#113349, parallel front end | The pool already lends rustc its threads | none |
 
+**Headstart as a candidate toolchain.**
+[Headstart](https://github.com/PowderworksCode/headstart/tree/ff81bfecda2116d54776a7fec538fc2f4e349d1f)
+patches Cargo and rustc to start dependents on early interface metadata. It
+can complement host-level scheduling, but it has not been tested with heli.
+Its [readiness assessment](https://github.com/PowderworksCode/headstart/blob/ff81bfecda2116d54776a7fec538fc2f4e349d1f/docs/readiness.md)
+identifies two relevant limits: a resumed compiler can run without a
+jobserver token, and paused compilers retain memory without a count limit.
+
+The useful lesson for heli is to measure active CPU work and resident memory
+separately, and to validate the inherited jobserver contract of an optional
+toolchain before recommending it. An integration experiment must compare
+stock and patched toolchains with one and multiple concurrent worktrees,
+record token accounting through wait/resume, peak memory and total wall time,
+and verify dependency-error/crash exit status and absence of cached false
+greens. The §6.1 FLUI run uses stock Rust and establishes none of those
+Headstart properties. heli does not enable its flags or ship compiler patches.
+
 ## 12. Plan
 
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
@@ -1873,7 +2000,8 @@ the one before, and the next event starts a new file.
 - **Phase 1.** Daemon, host pool, run pools and broker, governor, bounded
   top-up, `cargo heli build/check/clippy/test/nextest/exec`, detach and
   attach, `status`, output modes with the run log and `cargo heli log`. Exit
-  criteria, on flui with at least 4 agents:
+  criteria, with at least 4 agents across multiple Cargo repositories
+  (including flui), and multiple worktrees of a shared repository:
   - no run waits more than 10 s for its first rustc;
   - available commit never drops below 10 %;
   - no out-of-memory failure;
@@ -1884,7 +2012,20 @@ the one before, and the next event starts a new file.
     failure.
 - **Phase 2.** Build store: placement, accounting, the eviction ladder,
   conservative recycling, then precise recycling. Entry gate: flui's full test
-  suite passes with `build-dir` set (§6.1).
+  suite passes with `build-dir` set (§6.1). Operational acceptance uses the
+  same shared-host workload as phase 1: at least four concurrent agent runs
+  across repositories and distinct worktrees, mixing short checks, a full
+  gate and nested cargos.
+  Repeat worktree creation, builds and retirement across multiple cycles.
+  With B and F explicitly configured, record all managed build directories,
+  residual targets and nested outputs, GC decisions and busy-directory skips.
+  After builds become idle and GC completes, usage must satisfy the budget
+  and free-space policy. Insufficient eligible reclamation is an explicitly
+  unmet budget, not a passed acceptance check; live builds and unregistered
+  directories must survive. Record each run's
+  time to first compiler, completion, memory/commit headroom and cache reuse
+  alongside disk growth. The single-worktree compatibility gate in #27
+  establishes placement compatibility, not this multi-agent acceptance.
 - **Phase 3.** Result store and single-flight.
 - **Phase 4.** Donation by block cloning, priorities beyond equal shares,
   per-job memory calibration.
@@ -1903,8 +2044,13 @@ Measure throughout:
 ## 13. Open questions
 
 1. The name.
-2. `build-dir` in the user's Cargo configuration affects every project on the
-   machine. Should it be opt-in per repository instead?
+2. **Resolved in #27:** build placement is opt-in per repository (§6.1).
+   A user-wide setting requires a separate explicit choice. FLUI validation
+   establishes compatibility for the measured toolchain and test scope;
+   it cannot establish compatibility for every project, coverage tool or
+   volume on the machine. Repository configuration does not reach temporary
+   nested projects; a scoped `CARGO_BUILD_BUILD_DIR` can include those in an
+   opted-in run without changing the user's Cargo configuration.
 3. The default budget B (proposed: 150 GB on D:) and floor F (proposed: 50 GB).
    Until this is settled, neither has a default, and nothing is evicted
    unless the configuration sets one (§6.3).
