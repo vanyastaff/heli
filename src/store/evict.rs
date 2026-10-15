@@ -198,10 +198,6 @@ fn goals(policy: &Policy, used: u64, volumes: &[Volume]) -> Goals {
 /// Evicts `victim` from `surveyed`: renames it into the trash under cargo's
 /// locks (see the module docs). The error says why it was skipped.
 fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
-    // Cargo releases its compilation locks before running tests. Runtime
-    // assets remain live until the managed command has exited. This also
-    // closes the race between planning and a new command starting.
-    let _runtime = super::lease::exclusive()?;
     let root = &surveyed.dir.path;
     if !reached_without_links(root, &victim.path) {
         return Err("gone, or reached through a link".to_owned());
@@ -247,6 +243,11 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     if victim.tier == Tier::Orphan && !still_orphan(&surveyed.dir) {
         return Err("no longer an orphan".to_owned());
     }
+    // Inspecting a large victim above may be slow. Only the final rename
+    // needs the activity interlock: a new managed command takes its shared
+    // guard before Cargo starts, so its arrival makes this try-lock skip.
+    // Keep scans and Cargo-lock discovery outside this critical section.
+    let _runtime = super::lease::exclusive()?;
     // Windows does not rename a directory with a file open inside.
     let _inner = (!cfg!(windows)).then_some(inner);
     trash::put(&victim.path, &trash)
