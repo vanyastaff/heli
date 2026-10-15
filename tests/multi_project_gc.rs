@@ -233,3 +233,171 @@ fn a_deep_nested_cargo_lock_protects_the_whole_unknown_directory() {
     gc(&fixture);
     assert!(!directory.exists(), "completed nested cache retained");
 }
+
+#[test]
+fn gc_preserves_out_dir_assets_during_nested_cargo_test_runtime() {
+    runtime_gc_scenario(false, false);
+}
+
+#[test]
+fn another_project_proceeds_while_nested_test_runtime_holds_its_cache() {
+    runtime_gc_scenario(false, true);
+}
+
+#[test]
+fn gc_preserves_runtime_assets_when_only_the_daemon_is_killed() {
+    runtime_gc_scenario(true, false);
+}
+
+fn runtime_gc_scenario(kill_only_daemon: bool, check_other_project: bool) {
+    let (fixture, store) = configured();
+    let ready = fixture.path("runtime-ready");
+    let gate = fixture.path("runtime-gate");
+    let done = fixture.path("runtime-done");
+    #[cfg(windows)]
+    {
+        // A supported target runner gives Windows the same resource-lifetime
+        // test as Unix: its mapped executable lives outside the cache, so an
+        // incidental Windows rename failure cannot protect OUT_DIR for us.
+        let runner = fixture.path("runtime-runner.ps1");
+        std::fs::write(
+            &runner,
+            r#"param([Parameter(ValueFromRemainingArguments=$true)][string[]]$CargoTestArgs)
+$ErrorActionPreference = 'Stop'
+$destination = Join-Path $env:HELI_FIXTURE_RUNTIME_BIN ([IO.Path]::GetFileName($CargoTestArgs[0]))
+Copy-Item -LiteralPath $CargoTestArgs[0] -Destination $destination -Force
+$remaining = @($CargoTestArgs | Select-Object -Skip 1)
+& $destination @remaining
+exit $LASTEXITCODE
+"#,
+        )
+        .expect("write the Cargo target runner");
+        let cargo = fixture.workspace().join(".cargo");
+        std::fs::create_dir_all(&cargo).expect("Cargo configuration directory");
+        std::fs::write(cargo.join("config.toml"), format!(
+            "[target.x86_64-pc-windows-msvc]\nrunner = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', '{}']\n",
+            runner.display(),
+        )).expect("configure the supported target runner");
+    }
+    let runtime_bin = fixture.path("runtime-bin");
+    std::fs::create_dir_all(&runtime_bin).expect("runtime executable directory");
+    let mut child = fixture
+        .heli(["--no-cache", "test", "--quiet", "-p", "nested"])
+        .env("CARGO_BUILD_BUILD_DIR", store.join("{workspace-path-hash}"))
+        .env("CARGO_INCREMENTAL", "0")
+        .env("HELI_FIXTURE_ARTIFACT_MB", "64")
+        .env("HELI_FIXTURE_RUNTIME_READY", &ready)
+        .env("HELI_FIXTURE_RUNTIME_GATE", &gate)
+        .env("HELI_FIXTURE_RUNTIME_DONE", &done)
+        .env("HELI_FIXTURE_RUNTIME_BIN", &runtime_bin)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start nested Cargo runtime workload");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    let asset = loop {
+        if let Ok(path) = std::fs::read_to_string(&ready) {
+            break std::path::PathBuf::from(path);
+        }
+        if child
+            .try_wait()
+            .expect("inspect runtime workload")
+            .is_some()
+        {
+            let output = child.wait_with_output().expect("collect early failure");
+            assert_success(&output, "runtime workload before gate");
+            panic!("runtime workload exited without reaching its gate");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nested test did not reach runtime gate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // The ready file is written by the actual compiled test, not build.rs.
+    assert!(
+        asset.starts_with(&store),
+        "OUT_DIR must be in the shared store: {}",
+        asset.display()
+    );
+    if check_other_project {
+        let other = fixture.copy_workspace("second-runtime-project");
+        let mut second = fixture
+            .heli(["--no-cache", "check", "--quiet", "-p", "echo-args"])
+            .current_dir(&other)
+            .env_remove("CARGO_TARGET_DIR")
+            .env("CARGO_BUILD_BUILD_DIR", store.join("{workspace-path-hash}"))
+            .env("CARGO_INCREMENTAL", "0")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start a command in an independent workspace");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while second
+            .try_wait()
+            .expect("inspect independent command")
+            .is_none()
+        {
+            if std::time::Instant::now() >= deadline {
+                support::kill_tree(second.id());
+                std::fs::write(&gate, "continue").expect("release first runtime");
+                panic!("an independent workspace queued behind the active runtime lease");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let second = second
+            .wait_with_output()
+            .expect("collect independent command");
+        assert_success(&second, "independent command while first runtime is gated");
+        assert!(!done.exists(), "the first runtime must still be gated");
+    }
+    if kill_only_daemon {
+        let pid = fixture.daemon_pid().expect("a real fixture daemon");
+        // Fixture::kill_daemon intentionally kills the tree; this case must
+        // kill exactly the daemon, leaving its actual Cargo/test descendants.
+        support::kill_process(pid);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while support::process_runs(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixture daemon did not stop"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(asset.exists(), "runtime asset exists after daemon death");
+        assert!(!done.exists(), "runtime is still gated after daemon death");
+    }
+    let eviction = gc(&fixture);
+    assert_eq!(eviction["runtime_busy"], true, "{eviction}");
+    let survived = asset.exists();
+    std::fs::write(&gate, "continue").expect("release runtime workload");
+    let output = child.wait_with_output().expect("collect runtime workload");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !done.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        survived && done.exists() && (kill_only_daemon || output.status.success()),
+        "GC must preserve OUT_DIR assets until the real nested test ends; asset={}; existed_after_gc={survived}; eviction={eviction}; stdout={}; stderr={}",
+        asset.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // A detached runtime can finish just after the disconnected client. Give
+    // its guardian time to observe the end and release the activity lease.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let listing = loop {
+        gc(&fixture);
+        let listing = survey(&fixture);
+        if listing["used"].as_u64().expect("accounted bytes") <= 16 << 20
+            || std::time::Instant::now() >= deadline
+        {
+            break listing;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        listing["used"].as_u64().expect("accounted bytes") <= 16 << 20,
+        "the runtime lease must release its cache after the nested test ends: {listing}",
+    );
+}

@@ -68,6 +68,11 @@ fn main() {
         Err(error) => error.exit(),
     };
     let depth = nesting::current();
+    // This is an implementation process of an existing run, not another
+    // nested heli invocation. It must work even at the nesting limit.
+    if let cli::Action::LeaseRun { roots, command } = action {
+        store::runner::main(&roots, &command);
+    }
     if depth >= nesting::MAX {
         eprintln!(
             "cargo-heli: refusing to run: heli is already nested {depth} levels deep \
@@ -88,6 +93,7 @@ fn main() {
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),
         cli::Action::Warden => daemon::warden::main(),
+        cli::Action::LeaseRun { .. } => unreachable!("lease runner dispatched above"),
     }
 }
 

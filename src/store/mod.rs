@@ -23,6 +23,7 @@
 
 pub mod evict;
 pub mod ladder;
+pub mod lease;
 pub mod managed;
 pub mod orphan;
 pub mod owner;
@@ -30,6 +31,7 @@ pub mod probe;
 pub mod record;
 pub mod recycle;
 pub mod registry;
+pub mod runner;
 pub mod scan;
 pub mod sizes;
 pub mod trash;
@@ -234,6 +236,9 @@ pub fn busy(dir: &Path) -> bool {
 /// `.fingerprint/`, `build/`) but none of the [`LOCKS`] was laid out by a
 /// cargo heli does not know.
 pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
+    if lease::busy() {
+        return true;
+    }
     let profiles = lock_dirs(&dir.path);
     let busy = if dir.kind == Kind::Build {
         locks_inside(&dir.path).map_or(true, |locks| {

@@ -119,6 +119,14 @@ fn main() {
     if std::env::var_os("ECHO_SESSION").is_some() {
         println!("session {}", session());
     }
+    #[cfg(unix)]
+    if std::env::var_os("ECHO_PARENT").is_some() {
+        unsafe extern "C" {
+            fn getppid() -> i32;
+        }
+        // SAFETY: only queries this process's parent.
+        println!("parent {}", unsafe { getppid() });
+    }
     if std::env::var_os("ECHO_STDIN").is_some() {
         let mut input = Vec::new();
         std::io::Read::read_to_end(&mut std::io::stdin(), &mut input).expect("read stdin");

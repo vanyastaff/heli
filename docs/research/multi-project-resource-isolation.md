@@ -424,3 +424,33 @@ version-specific checking; the cited source notes older Cargo versions use a
 different package-cache locking contract. There is no demonstrated supported
 flag in this investigation that removes resolver serialization while retaining
 one shared mutable Cargo home.
+
+## Runtime assets require a different GC interlock
+
+Cargo's build locks do not span test execution. At Cargo commit
+`5f94df4789f005f9a352888e8355ffc645b7ed0e`, `BuildRunner::compile(self)` returns
+only `self.compilation`; its `CompilationFiles` owns the layouts and their
+locks and is dropped. `run_tests` then executes the test binaries.
+[BuildRunner return](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/compiler/build_runner/mod.rs#L287),
+[layout ownership](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/compiler/build_runner/compilation_files.rs#L116),
+[runtime ordering](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/ops/cargo_test.rs#L63).
+
+An executed Windows public-CLI regression confirmed the consequence: a real
+nested test paused after compilation, GC evicted its 64 MiB `OUT_DIR` asset,
+and the resumed test failed with `NotFound`. A supported Cargo target runner
+copies test executables outside the build cache, avoiding incidental Windows
+executable-mapping protection. The original red evidence is retained locally
+at `target/audit-evidence/runtime-outdir-red.log`; the committed regression is
+`gc_preserves_out_dir_assets_during_nested_cargo_test_runtime` in
+`tests/multi_project_gc.rs`.
+
+The fix uses compatible shared per-user activity guards for managed commands,
+with a command parent retaining the guard if the daemon dies. GC tries the
+exclusive side only through the rename. This protects nested runtime assets
+without guessing their workspace ownership or putting agents in a queue.
+It conservatively defers reclamation until managed activity is idle. The
+disk budget therefore remains an eventual reclamation target; continuous
+activity can defer it indefinitely. Precise eviction during arbitrary nested
+runtime would require a complete usage/lease protocol in the subprocesses,
+which Cargo metadata cannot provide. The earlier four-client spike did not
+exercise this long-runtime case and cannot by itself establish that safety.

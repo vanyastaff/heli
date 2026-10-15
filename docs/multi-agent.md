@@ -53,13 +53,29 @@ needs the same explicit integration review. Bare Cargo inheriting the host
 jobserver does not automatically supply this runner handshake. Do not export
 `HELI_RUN` manually or globally disable project locks.
 
-GC preserves active Cargo directories, including locks in deeply nested
-build-script caches. It can reclaim completed unknown nested Cargo artifacts
+GC protects the whole lifetime of managed commands, including runtime tests
+reading `OUT_DIR` after Cargo releases its build locks. Compatible shared
+activity guards let agents progress together; GC skips reclamation while any
+managed command is active. A command parent keeps this protection alive even
+if its daemon dies. This deliberately favors correct independent work over
+evicting caches during a continuously busy workload. Reclamation resumes at
+idle, so continuous managed activity can defer the disk target indefinitely.
+
+GC also respects locks in deeply nested build-script caches. It can reclaim completed unknown nested Cargo artifacts
 only inside a verified managed root, after the configured idle age and with
 a recognized lock protocol. A budget can be temporarily exceeded while
 artifacts are busy or young, or remain unmet when insufficient data is
 eligible; inspect GC's victims and skipped entries. This is cache reclamation,
 not a hard filesystem quota.
+
+Use `heli exec` around task runners that start nested Cargo commands. Bare
+Cargo's compile locks protect compilation; they cannot protect runtime assets
+after Cargo releases those locks. The runtime guarantee covers managed
+commands, not unintegrated bare tests or detached background descendants.
+Keep all participants on the same heli version. Do not override
+`HELI_ACTIVITY_DIR` for processes sharing caches: it selects a separate GC
+activity namespace for isolated tests and experiments, independent of daemon
+state directories and pools.
 
 Cargo's shared package-cache resolver lock still exists, even offline. The
 foreground cache-off path avoids extra result-cache resolutions; it does not

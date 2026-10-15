@@ -464,8 +464,8 @@ fn only_the_user_can_open_the_endpoint() {
 }
 
 /// On Windows, a run is in the client's logon session, window station and
-/// desktop, so it can reach the user's desktop. On Unix it leads a session
-/// of its own (the user's login session reaches it through the
+/// desktop, so it can reach the user's desktop. On Unix its runtime guardian
+/// leads a session of its own (the user's login session reaches it through the
 /// environment), so that `cancel` finds every process it started.
 #[test]
 fn a_run_is_in_the_clients_session() {
@@ -480,6 +480,7 @@ fn a_run_is_in_the_clients_session() {
         .heli(["exec", "--"])
         .arg(&echo)
         .env("ECHO_SESSION", "1")
+        .env("ECHO_PARENT", "1")
         .env("ECHO_PID", "1")
         .output()
         .expect("run heli");
@@ -490,8 +491,20 @@ fn a_run_is_in_the_clients_session() {
     assert_eq!(lines[0], text(&direct.stdout).trim_end());
     #[cfg(unix)]
     {
-        let pid = lines[1].strip_prefix("pid ").expect("a pid line");
-        assert_eq!(lines[0], format!("session {pid}"), "it leads its session");
+        let parent = lines
+            .iter()
+            .find_map(|line| line.strip_prefix("parent "))
+            .expect("the runtime guardian's pid");
+        assert_eq!(
+            lines[0],
+            format!("session {parent}"),
+            "the guardian leads the run's session"
+        );
+        assert_ne!(
+            lines[0],
+            text(&direct.stdout).trim_end(),
+            "the run has its own session"
+        );
     }
 }
 

@@ -185,6 +185,7 @@ idle_hours = 0
 dir_hours = 0
 ''', encoding="utf-8")
         self.base.update(HELI_STATE_DIR=str(self.root / "state"), HELI_CONFIG=str(config),
+                         HELI_ACTIVITY_DIR=str(self.root / "activity"),
                          HELI_POOL=(f"heli-spike-{self.token}" if os.name == "nt" else str(self.root / "pool")),
                          CARGO_BUILD_BUILD_DIR=str(store / "{workspace-path-hash}"),
                          HELI_SPIKE_EVENTS=str(self.root / "events"))

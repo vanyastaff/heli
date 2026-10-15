@@ -64,7 +64,11 @@ Goals:
   never share a build directory.
 - **G5, drop-in.** heli takes the same arguments as cargo and nextest. When
   heli is absent or broken, plain cargo runs: a failure of heli itself never
-  fails a run.
+  fails a run, except when the runtime/GC safety interlock cannot be acquired
+  (§6.3). That case refuses the managed command with a diagnostic: silently
+  starting it unprotected could let another GC delete its runtime assets.
+  An invalid explicit activity namespace is a configuration error. This is
+  a deliberate safety exception to unconditional fallback.
 - **G6, agent-proof.** A killed client neither kills nor wastes its run, and
   identical runs are not repeated.
 - **G7, small output for agents.** An agent reads what it needs to act: the
@@ -675,7 +679,8 @@ How a command line is read:
      dies. On Unix, a session of its own (`setsid`): a process group would
      not do, since nextest puts each test in a group of its own. Each phase
      of a test run (step 6) is a tree of its own, and cancel kills the one
-     that runs.
+     that runs. The runtime guardian (§6.3) is the tree's first process;
+     the actual command is its child in the same tree/session.
    - **Following.** The run writes its output only to its record (see
      "Output" below), and every client follows the record from its first
      byte, each in a thread of its own. A client that stops reading or is
@@ -1447,6 +1452,30 @@ Which directories have which tiers:
 
 Safety rules:
 
+- **Protect runtime, not just compilation.** Cargo 1.99 releases its layout
+  locks before executing tests. A public nested-test reproducer, gated after
+  compilation, lost its `OUT_DIR` asset to GC with `dir_hours = 0`. Every
+  managed command now holds a shared per-user activity guard for its whole
+  lifetime, including the build/test transition. Independent commands take
+  compatible shared guards; they do not queue behind each other. GC only
+  tries the exclusive guard, rechecks it at eviction, and holds it through
+  the rename, outside the victims and independently of `HELI_STATE_DIR`.
+  An internal command parent also holds the guard until the actual command
+  exits, so killing only the daemon does not expose surviving tests.
+  Nested commands can use another known workspace's cache, so metadata alone
+  cannot safely narrow this protection to an inferred set of directories.
+  Consequently GC conservatively defers reclamation while any managed
+  command runs in that user's activity namespace. Continuous activity can
+  defer the disk target indefinitely; B is a reclamation target, not a hard
+  disk quota. Bare Cargo's compilation locks remain respected, but bare
+  runtime and detached background descendants require explicit integration
+  and are not covered by this managed-command guarantee. All processes using
+  the same caches must use the same heli version and activity namespace;
+  `HELI_ACTIVITY_DIR` is only for explicitly isolated test/spike environments.
+  It must be absolute. `gc --json` exposes `runtime_busy`, including when an
+  unavailable interlock conservatively prevents proving idle. Failure to
+  acquire a run's guard refuses that managed command rather than executing
+  it without runtime protection (the narrow G5 exception above).
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
   directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
   directory) exclusively, in every profile directory of the victim's

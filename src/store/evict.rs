@@ -53,6 +53,8 @@ pub struct Volume {
 /// What a pass found and did.
 #[derive(Debug)]
 pub struct Pass {
+    /// Managed runtime, or an unavailable safety interlock, deferred GC.
+    pub runtime_busy: bool,
     pub policy: Policy,
     pub dirs: Vec<Surveyed>,
     /// What every directory takes together.
@@ -71,6 +73,7 @@ pub struct Pass {
 /// at all; otherwise the orphans' notes are brought up to date first
 /// (`super::orphan`).
 pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) -> Pass {
+    let runtime_busy = super::lease::busy();
     let policy = Policy::of(config);
     let mut dirs: Vec<Surveyed> = Vec::new();
     for dir in super::survey(config, registry) {
@@ -102,6 +105,7 @@ pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) 
     let volumes = volumes(config, registry, &dirs);
     let goals = goals(&policy, used, &volumes);
     let mut pass = Pass {
+        runtime_busy,
         policy,
         dirs,
         used,
@@ -194,6 +198,10 @@ fn goals(policy: &Policy, used: u64, volumes: &[Volume]) -> Goals {
 /// Evicts `victim` from `surveyed`: renames it into the trash under cargo's
 /// locks (see the module docs). The error says why it was skipped.
 fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
+    // Cargo releases its compilation locks before running tests. Runtime
+    // assets remain live until the managed command has exited. This also
+    // closes the race between planning and a new command starting.
+    let _runtime = super::lease::exclusive()?;
     let root = &surveyed.dir.path;
     if !reached_without_links(root, &victim.path) {
         return Err("gone, or reached through a link".to_owned());

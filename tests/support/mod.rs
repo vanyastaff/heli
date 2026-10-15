@@ -89,13 +89,14 @@ const ISOLATED_VARS: [&str; 12] = [
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
 /// configuration, or change what it prints.
-const HELI_VARS: [&str; 6] = [
+const HELI_VARS: [&str; 7] = [
     "HELI_STATE_DIR",
     "HELI_ENDPOINT",
     "HELI_DEPTH",
     "HELI_POOL",
     "HELI_CONFIG",
     "HELI_OUTPUT",
+    "HELI_ACTIVITY_DIR",
 ];
 
 /// Variables that locate the user's own configuration files, which
@@ -198,6 +199,10 @@ impl Fixture {
         let state_dir = fixture.state_dir();
         let endpoint = fixture.endpoint();
         fixture.isolation = vec![
+            (
+                "HELI_ACTIVITY_DIR".into(),
+                Some(fixture.path("activity").into()),
+            ),
             ("HELI_STATE_DIR".into(), Some(state_dir.into())),
             ("HELI_ENDPOINT".into(), Some(endpoint)),
             ("HELI_POOL".into(), Some(fixture.pool())),

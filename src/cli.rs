@@ -47,6 +47,11 @@ pub enum Action {
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
     Warden,
+    /// Internal parent retaining runtime leases while the actual command runs.
+    LeaseRun {
+        roots: Vec<std::path::PathBuf>,
+        command: Vec<OsString>,
+    },
 }
 
 /// The program heli runs, its arguments, the class of the run, and how to
@@ -114,6 +119,13 @@ impl OutputFlags {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    LeaseRun {
+        #[arg(long = "root", required = true)]
+        roots: Vec<std::path::PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
     /// Run any command: `cargo heli exec -- <command> [args...]`.
     Exec {
         #[command(flatten)]
@@ -234,6 +246,7 @@ pub fn parse(
     }
     let output = cli.output.mode();
     Ok(match cli.command {
+        Command::LeaseRun { roots, command } => Action::LeaseRun { roots, command },
         Command::Exec {
             output: own,
             command,

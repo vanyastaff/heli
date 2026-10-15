@@ -573,7 +573,7 @@ fn listed(document: &Value, path: &Path) -> Value {
         .clone()
 }
 
-/// While a build runs, its directories are busy: neither their units, nor
+/// While a bare Cargo build runs, its directories are busy: neither their units, nor
 /// the build directory, idle for a week by its last run, are touched, while
 /// another workspace's are evicted; the build completes. Once it is over,
 /// the same directory has victims again.
@@ -596,7 +596,12 @@ fn a_busy_directory_is_never_touched() {
     let unit = fake_unit(&incremental(&build), "old-unit", 1000, clock - 200 * HOUR);
 
     let gate = fixture.path("gate");
-    let running = heli_in(&fixture, &workspace, &["build", "--quiet", "-p", "gated"])
+    // Exercise Cargo's own compilation locks independently of the stronger
+    // managed-runtime activity guard (covered by multi_project_gc).
+    let running = fixture
+        .cargo(["build", "--quiet", "-p", "gated"])
+        .current_dir(&workspace)
+        .env_remove("CARGO_TARGET_DIR")
         .env("HELI_FIXTURE_GATE", &gate)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -620,7 +625,7 @@ fn a_busy_directory_is_never_touched() {
     let done = gc(&fixture, &["gc"]);
     std::fs::write(&gate, "").expect("open the gate");
     let output = running.wait_with_output().expect("wait for the build");
-    assert_success(&output, "cargo heli build -p gated");
+    assert_success(&output, "bare cargo build -p gated");
 
     let evicted = victims(&done);
     assert!(

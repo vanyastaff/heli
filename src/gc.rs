@@ -59,6 +59,7 @@ const SCHEMA: u32 = 1;
 struct Listing<'a> {
     schema: u32,
     dry_run: bool,
+    runtime_busy: bool,
     dirs: Vec<Entry>,
     used: u64,
     budget: Option<u64>,
@@ -148,6 +149,7 @@ pub fn main(dry_run: bool, json: bool) -> ! {
     let listing = Listing {
         schema: SCHEMA,
         dry_run,
+        runtime_busy: pass.runtime_busy,
         dirs,
         used: pass.used,
         budget: pass.policy.budget,
