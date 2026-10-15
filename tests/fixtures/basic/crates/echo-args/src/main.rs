@@ -33,12 +33,32 @@
 //! `rustc`) and exits 0, or exits 1 when there is no such file. With
 //! `ECHO_VERSION_LOG` naming a file, it first appends the request there as a
 //! line, so a test can count how often a tool was asked.
+//! With `ECHO_VERSION` set, metadata requests describe the nearest manifest's
+//! workspace with no dependency packages, without starting or waiting.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // A fake toolchain describes no dependencies. Metadata is an inquiry,
+    // like a version request: it neither starts a run nor waits on its gate.
+    if std::env::var_os("ECHO_VERSION").is_some() && args.iter().any(|arg| arg == "metadata") {
+        let cwd = std::env::current_dir().expect("a working directory");
+        let root = cwd
+            .ancestors()
+            .find(|path| path.join("Cargo.toml").is_file())
+            .unwrap_or(&cwd);
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.join("target"));
+        println!(
+            "{{\"workspace_root\":{:?},\"target_directory\":{:?},\"packages\":[]}}",
+            root.to_string_lossy(),
+            target.to_string_lossy()
+        );
+        return;
+    }
     if let Some(versions) = std::env::var_os("ECHO_VERSION")
         && let Some((flag, before)) = args.split_last()
         && (flag == "-V" || flag == "-vV" || flag == "--version")
@@ -153,8 +173,8 @@ fn main() {
         wait_for(Path::new(&gate));
     }
     eprintln!("echo-args: stderr");
-    let from_file = std::env::var_os("ECHO_EXIT_FILE")
-        .and_then(|file| std::fs::read_to_string(file).ok());
+    let from_file =
+        std::env::var_os("ECHO_EXIT_FILE").and_then(|file| std::fs::read_to_string(file).ok());
     let code = from_file
         .or_else(|| std::env::var("ECHO_EXIT").ok())
         .and_then(|code| code.trim().parse().ok())

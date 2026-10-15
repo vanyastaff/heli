@@ -131,7 +131,7 @@ impl Libtest {
 
     /// One line of the run's stdout.
     fn line(&mut self, line: &[u8], out: &mut Sink) {
-        if self.diagnostics.json_line(line, out) {
+        if !self.in_section && self.diagnostics.json_line(line, out) {
             return;
         }
         let text = String::from_utf8_lossy(line);

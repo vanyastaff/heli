@@ -18,9 +18,10 @@
 //! it waits for. The end is the reply that ends the run for its clients:
 //! how it exited, or that it never ran.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ipc::Stream;
 use crate::protocol::{self, Channel, Reply};
@@ -31,6 +32,10 @@ use crate::status;
 /// How often a follower with nothing to send checks that its client is
 /// still there.
 const TICK: Duration = Duration::from_millis(200);
+
+/// Once the run ends, a stalled follower cannot pin a retiring daemon.
+/// Its complete output remains in the record for a later `log` request.
+const DRAIN_WAIT: Duration = Duration::from_secs(1);
 
 /// The output of one run, as it grows.
 pub struct Live {
@@ -47,6 +52,7 @@ struct Journal {
     items: Vec<Item>,
     /// The reply that ends the run, once all of the above is complete.
     end: Option<Arc<Reply>>,
+    ended_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -121,7 +127,10 @@ impl Live {
 
     /// Ends the run for its clients with `reply`, after all of the above.
     pub fn end(&self, reply: Reply) {
-        self.journal().end = Some(Arc::new(reply));
+        let mut journal = self.journal();
+        journal.end = Some(Arc::new(reply));
+        journal.ended_at = Some(Instant::now());
+        drop(journal);
         self.changed.notify_all();
     }
 
@@ -179,7 +188,17 @@ pub struct Reads {
 /// it comes, then the run's end; returns early when the client goes away,
 /// or the record cannot be read back. A client is also told what the run
 /// waits for, and when its command started, as far as it `reads` them.
-pub fn follow(live: &Live, client: &mut Stream, reads: Reads) {
+pub fn follow(
+    live: &Live,
+    client: &mut Stream,
+    reads: Reads,
+    retiring: &dyn Fn() -> bool,
+) -> io::Result<()> {
+    let mut client = Follower {
+        stream: client,
+        live,
+        retiring,
+    };
     let mut record: Option<Events> = None;
     // Events read from the record, and things sent (or skipped).
     let mut read = 0;
@@ -196,43 +215,74 @@ pub fn follow(live: &Live, client: &mut Stream, reads: Reads) {
                     for _ in 0..count {
                         let event = match record.as_mut().and_then(Iterator::next) {
                             Some(Ok(event)) if event.index == read => event,
-                            _ => return,
+                            _ => {
+                                return Err(io::Error::other(
+                                    "run record does not contain the published event",
+                                ));
+                            }
                         };
-                        if protocol::write_output(client, event.channel, &event.bytes).is_err() {
-                            return;
-                        }
+                        protocol::write_output(&mut client, event.channel, &event.bytes)?;
                         read += 1;
                         sent += 1;
                     }
                 }
                 Item::Kept(channel, bytes) => {
-                    if protocol::write_output(client, channel, &bytes).is_err() {
-                        return;
-                    }
+                    protocol::write_output(&mut client, channel, &bytes)?;
                     sent += 1;
                 }
                 Item::Waiting(runs) => {
-                    if reads.waiting
-                        && protocol::write_message(client, &Reply::Waiting { runs }).is_err()
-                    {
-                        return;
+                    if reads.waiting {
+                        protocol::write_message(&mut client, &Reply::Waiting { runs })?;
                     }
                     sent += 1;
                 }
                 Item::Spawned => {
-                    if reads.spawned && protocol::write_message(client, &Reply::Spawned).is_err() {
-                        return;
+                    if reads.spawned {
+                        protocol::write_message(&mut client, &Reply::Spawned)?;
                     }
                     sent += 1;
                 }
             }
         }
         if let Some(end) = end {
-            let _ = protocol::write_message(client, end.as_ref());
-            return;
+            return protocol::write_message(&mut client, end.as_ref());
         }
-        if sent == before && !client.connected() {
-            return;
+        if sent == before && !client.stream.connected() {
+            return Ok(());
         }
+    }
+}
+
+/// Retry partial writes while the run is live, keeping their exact offset.
+/// A timeout never restarts a frame, which would corrupt its byte stream.
+struct Follower<'a> {
+    stream: &'a mut Stream,
+    live: &'a Live,
+    retiring: &'a dyn Fn() -> bool,
+}
+
+impl Write for Follower<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            self.stream.set_deadline(Some(Instant::now() + TICK))?;
+            match self.stream.write(bytes) {
+                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                    if (self.retiring)()
+                        && self
+                            .live
+                            .journal()
+                            .ended_at
+                            .is_some_and(|at| at.elapsed() >= DRAIN_WAIT)
+                    {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
     }
 }

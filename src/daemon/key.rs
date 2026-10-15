@@ -21,6 +21,7 @@
 //!   `config` cargo reads, by content;
 //! - the environment ([`environment`]): every variable but the neutral ones.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,13 +31,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::protocol::RunRequest;
-use crate::{environment, worktree};
+use crate::store::probe::Probe;
+use crate::{environment, source, worktree};
 
 /// Raised when what goes into the key, or how, changes, so that markers of
 /// another composition never match.
-const COMPOSITION: &[u8] = b"1";
+const COMPOSITION: &[u8] = b"2";
 
-/// The worktree's content at one moment: its tree with every change staged.
+/// The local source inventories at one moment: Git trees and raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     tree: Vec<u8>,
@@ -77,14 +79,139 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }))
 }
 
-/// The tree of `request`'s worktree with every change staged ([`staged`]),
-/// as `git write-tree` names it.
+/// The caller and Cargo's local source roots, with raw compiler inputs as
+/// well as staged Git identities. Missing inventories disable caching.
 pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String> {
-    let git = |args: &[&str], index: Option<&Path>| git(request, args, index);
-    let tree = staged(&git, &request.cwd(), scratch, |index| {
-        git(&["write-tree"], Some(index))
-    })?;
-    Ok(Snapshot { tree: trim(tree) })
+    let probe = Probe::request(request);
+    let selected = probe
+        .sources_at(None)
+        .ok_or("cannot discover the command's local Cargo sources offline")?;
+    let caller = worktree::of(&request.cwd());
+    let mut roots = BTreeSet::new();
+    roots.insert(caller.clone());
+    let mut pending = vec![selected];
+    let mut manifests = BTreeSet::new();
+    while let Some(workspace) = pending.pop() {
+        let root = worktree::of(&workspace.root);
+        if !root.join(".git").exists() {
+            return Err(format!(
+                "{} has no Git source inventory",
+                workspace.root.display()
+            ));
+        }
+        roots.insert(root);
+        for package in workspace
+            .packages
+            .iter()
+            .filter(|package| package.source.is_none())
+        {
+            let dir = package
+                .manifest_path
+                .parent()
+                .ok_or("a manifest has no parent")?;
+            let root = worktree::of(dir);
+            if !root.join(".git").exists() {
+                return Err(format!("{} has no Git source inventory", dir.display()));
+            }
+            roots.insert(root);
+            manifests.insert(package.manifest_path.clone());
+        }
+        for package in workspace
+            .packages
+            .iter()
+            .filter(|package| package.source.is_none())
+        {
+            for dependency in &package.dependencies {
+                if let Some(path) = &dependency.path {
+                    let manifest = path.join("Cargo.toml");
+                    if manifests.insert(manifest.clone()) {
+                        pending.push(probe.sources_at(Some(&manifest)).ok_or_else(|| {
+                            format!("cannot discover local dependency {}", path.display())
+                        })?);
+                    }
+                }
+            }
+        }
+    }
+    let mut sources = Vec::new();
+    for root in roots {
+        // A worktree's own absolute path must not prevent reuse by its twin.
+        let name = if root.starts_with(&caller) {
+            relative(&root, &caller)
+        } else {
+            root.as_os_str().as_encoded_bytes().to_vec()
+        };
+        sources.push((name, raw_tree(request, &root, scratch, 0)?));
+    }
+    sources.sort();
+    let mut fields = Fields::default();
+    for (name, content) in sources {
+        fields.push(b"source-root", &name);
+        fields.push(b"source", &content);
+    }
+    Ok(Snapshot {
+        tree: fields.finish().into_bytes(),
+    })
+}
+
+fn raw_tree(
+    request: &RunRequest,
+    root: &Path,
+    scratch: &Path,
+    depth: u32,
+) -> Result<Vec<u8>, String> {
+    if depth >= 32 {
+        return Err("Git submodule nesting exceeds 32".to_owned());
+    }
+    let git = |args: &[&str], index: Option<&Path>| git_at(request, root, args, index);
+    staged(&git, root, scratch, |index| {
+        let tree = git(&["write-tree"], Some(index))?;
+        let listing = git(&["ls-files", "--stage", "--full-name", "-z"], Some(index))?;
+        let mut fields = Fields::default();
+        fields.push(b"tree", &trim(tree));
+        for entry in listing
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let tab = entry
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or("invalid Git index entry")?;
+            let info = &entry[..tab];
+            let path = &entry[tab + 1..];
+            let file = root.join(git_path(path)?);
+            fields.push(b"path", path);
+            let identity = if info.starts_with(b"160000 ") {
+                raw_tree(request, &file, scratch, depth + 1)?
+            } else if info.starts_with(b"120000 ") {
+                std::fs::read_link(&file)
+                    .map_err(|error| format!("cannot read {}: {error}", file.display()))?
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else {
+                source::digest(&file)
+                    .map_err(|error| format!("cannot read {}: {error}", file.display()))?
+                    .into_bytes()
+            };
+            fields.push(b"content", &identity);
+        }
+        Ok(fields.finish().into_bytes())
+    })
+}
+
+#[cfg(unix)]
+fn git_path(bytes: &[u8]) -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    Ok(OsString::from_vec(bytes.to_vec()).into())
+}
+
+#[cfg(windows)]
+fn git_path(bytes: &[u8]) -> Result<PathBuf, String> {
+    String::from_utf8(bytes.to_vec())
+        .map(PathBuf::from)
+        .map_err(|_| "a Git path is not UTF-8".to_owned())
 }
 
 /// Runs git as a caller wants it run: with these arguments, and with this
@@ -262,6 +389,30 @@ fn cargo_config(request: &RunRequest, fields: &mut Fields) {
                     ) => {}
                 Err(error) => fields.push(
                     format!("unreadable {place} {file}").as_bytes(),
+                    format!("{:?} {:?}", error.kind(), error.raw_os_error()).as_bytes(),
+                ),
+            }
+        }
+    }
+    let mut args = request.argv.iter().skip(1).map(|arg| arg.0.as_os_str());
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        let value = if arg == "--config" {
+            args.next()
+        } else {
+            arg.to_str()
+                .and_then(|arg| arg.strip_prefix("--config="))
+                .map(OsStr::new)
+        };
+        // Inline KEY=VALUE configuration is already in argv. A file's
+        // spelling is there too, but its changing content must count.
+        if let Some(path) = value.filter(|value| !value.as_encoded_bytes().contains(&b'=')) {
+            match std::fs::read(cwd.join(path)) {
+                Ok(content) => fields.push(b"cargo-cli-config", &content),
+                Err(error) => fields.push(
+                    b"unreadable cargo-cli-config",
                     format!("{:?} {:?}", error.kind(), error.raw_os_error()).as_bytes(),
                 ),
             }
@@ -454,8 +605,14 @@ fn cargo_home(request: &RunRequest, cwd: &Path) -> Option<PathBuf> {
 /// `git <args>` as the client would run it, with `index` as the index when
 /// given; its stdout. Never takes the optional locks that would refresh the
 /// real index.
-fn git(request: &RunRequest, args: &[&str], index: Option<&Path>) -> Result<Vec<u8>, String> {
+fn git_at(
+    request: &RunRequest,
+    cwd: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+) -> Result<Vec<u8>, String> {
     let mut command = tool(request, OsStr::new("git"), args);
+    command.current_dir(cwd);
     command.env("GIT_OPTIONAL_LOCKS", "0");
     if let Some(index) = index {
         command.env("GIT_INDEX_FILE", index);

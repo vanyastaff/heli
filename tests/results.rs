@@ -34,6 +34,7 @@ fn init_repo(fixture: &Fixture) {
         .expect("run cargo");
     assert_success(&lockfile, "cargo generate-lockfile");
     git(fixture, &["init", "--quiet"]);
+    git(fixture, &["config", "core.autocrlf", "false"]);
     git(fixture, &["add", "-A"]);
     git(
         fixture,

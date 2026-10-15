@@ -383,9 +383,16 @@ fn submit(
         cache: invocation.cache,
         reads_spawned: true,
     };
+    stream
+        .set_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))
+        .map_err(|error| format!("cannot bound the daemon's answer: {error}"))?;
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
-    match protocol::read_message::<Reply>(&mut stream) {
+    let reply = protocol::read_message::<Reply>(&mut stream);
+    stream
+        .set_deadline(None)
+        .map_err(|error| format!("cannot follow the daemon: {error}"))?;
+    match reply {
         Ok(Reply::Started {
             run,
             attached,

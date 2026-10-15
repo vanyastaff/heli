@@ -6,13 +6,14 @@
 //! ```json
 //! {"taken_at":1791911112123456700,
 //!  "files":{"app/src/main.rs":{"blob":"3b18e512dba79e4c8300dd08aeb37f8e728b8dad",
+//!                              "content":"<raw SHA-256 digest>",
 //!                              "size":423,"mtime":1791910980000000000}}}
 //! ```
 //!
 //! - `taken_at`: when it was taken, before anything was read;
 //! - `files`: every tracked or untracked file of the worktree (ignored ones
 //!   are not), by its path from the worktree's top as git writes it: its
-//!   blob id, its size and its modification time. Times are nanoseconds
+//!   blob id, raw content digest, size and modification time. Times are nanoseconds
 //!   since 1970.
 //!
 //! **Clocks.** A file's modification time can be earlier than the moment,
@@ -31,7 +32,7 @@
 //! slack old, at most 2.05 s, so that the record of a run that just ended
 //! counts (below). The blob ids come from the snapshot machinery of the
 //! result store (`crate::daemon::key::staged`): `git add -A` into a scratch
-//! copy of the index, here listed with `git ls-files --stage`. The sizes and
+//! copy of the index, here listed with `git ls-files --stage`. Raw digests, sizes and
 //! times are read from the file system afterwards, so a file changed
 //! meanwhile has a newer time than its blob, and only looks newer to cargo.
 //! Symbolic links and submodules are left out. The file is replaced whole.
@@ -44,14 +45,14 @@
 //! and a build that changes what cargo decides writes a fingerprint.
 //!
 //! **Use** ([`stage`], then [`Worktree::settle`]). Each file of the new
-//! worktree whose blob id and size are the record's gets the recorded time,
+//! worktree whose raw digest and size are the record's gets the recorded time,
 //! if it was written before heli began to stage the worktree: its time plus
 //! its slack is no later. A file changed right after git read it, to
 //! content of the same size, may be dated before the staging all the same,
 //! and keeps its time. So that a worktree just made gets the recorded times,
 //! heli stages it again once its files are a slack old, when some were not.
-//! The size is checked too because a blob id is of the content after git's
-//! filters: two files that differ only in line endings can share one. Every
+//! The raw digest is checked again through the file handle before retiming:
+//! Git filters can equate different compiler inputs of the same size. Every
 //! other file last written at the donor's last build ([`last_build`]) or
 //! before gets the time now, and at least its slack after that build, so
 //! that cargo rebuilds what was built from another content (a time cut to
@@ -71,6 +72,7 @@ use serde::{Deserialize, Serialize};
 
 use super::probe::Probe;
 use crate::daemon::key;
+use crate::source;
 
 /// A source-state record, as `.heli/sources` holds it (see the module
 /// docs).
@@ -84,6 +86,9 @@ pub struct Record {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recorded {
     pub blob: String,
+    /// Absent in records written before raw content was recorded.
+    #[serde(default)]
+    pub content: Option<String>,
     pub size: u64,
     pub mtime: u64,
 }
@@ -120,6 +125,7 @@ pub fn write(build_dir: &Path, worktree: &Path, probe: &Probe) -> Result<bool, S
         if let (true, Some(mtime)) = (metadata.is_file(), mtime) {
             let recorded = Recorded {
                 blob: staged.blob,
+                content: Some(staged.content),
                 size: metadata.len(),
                 mtime,
             };
@@ -158,7 +164,8 @@ pub fn valid(build_dir: &Path) -> Option<Record> {
 pub fn valid_after(build_dir: &Path, last: LastBuild) -> Option<Record> {
     let text = std::fs::read(path(build_dir)).ok()?;
     let record: Record = serde_json::from_slice(&text).ok()?;
-    (record.taken_at >= last.until).then_some(record)
+    (record.taken_at >= last.until && record.files.values().all(|file| file.content.is_some()))
+        .then_some(record)
 }
 
 /// A second, in nanoseconds.
@@ -336,7 +343,7 @@ impl Worktree {
     /// ([`last_build`]), takes nothing built from another content for
     /// theirs:
     ///
-    /// - a file whose blob id and size `record` holds, written before the
+    /// - a file whose raw digest and size `record` holds, written before the
     ///   staging (its time and slack are no later, [`written_by`]), gets the
     ///   time recorded with it: what was built from it is fresh;
     /// - any other file last written at `newest` or before gets the time
@@ -355,7 +362,7 @@ impl Worktree {
             let recorded = record
                 .files
                 .get(&staged.path)
-                .filter(|recorded| recorded.blob == staged.blob);
+                .filter(|recorded| recorded.content.as_ref() == Some(&staged.content));
             match settle(&file, recorded, newest, staged_at) {
                 Some(true) => settled.restored += 1,
                 Some(false) => {}
@@ -374,7 +381,7 @@ impl Worktree {
 fn settle(file: &Path, recorded: Option<&Recorded>, newest: u64, staged_at: u64) -> Option<bool> {
     let older_than_build =
         |modified: Option<u64>| modified.is_none_or(|modified| modified <= newest);
-    let Ok(handle) = open_for_times(file) else {
+    let Ok(mut handle) = open_for_times(file) else {
         // Gone, or not a file: nothing to set. Kept open by a writer: its
         // time had better be newer than the build already.
         return match std::fs::symlink_metadata(file) {
@@ -396,6 +403,7 @@ fn settle(file: &Path, recorded: Option<&Recorded>, newest: u64, staged_at: u64)
     if let Some(recorded) = recorded
         && metadata.len() == recorded.size
         && modified.is_some_and(|modified| written_by(modified) <= staged_at)
+        && source::digest_reader(&mut handle).ok().as_ref() == recorded.content.as_ref()
         && handle
             .set_modified(UNIX_EPOCH + Duration::from_nanos(recorded.mtime))
             .is_ok()
@@ -420,10 +428,11 @@ fn settle(file: &Path, recorded: Option<&Recorded>, newest: u64, staged_at: u64)
 fn open_for_times(file: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_WRITE_ATTRIBUTES,
+        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_WRITE_ATTRIBUTES,
     };
     File::options()
-        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_READ_DATA | FILE_WRITE_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
         .open(file)
 }
@@ -440,6 +449,7 @@ fn open_for_times(file: &Path) -> io::Result<File> {
 struct Staged {
     path: String,
     blob: String,
+    content: String,
 }
 
 /// The regular files of `worktree`, with every change staged
@@ -450,7 +460,7 @@ fn staged_files(probe: &Probe, worktree: &Path, scratch: &Path) -> Result<Vec<St
     let listing = key::staged(&git, worktree, scratch, |index| {
         git(&["ls-files", "--stage", "-z"], Some(index))
     })?;
-    Ok(listing
+    listing
         .split(|&byte| byte == 0)
         .filter_map(|entry| {
             // `<mode> <blob> <stage>\t<path>`
@@ -459,12 +469,18 @@ fn staged_files(probe: &Probe, worktree: &Path, scratch: &Path) -> Result<Vec<St
             let mut info = info.split(' ');
             let (mode, blob, stage) = (info.next()?, info.next()?, info.next()?);
             let regular = mode == "100644" || mode == "100755";
-            (regular && stage == "0").then(|| Staged {
+            (regular && stage == "0").then_some((path, blob))
+        })
+        .map(|(path, blob)| {
+            let content = source::digest(&worktree.join(path))
+                .map_err(|error| format!("cannot read source {path}: {error}"))?;
+            Ok(Staged {
                 path: path.to_owned(),
                 blob: blob.to_owned(),
+                content,
             })
         })
-        .collect())
+        .collect()
 }
 
 /// `time` in nanoseconds since 1970, if it is after 1970 and before 2554.

@@ -566,8 +566,9 @@ daemon through the registration too (§3, "Starting on demand").
   `systemctl --user daemon-reload`. It runs `cargo-heli daemon` in the
   foreground (a detaching start would end the unit, and systemd would stop
   the daemon with it), with `SuccessExitStatus=3`, the exit of a daemon that
-  finds another one running. The user manager lives from the first login to
-  the last logout; heli does not enable lingering.
+  finds another one running, and `KillMode=process`, so stopping or losing
+  the daemon does not kill its already spawned runs. The user manager lives
+  from the first login to the last logout; heli does not enable lingering.
 - **macOS**: the launchd agent `io.github.vanyastaff.heli`, in
   `~/Library/LaunchAgents`, loaded at once with
   `launchctl bootstrap gui/<uid> <file>`: `cargo-heli daemon` in the
@@ -673,7 +674,11 @@ How a command line is read:
      byte, each in a thread of its own. A client that stops reading or is
      killed holds up nothing; a killed client is noticed within 200 ms, even
      while the run is silent. Output that cannot be recorded is kept in
-     memory, so clients still get all of it.
+     memory, so clients still get all of it. During retirement, once a run
+     has ended for at least one second, a follower stalled on writes is
+     disconnected: it cannot pin the retiring daemon. Otherwise a paused
+     reader can resume and receive the full stream and exit code. The full
+     recorded output remains available through `log`.
    - **Attach.** Re-running the same command attaches to the run in flight:
      the client prints one notice line (the run, how long it has been going,
      and `cargo heli cancel <run>` to run it anew), then the run's output
@@ -736,6 +741,9 @@ How a command line is read:
      broker takes slots back for it as for any. With no slot after 5 s, the
      tests run with one thread on the run's implicit slot and hold no pool
      slot (G1).
+     An invalid thread count, including a missing flag operand, runs
+     unchanged so the native runner reports its own failure and exit code;
+     heli never replaces an invalid option with a valid count.
    - It runs the tests with `--test-threads K` (nextest, in place of the
      user's own) or `-- --test-threads=K` (libtest, after the user's test
      arguments, in place of theirs) and holds the K slots until they finish.
@@ -1523,8 +1531,8 @@ worktree git cannot stage gets no recycled directory.
   this donor: cargo would find units built from another content fresh, and
   link the donor's code. heli tries the next orphan, and else the worktree
   builds cold. The cost of the `OUT_DIR` invalidations is to be measured.
-- **Precise.** The donor has a *source-state record*: the blob id, size and
-  mtime of every tracked or untracked file.
+- **Precise.** The donor has a *source-state record*: the raw content's
+  SHA-256 digest, Git blob id, size and mtime of every tracked or untracked file.
   - **File times and the clock.** A file's mtime can be earlier than the
     moment, by the clock heli reads, at which it was written: the kernel
     dates a write by a coarse clock, up to a tick (some milliseconds)
@@ -1544,7 +1552,7 @@ worktree git cannot stage gets no recycled directory.
     `incremental/` caches, which no freshness decision reads (a build that
     changes what cargo decides writes a fingerprint). Otherwise heli ignores
     it. It is read before the path scan, which changes the directory.
-  - For each file in the new worktree whose blob and size match the record,
+  - For each file in the new worktree whose raw content digest and size match the record,
     heli sets the recorded mtime, if the file was written before heli began
     to stage the worktree: its mtime plus its slack is no later. So that a
     worktree just made gets the recorded mtimes, heli stages it again, once,
@@ -1554,9 +1562,10 @@ worktree git cannot stage gets no recycled directory.
     donor's last build or before gets the time now, and at least its slack
     after that build, so that a time cut to whole seconds stays after it (a
     worktree made before that build has such files); any other keeps its
-    time, newer than every artifact already. The size counts because a blob
-    id is of the content after git's filters: two files that differ only in
-    line endings share one, and `include_str!` compiles in bytes. Should a
+    time, newer than every artifact already. Git's blob id alone cannot prove
+    equality: filters can normalize different files of the same size, and
+    `include_str!` compiles in bytes. The digest is checked again through
+    the handle used to restore the time. Should a
     file not get its newer time, heli deletes the fingerprint of every unit,
     and cargo rebuilds them all.
   - Every file with the donor's content then looks to cargo exactly as it did
@@ -1589,15 +1598,16 @@ worktree git cannot stage gets no recycled directory.
     and precise mode becomes unnecessary. The path scan does not.
 
   The record is `.heli/sources` in the build directory, JSON, replaced
-  whole: `{"taken_at":…,"files":{"<path>":{"blob":…,"size":…,"mtime":…}}}`,
+  whole: `{"taken_at":…,"files":{"<path>":{"blob":…,"content":…,"size":…,"mtime":…}}}`,
   each path from the top of the worktree as git writes it, times in
   nanoseconds since 1970. `taken_at` is read before anything else, so a
   build that starts meanwhile makes the record stale, its files dated at
   most a slack before `taken_at`. The blob ids come from
   the result store's snapshot (§7): `git add -A` into a scratch copy of the
-  index, then `git ls-files --stage`; sizes and mtimes are read afterwards,
+  index, then `git ls-files --stage`; raw content digests, sizes and mtimes are read afterwards,
   so a file changed in between looks newer, never older. Symbolic links and
-  submodules are left out.
+  submodules are left out. An older record without raw content digests is
+  ineligible for precise recycling; conservative recycling still applies.
 
 **Later: cloning.** On volumes with block cloning (Windows Dev Drive on ReFS,
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
@@ -1630,6 +1640,17 @@ was found by a failing test.
   on Linux) hid such a change, and git kept the old blob: a false hit here,
   and in the source-state record (§6.4) a stale link, which a recycling
   test showed on a Linux runner.
+  The key additionally hashes the raw bytes of every listed regular file:
+  Git clean filters, including `ident` and line ending normalization, must
+  not equate different compiler inputs. Gitlinks include the submodule's
+  recursive current inventory rather than only its recorded commit.
+  Cargo metadata selects the actual workspace (`--manifest-path`,
+  toolchain and configuration included). Offline resolution with all
+  features inventories local packages, including external path dependencies
+  and registry/git patches; their Git roots contribute raw content too.
+  If the inventory cannot be established, or a local source has no Git
+  inventory, the command runs without result caching. Existing key markers
+  use a different composition and cannot match these keys.
 - **Base.** For a command that diffs against a base, the merge base too. No
   verify or test subcommand does; `exec`, which can run such a command, does
   not use the store yet.
@@ -1645,6 +1666,8 @@ was found by a failing test.
   the working directory). They are keyed in the order cargo reads them, not
   by path, so worktrees in different places can share a key. A file that is
   there but cannot be read is keyed by its error, never as absent.
+  Files explicitly selected by `--config` are keyed by content too;
+  inline `KEY=VALUE` settings already contribute through argv.
 - **Argv**, normalized: without the program, which the toolchain stands for,
   and with the working directory relative to the worktree, which selects
   packages and configuration as an argument would. The worktree's own path is

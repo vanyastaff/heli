@@ -52,6 +52,7 @@ mod run_id;
 mod runlog;
 mod session;
 mod setup;
+mod source;
 mod status;
 mod store;
 mod worktree;

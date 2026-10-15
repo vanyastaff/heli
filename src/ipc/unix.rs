@@ -45,15 +45,20 @@ impl Listener {
     /// Waits for the next client.
     pub fn accept(&mut self) -> io::Result<Stream> {
         let (stream, _) = self.inner.accept()?;
-        Ok(Stream(stream))
+        Ok(Stream(stream, None))
     }
 }
 
 /// One connection. Dropping it closes it; the other side still reads what
 /// was written before.
-pub struct Stream(UnixStream);
+pub struct Stream(UnixStream, Option<Instant>);
 
 impl Stream {
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.0.set_nonblocking(deadline.is_some())?;
+        self.1 = deadline;
+        Ok(())
+    }
     /// Whether the other side still has the connection open; asks without
     /// reading or blocking.
     pub fn connected(&self) -> bool {
@@ -74,13 +79,27 @@ impl Stream {
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        loop {
+            match self.0.read(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && self.1.is_some() => {
+                    super::retry_until(self.1.unwrap())?
+                }
+                result => return result,
+            }
+        }
     }
 }
 
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        loop {
+            match self.0.write(buf) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && self.1.is_some() => {
+                    super::retry_until(self.1.unwrap())?
+                }
+                result => return result,
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -103,5 +122,5 @@ pub fn connect(path: &Path, _deadline: Instant) -> io::Result<Stream> {
             ),
         ));
     }
-    UnixStream::connect(path).map(Stream)
+    UnixStream::connect(path).map(|stream| Stream(stream, None))
 }

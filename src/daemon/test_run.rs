@@ -98,11 +98,19 @@ pub fn plan(request: &RunRequest) -> Option<TestRun> {
             let (_, test_args) = split_at_separator(&argv[at..]);
             thread_flags(test_args.unwrap_or_default(), &["--test-threads"])
                 .last()
-                .map(|value| value.parse().ok())
-                .or_else(|| env("RUST_TEST_THREADS").map(|value| value.parse().ok()))
+                .map(|value| value.parse().ok().filter(|value: &u32| *value > 0))
+                .or_else(|| {
+                    env("RUST_TEST_THREADS")
+                        .map(|value| value.parse().ok().filter(|value: &u32| *value > 0))
+                })
         }
+    };
+    // Let the runner reject an invalid value itself, with its own output
+    // and exit code. Substituting K here would turn a bad invocation green.
+    if asked == Some(None) {
+        return None;
     }
-    .flatten();
+    let asked = asked.flatten();
     Some(TestRun {
         runner,
         argv,
@@ -233,9 +241,11 @@ fn thread_flags(args: &[OsString], names: &[&str]) -> Vec<String> {
         match flag(arg, names) {
             Flag::Joined(value) => values.push(value.to_owned()),
             Flag::Next => {
-                if let Some(value) = args.next() {
-                    values.push(value.to_string_lossy().into_owned());
-                }
+                values.push(
+                    args.next()
+                        .map(|value| value.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
             }
             Flag::Not => {}
         }

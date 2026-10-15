@@ -26,8 +26,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-    PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe, WaitNamedPipeW,
+    ConnectNamedPipe, CreateNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE,
+    PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, PeekNamedPipe,
+    SetNamedPipeHandleState, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -69,7 +70,7 @@ impl Listener {
             let next = create_instance(&self.name, &self.security, false)?;
             let instance = std::mem::replace(&mut self.pending, next);
             if connected != 0 || error == ERROR_PIPE_CONNECTED {
-                return Ok(Stream(instance));
+                return Stream::new(instance);
             }
             // The client left before it was accepted: wait for the next one.
         }
@@ -79,9 +80,22 @@ impl Listener {
 /// One connection. Dropping it closes it; the other side still reads what
 /// was written before (only `DisconnectNamedPipe`, which heli never calls,
 /// would drop it).
-pub struct Stream(File);
+pub struct Stream(File, Option<Instant>);
 
 impl Stream {
+    fn new(file: File) -> io::Result<Self> {
+        let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+        // SAFETY: an open duplex pipe handle, and a pointer to its new mode.
+        if unsafe { SetNamedPipeHandleState(file.as_raw_handle(), &mode, null(), null()) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(file, None))
+    }
+
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) -> io::Result<()> {
+        self.1 = deadline;
+        Ok(())
+    }
     /// Whether the other side still has the connection open; asks without
     /// reading or blocking.
     pub fn connected(&self) -> bool {
@@ -104,13 +118,55 @@ impl Stream {
 
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        loop {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let mut available = 0;
+            // SAFETY: an open pipe and one writable count. The standard
+            // library maps an empty nonblocking pipe to EOF, so inspect
+            // availability before reading, without consuming any bytes.
+            if unsafe {
+                PeekNamedPipe(
+                    self.0.as_raw_handle(),
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut available,
+                    null_mut(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if available == 0 {
+                match self.1 {
+                    Some(deadline) => super::retry_until(deadline)?,
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                }
+                continue;
+            }
+            let count = buf.len().min(available as usize);
+            return self.0.read(&mut buf[..count]);
+        }
     }
 }
 
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write(buf)
+        // A nonblocking byte-pipe write larger than its buffer can make no
+        // progress even when empty (e.g. a long selected log line). Split
+        // it before retrying; write_all preserves each successful offset.
+        let buf = &buf[..buf.len().min(BUFFER as usize)];
+        loop {
+            match self.0.write(buf) {
+                Ok(0) if !buf.is_empty() => match self.1 {
+                    Some(deadline) => super::retry_until(deadline)?,
+                    None => std::thread::sleep(Duration::from_millis(1)),
+                },
+                result => return result,
+            }
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -145,7 +201,7 @@ pub fn connect(path: &Path, deadline: Instant) -> io::Result<Stream> {
             // SAFETY: a fresh handle the file now owns.
             let pipe = unsafe { File::from_raw_handle(handle) };
             check_owner(&pipe)?;
-            return Ok(Stream(pipe));
+            return Stream::new(pipe);
         }
         let error = io::Error::last_os_error();
         let now = Instant::now();
