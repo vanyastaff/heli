@@ -9,7 +9,7 @@
 
 use std::ffi::OsStr;
 use std::io;
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 
 /// Exit code when the command does not exist (as a shell reports it).
 const NOT_FOUND: i32 = 127;
@@ -24,6 +24,46 @@ pub fn run(mut command: Command) -> ! {
         error.kind() == io::ErrorKind::NotFound,
         &error.to_string(),
     )
+}
+
+/// Wait for a separate lifetime guardian; never replace this client with it.
+/// Killing only the client must leave the guardian protecting its child.
+pub fn wait(mut command: Command) -> ! {
+    #[cfg(windows)]
+    ignore_console_interrupts();
+    let mut child = command.spawn().unwrap_or_else(|error| {
+        report_spawn_failure(
+            command.get_program(),
+            error.kind() == io::ErrorKind::NotFound,
+            &error.to_string(),
+        )
+    });
+    loop {
+        match child.wait() {
+            Ok(status) => exit_as(status),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
+/// Preserve all platform exit-code bits and the terminating Unix signal.
+pub(crate) fn exit_as(status: ExitStatus) -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(number) = status.signal() {
+            unsafe extern "C" {
+                fn signal(number: i32, handler: usize) -> usize;
+                fn raise(number: i32) -> i32;
+            }
+            // SAFETY: restore and raise the child's terminating signal.
+            unsafe {
+                signal(number, 0);
+                raise(number);
+            }
+        }
+    }
+    std::process::exit(status.code().unwrap_or(1))
 }
 
 /// Reports that `program` could not be started, because of `error`, and

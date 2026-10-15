@@ -17,32 +17,65 @@ pub enum Handshake {
 
 /// Acquire before spawning: a daemon crash during startup cannot expose a
 /// running command whose guardian has not yet protected its store.
-pub fn main(roots: &[PathBuf], argv: &[OsString]) -> ! {
+pub fn main(
+    roots: &[PathBuf],
+    argv: &[OsString],
+    epoch: Option<&std::path::Path>,
+    direct: bool,
+) -> ! {
+    let fail = |error: io::Error| -> ! {
+        if direct {
+            crate::direct::report_spawn_failure(
+                argv.first()
+                    .map_or(std::ffi::OsStr::new("guarded command"), |arg| {
+                        arg.as_os_str()
+                    }),
+                error.kind() == io::ErrorKind::NotFound,
+                &error.to_string(),
+            );
+        }
+        failed(error)
+    };
+    // Parents can both disappear before this guardian acquires its guards.
+    // Reopen under ownership and recheck the snapshot before spawning, so
+    // GC in that handoff window cannot launch Cargo on retired inputs.
+    let _epoch = epoch
+        .map(crate::dependencies::Epoch::open)
+        .transpose()
+        .unwrap_or_else(|error| fail(io::Error::other(error)));
     let guards = roots
         .iter()
         .map(|root| super::lease::shared(root))
         .collect::<io::Result<Vec<_>>>();
     let _guards = match guards {
         Ok(guards) => guards,
-        Err(error) => failed(error),
+        Err(error) => fail(error),
     };
     let Some((program, args)) = argv.split_first() else {
-        failed(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "no guarded command",
-        ));
+        let error = io::Error::new(io::ErrorKind::InvalidInput, "no guarded command");
+        fail(error);
     };
     let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args);
+    if direct {
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    } else {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    }
     protect_while_waiting(&mut command);
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(error) => failed(error),
+        Err(error) => fail(error),
     };
+    if direct {
+        crate::direct::exit_as(wait(&mut child));
+    }
     // This frame precedes every byte from either actual command stream.
     // Losing the daemon must not kill the command or release its leases.
     let _ = crate::protocol::write_message(&mut io::stdout().lock(), &Handshake::Spawned);
@@ -65,12 +98,7 @@ pub fn main(roots: &[PathBuf], argv: &[OsString]) -> ! {
     }
     drop(done);
     // A wait error does not prove that the protected process has gone.
-    let status = loop {
-        match child.wait() {
-            Ok(status) => break status,
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    };
+    let status = wait(&mut child);
     // Descendants holding pipes open do not extend the run's lifetime.
     let until = Instant::now() + Duration::from_millis(500);
     for _ in 0..2 {
@@ -81,7 +109,7 @@ pub fn main(roots: &[PathBuf], argv: &[OsString]) -> ! {
             break;
         }
     }
-    exit_as(status)
+    crate::direct::exit_as(status)
 }
 
 fn failed(error: io::Error) -> ! {
@@ -93,6 +121,46 @@ fn failed(error: io::Error) -> ! {
         },
     );
     std::process::exit(126)
+}
+
+/// A separate guardian survives abrupt client loss during direct fallback.
+pub fn direct(command: Command, roots: &[PathBuf], epoch: &std::path::Path) -> ! {
+    let executable = std::env::current_exe().unwrap_or_else(|error| {
+        crate::direct::report_spawn_failure(command.get_program(), false, &error.to_string())
+    });
+    let mut guardian = Command::new(executable);
+    guardian
+        .arg("lease-run")
+        .arg("--direct")
+        .arg("--dependency-epoch")
+        .arg(epoch);
+    for root in roots {
+        guardian.arg("--root").arg(root);
+    }
+    guardian
+        .arg("--")
+        .arg(command.get_program())
+        .args(command.get_args());
+    if let Some(cwd) = command.get_current_dir() {
+        guardian.current_dir(cwd);
+    }
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            guardian.env(name, value);
+        } else {
+            guardian.env_remove(name);
+        }
+    }
+    crate::direct::wait(guardian)
+}
+
+fn wait(child: &mut std::process::Child) -> ExitStatus {
+    loop {
+        match child.wait() {
+            Ok(status) => return status,
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
 }
 
 fn forward(mut source: Box<dyn Read + Send>, stderr: bool) {
@@ -160,22 +228,3 @@ fn protect_while_waiting(_: &mut Command) {
 
 #[cfg(not(any(unix, windows)))]
 fn protect_while_waiting(_: &mut Command) {}
-
-fn exit_as(status: ExitStatus) -> ! {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(number) = status.signal() {
-            unsafe extern "C" {
-                fn signal(number: i32, handler: usize) -> usize;
-                fn raise(number: i32) -> i32;
-            }
-            // SAFETY: restore and raise the child's terminating signal.
-            unsafe {
-                signal(number, 0);
-                raise(number);
-            }
-        }
-    }
-    std::process::exit(status.code().unwrap_or(1))
-}

@@ -163,6 +163,7 @@ impl TestRun {
             cwd: request.cwd.clone(),
             argv: argv.into_iter().map(Text).collect(),
             env,
+            dependency_epoch: request.dependency_epoch.clone(),
             class: request.class,
             cache: request.cache,
             reads_spawned: request.reads_spawned,

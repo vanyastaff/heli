@@ -165,7 +165,8 @@ Windows host), and until then it would hold its endpoint, where a client
 would connect and get no answer, and the lock, which a new daemon needs.
 An older client asks
 nothing, so two installed versions never take turns retiring each other's
-daemon. The version stays 1 until the first release: until then a daemon
+daemon. The current protocol is 2: a dependency-epoch request must never be
+accepted by an old daemon that ignores its optional ownership field. A daemon
 answers a request it does not know (one a newer client added, such as `log`)
 with "unsupported", and the client treats that like a mismatch from an older
 daemon. It asks the daemon to retire and does without it, after one warning
@@ -246,7 +247,7 @@ lock or for recycling, §5): a client that loses the daemon in between runs
 the command itself, after one warning line, since the command never
 started. Once the daemon has said the command started, the client never
 runs it itself: if the daemon is lost then, it exits 1. A client asks for
-the second message in its run request (protocol version 1 still), and a
+the second message in its run request, and a
 daemon older than it says in its first that none follows: with one, the
 run counts as started once accepted, as before.
 
@@ -1773,6 +1774,96 @@ worktree git cannot stage gets no recycled directory.
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
 A *live* worktree can then donate, forking a warm build directory. The same
 rules apply.
+
+### 6.5 Immutable dependency epochs (opt-in integration)
+
+Separate worktrees and artifact directories do not remove Cargo's shared
+package-cache lock. The experiments linked in `docs/multi-agent.md` verified
+private writable Cargo homes consuming shared immutable vendor sources. This
+ownership model is now available explicitly, through ordinary managed runs:
+
+```text
+cargo heli deps import --store <absolute-new-store> --vendor <vendor-tree> --config <cargo-vendor-output.toml>
+cargo heli --dependency-epoch <printed-epoch-path> --cache off check --offline
+cargo heli --dependency-epoch <printed-epoch-path> test --offline
+cargo heli deps gc --store <absolute-owned-store>
+```
+
+Import accepts the source-only replacement TOML emitted by `cargo vendor` and
+one supplied directory source. It verifies the complete file inventory and
+each Cargo file checksum before and after copying. Original archive checksums
+are preserved for Cargo's lockfile verification; extracted files alone cannot
+authenticate the original archive. Unsupported configuration, links within
+input packages and path escapes are refused. Existing unknown directories
+are never adopted as managed stores.
+
+The store holds package objects by content identity. Epochs contain source
+configuration, a manifest and cheap views of those objects: NTFS junctions on
+Windows and directory symlinks on Unix. Different epochs can reference the
+same physical object. A complete staged epoch becomes visible by rename;
+partially published or corrupt state is refused, rather than executed.
+This is atomic visibility, not a claim of durability through arbitrary
+power loss. Objects include names, bytes, empty directories and executable
+bits in their identity. Opening an epoch verifies the stored bytes as well
+as its manifest, configuration and link targets.
+
+Each epoch has an external shared lifetime lease. It is acquired before
+reading its manifest, including before result lookup and metadata discovery.
+The daemon holds ownership across queueing, build/test phases and final
+keying; asynchronous metadata learning owns a separate lease. The command's
+guardian acquires and validates ownership before spawning Cargo, retaining
+it after client or daemon loss. Direct fallback uses a separate guardian
+too, preserves the prepared execution context and raw stdio, and never
+falls back to the original shared Cargo home. Invalid snapshots are terminal
+errors. Protocol 2 prevents silent execution by a daemon that does not honor
+this contract. A `Preparing` response acknowledges a live daemon before
+potentially expensive validation, without treating validation as a failed
+five-second connection handshake.
+
+Explicit dependency GC tries exclusive epoch leases without waiting for
+builds. It may retire an unleased epoch while another epoch remains active;
+all objects referenced by retained epochs stay live. Publication and GC
+serialize catalog mutations. Staging and GC's object verification happen
+outside that critical section; ready readers do not acquire the catalog
+lock. Duplicate import currently re-verifies reused objects under the catalog
+lock, so concurrent publishers can wait there; active ready consumers do not.
+Epoch lease files are never unlinked, avoiding split-lock identities after
+retirement and republication. Trash deletion does not follow package links.
+This source lifecycle does not weaken the conservative global runtime guard
+used for arbitrary build artifacts in §6.3.
+
+The invoking client prepares a stable private Cargo home for its worktree,
+epoch and original configuration/credential inputs. It publishes rather
+than rewriting an existing home. Cargo 1.99 or newer is required. Original
+`config.toml` is included at home precedence with its original path origin;
+workspace and CLI overrides retain their native higher precedence. The
+original config remains a live file, as in ordinary Cargo. Credentials are
+copied privately outside shared objects: Unix owner-only modes and Windows
+protected owner-only ACLs are established before bytes are written. An
+unsafe existing private home is refused. Nested Heli retains the selected
+home and epoch instead of building recursive include chains. Cargo,
+toolchain and wrapper selection retain the caller's PATH order; the original
+home's bin directory is appended only when absent.
+
+This is an explicit integration milestone, not the complete automatic
+isolation policy. Automatic dependency preparation/selection, capacity
+accounting for sources/staging/private homes/lease metadata and automatic
+private-home reclamation remain required work. Legacy home `config` is
+explicitly refused because Cargo includes require `.toml`; copying it would
+change relative-path semantics. Arbitrary cargo extensions, competing
+home-bin/PATH extension precedence and tools mutating the Cargo home need
+the tool profiles tracked in #38. Native workspace/CLI source overrides can
+select sources outside an epoch; this feature does not claim to lease those
+external directories. The existing artifact budget does not yet include
+this opt-in dependency store. No hard disk or RAM bound follows from enabling
+the profile alone.
+
+Public acceptance cases are in `tests/dependencies.rs`: two live Cargo
+builds under a held baseline package-cache lock; collecting an unrelated
+epoch during those builds; delayed source reads after client/daemon loss
+and during direct fallback; original config origins/precedence and private
+credentials; and refusal of corrupted source objects before execution.
+Cross-platform results must be reported for the exact tested revision.
 
 ## 7. Result store
 

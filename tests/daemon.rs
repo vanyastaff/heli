@@ -355,7 +355,7 @@ fn a_daemon_that_does_not_answer_means_a_direct_run() {
 /// asked to retire once idle, a newer one is left alone.
 #[test]
 fn a_daemon_of_another_version_means_a_direct_run() {
-    for (version, retire) in [(0, true), (u32::MAX, false)] {
+    for (version, retire) in [(0, true), (1, true), (u32::MAX, false)] {
         let fixture = Fixture::new("basic");
         let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Version(version));
         let warning =

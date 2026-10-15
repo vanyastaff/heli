@@ -60,13 +60,17 @@ pub fn spawn(
     let mut argv = argv.iter().cloned();
     let program = argv.next().unwrap_or_default();
     let resolved = resolve(&cwd, program);
-    let mut command = if roots.is_empty() {
+    let guarded = !roots.is_empty() || request.dependency_epoch.is_some();
+    let mut command = if !guarded {
         let mut command = Command::new(&resolved);
         command.args(argv);
         command
     } else {
         let mut command = Command::new(std::env::current_exe()?);
         command.arg("lease-run");
+        if let Some(epoch) = &request.dependency_epoch {
+            command.arg("--dependency-epoch").arg(&epoch.0);
+        }
         for root in roots {
             command.arg("--root").arg(root);
         }
@@ -83,7 +87,7 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (mut child, tree) = tree::spawn(&mut command)?;
-    if !roots.is_empty() {
+    if guarded {
         let handshake = crate::protocol::read_message::<crate::store::runner::Handshake>(
             child
                 .stdout

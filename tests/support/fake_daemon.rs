@@ -42,7 +42,7 @@ pub enum Answer {
 }
 
 /// The protocol version of this build of heli.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// A fake daemon serving one client.
 pub struct FakeDaemon {

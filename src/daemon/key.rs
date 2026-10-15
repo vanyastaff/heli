@@ -65,6 +65,22 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     let snapshot = snapshot(request, scratch)?;
     let mut fields = Fields::default();
     fields.push(b"composition", COMPOSITION);
+    if let Some(epoch) = &request.dependency_epoch {
+        // The daemon has opened and validated this immutable epoch before
+        // any key computation. Key its content identity, not the private
+        // Cargo home's location or a neutral HELI_* environment variable.
+        let identity = Path::new(&epoch.0)
+            .file_name()
+            .and_then(OsStr::to_str)
+            .filter(|name| {
+                name.len() == 64
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .ok_or("dependency epoch has no valid content identity")?;
+        fields.push(b"dependency-epoch", identity.as_bytes());
+    }
     fields.push(b"tree", &snapshot.tree);
     fields.push(b"dir", &relative(&cwd, &worktree));
     for arg in request.argv.iter().skip(1) {

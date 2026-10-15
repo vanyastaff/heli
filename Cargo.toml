@@ -15,7 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 # `preserve_order`: `setup` rewrites the user's JSON settings in their order.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
-toml = { version = "1.1", default-features = false, features = ["std", "parse", "serde"] }
+toml = { version = "1.1", default-features = false, features = ["std", "parse", "display", "serde"] }
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1", features = ["fs", "net", "process"] }
@@ -26,6 +26,7 @@ rustix = { version = "1.1", features = ["fs", "net", "process"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+junction = "2.1"
 # `NtQuerySemaphore`, which windows-sys does not declare.
 windows-link = "0.2"
 windows-sys = { version = "0.61", features = [

@@ -93,6 +93,7 @@ const TELLING_WAIT: Duration = Duration::from_secs(10);
 pub struct Command {
     cwd: PathBuf,
     argv: Vec<OsString>,
+    dependency_epoch: Option<OsString>,
     /// Sorted by name; on Windows, names are upper-cased, as they ignore
     /// case there.
     env: Vec<(OsString, OsString)>,
@@ -115,6 +116,7 @@ impl Command {
         Self {
             cwd: request.cwd(),
             argv: request.argv(),
+            dependency_epoch: request.dependency_epoch.as_ref().map(|path| path.0.clone()),
             env,
         }
     }

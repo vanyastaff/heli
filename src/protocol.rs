@@ -18,7 +18,8 @@
 //! its stdout or stderr. The client sends one request; the daemon answers:
 //!
 //! - [`Request::Status`]: one [`Reply::Status`].
-//! - [`Request::Run`]: [`Reply::Refused`] (the client then runs the command
+//! - [`Request::Run`]: [`Reply::SpawnFailed`] for invalid execution inputs,
+//!   [`Reply::Refused`] (the client then runs the command
 //!   itself), or [`Reply::Started`], then [`Reply::Waiting`] if the run
 //!   has to wait for its worktree's lock, then [`Reply::Spawned`] once its
 //!   command has started (to a client that reads it, and then `Started`
@@ -47,8 +48,9 @@
 //!   does without the daemon (it runs the command, or reads the run log,
 //!   itself).
 //!
-//! **Changes.** The version stays 1 until the first release. Until then a
-//! new request needs no new version: older daemons answer it with
+//! **Changes.** Version 2 requires dependency-epoch ownership: a version 1
+//! daemon would ignore that added request field and run without its lease.
+//! A new request otherwise needs no new version: older daemons answer it with
 //! `Unsupported`. Fields are only added, with defaults, so that both sides
 //! read each other's messages, and a value a newer side adds to an enum
 //! reads as unknown on an older one: a reply ([`Reply::Unknown`], which a
@@ -74,7 +76,7 @@ use crate::runlog::select::Select;
 use crate::status::{self, Status};
 
 /// This build's protocol version.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// Sent by a newer client after a version mismatch: exit once idle.
 pub const RETIRE: u8 = b'R';
@@ -151,6 +153,10 @@ pub struct RunRequest {
     /// The program, then its arguments.
     pub argv: Vec<Text>,
     pub env: Vec<(Text, Text)>,
+    /// The immutable dependency epoch selected by this execution context.
+    /// The daemon validates it and owns its lease before inspecting inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_epoch: Option<Text>,
     /// What kind of run it is, as the client read its command line; `None`
     /// from a client older than run classes.
     #[serde(default)]
@@ -224,6 +230,9 @@ impl Cache {
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
+    /// The daemon is validating explicitly selected immutable inputs. No
+    /// command has started; the client may remove its first-answer deadline.
+    Preparing,
     /// The daemon accepted the run, and starts it now or once its wait
     /// ends; or, with `attached`, the same run was already in flight as
     /// `run`, and the client follows that run from its start.

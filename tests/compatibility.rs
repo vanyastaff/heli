@@ -11,7 +11,7 @@ use support::{Fixture, assert_success, runs};
 /// The status a newer daemon answers: a run in a phase this client does not
 /// know, of a class it does not know, with a field it does not know.
 const NEWER_STATUS: &str = r#"{"Status":{"schema":1,
-    "daemon":{"pid":4242,"protocol":1,"started_at":1791910980},
+    "daemon":{"pid":4242,"protocol":2,"started_at":1791910980},
     "runs":[{"id":"r7","worktree":"/w","argv":["cargo","build"],
              "class":"profile","phase":"paused","started_at":1791911112,
              "paused_by":"r6"}]}}"#;
@@ -80,4 +80,51 @@ fn a_run_skips_a_message_it_does_not_know() {
     assert_eq!(output.status.code(), Some(3), "{stderr}");
     assert!(!stderr.contains("lost"), "{stderr}");
     assert!(output.stdout.is_empty(), "nothing ran here: {output:?}");
+}
+
+/// Rejected execution inputs cannot fall back to a different command context.
+#[test]
+fn invalid_execution_inputs_never_fall_back_to_a_direct_run() {
+    const FAILURE: &str = r#"{"SpawnFailed":{"not_found":false,"message":"cannot use dependency epoch: invalid inventory"}}"#;
+    for answer in [
+        Answer::Reply(FAILURE),
+        Answer::Replies(&[r#""Preparing""#, FAILURE]),
+    ] {
+        let fixture = Fixture::new("basic");
+        let echo = fixture.echo_args();
+        let fake = FakeDaemon::start(&fixture.endpoint(), answer);
+        let output = fixture
+            .heli(["exec", "--"])
+            .arg(echo)
+            .output()
+            .expect("run heli");
+        fake.received();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(126), "{stderr}");
+        assert!(stderr.contains("invalid inventory"), "{stderr}");
+        assert!(!stderr.contains("running the command directly"), "{stderr}");
+        assert!(output.stdout.is_empty(), "nothing ran here: {output:?}");
+    }
+}
+
+/// Validation has not started a command, so loss there still permits fallback.
+#[test]
+fn losing_a_daemon_while_preparing_still_runs_the_command() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let fake = FakeDaemon::start(&fixture.endpoint(), Answer::LostAfter(&[r#""Preparing""#]));
+    let output = fixture
+        .heli(["exec", "--"])
+        .arg(echo)
+        .arg("preparation-loss-fallback-ran")
+        .output()
+        .expect("run heli");
+    fake.received();
+    assert_success(&output, "fallback before any command started");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("answered Preparing"), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("preparation-loss-fallback-ran"),
+        "the command ran: {output:?}"
+    );
 }

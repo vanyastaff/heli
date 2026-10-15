@@ -81,8 +81,15 @@ Cargo's shared package-cache resolver lock still exists, even offline. The
 foreground cache-off path avoids extra result-cache resolutions; it does not
 promise that Cargo itself never briefly waits. Do not give independent lock
 files to multiple Cargo homes that symlink the same mutable registry cache.
-Immutable shared vendor snapshots with private Cargo homes are experimental;
-they are not yet selected automatically by heli. See the
+Immutable shared vendor snapshots with private Cargo homes are available
+through the explicit `deps import` / `--dependency-epoch` profile described in
+[DESIGN §6.5](../DESIGN.md#65-immutable-dependency-epochs-opt-in-integration).
+They are not selected automatically. The dependency store currently has
+explicit GC rather than automatic capacity enforcement, and private homes
+are retained. Its bytes are outside `[store] budget_mb`; enabling the profile
+does not establish a total disk bound. Cargo 1.99+ and home `config.toml` are
+required; legacy `config` and unsafe private homes are refused. Review the
+documented tool/source-override limits before opting in. See the
 [real Heli/FLUI workload and its verification limits](research/real-dependency-epochs.md)
 and [package objects with cheap NTFS epoch views](research/package-epoch-views.md).
 
