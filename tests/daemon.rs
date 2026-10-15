@@ -1018,3 +1018,30 @@ fn an_unsupported_answer_means_a_direct_run() {
     assert!(warning.contains("does not support"), "{warning}");
     assert_eq!(fake.received(), b"R", "asked to retire");
 }
+
+#[test]
+fn cache_off_falls_back_once_when_an_older_daemon_refuses_its_contract() {
+    let fixture = Fixture::new("basic");
+    let cargo = fixture.echo_args();
+    let starts = fixture.path("direct-starts");
+    let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Unsupported);
+    let output = fixture
+        .heli(["--cache", "off", "check"])
+        .env("CARGO", cargo)
+        .env("ECHO_STARTS", &starts)
+        .output()
+        .expect("uncached check");
+    assert_success(&output, "direct uncached check");
+    assert!(
+        text(&output.stderr).contains("does not support"),
+        "{output:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(starts)
+            .expect("command starts")
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(fake.received(), b"R", "older daemon asked to retire");
+}

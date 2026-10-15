@@ -304,7 +304,7 @@ fn parse_cache(text: &str) -> Result<Cache, String> {
     match text {
         "on" => Ok(Cache::On),
         "refresh" => Ok(Cache::Refresh),
-        "off" => Ok(Cache::Off),
+        "off" => Ok(Cache::Disabled),
         _ => Err("cache mode must be on, refresh or off".to_owned()),
     }
 }

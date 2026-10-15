@@ -204,7 +204,7 @@ impl Surveyed {
     /// `dir` as it is at `now`; `orphaned_since` says since when an orphan
     /// is unclaimed.
     pub fn of(dir: Dir, now: u64, orphaned_since: impl FnOnce(&Dir) -> Option<u64>) -> Self {
-        let state = if super::busy_for_eviction(&dir.path, now) {
+        let state = if super::busy_for_eviction(&dir, now) {
             State::Busy
         } else {
             dir.state()

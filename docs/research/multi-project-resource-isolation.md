@@ -38,7 +38,9 @@ sizes. The practical order is:
    only documents its own `FLUI_XTASK_NO_LOCK` escape hatch and nested-lock
    marker. The inspected module has no `HELI_RUN` check. heli's adoption
    instructions in DESIGN §9 therefore describe a consumer integration that
-   must be verified, not assumed to exist.
+   must be verified, not assumed to exist. This finding describes the earlier
+   compatibility baseline; the follow-up consumer fix and held-lock experiment
+   are recorded below.
    [FLUI host lock at the compatibility baseline](https://github.com/vanyastaff/flui/blob/b653a7ad8ddfb17c2f43b9cec8c3b9c56e5284a0/tools/xtask/src/host_lock.rs)
 3. Define a runner handshake: a verified heli-managed invocation may skip
    that runner's redundant host lock and inherit the host jobserver; ordinary
@@ -149,8 +151,9 @@ another agent may have created it. Never solve the gap by deleting unrelated
 unknown directories. A scoped namespace is a candidate, not permission to
 rewrite global Cargo configuration.
 
-The exclusive-root alternative is a practical candidate for the reproduced
-case: heli creates the final root using `create_dir`, and only a successful
+The exclusive-root alternative has now been implemented in
+`src/store/managed.rs` for the reproduced case: heli creates the final root
+using `create_dir`, and only a successful
 new creation authorizes writing a versioned ownership marker before Cargo or
 metadata probes start. `AlreadyExists`, even for an empty root, is not proof.
 Failed marker creation leaves the root conservative; defaults are not adopted.
@@ -163,10 +166,15 @@ Before eviction, recheck marker/version, link-free containment and relevant
 locks. Dry runs must not create or mark roots. Tests must cover preexisting
 empty/nonempty unmarked roots, invalid/future markers, busy nested builds,
 new-lock races, link escapes and restart persistence. Document new explicitly
-configured roots as exclusively regenerable cache namespaces. This candidate
+configured roots as exclusively regenerable cache namespaces. This policy
 still cannot promise immediate budget compliance while all eligible space is
 busy or younger than the configured age; it removes the permanent unknown
-directory gap rather than removing safety rules.
+directory gap rather than removing safety rules. The implementation has eight
+public GC regression cases. A further reproducer found a lock deeper inside
+the build directory: recursive lock discovery/retention was fixed, including
+keeping the lock guards across Unix rename. The investigator reported the
+focused cases green; final-suite and final-binary acceptance are tracked
+separately below.
 
 ### Reuse without sharing a locked target directory
 
@@ -237,6 +245,77 @@ targeted kernel extraction failed; official kernel documentation was read
 through the browser fallback. A systemd manual fetch timed out in the browser,
 but Firecrawl's targeted retrieval returned its memory-limit documentation.
 No live systemd configuration or delegation capability was tested.
+
+## Measured Windows experiment: progress and reclamation
+
+Evidence reviewed: `target/mps-1015-2027/result.json` and
+`target/mps-1015-2032/result.json`, together with their manifests. Both runs
+used four detached worktrees: two for heli and two for FLUI. The workload was
+heli check/test and `flui-foundation` check/lib-test, followed by a real xtask
+host-lock control and three cycles of two generated nested Cargo tests. Each
+child wrote a 512 MiB build-script artifact. Pool capacity was eight borrowed
+slots, store budget 2 GiB, floor 50 GiB, and all GC ages were explicitly zero
+to accelerate the reclamation experiment. Stock Cargo/rustc 1.99.0 were used.
+
+| Observation | Earlier Refresh run | Cache-off run |
+|---|---:|---:|
+| Harness verdict | FAIL | PASS |
+| All requested commands exit successfully | Yes | Yes |
+| First actual compiler, heli check | 3.302 s | 0.822 s |
+| First actual compiler, heli test | 3.287 s | 0.771 s |
+| First actual compiler, FLUI test | 35.021 s | 1.020 s |
+| First actual compiler, late FLUI check | 31.620 s | 1.096 s |
+| Peak distinct real agents in compiler intervals | 2 | 4 |
+| Cross-repository compiler overlap | No | Yes |
+| Late check arrived during another compilation | Yes | Yes |
+| Final accounted bytes after fresh post-GC survey | 1,668,322,106 | 1,668,322,106 |
+| Configured budget bytes | 2,147,483,648 | 2,147,483,648 |
+
+The cache-off run measured minimum available physical memory of
+31,473,807,360 bytes and minimum available commit of 19,556,368,384 bytes.
+Its free-space-floor and unmarked-unknown sentinel checks passed. These are
+sampled headroom observations, not hard memory containment guarantees.
+Compiler intervals are instrumented subprocess lifetimes, not CPU-utilization
+samples. Both runs still logged package-cache waits; neither establishes that
+all Cargo locks disappeared.
+
+The cache-off manifest pins heli `971bdeddf1815827d44013da5abf953b38cae523`
+and FLUI `1800e914fe1ac99a2d8d6e5bece824c9b18a1b1c`. Its measured heli binary
+SHA-256 is
+`59553a3e96f0bc35cab50f8d1a16a7f02a3770dc30691d7f339e7d130d32ffbd`.
+The earlier run pins heli `929d318898d84f68cb89e95d12fbd481d0023554` and the
+same FLUI commit. Distinct experiment roots, warmed OS caches and uncontrolled
+background work by other agents prevent a causal throughput or speedup claim
+from this pair. The observations justify the separate cache-off mode and
+further startup investigation; they are not a controlled performance benchmark.
+
+**Real consumer lock control:** the harness built FLUI xtask through heli,
+then held an isolated FLUI host lock using the standalone Rust helper. Bare
+`xtask clean-nested` remained blocked. Through `heli exec`, the same prebuilt
+xtask completed successfully in 0.212 s while that lock remained held. After
+release, the bare command completed successfully. Both used an empty owned
+target path. This demonstrates the patched FLUI consumer handshake for that
+entry point, without bypassing another user's lock or deleting existing
+caches. It does not validate every project-specific task runner.
+
+**Post-measurement repair still awaiting final-binary acceptance:** reviewing
+the new cache-off behavior found that identical verification/test requests
+could incorrectly single-flight by command despite changed source inputs.
+The public source-change reproducer failed before a registry guard was added;
+the investigator then reported ten single-flight and 27 result-cache cases
+green. Those later registry changes are absent from the cache-off binary
+identified above. At the time this section was written, the complete suite
+was running and a new frozen-binary experiment was planned. Do not present
+the earlier PASS as validation of those later edits.
+
+The reproducible harness is `experiments/multi-project-spike.py`, with
+`experiments/spike-rustc-wrapper.rs` recording compiler start/end events while
+excluding compiler-information probes. It uses private daemon/config/pool
+locations, preserves per-run logs and samples, verifies an unchanged binary,
+and removes only its owned clean worktrees through Git. The experiment
+establishes bounded convergence for this generated workload at zero retention
+ages; normal retention defaults, other toolchains and Linux/macOS runtime
+remain outside this evidence.
 
 ## Follow-up: shared Cargo-home startup contention
 

@@ -117,7 +117,7 @@ impl Store {
     /// now. The key is `known` when given (the key of [`Store::before`], for
     /// a run that waited for nothing), else computed again.
     pub fn admitted(&self, request: &RunRequest, known: Option<Key>) -> Admitted {
-        if request.cache == Cache::Off {
+        if matches!(request.cache, Cache::Off | Cache::Disabled) {
             return Admitted::Run {
                 key: None,
                 note: None,

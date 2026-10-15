@@ -14,7 +14,7 @@
 //! One that comes while the run's own client is being told waits for that
 //! (an instant).
 //!
-//! - A run without a key (compile, mutate, exec, a request for help) is the
+//! - A run without a verdict (compile, mutate, exec) is the
 //!   same as another when its [`Command`] is.
 //! - A verify or test run is the same as another when its key is, which
 //!   holds the tree: the same command after an edit is another run. This
@@ -27,7 +27,7 @@
 //!   of another worktree. A run that waits for nothing has its key from the
 //!   start.
 //! - A verify or test run without a key as it asks (`--no-cache`, outside
-//!   git, a key that cannot be computed) attaches to no run. One keyed
+//!   git, `--cache off`, a key that cannot be computed) attaches to no run. One keyed
 //!   once admitted (`--no-cache`) takes the clients of its key from then
 //!   on.
 //!
@@ -134,9 +134,11 @@ pub enum Same {
 
 impl Same {
     /// What `request` is the same as: its `key` (`None` when it has none)
-    /// when it uses the result store, its command when it does not.
+    /// when it uses the result store. Explicitly disabled checks/tests never attach;
+    /// other classes retain command identity.
     pub fn of(request: &RunRequest, key: Option<&Key>) -> Self {
         match (request.cache, key) {
+            (Cache::Disabled, _) => Self::Nothing,
             (Cache::Off, _) => Self::Command,
             (Cache::On | Cache::Refresh, Some(key)) => Self::Key(key.digest.clone()),
             (Cache::On | Cache::Refresh, None) => Self::Nothing,

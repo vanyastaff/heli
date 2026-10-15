@@ -835,6 +835,15 @@ These are the only waits; nothing else makes a heli run wait for another run.
 5. **The source-state record:** as a run ends, its clients hear the end
    once the record of its build directory is written (§6.4), at most 10 s
    later. This waits for no other run.
+6. **Cargo resolution and optional verdict preparation:** Cargo serializes
+   dependency resolution on its package-cache lock, including offline runs.
+   The full metadata and source inventory of `--cache on` / `refresh` add
+   preparation before compilation; they are not bounded by the scheduler's
+   first-job latency target. Foreground concurrency checks use `--cache off`
+   to omit this optional work, while preserving safe complete inventories
+   whenever a verdict is cached. This does not remove Cargo's own resolver
+   lock or promise zero startup work. See `docs/multi-agent.md` and the
+   pinned Cargo-source analysis in `docs/research/multi-project-resource-isolation.md`.
 
 ### Command line and contracts
 

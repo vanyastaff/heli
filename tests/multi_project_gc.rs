@@ -33,11 +33,21 @@ fn gc(fixture: &Fixture) -> Value {
     serde_json::from_slice(&output.stdout).expect("GC JSON")
 }
 
+fn survey(fixture: &Fixture) -> Value {
+    let output = fixture
+        .heli(["gc", "--dry-run", "--json"])
+        .output()
+        .expect("survey");
+    assert_success(&output, "survey");
+    serde_json::from_slice(&output.stdout).expect("survey JSON")
+}
+
 #[test]
 fn nested_cargo_artifacts_can_be_reclaimed_under_the_shared_budget() {
     let (fixture, store) = configured();
     nested_build(&fixture, &store);
-    let listing = gc(&fixture);
+    gc(&fixture);
+    let listing = survey(&fixture);
     assert!(
         listing["used"].as_u64().expect("accounted bytes") <= 16 << 20,
         "completed nested Cargo left unreclaimable artifacts above budget: {listing}"
@@ -150,7 +160,8 @@ fn gc_preserves_a_busy_nested_cargo_then_reclaims_it_after_completion() {
     assert!(busy.exists(), "GC removed a busy child build directory");
     std::fs::write(gate, "open").expect("release child");
     assert!(child.wait().expect("wait for build").success());
-    let listing = gc(&fixture);
+    gc(&fixture);
+    let listing = survey(&fixture);
     assert!(
         listing["used"].as_u64().expect("bytes") <= 16 << 20,
         "{listing}"
