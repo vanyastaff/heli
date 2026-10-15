@@ -37,7 +37,8 @@ struct Manifest {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+// Cargo permits informational envelope fields such as `$comment`. The raw
+// checksum file is still hashed, and its checked file inventory stays strict.
 struct Checksums {
     files: BTreeMap<String, String>,
     package: Option<String>,
@@ -76,7 +77,11 @@ impl Epoch {
         let store = owned_store(store)?;
         let lease_root = store.join("leases").join(identity);
         let lease = open_lease(&store, identity)?;
-        lease.lock_shared().map_err(error)?;
+        match lease.try_lock_shared() {
+            Ok(()) => {},
+            Err(TryLockError::WouldBlock) => return Err("dependency epoch is being retired; select a ready epoch or retry after publication".into()),
+            Err(TryLockError::Error(problem)) => return Err(error(problem)),
+        }
         let path = store.join("epochs").join(identity);
         let manifest = ready(&store, &path)?;
         Ok(Self {
@@ -1146,7 +1151,7 @@ mod tests {
         }
         fs::write(
             package.join(CHECKSUM),
-            serde_json::json!({"files":sums,"package":"a".repeat(64)}).to_string(),
+            serde_json::json!({"$comment":"Cargo vendor includes informational metadata","files":sums,"package":"a".repeat(64)}).to_string(),
         )
         .unwrap();
         let config = root.join("sources.toml");

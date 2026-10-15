@@ -894,7 +894,12 @@ pub fn copy_program(from: &Path, to: &Path) {
 
 /// The `cargo-heli` binary under test.
 pub fn heli_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cargo-heli"))
+    // Cargo can retain a mixed-separator spelling from --target-dir in
+    // this compile-time variable. Match current_exe's native spelling in
+    // registration and protocol assertions without relocating any files.
+    Path::new(env!("CARGO_BIN_EXE_cargo-heli"))
+        .components()
+        .collect()
 }
 
 /// The cargo running the tests, else `cargo` on the search path.

@@ -1796,6 +1796,9 @@ are preserved for Cargo's lockfile verification; extracted files alone cannot
 authenticate the original archive. Unsupported configuration, links within
 input packages and path escapes are refused. Existing unknown directories
 are never adopted as managed stores.
+Informational checksum-envelope fields such as Cargo's `$comment` are
+accepted, as Cargo accepts them; the raw checksum file remains part of the
+object identity and the actual file inventory is still verified strictly.
 
 The store holds package objects by content identity. Epochs contain source
 configuration, a manifest and cheap views of those objects: NTFS junctions on
@@ -1827,6 +1830,8 @@ serialize catalog mutations. Staging and GC's object verification happen
 outside that critical section; ready readers do not acquire the catalog
 lock. Duplicate import currently re-verifies reused objects under the catalog
 lock, so concurrent publishers can wait there; active ready consumers do not.
+Selecting an epoch already being retired fails promptly rather than waiting
+for its trash deletion; callers can select a ready epoch or retry publication.
 Epoch lease files are never unlinked, avoiding split-lock identities after
 retirement and republication. Trash deletion does not follow package links.
 This source lifecycle does not weaken the conservative global runtime guard

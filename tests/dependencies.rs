@@ -34,6 +34,7 @@ fn vendor(fixture: &Fixture, value: u32) -> (PathBuf, PathBuf) {
     write(&package.join("Cargo.toml"), manifest);
     write(&package.join("src/lib.rs"), &library);
     let checksum = serde_json::json!({
+        "$comment": "Cargo vendor checksum metadata is informational, not an additional checked source file.",
         "files": {
             "Cargo.toml": format!("{:x}", Sha256::digest(manifest.as_bytes())),
             "src/lib.rs": format!("{:x}", Sha256::digest(library.as_bytes()))
@@ -453,4 +454,51 @@ fn source_ownership_survives_client_and_daemon_loss() {
 #[test]
 fn fallback_guardian_survives_client_loss() {
     ownership_survives_parent_loss(true);
+}
+
+#[test]
+fn selecting_a_retiring_epoch_fails_promptly_instead_of_waiting_for_gc() {
+    let fixture = Fixture::new("basic");
+    let store = fixture.path("store");
+    let selected = import(&fixture, &store, &vendor(&fixture, 7));
+    let lease = store
+        .join("leases")
+        .join(selected.file_name().unwrap())
+        .join(".heli-runtime.lock");
+    let held = File::options().read(true).write(true).open(lease).unwrap();
+    held.lock().unwrap();
+    let mut child = fixture
+        .heli(["--dependency-epoch"])
+        .arg(&selected)
+        .args(["exec", "--", "missing-epoch-test-command"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    let mut completed = false;
+    while Instant::now() < until {
+        if child.try_wait().unwrap().is_some() {
+            completed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !completed {
+        child.kill().unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        completed,
+        "a retiring epoch must not make the client queue behind GC: {output:?}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a command must not start: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("retired"),
+        "{output:?}"
+    );
 }

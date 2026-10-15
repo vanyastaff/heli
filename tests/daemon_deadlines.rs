@@ -9,7 +9,7 @@ use support::fake_daemon::{Answer, FakeDaemon};
 #[test]
 fn post_handshake_silence_falls_back_within_five_seconds() {
     let fixture = Fixture::new("basic");
-    // An empty reply sequence still completes the HELI1 handshake; the
+    // An empty reply sequence still completes the current handshake; the
     // fake then reads and holds the connection without a reply.
     let fake = FakeDaemon::start(&fixture.endpoint(), Answer::Replies(&[]));
     let mut client = fixture
@@ -38,7 +38,7 @@ fn post_handshake_silence_falls_back_within_five_seconds() {
     assert!(
         completed,
         "DESIGN sections 3/10 require fallback after 5 seconds without a daemon answer; \
-         the public CLI remained blocked for 7 seconds after a successful HELI1 handshake. \
+         the public CLI remained blocked for 7 seconds after a successful handshake. \
          stdout={:?}; stderr={:?}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -75,7 +75,10 @@ fn completed_run_with_a_stalled_client_does_not_block_retirement() {
     }});
     let bytes = serde_json::to_vec(&request).expect("request JSON");
     let mut stalled = support::endpoint::connect(&fixture.endpoint());
-    stalled.write_all(b"HELI\x01\0\0\0").expect("hello");
+    stalled.write_all(b"HELI").expect("magic");
+    stalled
+        .write_all(&support::fake_daemon::PROTOCOL.to_le_bytes())
+        .expect("current version");
     let mut hello = [0u8; 8];
     stalled.read_exact(&mut hello).expect("daemon hello");
     let mut frame = vec![0u8];
