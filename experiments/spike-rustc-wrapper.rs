@@ -72,7 +72,16 @@ fn main() {
             .expect("open isolated host lock");
         file.lock().expect("take isolated host lock");
         fs::write(ready, std::process::id().to_string()).expect("signal lock held");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let seconds = args
+            .next()
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .parse::<u64>()
+                    .expect("lock timeout seconds")
+            })
+            .unwrap_or(120);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
         while !release.exists() {
             assert!(std::time::Instant::now() < deadline, "lock-holder deadline");
             std::thread::sleep(std::time::Duration::from_millis(20));

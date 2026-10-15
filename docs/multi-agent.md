@@ -81,7 +81,10 @@ Cargo's shared package-cache resolver lock still exists, even offline. The
 foreground cache-off path avoids extra result-cache resolutions; it does not
 promise that Cargo itself never briefly waits. Do not give independent lock
 files to multiple Cargo homes that symlink the same mutable registry cache.
-An immutable shared vendor snapshot is a possible separate experiment.
+Immutable shared vendor snapshots with private Cargo homes are experimental;
+they are not yet selected automatically by heli. See the
+[real Heli/FLUI workload and its verification limits](research/real-dependency-epochs.md)
+and [package objects with cheap NTFS epoch views](research/package-epoch-views.md).
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
