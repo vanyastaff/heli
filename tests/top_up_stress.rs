@@ -44,12 +44,17 @@ fn now_ns() -> u128 {
 }
 
 /// A pseudo-random number generator (xorshift), seeded from the clock: the
-/// order of kills changes from run to run, and the seed is printed.
+/// order of kills changes from run to run, and the seed is printed. Set
+/// `HELI_STRESS_SEED` to replay the random choices of a failed run.
 struct Random(u64);
 
 impl Random {
     fn new() -> Self {
-        let seed = (now_ns() as u64) | 1;
+        let seed = std::env::var("HELI_STRESS_SEED")
+            .ok()
+            .map(|value| value.parse::<u64>().expect("HELI_STRESS_SEED is a u64"))
+            .unwrap_or_else(|| (now_ns() as u64) | 1);
+        assert_ne!(seed, 0, "HELI_STRESS_SEED must be nonzero");
         eprintln!("seed {seed}");
         Self(seed)
     }
@@ -66,6 +71,35 @@ impl Random {
 struct Cargo {
     child: Child,
     killed_at: Option<u128>,
+}
+
+impl Drop for Cargo {
+    fn drop(&mut self) {
+        kill(self);
+    }
+}
+
+/// A killed job need not log an end; only complete starts prove slot use.
+fn starts(log: &str) -> usize {
+    log.lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next().is_some()
+                && fields.next() == Some("start")
+                && fields
+                    .next()
+                    .and_then(|at| at.parse::<u128>().ok())
+                    .is_some()
+        })
+        .count()
+}
+
+struct StopClock<'a>(&'a AtomicBool);
+
+impl Drop for StopClock<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 /// The most slots the logged holds had at the same moment. A hold that
@@ -149,24 +183,50 @@ fn no_top_up_lets_more_than_n_jobs_hold_slots_while_cargos_are_killed() {
     // The governor's clock runs fast, a sample every 150 ms: a top-up
     // could happen at any moment of the load.
     let ticking = AtomicBool::new(true);
-    let (cargos, started) = std::thread::scope(|scope| {
+    let (cargos, started, seed) = std::thread::scope(|scope| {
         let ticker = scope.spawn(|| {
             while ticking.load(Ordering::Relaxed) {
                 fixture.advance_clock(1000);
                 std::thread::sleep(Duration::from_millis(150));
             }
         });
+        // An assertion must stop the scoped clock thread even on unwind.
+        let _stop_clock = StopClock(&ticking);
         let mut random = Random::new();
+        let seed = random.0;
         let mut cargos: Vec<Cargo> = Vec::new();
         let mut started = 0;
         for round in 0..ROUNDS {
+            let before = starts(&std::fs::read_to_string(&log).unwrap_or_default());
+            for _ in 0..SLOTS {
+                cargos.push(Cargo {
+                    child: start(&mut random, started),
+                    killed_at: None,
+                });
+                started += 1;
+            }
+            // Start timing random kills only after real slot use, rather
+            // than assuming process creation means the jobs have started.
+            let readiness = Instant::now();
+            loop {
+                let held = std::fs::read_to_string(&log).unwrap_or_default();
+                if starts(&held) >= before + SLOTS {
+                    break;
+                }
+                assert!(
+                    readiness.elapsed() < Duration::from_secs(30),
+                    "seed {seed}, round {round}: cargos never drew {SLOTS} slots; pool {}; held log:\n{held}",
+                    fixture.status()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
             let loading = Instant::now();
             while loading.elapsed() < ROUND {
                 while cargos
                     .iter()
                     .filter(|cargo| cargo.killed_at.is_none())
                     .count()
-                    < 3
+                    < SLOTS
                 {
                     cargos.push(Cargo {
                         child: start(&mut random, started),
@@ -187,15 +247,16 @@ fn no_top_up_lets_more_than_n_jobs_hold_slots_while_cargos_are_killed() {
             while fixture.status()["pool"]["free"] != SLOTS {
                 assert!(
                     waiting.elapsed() < Duration::from_secs(30),
-                    "round {round}: the lost slots never came back: {}",
-                    fixture.status()
+                    "seed {seed}, round {round}: the lost slots never came back: {}; held log:\n{}",
+                    fixture.status(),
+                    std::fs::read_to_string(&log).unwrap_or_default()
                 );
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
         ticking.store(false, Ordering::Relaxed);
         ticker.join().expect("the clock's thread");
-        (cargos, started)
+        (cargos, started, seed)
     });
     let killed: BTreeMap<u32, u128> = cargos
         .iter()
@@ -203,21 +264,24 @@ fn no_top_up_lets_more_than_n_jobs_hold_slots_while_cargos_are_killed() {
         .collect();
 
     let held = std::fs::read_to_string(&log).unwrap_or_default();
-    // Each round's first cargos have the pool's slots to themselves; how
-    // many more they get depends on the machine.
+    // Each round proves SLOTS starts before its random kills. A 2500 ms
+    // hold killed during a 2 s round correctly has no matching end record.
     assert!(
-        held.lines().count() >= 2 * SLOTS * ROUNDS,
-        "the cargos drew from the pool: {} lines",
-        held.lines().count()
+        starts(&held) >= SLOTS * ROUNDS,
+        "seed {seed}: the cargos drew from the pool: {} starts; held log:\n{held}",
+        starts(&held)
     );
     let most = most_held(&held, &killed);
-    assert!(most <= SLOTS, "{most} slots held at once, of {SLOTS}");
+    assert!(
+        most <= SLOTS,
+        "seed {seed}: {most} slots held at once, of {SLOTS}; held log:\n{held}"
+    );
     for index in 0..started {
         let stderr = std::fs::read_to_string(fixture.path(&format!("cargo-{index}.stderr")))
             .unwrap_or_default();
         assert!(
             !stderr.contains("cannot give a slot back"),
-            "a cargo was refused a slot it held: {stderr}"
+            "seed {seed}: a cargo was refused a slot it held: {stderr}; held log:\n{held}"
         );
     }
 }
