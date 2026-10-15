@@ -839,7 +839,7 @@ These are the only waits; nothing else makes a heli run wait for another run.
 ### Command line and contracts
 
 ```
-cargo heli [--output full|compact|quiet] [-q] [--no-cache] <subcommand> [tool args…]
+cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cache] <subcommand> [tool args…]
 cargo heli exec [heli flags] -- <command…>
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
@@ -1835,7 +1835,15 @@ fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key. `--no-cache` skips both lookups, not the recording, and attaches to
+the key. `--cache off` skips result lookups, recording, single-flight reuse
+and their full source inventory; it retains host scheduling, test phases,
+directory isolation and GC. This mode suits foreground multi-agent runs
+where predictable startup matters more than reusing a verdict. Full source
+inventory uses Cargo's resolver lock even offline; a large workspace can
+otherwise delay its own first compiler. `--cache on` is the default for
+checks/tests; `--cache refresh` is equivalent to `--no-cache`. Compile,
+mutate and exec commands remain uncached regardless of this option.
+`--no-cache` skips both lookups, not the recording, and attaches to
 no run in flight (§5, step 3).
 
 Compile runs are never recorded, because their product is the artifact, not

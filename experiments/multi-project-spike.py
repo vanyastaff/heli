@@ -209,6 +209,7 @@ dir_hours = 0
                              floor_bytes=50 * GIB, pool_slots=8,
                              memory_watermarks_mib=[12288, 16384],
                              cargo_incremental="0", store=str(store),
+                             result_cache=self.args.result_cache,
                              eviction_ages_hours=0,
                              note="Accelerated ages test reclamation safety/convergence; not normal retention defaults.")
         emit(self.root / "manifest.json", self.manifest)
@@ -227,7 +228,7 @@ dir_hours = 0
         env.update(extra_env or {})
         log = (self.root / "logs" / f"{name}.txt").open("wb")
         start = time.time_ns()
-        process = subprocess.Popen(self.heli_command("--no-cache", "--output", "full", *args),
+        process = subprocess.Popen(self.heli_command("--cache", self.args.result_cache, "--output", "full", *args),
                                    cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT,
                                    creationflags=CREATE_FLAGS)
         entry = {"agent": name, "cwd": str(cwd), "args": args, "submitted_ns": start,
@@ -514,6 +515,8 @@ def main():
     parser.add_argument("--flui-ref", default="HEAD")
     parser.add_argument("--output", default=f"E:/heli/target/mps-{time.strftime('%m%d-%H%M%S')}-{uuid.uuid4().hex[:4]}")
     parser.add_argument("--budget-mib", type=int, default=2048)
+    parser.add_argument("--result-cache", choices=["off", "refresh"], default="off",
+                        help="off avoids verdict inventory on the foreground scheduling path")
     parser.add_argument("--payload-mib", type=int, default=512)
     parser.add_argument("--cycles", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=1800)

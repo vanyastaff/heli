@@ -44,6 +44,12 @@ fn main() {
     // A fake toolchain describes no dependencies. Metadata is an inquiry,
     // like a version request: it neither starts a run nor waits on its gate.
     if std::env::var_os("ECHO_VERSION").is_some() && args.iter().any(|arg| arg == "metadata") {
+        if args.iter().any(|arg| arg == "--all-features") {
+            if let Some(path) = std::env::var_os("ECHO_SOURCE_METADATA_LOG") {
+                use std::io::Write;
+                writeln!(std::fs::OpenOptions::new().create(true).append(true).open(path).expect("metadata log"), "source inventory").expect("log inventory");
+            }
+        }
         let cwd = std::env::current_dir().expect("a working directory");
         let root = cwd
             .ancestors()

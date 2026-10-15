@@ -237,3 +237,75 @@ targeted kernel extraction failed; official kernel documentation was read
 through the browser fallback. A systemd manual fetch timed out in the browser,
 but Firecrawl's targeted retrieval returned its memory-limit documentation.
 No live systemd configuration or delegation capability was tested.
+
+## Follow-up: shared Cargo-home startup contention
+
+The runtime experiment observed repeated `Blocking waiting for file lock on
+package cache` lines even with `--offline`. Other unrelated Cargo processes
+were active on the host, so the log line alone does not identify the holder
+or prove that heli introduced the wait.
+
+Cargo 1.99.0's exact source commit from the experiment is
+`5f94df4789f005f9a352888e8355ffc645b7ed0e`. Its lock implementation assigns
+different descriptions to three locks: `package cache` is DownloadExclusive,
+`shared package cache` is Shared, and `package cache mutation` is
+MutateExclusive. DownloadExclusive serializes resolution/downloads while
+permitting existing builds to read through Shared; it does not serialize the
+whole compilation stage.
+[Pinned cache-lock implementation](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/util/cache_lock.rs)
+
+`resolve_with_previous` unconditionally obtains DownloadExclusive before
+resolving, without an offline exception. Thus offline mode does not eliminate
+this lock, and separate build directories do not eliminate a shared
+Cargo-home resolver bottleneck.
+[Pinned resolver](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/ops/resolve.rs)
+The metadata command's `--no-deps` branch directly exports workspace members;
+full metadata instead builds a resolve graph through `resolve_ws_with_opts`.
+[Pinned metadata implementation](https://github.com/rust-lang/cargo/blob/5f94df4789f005f9a352888e8355ffc645b7ed0e/src/ops/cargo_metadata.rs)
+
+**heli-specific hypothesis:** result-cache key computation adds resolver work.
+`src/store/probe.rs::sources_at` requests full offline all-features metadata.
+`src/daemon/results.rs::admitted` still computes it for `--no-cache`
+(Cache::Refresh), and successful keyed runs repeat it in `after`. The ordinary
+background workspace-learning probe uses `--no-deps` and takes the cheaper
+metadata branch. This static call trace does not measure the contribution of
+either probe to the observed waits.
+
+Before changing production behavior, compare the same pinned command through
+`cargo heli --no-cache check` and `cargo heli exec -- cargo check` (the latter
+uses Cache::Off), plus direct Cargo, on the same dependency-cache state.
+Record probe start/end and actual compiler start separately. A scoped Cargo
+cache-lock trace or an isolated held `.package-cache` control can distinguish
+resolver waits from artifact locks without touching the user's cache lock.
+Do not remove full dependency inventories or replace them with `--no-deps`
+when computing a successful verdict key. A bounded best-effort cache-key
+attempt that explicitly declines caching when busy is a possible design,
+requiring child-process cancellation and false-green regression tests.
+
+Practical choices, in priority order:
+
+1. Remove proven redundant metadata requests or keep optional cache work off
+   the compilation startup path, while retaining complete validated inputs
+   for every cached success. Preserve the distinction between bypassing a
+   cache lookup and disabling cache recording.
+2. Prefetch dependencies once and use locked/offline invocations when their
+   semantics fit. This avoids network work during the exclusive phase; it
+   does not remove the exclusive resolver phase or solve every toolchain.
+3. If contention remains material, spike one shared immutable dependency
+   snapshot plus small isolated Cargo homes for agents. Cargo's supported
+   `vendor --sync` option can combine multiple workspaces into one dependency
+   directory, and Cargo treats vendored sources as read-only.
+   [Cargo vendor](https://doc.rust-lang.org/cargo/commands/cargo-vendor.html)
+   This can separate lock files without copying all dependency sources per
+   agent, but requires explicit source replacement and compatibility work for
+   git dependencies, registry identities, configuration, toolchain selection,
+   diagnostics paths, snapshot refresh and snapshot GC. It is an opt-in
+   experiment, not an established heli fix.
+
+Do not symlink a mutable registry/source cache into multiple Cargo homes with
+independent lock files: that removes the coordination protecting the shared
+contents. Do not delete a live lock file. Multi-toolchain behavior also needs
+version-specific checking; the cited source notes older Cargo versions use a
+different package-cache locking contract. There is no demonstrated supported
+flag in this investigation that removes resolver serialization while retaining
+one shared mutable Cargo home.

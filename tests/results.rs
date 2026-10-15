@@ -855,6 +855,44 @@ fn no_cache_runs_and_records_a_pass() {
     assert_eq!(outcome(&mut forced()), Outcome::Ran, "forced again");
 }
 
+/// Fully disabling result reuse must also skip its expensive source inventory.
+/// Existing cached verdicts remain available to other clients.
+#[test]
+fn cache_off_runs_without_inventorying_or_recording_results() {
+    let verifier = Verifier::new();
+    let log = verifier.fixture.path("source-metadata-log");
+    let run = |args: &[&str]| {
+        let mut command = verifier.heli(args);
+        command.env("ECHO_SOURCE_METADATA_LOG", &log);
+        command
+    };
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Ran);
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
+    assert!(
+        !std::fs::read(&log)
+            .expect("source metadata logged")
+            .is_empty()
+    );
+    std::fs::write(&log, "").expect("clear metadata log");
+    let before = markers(&verifier.fixture);
+    for _ in 0..2 {
+        assert_eq!(
+            outcome(&mut run(&["--cache", "off", "check"])),
+            Outcome::Ran
+        );
+    }
+    assert!(
+        std::fs::read(&log).expect("metadata log").is_empty(),
+        "cache-off performed source inventory"
+    );
+    assert_eq!(
+        markers(&verifier.fixture),
+        before,
+        "cache-off wrote a verdict"
+    );
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
+}
+
 /// A run that fails drops the pass recorded for its key, so a flaky pass is
 /// no longer reused once a forced run has failed.
 #[test]
