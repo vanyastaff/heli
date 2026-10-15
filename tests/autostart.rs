@@ -438,6 +438,7 @@ mod platform {
              \n\
              [Service]\n\
              Type=simple\n\
+             KillMode=process\n\
              ExecStart=\"{}\" daemon\n\
              Environment=\"HELI_STATE_DIR={}\" \"HELI_ENDPOINT={}\" \"HELI_POOL={}\" \"HELI_CONFIG={}\"\n\
              SuccessExitStatus=3\n\

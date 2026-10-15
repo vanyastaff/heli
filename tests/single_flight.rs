@@ -50,6 +50,7 @@ impl Twins {
         let echo = fixture.echo_args();
         let workspace = fixture.workspace();
         git(&workspace, &["init", "--quiet"]);
+        git(&workspace, &["config", "core.autocrlf", "false"]);
         git(&workspace, &["add", "-A"]);
         git(
             &workspace,

@@ -25,8 +25,8 @@
 //! - `SuccessExitStatus=3`: a daemon that finds another one running exits
 //!   with 3 (`crate::daemon::ALREADY_RUNNING`), which is no failure.
 //!
-//! Stopping the unit stops the daemon and its runs, which are in its
-//! control group.
+//! `KillMode=process` stops only the daemon: its already spawned runs
+//! survive, as when an on-demand daemon dies. heli cancels a run explicitly.
 
 use std::path::{Path, PathBuf};
 
@@ -143,6 +143,7 @@ fn definition(locations: &Locations, program: &str) -> Result<String, String> {
          \n\
          [Service]\n\
          Type=simple\n\
+         KillMode=process\n\
          ExecStart={program} daemon\n\
          Environment={environment}\n\
          SuccessExitStatus=3\n\

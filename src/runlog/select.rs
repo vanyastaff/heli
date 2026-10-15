@@ -159,6 +159,7 @@ fn test(
 fn errors(lines: impl Iterator<Item = io::Result<Line>>, out: &mut Out<'_>) -> io::Result<()> {
     let mut seen = HashSet::new();
     let mut in_error = false;
+    let ansi = Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]").expect("a constant ANSI pattern");
     for line in lines {
         let line = line?;
         if line.channel == Channel::Stdout {
@@ -170,7 +171,9 @@ fn errors(lines: impl Iterator<Item = io::Result<Line>>, out: &mut Out<'_>) -> i
             }
             continue;
         }
-        let text = line.bytes.trim_ascii_end();
+        // Classify the visible text, but return the original rendering.
+        let plain = ansi.replace_all(&line.bytes, &b""[..]);
+        let text = plain.trim_ascii_end();
         if text.starts_with(b"error:") || text.starts_with(b"error[") {
             in_error = true;
         } else if text.starts_with(b"warning") {

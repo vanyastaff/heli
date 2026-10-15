@@ -693,7 +693,9 @@ impl Daemon {
     /// byte, until the run ends or the client goes away; the client also
     /// hears what it `reads` of the run's waits and start.
     fn follow(&self, id: RunId, live: &Live, mut stream: Stream, reads: live::Reads) {
-        live::follow(live, &mut stream, reads);
+        if let Err(error) = live::follow(live, &mut stream, reads, &|| self.lifecycle().retiring) {
+            self.log.write(&format!("stopped following {id}: {error}"));
+        }
         drop(stream);
         self.registry.detach(id);
     }

@@ -35,6 +35,21 @@ pub struct Workspace {
     /// the target directory.
     #[serde(rename = "build_directory")]
     pub build: Option<PathBuf>,
+    #[serde(default)]
+    pub packages: Vec<Package>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Package {
+    pub manifest_path: PathBuf,
+    pub source: Option<String>,
+    #[serde(default)]
+    pub dependencies: Vec<Dependency>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Dependency {
+    pub path: Option<PathBuf>,
 }
 
 impl Workspace {
@@ -50,6 +65,8 @@ pub struct Probe {
     pub cwd: PathBuf,
     cargo: OsString,
     env: Vec<(OsString, OsString)>,
+    args: Vec<OsString>,
+    target: Option<PathBuf>,
 }
 
 impl Probe {
@@ -63,15 +80,35 @@ impl Probe {
         if !named_cargo {
             return None;
         }
-        Some(Self {
-            cwd: request.cwd(),
-            cargo: program.clone(),
+        Some(Self::request(request))
+    }
+
+    /// Cargo selected by a cargo-subcommand request, including wrappers.
+    pub fn request(request: &RunRequest) -> Self {
+        let cwd = request.cwd();
+        let argv: Vec<_> = request
+            .argv
+            .iter()
+            .skip(1)
+            .map(|arg| arg.0.clone())
+            .collect();
+        let args = metadata_args(&argv, &cwd);
+        let target = target_override(&argv, &cwd);
+        Self {
+            cwd,
+            cargo: request
+                .argv
+                .first()
+                .map(|program| program.0.clone())
+                .unwrap_or_default(),
             env: request
                 .env
                 .iter()
                 .map(|(name, value)| (name.0.clone(), value.0.clone()))
                 .collect(),
-        })
+            args,
+            target,
+        }
     }
 
     /// The probe for `cwd`, with this process's environment and its cargo
@@ -80,10 +117,13 @@ impl Probe {
         let cargo = std::env::var_os("CARGO")
             .filter(|cargo| !cargo.is_empty())
             .unwrap_or_else(|| OsString::from("cargo"));
+        let args = metadata_args(&[], &cwd);
         Self {
             cwd,
             cargo,
             env: std::env::vars_os().collect(),
+            args,
+            target: None,
         }
     }
 
@@ -137,14 +177,57 @@ impl Probe {
 
     /// The workspace as `cargo metadata` describes it.
     pub fn workspace(&self) -> Option<Workspace> {
-        let output = self
-            .command(
-                &self.cargo,
-                &["metadata", "--format-version", "1", "--no-deps"],
-                &self.cwd,
-            )
-            .output()
-            .ok()?;
+        self.workspace_at(None)
+    }
+
+    /// The local dependency declarations of a selected manifest, without
+    /// resolving or downloading registry dependencies.
+    pub fn workspace_at(&self, manifest: Option<&Path>) -> Option<Workspace> {
+        self.metadata(manifest, false)
+    }
+
+    /// Resolve local sources, including registry/git patches, without network
+    /// access. All features expose optional path dependencies as well. Failure
+    /// disables result caching; it must never certify an incomplete inventory.
+    pub fn sources_at(&self, manifest: Option<&Path>) -> Option<Workspace> {
+        self.metadata(manifest, true)
+    }
+
+    fn metadata(&self, manifest: Option<&Path>, sources: bool) -> Option<Workspace> {
+        let mut args = self.args.clone();
+        if sources {
+            args.retain(|arg| arg != "--no-deps");
+            args.push("--all-features".into());
+            if !args.iter().any(|arg| arg == "--offline") {
+                args.push("--offline".into());
+            }
+        }
+        if let Some(manifest) = manifest {
+            let mut index = 0;
+            while index < args.len() {
+                if args[index] == "--manifest-path" {
+                    args.drain(index..index + 2);
+                } else {
+                    index += 1;
+                }
+            }
+            args.extend([
+                OsString::from("--manifest-path"),
+                manifest.as_os_str().to_owned(),
+            ]);
+        }
+        let mut command = environment::command(
+            &self.cargo,
+            args,
+            &self.cwd,
+            self.env.iter().map(|(name, value)| (name, value)),
+        );
+        if let Some(target) = &self.target {
+            command
+                .env("CARGO_TARGET_DIR", target)
+                .env("CARGO_BUILD_TARGET_DIR", target);
+        }
+        let output = command.output().ok()?;
         if !output.status.success() {
             return None;
         }
@@ -191,4 +274,78 @@ impl Probe {
         }
         worktrees
     }
+}
+
+/// Only options Cargo metadata understands. --target-dir has no metadata
+/// flag; express its higher-priority value as a final config override.
+fn metadata_args(args: &[OsString], cwd: &Path) -> Vec<OsString> {
+    let mut output = Vec::new();
+    if let Some(toolchain) = args
+        .first()
+        .filter(|arg| arg.to_string_lossy().starts_with('+'))
+    {
+        output.push(toolchain.clone());
+    }
+    output.extend(["metadata", "--format-version", "1", "--no-deps"].map(OsString::from));
+    let mut target = None;
+    let mut arguments = args.iter().peekable();
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        let Some(text) = argument.to_str() else {
+            continue;
+        };
+        let (name, joined) = text
+            .split_once('=')
+            .map_or((text, None), |(name, value)| (name, Some(value)));
+        if ["--manifest-path", "-m", "--config", "-Z", "--target-dir"].contains(&name) {
+            let value = joined
+                .map(OsString::from)
+                .or_else(|| arguments.next().cloned());
+            if let Some(value) = value {
+                if name == "--target-dir" {
+                    target = Some(cwd.join(value));
+                } else {
+                    output.push(if name == "-m" {
+                        "--manifest-path".into()
+                    } else {
+                        name.into()
+                    });
+                    output.push(value);
+                }
+            }
+        } else if ["--locked", "--offline", "--frozen"].contains(&name) {
+            output.push(argument.clone());
+        } else if let Some(flag) = text.strip_prefix("-Z").filter(|flag| !flag.is_empty()) {
+            output.extend([OsString::from("-Z"), OsString::from(flag)]);
+        }
+    }
+    if let Some(target) = target.and_then(|path| path.to_str().map(str::to_owned)) {
+        let quoted = serde_json::to_string(&target).expect("a path string serializes");
+        output.extend([
+            OsString::from("--config"),
+            OsString::from(format!("build.target-dir={quoted}")),
+        ]);
+    }
+    output
+}
+
+fn target_override(args: &[OsString], cwd: &Path) -> Option<PathBuf> {
+    let mut target = None;
+    let mut arguments = args.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--target-dir" {
+            target = arguments.next().map(|path| cwd.join(path));
+        } else if let Some(path) = argument
+            .to_str()
+            .and_then(|text| text.strip_prefix("--target-dir="))
+        {
+            target = Some(cwd.join(path));
+        }
+    }
+    target
 }

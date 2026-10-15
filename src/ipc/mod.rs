@@ -21,6 +21,20 @@
 //! connections are plain blocking streams.
 
 use std::io;
+use std::time::{Duration, Instant};
+
+/// Short nonblocking retries keep one deadline across every part of a frame.
+fn retry_until(deadline: Instant) -> io::Result<()> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "IPC deadline expired",
+        ));
+    }
+    std::thread::sleep(left.min(Duration::from_millis(1)));
+    Ok(())
+}
 
 #[cfg(unix)]
 mod unix;

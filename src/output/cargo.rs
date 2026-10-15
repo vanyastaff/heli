@@ -141,7 +141,10 @@ impl Message {
                 serde_json::from_value(message).ok().map(Self::Diagnostic)
             }
             ("compiler-message", None) => None,
-            _ => Some(Self::Other),
+            ("compiler-artifact" | "build-script-executed" | "build-finished", _) => {
+                Some(Self::Other)
+            }
+            _ => None,
         }
     }
 }

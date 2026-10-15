@@ -221,6 +221,61 @@ fn a_client_that_stops_reading_holds_up_nothing() {
     assert!(logged.stderr == direct.stderr, "stderr differs");
 }
 
+/// A completed command does not impose a read-speed deadline on its client
+/// while the daemon continues serving. A paused reader can resume the full
+/// stream, including its exit code.
+#[test]
+fn a_slow_client_can_resume_a_completed_runs_output() {
+    use std::io::Read;
+    let fixture = Fixture::new("basic");
+    let chatter = fixture.binary("chatter");
+    let args = ["100000", "mix"];
+    let direct = fixture
+        .command(&chatter, args)
+        .output()
+        .expect("direct chatter");
+    start_daemon(&fixture);
+    let mut argv = vec![chatter.as_os_str()];
+    argv.extend(args.iter().map(std::ffi::OsStr::new));
+    let mut client = submit_raw(&fixture, &argv, &[]);
+    fixture.wait_for_status("the noisy run to finish", |status| {
+        listed(status, &client.run).is_none()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    loop {
+        let mut header = [0; 5];
+        client
+            ._connection
+            .read_exact(&mut header)
+            .expect("a complete output frame or exit code after resuming");
+        let mut bytes = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+        client
+            ._connection
+            .read_exact(&mut bytes)
+            .expect("complete frame payload after resuming");
+        match header[0] {
+            1 => stdout.extend(bytes),
+            2 => stderr.extend(bytes),
+            0 => {
+                let reply: Value = serde_json::from_slice(&bytes).expect("reply JSON");
+                assert_eq!(reply["Exited"]["code"], 0, "{reply}");
+                break;
+            }
+            kind => panic!("unknown frame {kind}"),
+        }
+    }
+    assert!(
+        stdout == direct.stdout,
+        "stdout must survive a paused reader"
+    );
+    assert!(
+        stderr == direct.stderr,
+        "stderr must survive a paused reader"
+    );
+}
+
 /// When the run log cannot be written (here `runs` in the state directory
 /// is a file), a run's client still gets all of its output.
 #[test]
