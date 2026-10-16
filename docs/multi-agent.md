@@ -75,6 +75,10 @@ and no saved build verdict can stand in for missing artifacts. A live-only
 client follows a cache-enabled run only once real execution has started,
 so it cannot inherit a queued run's saved-result hit.
 
+The [2026-10-16 acceptance report](research/shared-verification-acceptance.md)
+records real Cargo same-worktree counters and the matched FLUI comparison
+against both stock xtask and its lock-disabled control, including limits.
+
 A project's own machine-wide queue also needs integration. As checked on
 2026-10-16, FLUI main still has a common per-user host lock in
 `tools/xtask/src/host_lock.rs`.

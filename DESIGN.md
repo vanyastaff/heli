@@ -2299,6 +2299,40 @@ that xtask queue. Local evidence is in
 `target/flui-two-3b0a26b-current/REPORT.md`, its `final-summary.json`, and
 `matched-control-20261016T081315547457Z/results.json` beneath that lab.
 
+**Shared verification acceptance, 2026-10-16.** Heli `7326ac9` and FLUI
+`bf23bf57f` passed a fresh three-mode comparison using two pinned worktrees,
+ordinary checkout-local targets, and one shared owned Cargo home per mode.
+All 18 client commands exited 0. The pair's cold changed-scope gate took
+728.9 s with the stock xtask host lock, 505.5 s with that lock disabled,
+and 334.7 s through `exec --verify` with Heli's saved verdicts disabled.
+The exact repeats hit xtask's cache in all modes (6.7/7.2/7.7 s).
+The native nested group took 616.6/536.9/304.4 s, respectively; its 11 tests
+passed in every executed group. Heli served each matching pair from one
+actual run, rather than compiling and testing both worktrees. Ordinary
+unlocked Cargo also compiled concurrently; parallelism alone is not a
+benefit unique to Heli. The measured Heli benefit here is live sharing of
+identical verification, with xtask's managed-result cache restored.
+
+The frozen release's same-worktree counter separately passed all 12 clients:
+native Cargo executed identical tests twice; live-only direct and wrapped
+Heli executed once. An edit required a second source generation, queued
+behind the first before rebuilding. Real Cargo regression tests also prove
+that compile commands produce an artifact for each independent worktree.
+Cargo already reuses up-to-date artifacts for ordinary repeated builds;
+Heli does not claim to eliminate a second compilation that Cargo would skip.
+
+Four busy GC surveys reclaimed nothing; an idle survey resumed afterward.
+Minimum system-available RAM was 22.3/20.9/27.2 GiB across the three modes.
+This was not a pressure or hard-quota test. Heli's complete local suite
+passed 393 tests, Clippy passed with warnings denied, and FLUI's scoped
+gate passed all 61 xtask tests. The FLUI experiment covers the changed-scope
+gate and native nested group, not full platform/feature CI parity. It was
+one fixed-order Windows run; Linux/macOS execution remains unverified here.
+See [the acceptance report](docs/research/shared-verification-acceptance.md)
+for pins, regression mapping, the excluded prototype-profile preparation,
+retained receipts and remaining interference boundaries. Q2 stays opt-in;
+this ordinary-layout experiment does not change its build-dir acceptance.
+
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned
   off. It measures whether a shared pool alone ends the queues and bounds
