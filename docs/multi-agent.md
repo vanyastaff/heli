@@ -158,8 +158,16 @@ The 2026-10-16 FLUI control also established actual parallel compilation
 with ordinary Cargo, including a shared lab Cargo home. Manually separating
 artifacts and homes is not a benefit attributable to heli. The small matched
 checks do not establish a general speedup or a full-suite comparison.
-Both full workspace test attempts stopped on a consumer fixture that also
-failed natively with a relocated target; the suite is not claimed green.
+Earlier full workspace test attempts stopped on a consumer fixture that also
+failed natively with a relocated target. After that fixture repair, the native
+private-home repeat at Heli `c86d153` and FLUI `8c48ac7a3` passed seven of eight
+commands: both fmt/clippy/check runs and A's full workspace test. B's test had
+five failures across four consumer targets; independent native reproductions
+identified test-fixture problems, rather than establishing a Heli cause.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) at `d85ab1e73`
+contains repairs with targeted RED/GREEN evidence and a passing scoped gate.
+The full repaired concurrent repeat remains required; no full-suite speedup
+or universal absence of waits is established.
 The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
 contains the scopes, timings and invalid GC setup finding.
 
@@ -168,8 +176,9 @@ response can block another project's fully cached offline check through the
 shared package-cache lock. The [local registry fixture](../experiments/real-download-hol.py)
 compares that baseline with ordinary manually isolated Cargo and Heli's
 dependency epoch. Both isolated cases finish while the download is waiting.
-This proves the value of isolation for that case; automatic epoch setup is
-still required to remove the manual preparation from the agent workflow.
+This proves the value of isolation for that case. Explicit epochs still need
+preparation; the native private-home profile described above provides automatic
+mutable-cache isolation without requiring an epoch or vendor snapshot.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
