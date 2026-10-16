@@ -10,6 +10,7 @@ on:
       - rust-toolchain.toml
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
+      - experiments/isolated-home-concurrency.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
   push:
@@ -21,6 +22,7 @@ on:
       - rust-toolchain.toml
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
+      - experiments/isolated-home-concurrency.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
 
@@ -48,6 +50,10 @@ jobs:
         run: cargo build --locked --bin cargo-heli
       - name: Test progress during a real Cargo download
         run: python experiments/real-download-hol.py --run --heli "${{ github.workspace }}/target/debug/cargo-heli${{ matrix.os == 'windows-latest' && '.exe' || '' }}" --output "${{ runner.temp }}/heli-real-download-hol"
+      - name: Test automatic worktree homes and nested registry resolution
+        run: python experiments/isolated-home-concurrency.py --run --heli "${{ github.workspace }}/target/debug/cargo-heli${{ matrix.os == 'windows-latest' && '.exe' || '' }}" --output "${{ runner.temp }}/heli-isolated-homes"
+      - name: Test authenticated registry access from isolated homes
+        run: python experiments/isolated-home-concurrency.py --run --authenticated --heli "${{ github.workspace }}/target/debug/cargo-heli${{ matrix.os == 'windows-latest' && '.exe' || '' }}" --output "${{ runner.temp }}/heli-isolated-homes-auth"
       - name: Preserve experiment evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -61,3 +67,7 @@ jobs:
             ${{ runner.temp }}/heli-package-epoch-views/*.stderr
             ${{ runner.temp }}/heli-real-download-hol/**/*.json
             ${{ runner.temp }}/heli-real-download-hol/**/*.log
+            ${{ runner.temp }}/heli-isolated-homes/**/*.json
+            ${{ runner.temp }}/heli-isolated-homes/**/*.log
+            ${{ runner.temp }}/heli-isolated-homes-auth/**/*.json
+            ${{ runner.temp }}/heli-isolated-homes-auth/**/*.log

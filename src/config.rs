@@ -20,6 +20,9 @@
 //! mode = "compact"     # full, compact or quiet; default: full on a
 //!                      # terminal, compact without
 //!
+//! [cargo]
+//! home = "isolated"    # shared (default), or a full private home per worktree
+//!
 //! [store]
 //! paths = ['D:\.heli\build']        # build stores, the first on a volume
 //!                                   # serves it; default <volume>/.heli/build
@@ -37,9 +40,9 @@
 //! this build does not know are ignored, so a file written for a newer heli
 //! still works with an older one.
 //!
-//! The client reads `[output]` too, as it chooses a run's output mode
-//! (`crate::output`). It ignores a file it cannot use: the daemon does not
-//! start with it, and its log says why.
+//! The client reads `[output]` and `[cargo]` before preparing a run.
+//! Invalid settings are terminal: they must not silently disable requested
+//! Cargo-home isolation during daemon startup or direct fallback.
 //!
 //! **The test seam.** Debug builds also read a `[test]` table ([`Seam`]):
 //! memory figures, and a clock for the memory governor and the eviction
@@ -58,6 +61,7 @@ use crate::output::Mode;
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    pub cargo: CargoConfig,
     pub pool: PoolConfig,
     pub log: LogConfig,
     pub output: OutputConfig,
@@ -66,6 +70,22 @@ pub struct Config {
     pub store: StoreConfig,
     #[cfg(debug_assertions)]
     test: Seam,
+}
+
+/// The writable Cargo home each managed invocation uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CargoHome {
+    #[default]
+    Shared,
+    Isolated,
+}
+
+/// Client-side policy; changing it does not require restarting the daemon.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct CargoConfig {
+    pub home: CargoHome,
 }
 
 /// `[store]`: the build store (`crate::store`).

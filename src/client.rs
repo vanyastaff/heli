@@ -39,7 +39,7 @@
 //!   daemon there is no run to cancel, and none is started.
 
 use std::convert::Infallible;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,7 +47,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::cli::Invocation;
-use crate::config::Config;
+use crate::config::{CargoHome, Config};
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::output::{self, Plan, Printer, print};
@@ -76,14 +76,34 @@ const FAILED: i32 = 1;
 const USAGE: i32 = 2;
 
 /// Runs `invocation` through the daemon, or directly when it cannot; this
-/// process's nesting depth is `depth`.
+/// process's nesting depth is `depth`. Isolation is prepared before either
+/// path; a daemon failure never falls back to the original mutable Cargo home.
 pub fn run(invocation: Invocation, depth: u32) -> ! {
     let child_depth = OsString::from((depth + 1).to_string());
     let locations = Locations::resolve();
-    let configured = || {
-        let locations = locations.as_ref().ok()?;
-        Config::load(&locations.config).ok()?.output.mode
+    // Isolation is a client policy, including direct fallback. A malformed
+    // settings file must never silently select the shared mutable home.
+    let config_path = locations
+        .as_ref()
+        .map(|locations| locations.config.clone())
+        .or_else(|_| Locations::config_path());
+    let config = match config_path {
+        Ok(path) => Config::load(&path).unwrap_or_else(|error| {
+            eprintln!("cargo-heli: {error}");
+            std::process::exit(USAGE);
+        }),
+        Err(error)
+            if std::env::var_os(crate::locations::CONFIG_VAR)
+                .is_some_and(|value| !value.is_empty()) =>
+        {
+            eprintln!("cargo-heli: {error}");
+            std::process::exit(USAGE);
+        }
+        // With neither a discoverable default config nor an explicit path,
+        // ordinary shared-mode commands retain direct fallback.
+        Err(_) => Config::default(),
     };
+    let configured = || config.output.mode;
     let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
         eprintln!("cargo-heli: {error}");
         std::process::exit(USAGE)
@@ -93,16 +113,33 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
     });
-    let prepared = epoch_path
-        .as_ref()
-        .map(|path| {
+    let inherited = crate::dependency_home::inherited().unwrap_or_else(|error| {
+        eprintln!("cargo-heli: cannot inspect inherited Cargo home: {error}");
+        std::process::exit(USAGE);
+    });
+    let isolated = isolated_home(
+        invocation.cargo_home,
+        config.cargo.home,
+        epoch_path.is_some(),
+        inherited,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("cargo-heli: {error}");
+        std::process::exit(USAGE);
+    });
+    let prepared = isolated
+        .then(|| {
             let locations = locations.as_ref().map_err(Clone::clone)?;
+            isolated_command(&invocation)?;
             dependency_cargo(&invocation)?;
-            crate::dependency_home::prepare(path, &locations.state_dir.join("dependency-homes"))
+            crate::dependency_home::prepare(
+                epoch_path.as_deref(),
+                &locations.state_dir.join("dependency-homes"),
+            )
         })
         .transpose()
         .unwrap_or_else(|reason| {
-            eprintln!("cargo-heli: cannot prepare dependency isolation: {reason}");
+            eprintln!("cargo-heli: cannot prepare isolated Cargo home: {reason}");
             std::process::exit(USAGE);
         });
     let dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
@@ -141,26 +178,127 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
             eprintln!("cargo-heli: cannot protect direct execution: {error}");
             std::process::exit(USAGE);
         });
+        let mut roots = vec![activity];
+        if let Some(epoch) = &prepared.epoch {
+            roots.push(epoch.lease_root().to_path_buf());
+        }
         crate::store::runner::direct(
             command,
-            &[activity, prepared.epoch.lease_root().to_path_buf()],
-            prepared.epoch.path(),
+            &roots,
+            prepared.epoch.as_ref().map(|epoch| epoch.path()),
         );
     }
     direct::run(command)
 }
 
+fn isolated_home(
+    explicit: Option<CargoHome>,
+    configured: CargoHome,
+    epoch: bool,
+    inherited: bool,
+) -> Result<bool, String> {
+    if explicit == Some(CargoHome::Shared) && (epoch || inherited) {
+        return Err("an explicit shared Cargo home conflicts with an epoch or inherited isolated home; select shared mode at the outer command boundary".into());
+    }
+    Ok(epoch || inherited || explicit.unwrap_or(configured) == CargoHome::Isolated)
+}
+
+fn cargo_arguments(invocation: &Invocation) -> Option<&[OsString]> {
+    (!invocation.exec
+        || Path::new(&invocation.program)
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.eq_ignore_ascii_case("cargo")))
+    .then_some(invocation.args.as_slice())
+}
+
+fn isolated_command(invocation: &Invocation) -> Result<(), String> {
+    let command = cargo_arguments(invocation)
+        .map(isolated_subcommand)
+        .transpose()?
+        .flatten();
+    if let Some(command) = command
+        && ["install", "uninstall", "login", "logout", "publish"]
+            .iter()
+            .any(|name| command == *name)
+    {
+        return Err(format!(
+            "cargo {} is not supported with an isolated Cargo home; use bare Cargo with the original home or --cargo-home shared at the outer command boundary",
+            command.to_string_lossy()
+        ));
+    }
+    Ok(())
+}
+
+/// Read only Cargo's leading global options for the isolation guard. Keep the
+/// original argv untouched; an unrecognized option cannot hide a home mutation.
+fn isolated_subcommand(mut args: &[OsString]) -> Result<Option<&OsStr>, String> {
+    if args
+        .first()
+        .is_some_and(|arg| arg.as_encoded_bytes().starts_with(b"+"))
+    {
+        args = &args[1..];
+    }
+    while let Some((arg, rest)) = args.split_first() {
+        let bytes = arg.as_encoded_bytes();
+        if !bytes.starts_with(b"-") {
+            return Ok(Some(arg));
+        }
+        let text = arg.to_str().unwrap_or_default();
+        if matches!(text, "--color" | "--config" | "-Z" | "-C") {
+            let Some((_, remaining)) = rest.split_first() else {
+                return Err(format!(
+                    "Cargo option {text} requires a value in isolated mode"
+                ));
+            };
+            args = remaining;
+        } else if matches!(
+            text,
+            "--verbose"
+                | "--quiet"
+                | "--locked"
+                | "--offline"
+                | "--frozen"
+                | "--help"
+                | "--version"
+                | "--list"
+                | "-q"
+                | "-h"
+                | "-V"
+        ) || text.starts_with("--color=")
+            || text.starts_with("--config=")
+            || (bytes.len() > 2 && (bytes.starts_with(b"-Z") || bytes.starts_with(b"-C")))
+            || (bytes.len() > 1 && bytes[0] == b'-' && bytes[1..].iter().all(|b| *b == b'v'))
+        {
+            args = rest;
+        } else {
+            return Err(format!(
+                "cannot identify the Cargo command after option {} in isolated mode; use a supported global option or bare Cargo with the original home",
+                arg.to_string_lossy()
+            ));
+        }
+    }
+    Ok(None)
+}
+
 /// Configuration includes at home precedence are part of this profile's
 /// compatibility contract, verified with Cargo 1.99 and newer.
 fn dependency_cargo(invocation: &Invocation) -> Result<(), String> {
-    let cargo = if invocation.exec {
+    let cargo = if cargo_arguments(invocation).is_none() {
         std::env::var_os("CARGO")
             .filter(|cargo| !cargo.is_empty())
             .unwrap_or_else(|| "cargo".into())
     } else {
         invocation.program.clone()
     };
-    let output = Command::new(cargo)
+    let mut probe = Command::new(cargo);
+    if let Some(selector) = cargo_arguments(invocation)
+        .and_then(|args| args.first())
+        .filter(|arg| arg.as_encoded_bytes().starts_with(b"+"))
+    {
+        probe.arg(selector);
+    }
+    let output = probe
         .arg("--version")
         .output()
         .map_err(|error| format!("cannot identify Cargo for dependency isolation: {error}"))?;
@@ -171,7 +309,7 @@ fn dependency_cargo(invocation: &Invocation) -> Result<(), String> {
     let minor = numbers.next().and_then(|n| n.parse::<u32>().ok());
     if !output.status.success() || !matches!((major, minor), (Some(1), Some(99..)) | (Some(2..), _))
     {
-        return Err("dependency isolation requires Cargo 1.99 or newer".into());
+        return Err("isolated Cargo homes require Cargo 1.99 or newer".into());
     }
     Ok(())
 }
@@ -195,14 +333,11 @@ fn dependency_environment(
     }
     let path = std::env::join_paths(entries)
         .map_err(|error| format!("cannot preserve Cargo tool search: {error}"))?;
-    Ok(vec![
-        ("CARGO_HOME", prepared.home.clone().into()),
-        (
-            "HELI_DEPENDENCY_EPOCH",
-            prepared.epoch.path().as_os_str().to_owned(),
-        ),
-        ("PATH", path),
-    ])
+    let mut overrides = vec![("CARGO_HOME", prepared.home.clone().into()), ("PATH", path)];
+    if let Some(epoch) = &prepared.epoch {
+        overrides.push(("HELI_DEPENDENCY_EPOCH", epoch.path().as_os_str().to_owned()));
+    }
+    Ok(overrides)
 }
 
 /// Prints the daemon's status, as JSON or as text.
@@ -481,7 +616,8 @@ fn submit(
         cache: invocation.cache,
         reads_spawned: true,
         dependency_epoch: prepared
-            .map(|prepared| Text(prepared.epoch.path().as_os_str().to_owned())),
+            .and_then(|prepared| prepared.epoch.as_ref())
+            .map(|epoch| Text(epoch.path().as_os_str().to_owned())),
     };
     stream
         .set_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))
@@ -691,4 +827,44 @@ fn exit_as(code: i32, signal: Option<i32>) -> ! {
     #[cfg(not(unix))]
     let _ = signal;
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod isolation_options {
+    use super::isolated_subcommand;
+    use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn global_options_cannot_hide_a_home_command() {
+        for prefix in [
+            vec!["+nightly", "--color", "never"],
+            vec!["--color=never", "--config", "net.retry=2"],
+            vec!["--config=net.retry=2", "-Z", "unstable-options"],
+            vec!["-Zunstable-options", "-C", "elsewhere"],
+            vec!["-Celsewhere", "-vv", "--locked", "--offline", "--frozen"],
+        ] {
+            let args: Vec<OsString> = prefix
+                .into_iter()
+                .chain(["install", "--list"])
+                .map(Into::into)
+                .collect();
+            assert_eq!(
+                isolated_subcommand(&args).unwrap(),
+                Some(OsStr::new("install"))
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_or_incomplete_global_options_refuse_isolation() {
+        for args in [
+            vec!["--unknown", "login"],
+            vec!["--color"],
+            vec!["-Z"],
+            vec!["--", "install"],
+        ] {
+            let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
+            assert!(isolated_subcommand(&args).is_err());
+        }
+    }
 }

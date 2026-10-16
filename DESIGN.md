@@ -1869,10 +1869,12 @@ home and epoch instead of building recursive include chains. Cargo,
 toolchain and wrapper selection retain the caller's PATH order; the original
 home's bin directory is appended only when absent.
 
-This is an explicit integration milestone, not the complete automatic
-isolation policy. Automatic dependency preparation/selection, capacity
-accounting for sources/staging/private homes/lease metadata and automatic
-private-home reclamation remain required work. Legacy home `config` is
+This immutable-source profile requires explicit preparation and selection.
+The native home profile in §6.6 needs no epoch publisher or vendor prepass;
+automatic epoch publication is an optional storage optimization, not a
+prerequisite for independent Cargo downloads. Capacity accounting for
+sources/staging/private homes/lease metadata and automatic private-home
+reclamation remain unfinished. Legacy home `config` is
 explicitly refused because Cargo includes require `.toml`; copying it would
 change relative-path semantics. Arbitrary cargo extensions, competing
 home-bin/PATH extension precedence and tools mutating the Cargo home need
@@ -1893,6 +1895,67 @@ target while retaining both source views. The production concurrency canary
 in `experiments/dependency-epoch-concurrency.py` exercises shared-object GC
 between exits of three consumers across two projects and two Git worktrees.
 Cross-platform results must be reported for the exact tested revision.
+
+### 6.6 Automatic worktree Cargo homes
+
+The independence profile uses ordinary writable Cargo homes, one per
+worktree, rather than requiring a vendor snapshot before a command can run.
+With `[cargo] home = "isolated"` in the user configuration, or
+`--cargo-home isolated` on a command, the invoking client prepares the home
+before submitting the command. Default `shared` preserves the caller's
+Cargo home. Explicit epochs remain an optional source-storage optimization;
+an explicit shared-home request conflicts with an epoch selection.
+
+Preparation creates configuration and private credentials, not a dependency
+resolution pass. Cargo itself downloads, resolves and builds with its native
+flags. Each worktree owns its mutable registry, index, extracted sources and
+git cache. None are links to another worktree's or the original home's
+mutable cache. Concurrent cold worktrees may download the same crate twice;
+avoiding their mutual package-cache lock takes priority over storage savings.
+There is no global preparation queue or blocking cross-worktree singleflight.
+
+The secure publication mechanism in §6.5 also applies without an epoch:
+original home configuration is included at home precedence with its relative
+origins intact, credentials are copied only into protected files, and a
+stable generation is published rather than rewritten under active commands.
+Worktree identity is the canonical nearest checkout root, not Git's common
+directory; outside Git it is the invoking directory. Config or credential
+changes select a new generation for a new outer command. Already running
+commands and their nested Heli invocations retain their exact parent home,
+including in generated directories outside the parent's repository.
+
+Cold `--offline` runs can fail because the private home has no dependencies
+yet. Heli must not hide that failure by retrying through the original shared
+cache. Warm offline runs reuse their worktree's cache. No hidden step creates
+or updates `Cargo.lock`; `--locked` retains Cargo's normal meaning. Interrupted
+downloads are recovered by Cargo in that home. Selected isolation survives
+daemon loss and direct fallback rather than silently becoming shared.
+
+Home-mutating Cargo commands need an explicit destination policy. This
+profile refuses known install/login/logout-style operations instead of
+silently changing their original destination. An explicit shared request
+inside an inherited isolated command is refused rather than escaping its
+parent's context. Use an outer shared command for home maintenance. Arbitrary
+extensions and executables may interpret Cargo home themselves; their full
+compatibility remains part of #38. Existing Cargo 1.99+ and legacy home
+`config` limitations apply. Private native homes are retained and are outside
+artifact-store accounting; automatic retirement requires lifetime ownership
+before deletion. No hard resource bound follows from this profile.
+
+Acceptance must exercise the public CLI with two actual Git worktrees and
+a localhost registry: delay A's real download and observe B's build-script
+and compiler progress before releasing it; resolve a nested generated
+project whose dependency is outside the parent's graph; preserve original
+home/config/credential and project lockfile bytes; distinguish cold and warm
+offline runs; and verify configuration origins, private credentials, unsafe
+home refusal and direct fallback. `tests/cargo_homes.rs` covers the public
+home policy, config/credential semantics, simultaneous worktrees and a real
+fallback command surviving client loss with its GC guard. The local registry
+fixture `experiments/isolated-home-concurrency.py` covers actual cold downloads,
+nested resolution, offline behavior and optional authenticated access through
+Cargo's token provider. Native Windows runs pass; cross-platform verification
+must be reported for the exact tested revision. This is not a completion
+claim for #38 or the overall multi-agent acceptance.
 
 ## 7. Result store
 

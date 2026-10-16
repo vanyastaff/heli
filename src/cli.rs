@@ -11,6 +11,7 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::class::Class;
+use crate::config::CargoHome;
 use crate::output::Mode;
 use crate::protocol::Cache;
 use crate::run_id::RunId;
@@ -73,6 +74,7 @@ pub struct Invocation {
     pub output: Option<Mode>,
     /// Explicit immutable dependency snapshot; inherited by nested Heli.
     pub dependency_epoch: Option<std::path::PathBuf>,
+    pub cargo_home: Option<CargoHome>,
 }
 
 #[derive(Debug, Parser)]
@@ -98,6 +100,9 @@ struct Cli {
     /// Use an imported immutable dependency snapshot and a private Cargo home.
     #[arg(long, value_name = "PATH")]
     dependency_epoch: Option<std::path::PathBuf>,
+    /// Writable Cargo home: isolated per worktree, or the caller's shared home.
+    #[arg(long, value_name = "MODE", value_parser = parse_cargo_home)]
+    cargo_home: Option<CargoHome>,
     #[command(subcommand)]
     command: Command,
 }
@@ -308,6 +313,7 @@ pub fn parse(
                 cache: Cache::Off,
                 output: own.mode().or(output),
                 dependency_epoch: cli.dependency_epoch,
+                cargo_home: cli.cargo_home,
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -358,6 +364,7 @@ pub fn parse(
                 args,
                 output,
                 dependency_epoch: cli.dependency_epoch,
+                cargo_home: cli.cargo_home,
             })
         }
     })
@@ -369,6 +376,16 @@ fn parse_cache(text: &str) -> Result<Cache, String> {
         "refresh" => Ok(Cache::Refresh),
         "off" => Ok(Cache::Disabled),
         _ => Err("cache mode must be on, refresh or off".to_owned()),
+    }
+}
+
+fn parse_cargo_home(text: &str) -> Result<CargoHome, String> {
+    match text {
+        "shared" => Ok(CargoHome::Shared),
+        "isolated" => Ok(CargoHome::Isolated),
+        _ => Err(format!(
+            "unknown Cargo home mode {text:?}; expected isolated or shared"
+        )),
     }
 }
 

@@ -8,6 +8,43 @@ The current priority is independent progress across projects and worktrees.
 Disk and RAM caps are secondary; preserve runtime safety without treating
 disk optimization as a demonstrated prerequisite for concurrency.
 
+To automatically isolate Cargo's mutable dependency caches, select this once
+in heli's user configuration (`%APPDATA%\heli\config.toml` on Windows,
+`$XDG_CONFIG_HOME/heli/config.toml` or `~/.config/heli/config.toml` on Unix):
+
+```toml
+[cargo]
+home = "isolated"
+```
+
+Each worktree then gets a persistent private Cargo home when a managed
+command starts. No vendor, import or explicit fetch preparation is required:
+Cargo downloads and resolves dependencies itself. For a command-scoped
+choice, use `cargo heli --cargo-home isolated --cache off check --locked`.
+The default is `shared`; an outer `--cargo-home shared` keeps the caller's
+original home. An explicit epoch selection still uses its isolated profile.
+
+This trades duplicate downloads and storage for independence. A cold
+isolated home cannot build offline just because another home has the
+dependencies; run the ordinary online check first, then subsequent offline
+commands can reuse that worktree's cache. Heli never retries through the
+shared home after an isolated failure. Keep native `--locked`/`--offline`
+flags as needed; Heli does not insert a lockfile-generation step.
+
+Nested Cargo and nested Heli retain the parent's chosen home, including
+generated projects with additional dependencies. Credentials/configuration
+changes select a new home generation for a new outer invocation, while live
+nested consumers retain the existing generation. Homes are protected and
+retained; their bytes are outside the artifact GC budget. Original home
+`config.toml` keeps its relative path origins; legacy home `config` is
+refused rather than silently rebased. Cargo 1.99+ is required.
+
+Perform Cargo-home maintenance such as install/login/logout from an outer
+shared command. The isolated profile refuses known home-maintenance
+commands and refuses an explicit switch to shared inside an already
+isolated invocation. Arbitrary external tools can have their own Cargo-home
+assumptions; the full tool compatibility work remains open in #38.
+
 Give intermediate artifacts a separate path per workspace. For a project on
 Windows drive D, its `.cargo/config.toml` can contain:
 
