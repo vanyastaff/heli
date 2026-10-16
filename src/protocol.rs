@@ -197,12 +197,16 @@ impl RunRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Cache {
-    /// Neither looked up nor recorded: compile, mutate and exec runs.
+    /// Neither looked up nor recorded: mutate and ordinary exec runs.
     #[default]
     Off,
-    /// Explicitly uncached checks/tests: no key, record or single-flight.
-    /// A distinct wire value makes older daemons refuse this new contract.
+    /// Legacy cache-off requests: no key, record or single-flight.
+    /// Retained for clients predating source-keyed live sharing.
     Disabled,
+    /// Source-keyed live sharing, without reading or changing saved verdicts.
+    /// A separate wire value prevents older daemons from silently skipping
+    /// the source-freshness contract of a new `--cache off` request.
+    Live,
     /// Looked up first, and recorded when it passes: verify and test runs.
     On,
     /// Run whatever is recorded (`--no-cache`), and recorded when it passes.
@@ -215,13 +219,15 @@ impl Cache {
     /// `no_cache`, only recorded), the result-store column of the class
     /// table (`crate::class`). A request for help (`-h` or `--help`,
     /// cargo's or, after `--`, the test runner's) is no verdict, so it does
-    /// not use it. `exec` is opt-in, and nothing opts in yet.
+    /// not use it. CLI `exec --verify` explicitly declares verification
+    /// and selects its policy separately (live sharing by default).
     pub fn of(class: Class, args: &[OsString], no_cache: bool) -> Self {
         let help = args.iter().any(|arg| arg == "-h" || arg == "--help");
         match class {
             Class::Verify | Class::Test if help => Self::Off,
             Class::Verify | Class::Test if no_cache => Self::Refresh,
             Class::Verify | Class::Test => Self::On,
+            Class::Compile if !help => Self::Live,
             Class::Compile | Class::Mutate | Class::Exec => Self::Off,
         }
     }
@@ -230,7 +236,7 @@ impl Cache {
 /// What the daemon answers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Reply {
-    /// The daemon is validating explicitly selected immutable inputs. No
+    /// The daemon is preparing source keys or selected immutable inputs. No
     /// command has started; the client may remove its first-answer deadline.
     Preparing,
     /// The daemon accepted the run, and starts it now or once its wait

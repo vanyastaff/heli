@@ -259,6 +259,17 @@ fn a_run_waiting_for_its_worktree_takes_clients() {
 #[test]
 fn a_call_again_after_a_killed_one_attaches_to_its_build() {
     let fixture = Fixture::new("basic");
+    // Source-aware build sharing needs a complete inventory. Non-Git
+    // commands intentionally run independently rather than attach stale work.
+    std::fs::write(fixture.workspace().join(".gitignore"), "/target/\n").unwrap();
+    for args in [vec!["init", "--quiet"], vec!["add", "-A"]] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(fixture.workspace())
+            .output()
+            .unwrap();
+        assert_success(&output, "initialize build source inventory");
+    }
     let gate = fixture.path("gate");
     // Full output: cargo's own lines show the build under way.
     let build = || {

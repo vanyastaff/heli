@@ -94,7 +94,7 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
     /// Result cache for checks/tests: on (reuse and record), refresh (record
-    /// only), off (skip result lookup, recording and source inventory).
+    /// only), off (share matching live checks without saved verdicts).
     #[arg(long, value_name = "MODE", value_parser = parse_cache, conflicts_with = "no_cache")]
     cache: Option<Cache>,
     /// Use an imported immutable dependency snapshot and a private Cargo home.
@@ -153,6 +153,10 @@ enum Command {
     Exec {
         #[command(flatten)]
         output: OutputFlags,
+        /// Declare a read-only verification: share only matching source and
+        /// configuration inputs. Defaults to no saved result cache.
+        #[arg(long)]
+        verify: bool,
         /// The command and its arguments, after `--`.
         #[arg(last = true, required = true, value_name = "COMMAND")]
         command: Vec<OsString>,
@@ -302,15 +306,24 @@ pub fn parse(
         Command::Deps { command } => Action::Dependencies(command),
         Command::Exec {
             output: own,
+            verify,
             command,
         } => {
             let mut command = command.into_iter();
             Action::Run(Invocation {
                 program: command.next().expect("BUG: clap requires a command"),
                 args: command.collect(),
-                class: Class::Exec,
+                class: if verify { Class::Verify } else { Class::Exec },
                 exec: true,
-                cache: Cache::Off,
+                cache: if verify {
+                    if cli.no_cache {
+                        Cache::Refresh
+                    } else {
+                        cli.cache.unwrap_or(Cache::Live)
+                    }
+                } else {
+                    Cache::Off
+                },
                 output: own.mode().or(output),
                 dependency_epoch: cli.dependency_epoch,
                 cargo_home: cli.cargo_home,
@@ -359,6 +372,9 @@ pub fn parse(
                 exec: false,
                 cache: match Cache::of(class, &args, cli.no_cache) {
                     Cache::Off => Cache::Off,
+                    // A successful build is not a reusable verdict: each
+                    // artifact owner must get its actual outputs.
+                    _ if class == Class::Compile => Cache::Live,
                     default => cli.cache.unwrap_or(default),
                 },
                 args,
@@ -374,7 +390,7 @@ fn parse_cache(text: &str) -> Result<Cache, String> {
     match text {
         "on" => Ok(Cache::On),
         "refresh" => Ok(Cache::Refresh),
-        "off" => Ok(Cache::Disabled),
+        "off" => Ok(Cache::Live),
         _ => Err("cache mode must be on, refresh or off".to_owned()),
     }
 }

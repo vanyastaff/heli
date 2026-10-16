@@ -210,11 +210,15 @@ pub fn plan(invocation: &Invocation, mode: Mode) -> Plan {
 /// runs show their tests ([`tests_view`]); `cargo heli exec` shows its head
 /// and tail. Every other run passes through.
 fn view_of(invocation: &Invocation) -> View {
+    // Verification declares input identity, not a Cargo output protocol.
+    // Wrappers keep their arguments and head/tail rendering unchanged.
+    if invocation.exec {
+        return View::Exec;
+    }
     let warnings = match invocation.class {
         Class::Compile => cargo::Warnings::Counts,
         Class::Verify => cargo::Warnings::ByLint,
         Class::Test => return tests_view(&invocation.args),
-        Class::Exec if invocation.exec => return View::Exec,
         Class::Mutate | Class::Exec => return View::PassThrough,
     };
     if cargo::reports_json(&invocation.args) && !cargo::sets_output(&invocation.args) {

@@ -658,7 +658,11 @@ fn orphaned_metadata_keeps_sources_after_the_run_and_daemon_have_ended() {
     let mut child = fixture
         .heli(["--dependency-epoch"])
         .arg(&selected)
-        .args(["--output", "full", "--cache", "off", "check", "--offline"])
+        // This exercises asynchronous store discovery, not verification
+        // input preparation, which must finish before a check starts.
+        .args(["--output", "full", "exec", "--"])
+        .arg(&cargo)
+        .args(["build", "--offline"])
         .current_dir(&workspace)
         .env("CARGO", &cargo)
         .env("CARGO_HOME", fixture.path("original/.cargo"))

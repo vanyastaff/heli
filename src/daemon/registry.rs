@@ -14,22 +14,23 @@
 //! One that comes while the run's own client is being told waits for that
 //! (an instant).
 //!
-//! - A run without a verdict (compile, mutate, exec) is the
+//! - A run without a key (mutate, ordinary exec) is the
 //!   same as another when its [`Command`] is.
-//! - A verify or test run is the same as another when its key is, which
+//! - A compile, verify or test run is the same as another when its key is, which
 //!   holds the tree: the same command after an edit is another run. This
 //!   is single-flight: the key leaves the worktree's path out, so the run
-//!   may be in any worktree. Until a run has the key it runs on, it takes
+//!   may be in any worktree for verification; compile keys include artifact
+//!   ownership and stay within one worktree. Until a run has the key it runs on, it takes
 //!   such clients from its own worktree only: a run that waits at its
 //!   worktree lock is keyed again after the wait ([`Registry::keyed`]),
 //!   since the runs it waits for (a `fmt`) may change its tree, which
 //!   changes the tree of every client in that worktree alike, but not that
 //!   of another worktree. A run that waits for nothing has its key from the
 //!   start.
-//! - A verify or test run without a key as it asks (`--no-cache`, outside
-//!   git, `--cache off`, a key that cannot be computed) attaches to no run. One keyed
-//!   once admitted (`--no-cache`) takes the clients of its key from then
-//!   on.
+//! - A forced-new request (`--no-cache`) never attaches. Neither does a
+//!   verification without a complete key (outside Git or failed inventory).
+//!   `--cache off` uses a complete key for sharing without saved verdicts.
+//!   Once admitted, a forced-new run takes other clients of its key.
 //!
 //! **Cancelling** marks a run cancelled: it takes no new clients, ends as
 //! cancelled, and stops waiting for its turn. A run that runs hands out its
@@ -48,7 +49,10 @@
 //! either is exclusive. So a mutate run waits for every earlier run in its
 //! worktree, every later one waits for it, and a mutate run that waits is
 //! never overtaken by runs that would keep it waiting. A run holds the lock
-//! from the end of its wait until it ends. The worktree is
+//! from the end of its wait until it ends.
+//! Keyed compile, verify and test runs of different source generations also conflict
+//! in the same worktree: rebuilding must not overwrite an executable still
+//! running on Windows. Equal source generations keep shared access. The worktree is
 //! `crate::worktree::of` the run's directory, compared as a canonical path,
 //! so two spellings of one directory (on Windows, in another case) share
 //! one lock.
@@ -67,7 +71,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::key::Key;
+use super::key::{Key, Snapshot};
 use super::live::Live;
 use super::tree::Tree;
 use crate::class::{Access, Class};
@@ -128,22 +132,45 @@ impl Command {
 pub enum Same {
     /// A run without a key: the same [`Command`].
     Command,
-    /// A verify or test run: the same key, by its digest.
-    Key(String),
-    /// A verify or test run without a key: no other run.
+    /// A source-keyed run: the same key, by its digest.
+    Key {
+        digest: String,
+        source: Snapshot,
+        live_only: bool,
+    },
+    /// A force-new request still identifies the source generation it must
+    /// wait for, but takes no clients until admitted and settled.
+    Fresh(Snapshot),
+    /// A source-keyed run without a complete key: no other run.
     Nothing,
 }
 
 impl Same {
     /// What `request` is the same as: its `key` (`None` when it has none)
-    /// when it uses the result store. Explicitly disabled checks/tests never attach;
-    /// other classes retain command identity.
+    /// when it keys a build or verification. Legacy disabled checks/tests
+    /// never attach; ordinary exec and mutating commands retain command identity.
     pub fn of(request: &RunRequest, key: Option<&Key>) -> Self {
         match (request.cache, key) {
             (Cache::Disabled, _) => Self::Nothing,
             (Cache::Off, _) => Self::Command,
-            (Cache::On | Cache::Refresh, Some(key)) => Self::Key(key.digest.clone()),
-            (Cache::On | Cache::Refresh, None) => Self::Nothing,
+            (Cache::Refresh, Some(key)) => Self::Fresh(key.snapshot.clone()),
+            (Cache::On | Cache::Live, Some(key)) => Self::keyed(key, request.cache),
+            (Cache::On | Cache::Live | Cache::Refresh, None) => Self::Nothing,
+        }
+    }
+
+    fn keyed(key: &Key, cache: Cache) -> Self {
+        Self::Key {
+            digest: key.digest.clone(),
+            source: key.snapshot.clone(),
+            live_only: cache != Cache::On,
+        }
+    }
+
+    fn source(&self) -> Option<&Snapshot> {
+        match self {
+            Self::Key { source, .. } | Self::Fresh(source) => Some(source),
+            Self::Command | Self::Nothing => None,
         }
     }
 }
@@ -158,6 +185,9 @@ struct Entry {
     command: Command,
     /// Which clients it takes.
     same: Same,
+    /// Fixed at admission so a source rekey cannot introduce or remove
+    /// blockers after a run has decided whether it must refresh its key.
+    admitted_source: Option<Snapshot>,
     /// Its key is the one it runs on: it takes the clients of that key from
     /// any worktree, and not only from its own.
     settled: bool,
@@ -199,8 +229,22 @@ impl Entry {
         }
         match (same, &self.same) {
             (Same::Command, Same::Command) => self.command == *command,
-            (Same::Key(asked), Same::Key(key)) => {
+            (
+                Same::Key {
+                    digest: asked,
+                    live_only: asked_live,
+                    ..
+                },
+                Same::Key {
+                    digest: key,
+                    live_only: owner_live,
+                    ..
+                },
+            ) => {
                 asked == key && (self.settled || self.lock == lock)
+                    // A queued cached run can still resolve to a saved
+                    // verdict. Live-only clients require real execution.
+                    && (!asked_live || *owner_live || matches!(self.state, State::Running { .. }))
             }
             _ => false,
         }
@@ -346,7 +390,8 @@ impl Registry {
                             id,
                             live,
                             running_for: entry.started_at.elapsed().unwrap_or_default(),
-                            keyed_in: matches!(same, Same::Key(_)).then(|| entry.worktree.clone()),
+                            keyed_in: matches!(same, Same::Key { .. })
+                                .then(|| entry.worktree.clone()),
                         });
                     }
                     break;
@@ -380,6 +425,7 @@ impl Registry {
                 lock,
                 nested,
                 command,
+                admitted_source: same.source().cloned(),
                 same,
                 settled: false,
                 class,
@@ -403,11 +449,11 @@ impl Registry {
     /// Run `id`, admitted and done waiting, was keyed again: `key` is the
     /// key it runs on (`None`: it has none). It now takes the clients of
     /// that key from any worktree. A run without a key is left as it is.
-    pub fn keyed(&self, id: RunId, key: Option<&Key>) {
+    pub fn keyed(&self, id: RunId, key: Option<&Key>, cache: Cache) {
         if let Some(entry) = self.lock().runs.get_mut(&id)
             && entry.same != Same::Command
         {
-            entry.same = key.map_or(Same::Nothing, |key| Same::Key(key.digest.clone()));
+            entry.same = key.map_or(Same::Nothing, |key| Same::keyed(key, cache));
             entry.settled = true;
         }
     }
@@ -588,7 +634,10 @@ impl Inner {
             .filter(|(_, earlier)| {
                 earlier.state.in_flight()
                     && earlier.lock == run.lock
-                    && (exclusive(earlier) || exclusive(run))
+                    && (exclusive(earlier)
+                        || exclusive(run)
+                        || matches!((&earlier.admitted_source, &run.admitted_source),
+                            (Some(before), Some(after)) if before != after))
             })
             .map(|(&earlier, _)| earlier)
             .collect()
