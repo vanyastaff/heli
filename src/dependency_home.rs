@@ -298,6 +298,11 @@ fn publish_context(
     }
     let name = hex(&identity.finalize());
     private_dir(home_base)?;
+    // The first invocation may resolve a not-yet-created base lexically
+    // (for example /var on macOS); subsequent invocations canonicalize it.
+    // Expose the same physical spelling from the first publication onward.
+    // Original config paths above deliberately retain their lexical origin.
+    let home_base = absolute(home_base)?;
     let home = home_base.join(&name);
     let marker = Marker {
         schema: 2,
@@ -310,7 +315,7 @@ fn publish_context(
         validate_home(&home, &marker)?;
         return Ok(home);
     }
-    let stage = Stage::create(home_base)?;
+    let stage = Stage::create(&home_base)?;
     private_file(&stage.0.join("config.toml"), generated.as_bytes())?;
     private_file(
         &stage.0.join(MARKER),
@@ -789,6 +794,33 @@ mod tests {
         let first = select(&original, &epoch, &homes, &temp.path().join("first"));
         let second = select(&original, &epoch, &homes, &temp.path().join("second"));
         assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_publication_and_reuse_expose_the_same_home_through_a_parent_alias() {
+        let (temp, original, _, _) = setup();
+        let real = temp.path().join("real-state");
+        fs::create_dir(&real).unwrap();
+        let alias = temp.path().join("state-alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let base = alias.join("dependency-homes");
+        assert!(!base.exists());
+        let first =
+            publish_context(&original, temp.path(), None, &absolute(&base).unwrap()).unwrap();
+        let reused =
+            publish_context(&original, temp.path(), None, &absolute(&base).unwrap()).unwrap();
+        assert_eq!(first, reused);
+        assert_eq!(
+            first,
+            crate::store::simplified(&fs::canonicalize(&first).unwrap())
+        );
+        let config: toml::Table =
+            toml::from_str(&fs::read_to_string(first.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(
+            Path::new(config["include"][0].as_str().unwrap()),
+            original.join("config.toml")
+        );
     }
 
     #[test]
