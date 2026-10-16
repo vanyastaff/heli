@@ -119,6 +119,14 @@ failed natively with a relocated target; the suite is not claimed green.
 The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
 contains the scopes, timings and invalid GC setup finding.
 
+There is also a real contention case: a Cargo download waiting on an HTTP
+response can block another project's fully cached offline check through the
+shared package-cache lock. The [local registry fixture](../experiments/real-download-hol.py)
+compares that baseline with ordinary manually isolated Cargo and Heli's
+dependency epoch. Both isolated cases finish while the download is waiting.
+This proves the value of isolation for that case; automatic epoch setup is
+still required to remove the manual preparation from the agent workflow.
+
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
 for actual compiler-overlap, held-runner-lock and GC acceptance checks.

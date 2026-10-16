@@ -2235,6 +2235,29 @@ in 13.036 s; each reported one package-cache wait. Different jobs preclude
 a strict ratio with that pair. Manual isolation gets no credit as heli
 behavior; these controls establish no full-suite ratio or general speedup.
 
+**Real download contention, 2026-10-16.** The public CLI fixture
+`experiments/real-download-hol.py` uses a localhost sparse registry and real
+Cargo downloads, without an artificial cache-lock holder. While A waits for
+an HTTP archive response, B has all its dependencies cached and runs
+`check --offline --locked` with fresh artifacts. With a shared home, B
+reports a package-cache lock wait and makes no build-script progress until
+the response is released. Both an ordinary private home with actual
+`cargo vendor` source configuration and Heli's imported dependency epoch
+let B finish while A's response remains gated. Native Windows evidence is
+in `target/real-hol-public-1016-0339/results.json`; all commands succeeded
+and B's lockfile remained unchanged. This establishes a real Cargo
+head-of-line blocking case and the benefit of source isolation, not a
+unique Heli mechanism or a throughput speedup. Heli still requires explicit
+preparation and selection; automatic safe setup remains unfinished. The
+dependency experiment workflow repeats this public fixture on three OSes.
+
+The FLUI marker fixture repair is published in PR #1683 at `8c48ac7a3`:
+runtime scratch now uses a unique temporary path rather than assuming a
+checkout-local `target/`. The same public test is red before and green
+after the change with relocated Cargo outputs. All four library tests and
+the 14-test changed-scope gate through Heli passed locally. This is scoped
+repair evidence, not a successful rerun of both full concurrent suites.
+
 FLUI main still had a common per-user host lock in
 `tools/xtask/src/host_lock.rs` when checked on this date.
 [FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683), containing the
