@@ -557,6 +557,67 @@ fn native_isolated_fallback_keeps_runtime_ownership_after_client_loss() {
     assert!(home.join("config.toml").is_file());
 }
 
+#[test]
+fn invalid_daemon_memory_settings_keep_native_isolation_during_direct_fallback() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[cargo]\nhome='isolated'\n[memory]\nlow_watermark_mb='lots'\n");
+    let outer = fixture.path("fallback-outer");
+    let generated = fixture.path("fallback-generated/inner");
+    project(&outer);
+    project(&generated);
+    let original = fixture.path("original/.cargo");
+    let config = "[env]\nHELI_HOME_CANARY='original-config'\n";
+    let credentials = "[registry]\ntoken='fallback-private-native-canary'\n";
+    write(&original.join("config.toml"), config);
+    write(&original.join("credentials.toml"), credentials);
+    let report = fixture.path("fallback-outer-home");
+    let nested_report = fixture.path("fallback-inner-home");
+    let output = bounded_output(
+        selected(&fixture, &outer, &original, &report)
+            .args(["check", "--offline"])
+            .env("HELI_UNDER_TEST", support::heli_binary())
+            .env("NESTED_PROJECT", &generated)
+            // The common helper writes this optional canary before nesting;
+            // preserve the actual original configuration in this acceptance.
+            .env("ROTATE_CONFIG", fixture.path("unused-rotation-config.toml"))
+            .env("NESTED_REPORT", &nested_report)
+            .env("NESTED_TARGET", fixture.path("fallback-inner-target")),
+    );
+    assert_success(
+        &output,
+        "unusable daemon policy keeps isolated native direct fallback",
+    );
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostics.contains("warning") && diagnostics.contains("running the command directly"),
+        "{diagnostics}"
+    );
+    let (home, canary) = reported(&report);
+    assert_ne!(home, original);
+    assert_eq!(canary, "original-config");
+    assert_eq!(
+        reported(&nested_report),
+        (home.clone(), "original-config".into())
+    );
+    assert!(home.join("config.toml").is_file());
+    assert_eq!(
+        std::fs::read_to_string(home.join("credentials.toml")).unwrap(),
+        credentials
+    );
+    assert_eq!(
+        std::fs::read_to_string(original.join("credentials.toml")).unwrap(),
+        credentials
+    );
+    assert_eq!(
+        std::fs::read_to_string(original.join("config.toml")).unwrap(),
+        config
+    );
+    assert!(!original.join(".package-cache").exists());
+    assert_private(&home);
+    assert_private(&home.join("credentials.toml"));
+    assert!(!diagnostics.contains("fallback-private-native-canary"));
+}
+
 #[cfg(unix)]
 fn assert_private(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

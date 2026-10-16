@@ -41,8 +41,9 @@
 //! still works with an older one.
 //!
 //! The client reads `[output]` and `[cargo]` before preparing a run.
-//! Invalid settings are terminal: they must not silently disable requested
-//! Cargo-home isolation during daemon startup or direct fallback.
+//! Invalid Cargo policy or TOML is terminal: neither may silently disable
+//! isolation. Invalid daemon-owned settings still permit direct fallback,
+//! preserving the selected home; an invalid output setting uses the default.
 //!
 //! **The test seam.** Debug builds also read a `[test]` table ([`Seam`]):
 //! memory figures, and a clock for the memory governor and the eviction
@@ -70,6 +71,35 @@ pub struct Config {
     pub store: StoreConfig,
     #[cfg(debug_assertions)]
     test: Seam,
+}
+
+/// Only settings the client owns. Daemon settings are validated on startup;
+/// their failure must not prevent direct execution with the selected home.
+#[derive(Debug, Default)]
+pub struct ClientConfig {
+    pub cargo: CargoConfig,
+    pub output: OutputConfig,
+}
+
+impl ClientConfig {
+    fn parse(text: &str) -> Result<Self, String> {
+        let value: toml::Value = toml::from_str(text).map_err(|error| error.to_string())?;
+        let cargo: CargoConfig = value
+            .get("cargo")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|error: toml::de::Error| error.to_string())?
+            .unwrap_or_default();
+        // Output historically fell back to its default when config loading
+        // failed. Preserve that behavior without discarding Cargo policy.
+        let output: OutputConfig = value
+            .get("output")
+            .cloned()
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default();
+        Ok(Self { cargo, output })
+    }
 }
 
 /// The writable Cargo home each managed invocation uses.
@@ -181,6 +211,19 @@ pub struct InjectedMemory {
 }
 
 impl Config {
+    /// Reads client policy independently of daemon-owned configuration.
+    pub fn load_client(path: &Path) -> Result<ClientConfig, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ClientConfig::default());
+            }
+            Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        };
+        ClientConfig::parse(&text)
+            .map_err(|error| format!("invalid configuration {}: {error}", path.display()))
+    }
+
     /// Reads the configuration at `path`; no file there is the default
     /// configuration. The error says what is wrong, and where.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -240,5 +283,38 @@ pub fn current_seam(path: &Path) -> Option<Seam> {
         Config::load(path).ok().map(|config| config.seam())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod client_policy_tests {
+    use super::{CargoHome, ClientConfig, Config};
+
+    #[test]
+    fn daemon_configuration_errors_preserve_selected_client_home() {
+        let text = "[cargo]\nhome='isolated'\n[memory]\nlow_watermark_mb='lots'\n[pool]\nslots='many'\n[store]\npaths=['relative']\n";
+        let client = ClientConfig::parse(text).unwrap();
+        assert_eq!(client.cargo.home, CargoHome::Isolated);
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn invalid_cargo_policy_and_invalid_toml_are_terminal() {
+        for text in [
+            "[cargo]\nhome='unknown'",
+            "[cargo]\nhome=42",
+            "cargo='isolated'",
+            "[memory\nlow_watermark_mb=1",
+        ] {
+            assert!(ClientConfig::parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn invalid_output_uses_default_without_losing_isolation() {
+        let client =
+            ClientConfig::parse("[cargo]\nhome='isolated'\n[output]\nmode='unknown'").unwrap();
+        assert_eq!(client.cargo.home, CargoHome::Isolated);
+        assert!(client.output.mode.is_none());
     }
 }

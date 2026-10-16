@@ -47,7 +47,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::cli::Invocation;
-use crate::config::{CargoHome, Config};
+use crate::config::{CargoHome, ClientConfig, Config};
 use crate::ipc::{self, Stream};
 use crate::locations::Locations;
 use crate::output::{self, Plan, Printer, print};
@@ -88,7 +88,7 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         .map(|locations| locations.config.clone())
         .or_else(|_| Locations::config_path());
     let config = match config_path {
-        Ok(path) => Config::load(&path).unwrap_or_else(|error| {
+        Ok(path) => Config::load_client(&path).unwrap_or_else(|error| {
             eprintln!("cargo-heli: {error}");
             std::process::exit(USAGE);
         }),
@@ -101,7 +101,7 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         }
         // With neither a discoverable default config nor an explicit path,
         // ordinary shared-mode commands retain direct fallback.
-        Err(_) => Config::default(),
+        Err(_) => ClientConfig::default(),
     };
     let configured = || config.output.mode;
     let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
