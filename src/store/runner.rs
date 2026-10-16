@@ -15,6 +15,41 @@ pub enum Handshake {
     SpawnFailed { not_found: bool, message: String },
 }
 
+/// Capture a discovery query without adding the normal runner's handshake
+/// to its stdout. The epoch is protected before handoff and independently
+/// reopened by the guardian before it starts the real consumer.
+pub fn capture(command: Command, epoch: &std::path::Path) -> io::Result<std::process::Output> {
+    let epoch = crate::dependencies::Epoch::open(epoch).map_err(io::Error::other)?;
+    let mut guardian = Command::new(std::env::current_exe()?);
+    guardian
+        .arg("lease-run")
+        .arg("--direct")
+        .arg("--dependency-epoch")
+        .arg(epoch.path())
+        .arg("--root")
+        .arg(epoch.lease_root())
+        .arg("--")
+        .arg(command.get_program())
+        .args(command.get_args())
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(cwd) = command.get_current_dir() {
+        guardian.current_dir(cwd);
+    }
+    // Probe commands start with env_clear and explicitly install the whole
+    // request environment, including their target-directory overrides.
+    for (name, value) in command.get_envs() {
+        if let Some(value) = value {
+            guardian.env(name, value);
+        } else {
+            guardian.env_remove(name);
+        }
+    }
+    guardian.output()
+}
+
 /// Acquire before spawning: a daemon crash during startup cannot expose a
 /// running command whose guardian has not yet protected its store.
 pub fn main(

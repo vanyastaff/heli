@@ -67,6 +67,7 @@ pub struct Probe {
     env: Vec<(OsString, OsString)>,
     args: Vec<OsString>,
     target: Option<PathBuf>,
+    epoch: Option<PathBuf>,
 }
 
 impl Probe {
@@ -108,6 +109,10 @@ impl Probe {
                 .collect(),
             args,
             target,
+            epoch: request
+                .dependency_epoch
+                .as_ref()
+                .map(|path| PathBuf::from(&path.0)),
         }
     }
 
@@ -124,6 +129,12 @@ impl Probe {
             env: std::env::vars_os().collect(),
             args,
             target: None,
+            // Hooks and a daemon started by nested Heli inherit the same
+            // selected context as Cargo. Preserve that existing selection
+            // when their own metadata query needs an independent guardian.
+            epoch: std::env::var_os("HELI_DEPENDENCY_EPOCH")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from),
         }
     }
 
@@ -227,7 +238,14 @@ impl Probe {
                 .env("CARGO_TARGET_DIR", target)
                 .env("CARGO_BUILD_TARGET_DIR", target);
         }
-        let output = command.output().ok()?;
+        // Metadata is an independent consumer: its parent daemon can die
+        // while Cargo still runs. A worker-thread lease cannot protect that
+        // orphan, so let a guardian own the epoch through the actual query.
+        let output = match &self.epoch {
+            Some(epoch) => super::runner::capture(command, epoch),
+            None => command.output(),
+        }
+        .ok()?;
         if !output.status.success() {
             return None;
         }

@@ -1813,7 +1813,13 @@ as its manifest, configuration and link targets.
 Each epoch has an external shared lifetime lease. It is acquired before
 reading its manifest, including before result lookup and metadata discovery.
 The daemon holds ownership across queueing, build/test phases and final
-keying; asynchronous metadata learning owns a separate lease. The command's
+keying; asynchronous metadata learning owns a separate lease. Each selected
+epoch's Cargo metadata subprocess also runs under an independent guardian:
+a daemon-thread lease alone cannot protect an orphaned metadata child after
+the daemon dies. Hooks and daemon maintenance queries preserve a nonempty
+inherited epoch selector too; they must not lose ownership merely because
+they bypass normal client preparation. Discovery capture preserves raw Cargo
+JSON without a runner handshake prefix. The command's
 guardian acquires and validates ownership before spawning Cargo, retaining
 it after client or daemon loss. Direct fallback uses a separate guardian
 too, preserves the prepared execution context and raw stdio, and never
@@ -1868,6 +1874,11 @@ builds under a held baseline package-cache lock; collecting an unrelated
 epoch during those builds; delayed source reads after client/daemon loss
 and during direct fallback; original config origins/precedence and private
 credentials; and refusal of corrupted source objects before execution.
+They also keep a gated metadata child alive after the foreground command and
+daemon end, and switch source values 7 → 8 → 7 with one unchanged lockfile and
+target while retaining both source views. The production concurrency canary
+in `experiments/dependency-epoch-concurrency.py` exercises shared-object GC
+between exits of three consumers across two projects and two Git worktrees.
 Cross-platform results must be reported for the exact tested revision.
 
 ## 7. Result store

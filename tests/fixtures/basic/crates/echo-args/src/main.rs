@@ -34,7 +34,10 @@
 //! `ECHO_VERSION_LOG` naming a file, it first appends the request there as a
 //! line, so a test can count how often a tool was asked.
 //! With `ECHO_VERSION` set, metadata requests describe the nearest manifest's
-//! workspace with no dependency packages, without starting or waiting.
+//! workspace with no dependency packages, without starting or waiting unless
+//! `ECHO_METADATA_WAIT_FOR` explicitly gates just that query. With
+//! `ECHO_METADATA_PID` it first records its pid; after the gate it reads
+//! `ECHO_METADATA_SOURCE` into `ECHO_METADATA_READ`, before emitting JSON.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -44,6 +47,22 @@ fn main() {
     // A fake toolchain describes no dependencies. Metadata is an inquiry,
     // like a version request: it neither starts a run nor waits on its gate.
     if std::env::var_os("ECHO_VERSION").is_some() && args.iter().any(|arg| arg == "metadata") {
+        if let Some(path) = std::env::var_os("ECHO_METADATA_PID") {
+            std::fs::write(path, std::process::id().to_string()).expect("metadata pid");
+        }
+        if let Some(gate) = std::env::var_os("ECHO_METADATA_WAIT_FOR") {
+            wait_for(Path::new(&gate));
+        }
+        if let Some(source) = std::env::var_os("ECHO_METADATA_SOURCE") {
+            let result = match std::fs::read(source) {
+                Ok(bytes) => format!("READ_OK:{}", String::from_utf8_lossy(&bytes)),
+                Err(error) => format!("READ_FAILED:{:?}:{error}", error.kind()),
+            };
+            // The daemon may have died, closing the JSON pipe. Persist the
+            // late read before trying to print into that pipe.
+            std::fs::write(std::env::var_os("ECHO_METADATA_READ").expect("read report"), result)
+                .expect("metadata read report");
+        }
         if args.iter().any(|arg| arg == "--all-features") {
             if let Some(path) = std::env::var_os("ECHO_SOURCE_METADATA_LOG") {
                 use std::io::Write;

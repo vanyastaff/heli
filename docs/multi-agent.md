@@ -92,6 +92,9 @@ required; legacy `config` and unsafe private homes are refused. Review the
 documented tool/source-override limits before opting in. See the
 [real Heli/FLUI workload and its verification limits](research/real-dependency-epochs.md)
 and [package objects with cheap NTFS epoch views](research/package-epoch-views.md).
+The [production dependency canary](../experiments/dependency-epoch-concurrency.py)
+reproduces three concurrent consumers across two projects and two Git worktrees,
+with a held baseline package-cache lock and source GC between consumer exits.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)

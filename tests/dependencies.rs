@@ -231,6 +231,25 @@ fn independent_homes_and_live_epoch_survive_collection_of_another_epoch() {
             "concurrent isolated Cargo test",
         );
     }
+    // Discovery's captured stdout must remain raw Cargo JSON. A guardian
+    // handshake prefix would silently disable target registration.
+    let status = fixture.status();
+    for index in 0..2 {
+        let expected =
+            std::fs::canonicalize(fixture.path(&format!("consumer-{index}/target"))).unwrap();
+        assert!(
+            status["disk"]["targets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    std::fs::canonicalize(entry["path"].as_str().unwrap_or_default()).ok()
+                        == Some(expected.clone())
+                }),
+            "metadata discovery did not register {}: {status}",
+            expected.display()
+        );
+    }
     assert!(
         control.try_wait().unwrap().is_none(),
         "control lock was released during the isolated workload"
@@ -501,4 +520,307 @@ fn selecting_a_retiring_epoch_fails_promptly_instead_of_waiting_for_gc() {
         String::from_utf8_lossy(&output.stderr).contains("retired"),
         "{output:?}"
     );
+}
+
+/// Cargo must notice a different immutable source path even when package
+/// version, archive checksum, Cargo.lock and the target directory stay fixed.
+#[test]
+fn switching_epochs_rebuilds_the_same_locked_consumer_in_the_same_target() {
+    let fixture = Fixture::new("basic");
+    let store = fixture.path("dependency-store");
+    let first_source = vendor(&fixture, 7);
+    let second_source = vendor(&fixture, 8);
+    let checksum = |source: &(PathBuf, PathBuf)| -> serde_json::Value {
+        serde_json::from_slice(
+            &std::fs::read(source.0.join("heli-epoch-dep/.cargo-checksum.json")).unwrap(),
+        )
+        .unwrap()
+    };
+    let first_checksum = checksum(&first_source);
+    let second_checksum = checksum(&second_source);
+    assert_eq!(first_checksum["package"], second_checksum["package"]);
+    assert_eq!(
+        first_checksum["files"]["Cargo.toml"],
+        second_checksum["files"]["Cargo.toml"]
+    );
+    assert_ne!(
+        first_checksum["files"]["src/lib.rs"],
+        second_checksum["files"]["src/lib.rs"]
+    );
+    let first = import(&fixture, &store, &first_source);
+    let second = import(&fixture, &store, &second_source);
+    assert_ne!(first, second);
+    // Keep both source views available throughout the switch. Rebuilding
+    // must follow source selection, not disappearance of a previous input.
+    let _leases: Vec<File> = [&first, &second]
+        .into_iter()
+        .map(|epoch| {
+            let lease = File::options()
+                .read(true)
+                .write(true)
+                .open(
+                    store
+                        .join("leases")
+                        .join(epoch.file_name().unwrap())
+                        .join(".heli-runtime.lock"),
+                )
+                .unwrap();
+            lease.lock_shared().unwrap();
+            lease
+        })
+        .collect();
+    let original = fixture.path("original/.cargo");
+    std::fs::create_dir_all(&original).unwrap();
+    let workspace = fixture.path("consumer");
+    project(&workspace);
+    // This consumer observes the linked value at runtime without the
+    // separate lifetime-canary build script used by the other tests.
+    std::fs::remove_file(workspace.join("build.rs")).unwrap();
+    write(
+        &workspace.join("src/main.rs"),
+        "fn main() { println!(\"epoch-value={}\", epoch_consumer::value()); }\n",
+    );
+    let target = workspace.join("target");
+    let selected = |epoch: &Path| {
+        let mut command = fixture.heli(["--dependency-epoch"]);
+        command
+            .arg(epoch)
+            .args(["--output", "full", "--cache", "off"])
+            .current_dir(&workspace)
+            .env("CARGO_HOME", &original)
+            .env("CARGO_TARGET_DIR", &target);
+        command
+    };
+    let output = selected(&first)
+        .args(["generate-lockfile", "--offline"])
+        .output()
+        .unwrap();
+    assert_success(&output, "generate the shared lockfile once");
+    let lock = std::fs::read(workspace.join("Cargo.lock")).unwrap();
+    for (epoch, value) in [(&first, 7), (&second, 8), (&first, 7)] {
+        let output = selected(epoch)
+            .args(["run", "--offline", "--locked", "--quiet"])
+            .output()
+            .unwrap();
+        assert_success(
+            &output,
+            "run the same locked consumer after selecting an epoch",
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            format!("epoch-value={value}"),
+            "selected epoch {}: {output:?}",
+            epoch.display()
+        );
+        assert!(target.is_dir());
+        assert_eq!(std::fs::read(workspace.join("Cargo.lock")).unwrap(), lock);
+        let report = gc(&fixture, &store);
+        assert!(
+            first.is_dir() && second.is_dir(),
+            "source views disappeared: {report}"
+        );
+        assert_eq!(
+            report["busy_epochs"].as_array().unwrap().len(),
+            2,
+            "{report}"
+        );
+        assert!(
+            report["retired_epochs"].as_array().unwrap().is_empty(),
+            "{report}"
+        );
+    }
+}
+
+#[test]
+fn orphaned_metadata_keeps_sources_after_the_run_and_daemon_have_ended() {
+    let fixture = Fixture::new("basic");
+    let store = fixture.path("metadata-sources");
+    let selected = import(&fixture, &store, &vendor(&fixture, 7));
+    let echo = fixture.echo_args();
+    let cargo = fixture.path(&format!("tools/cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    std::fs::copy(echo, &cargo).unwrap();
+    let versions = fixture.path("versions");
+    write(&versions.join("cargo"), "cargo 1.99.0 (metadata-fixture)\n");
+    let workspace = fixture.path("metadata-consumer");
+    project(&workspace);
+    let ready = fixture.path("metadata-pid");
+    let release = fixture.path("metadata-release");
+    let read = fixture.path("metadata-read");
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let mut child = fixture
+        .heli(["--dependency-epoch"])
+        .arg(&selected)
+        .args(["--output", "full", "--cache", "off", "check", "--offline"])
+        .current_dir(&workspace)
+        .env("CARGO", &cargo)
+        .env("CARGO_HOME", fixture.path("original/.cargo"))
+        .env("ECHO_VERSION", &versions)
+        .env("ECHO_METADATA_PID", &ready)
+        .env("ECHO_METADATA_WAIT_FOR", &release)
+        .env(
+            "ECHO_METADATA_SOURCE",
+            selected.join("vendor/heli-epoch-dep/src/lib.rs"),
+        )
+        .env("ECHO_METADATA_READ", &read)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_file(&ready, &mut child);
+    let metadata: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    // The real command and its guardian must end first. The client's
+    // bounded learning wait expires while the separate metadata stays gated.
+    let until = Instant::now() + Duration::from_secs(35);
+    while child.try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < until,
+            "completed command still waits for metadata"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output, "the foreground command ends before discovery");
+    assert!(support::process_runs(metadata));
+    assert!(!read.exists());
+    let report = gc(&fixture, &store);
+    assert!(
+        selected.exists(),
+        "live daemon must retain discovery inputs: {report}"
+    );
+    let daemon = fixture.daemon_pid().expect("this fixture's daemon");
+    support::kill_process(daemon);
+    while support::process_runs(daemon) {
+        assert!(Instant::now() < until, "fixture daemon did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        support::process_runs(metadata),
+        "the metadata consumer must survive"
+    );
+    let report = gc(&fixture, &store);
+    assert!(
+        selected.exists(),
+        "GC retired a live orphan's inputs: {report}"
+    );
+    assert_eq!(
+        report["busy_epochs"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    write(&release, "go");
+    while !read.exists() {
+        assert!(
+            Instant::now() < until,
+            "orphan metadata never reported its late read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&read).unwrap(),
+        "READ_OK:pub const VALUE: u32 = 7;\n"
+    );
+    while selected.exists() {
+        let report = gc(&fixture, &store);
+        assert!(
+            Instant::now() < until,
+            "completed metadata retained its epoch: {report}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A post-checkout hook inherits the selected context but bypasses client::run.
+/// Its discovery query must retain sources even after that hook process dies.
+#[test]
+fn inherited_epoch_protects_recycle_metadata_after_its_parent_is_killed() {
+    let fixture = Fixture::new("basic");
+    let store = fixture.path("metadata-sources");
+    let selected = import(&fixture, &store, &vendor(&fixture, 7));
+    let echo = fixture.echo_args();
+    let cargo = fixture.path(&format!("tools/cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::create_dir_all(cargo.parent().unwrap()).unwrap();
+    std::fs::copy(echo, &cargo).unwrap();
+    let versions = fixture.path("versions");
+    write(&versions.join("cargo"), "cargo 1.99.0 (metadata-fixture)\n");
+    let workspace = fixture.path("hook-consumer");
+    project(&workspace);
+    // Like the recycling fixtures, provide an orphan of this repository.
+    // Without one the hook correctly avoids starting Cargo metadata at all.
+    let artifacts = fixture.path("artifacts");
+    fixture.configure(&format!("[store]\npaths=[{}]\n", quoted(&artifacts)));
+    let owner = serde_json::json!({
+        "workspace": fixture.path("removed-worktree"),
+        "repository": workspace.join(".git"),
+        "created_at": 1,
+        "last_run": 1,
+    });
+    write(&artifacts.join("aa/bbbb/.heli/owner"), owner.to_string());
+    // Reproduce the environment inherited by a hook in an isolated run.
+    // There is deliberately no --dependency-epoch client preparation here.
+    let home = fixture.path("inherited-home");
+    write(
+        &home.join("config.toml"),
+        format!("include=[{}]\n", quoted(&selected.join("config.toml"))),
+    );
+    let ready = fixture.path("metadata-pid");
+    let release = fixture.path("metadata-release");
+    let read = fixture.path("metadata-read");
+    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let mut child = fixture
+        .heli(["recycle"])
+        .current_dir(&workspace)
+        .env("CARGO", &cargo)
+        .env("CARGO_HOME", &home)
+        .env("HELI_DEPENDENCY_EPOCH", &selected)
+        .env("ECHO_VERSION", &versions)
+        .env("ECHO_METADATA_PID", &ready)
+        .env("ECHO_METADATA_WAIT_FOR", &release)
+        .env(
+            "ECHO_METADATA_SOURCE",
+            selected.join("vendor/heli-epoch-dep/src/lib.rs"),
+        )
+        .env("ECHO_METADATA_READ", &read)
+        .stdout(Stdio::null())
+        .stderr(File::create(fixture.path("stderr")).unwrap())
+        .spawn()
+        .unwrap();
+    wait_file(&ready, &mut child);
+    let metadata: u32 = std::fs::read_to_string(&ready).unwrap().parse().unwrap();
+    // Kill only the direct hook parent, leaving the independent query alive.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(support::process_runs(metadata));
+    let report = gc(&fixture, &store);
+    assert!(
+        selected.is_dir(),
+        "orphan hook metadata lost its sources: {report}"
+    );
+    assert_eq!(
+        report["busy_epochs"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+    assert!(support::process_runs(metadata));
+    write(&release, "go");
+    let until = Instant::now() + Duration::from_secs(40);
+    while !read.is_file() {
+        assert!(
+            Instant::now() < until,
+            "hook metadata never completed its late read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&read).unwrap(),
+        "READ_OK:pub const VALUE: u32 = 7;\n"
+    );
+    while selected.exists() {
+        let report = gc(&fixture, &store);
+        assert!(
+            Instant::now() < until,
+            "completed hook metadata retained its sources: {report}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
