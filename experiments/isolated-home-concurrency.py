@@ -256,7 +256,7 @@ class Experiment:
         flags = [self.heli, "--cache", "off", "--output", "full"]
         if mode is not None:
             flags += ["--cargo-home", mode]
-        return flags + ["exec", "--"] + self.cargo_args(manifest, offline)
+        return flags + ["exec", "--verify", "--"] + self.cargo_args(manifest, offline)
 
     def report(self, name):
         text = (self.root / name).read_text(encoding="utf-8")

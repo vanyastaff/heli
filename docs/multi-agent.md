@@ -123,14 +123,15 @@ The [2026-10-16 acceptance report](research/shared-verification-acceptance.md)
 records real Cargo same-worktree counters and the matched FLUI comparison
 against both stock xtask and its lock-disabled control, including limits.
 
-A project's own machine-wide queue also needs integration. As checked on
-2026-10-16, FLUI main still has a common per-user host lock in
-`tools/xtask/src/host_lock.rs`.
-[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) adds a bypass
-when heli supplies a nonempty `HELI_RUN`, retaining standalone protection;
-the PR was open and unmerged. Check the consumer revision before relying
-on that handshake. Bare Cargo inheriting the host jobserver does not supply
-it. Do not export `HELI_RUN` manually or globally disable project locks.
+A project's own machine-wide queue also needs integration.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683), merged on
+2026-10-16, bypasses its host lock when heli supplies a nonempty `HELI_RUN`,
+retaining standalone protection.
+[FLUI PR #1684](https://github.com/vanyastaff/flui/pull/1684) also preserves
+xtask's verified-result cache across managed run IDs. Check the consumer
+revision before relying on that handshake. Bare Cargo inheriting the host
+jobserver does not supply it. Do not export `HELI_RUN` manually or globally
+disable project locks.
 
 GC protects the whole lifetime of managed commands, including runtime tests
 reading `OUT_DIR` after Cargo releases its build locks. Compatible shared

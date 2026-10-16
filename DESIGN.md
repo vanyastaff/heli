@@ -1952,7 +1952,9 @@ flags. Each worktree owns its mutable registry, index, extracted sources and
 git cache. None are links to another worktree's or the original home's
 mutable cache. Concurrent cold worktrees may download the same crate twice;
 avoiding their mutual package-cache lock takes priority over storage savings.
-There is no global preparation queue or blocking cross-worktree singleflight.
+Home preparation does not wait for another worktree to download its
+dependencies. Live verification sharing still follows the complete input-key
+policy in §5.
 
 The secure publication mechanism in §6.5 also applies without an epoch:
 original home configuration is included at home precedence with its relative
@@ -2013,6 +2015,38 @@ nested resolution, offline behavior and optional authenticated access through
 Cargo's token provider. Native Windows runs pass; cross-platform verification
 must be reported for the exact tested revision. This is not a completion
 claim for #38 or the overall multi-agent acceptance.
+
+**Isolation and live-sharing integration, 2026-10-16.** The native-home
+profile is integrated with the source-aware live policy from §5. Home
+selection happens before submission and inventory uses the selected home.
+The generated home's location alone does not prevent equivalent verification
+from sharing; its Cargo configuration and all other keyed inputs still count.
+Incomplete offline source discovery disables sharing rather than certifying
+an unknown dependency graph.
+
+Public real-Cargo tests in `tests/single_flight.rs` cover both shared and
+isolated modes: two same-worktree test clients execute one test process,
+then a source edit executes the new revision after the old executable exits.
+Both direct tests and `exec --verify` wrappers exercise that transition.
+Equivalent checks can share across isolated worktrees with result caching
+off, while builds in another worktree or output directory produce their own
+actual `.rlib` files. No persistent verdict marker is created by those runs.
+
+The native-home registry experiment now uses `exec --verify`, exercising
+source-key preparation as well as isolation. Local Windows integration
+runs pass its ten unauthenticated and thirteen authenticated checks: B
+finishes with real compiler output while both A's download and a shared-home
+control remain blocked; nested resolution retains B's home; original
+configuration, credentials and lockfile bytes remain unchanged. These are
+mechanism checks, not a throughput comparison or a hard disk bound. They do
+not remove Cargo's artifact lock for distinct commands sharing one target,
+the nested-run admission bypass, or the need for separate worktrees for
+independent editors.
+
+The integrated Windows revision passes the full 419-test suite across 38
+targets, strict all-target Clippy and formatting. Five acceptance-driver
+safety tests also pass. Cross-platform results must refer to the integrated
+revision, rather than the earlier private-home or live-sharing CI alone.
 
 ## 7. Result store
 
