@@ -158,7 +158,11 @@ sources to preserve the original content. Checksums are not a security defense
 against deliberate modification.
 [Cargo source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
 
-## Proposed production protocol, still unimplemented
+## Protocol proposed by the original experiment
+
+The following proposal describes the original experiment's next steps. The
+explicit production integration below now implements its core ownership
+protocol; the remaining compatibility and capacity work is still open.
 
 1. Build a package object under a private staging name, validate its complete
    inventory and Cargo checksum metadata, then publish the immutable object.
@@ -221,7 +225,50 @@ Windows. The authoritative POSIX evidence is successful Linux/macOS CI jobs for
 the reviewed commit; portable source code and a declared matrix alone are not
 cross-platform evidence.
 
-The narrow conclusion is that package-granular shared immutable sources with
-cheap NTFS junction views are technically viable on this host. The next
-engineering problem is ownership/publication and garbage collection, rather
-than copying a full vendor tree for each dependency epoch.
+The narrow conclusion of the original experiment was that package-granular
+shared immutable sources with cheap NTFS junction views are technically viable
+on this host. The next section tests their production ownership and GC path.
+
+## Explicit production integration
+
+Heli now exposes `deps import`, `--dependency-epoch` on ordinary managed
+commands, and `deps gc`; see [DESIGN §6.5](../../DESIGN.md#65-immutable-dependency-epochs-opt-in-integration).
+The separate [production canary](../../experiments/dependency-epoch-concurrency.py)
+uses those commands rather than constructing or retiring views itself:
+
+```powershell
+python experiments/dependency-epoch-concurrency.py `
+  --tool E:/heli/target/debug/cargo-heli.exe `
+  --vendor E:/prepared-vendor `
+  --lab E:/heli/target/dependency-concurrency-NEW-ID
+```
+
+Supply an already built binary and a vendor directory containing exactly
+`itoa` 1.0.18 and `ryu` 1.0.23, for example the `prepared-vendor` output of the
+earlier harness's `--prepare-vendor` mode. The lab must be a fresh absolute
+path. The canary records tool SHA-256, Cargo version/commit, Git version and
+generated project commits, JSON results and command logs. It creates two clean
+Git worktrees of one project and a separate second project, each with its own
+writable home, target and intermediate directory, under one isolated daemon.
+
+Native Windows runs at Heli `8fa21cd5e789f91881d3f23e7a8be5b06a952a9d`
+passed both the initial and portable harness. Portable evidence root:
+`target/dependency-integration/shared-worktrees-portable-8fa21cd/`.
+
+| Observation | Result |
+|---|---|
+| Held original-home package-cache lock | Ordinary Cargo logs a lock wait and remains blocked throughout the managed workload |
+| Three managed Cargo consumers | All enter their build-script gates before any gate is released; distinct private homes |
+| Shared package object | Both epoch views expose the same itoa volume/file identity |
+| GC with all consumers gated | Both epochs busy; no object removed |
+| Release only consumer A | Its epoch is collected while B/C remain gated; their two package objects survive |
+| Release B/C afterward | Delayed source reads succeed, both test commands exit zero |
+| Final idle source GC | Unleased epochs and package objects are reclaimed |
+| Original input and cleanup | Vendor byte inventory unchanged; clean worktrees retired through Git; only the isolated daemon stopped |
+
+The unique package payload is 238,924 logical bytes. Each private home in the
+initial run occupies 58,246 logical bytes. Summing view paths double-counts
+shared packages; these are not physical-allocation or host-total measurements.
+Private homes remain after source GC. This is a small production-path canary,
+not a new full FLUI gate, arbitrary tool compatibility proof or disk/RAM bound.
+Automatic publication/selection and capacity policy remain required work.

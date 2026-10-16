@@ -1,6 +1,6 @@
 # heli: one machine, many agents, one cargo budget
 
-Status: design draft, updated 2026-10-15. "heli" is a working name.
+Status: design draft, updated 2026-10-16. "heli" is a working name.
 
 This document is the single source of truth for heli's mechanisms and
 contracts. Issue #1 states the problem, the user stories and the testing
@@ -52,6 +52,11 @@ None of the cargo issues that would fix this is close to landing as a whole
 ## 2. Goals and non-goals
 
 Goals:
+
+The current acceptance priority is independent progress across projects and
+worktrees. Disk and RAM caps are secondary to that goal. Their safety
+contracts still apply, but an experiment showing concurrency does not by
+itself establish a need for disk optimization or prove a resource bound.
 
 - **G1, no head-of-line blocking.** A run starts compiling at once, with at
   least one job, whatever else runs. The only places a run can wait at all are
@@ -165,7 +170,8 @@ Windows host), and until then it would hold its endpoint, where a client
 would connect and get no answer, and the lock, which a new daemon needs.
 An older client asks
 nothing, so two installed versions never take turns retiring each other's
-daemon. The version stays 1 until the first release: until then a daemon
+daemon. The current protocol is 2: a dependency-epoch request must never be
+accepted by an old daemon that ignores its optional ownership field. A daemon
 answers a request it does not know (one a newer client added, such as `log`)
 with "unsupported", and the client treats that like a mismatch from an older
 daemon. It asks the daemon to retire and does without it, after one warning
@@ -246,7 +252,7 @@ lock or for recycling, §5): a client that loses the daemon in between runs
 the command itself, after one warning line, since the command never
 started. Once the daemon has said the command started, the client never
 runs it itself: if the daemon is lost then, it exits 1. A client asks for
-the second message in its run request (protocol version 1 still), and a
+the second message in its run request, and a
 daemon older than it says in its first that none follows: with one, the
 run counts as started once accepted, as before.
 
@@ -1476,6 +1482,14 @@ Safety rules:
   unavailable interlock conservatively prevents proving idle. Failure to
   acquire a run's guard refuses that managed command rather than executing
   it without runtime protection (the narrow G5 exception above).
+  A daemon-owned runtime guard releases its file before requesting another
+  accounting/GC pass on every exit path. The request is retained under the
+  accountant's condition-variable mutex, so an idle transition cannot be lost
+  before the accountant starts waiting. This also covers `exec`, which has no
+  Cargo learning worker. Shared activity still prevents eviction while another
+  managed command runs. Activity released only by another daemon, a surviving
+  command guardian or an external participant is observed by the existing
+  periodic survey; this local notification is not a cross-process broadcast.
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
   directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
   directory) exclusively, in every profile directory of the victim's
@@ -1773,6 +1787,112 @@ worktree git cannot stage gets no recycled directory.
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
 A *live* worktree can then donate, forking a warm build directory. The same
 rules apply.
+
+### 6.5 Immutable dependency epochs (opt-in integration)
+
+Separate worktrees and artifact directories do not remove Cargo's shared
+package-cache lock. The experiments linked in `docs/multi-agent.md` verified
+private writable Cargo homes consuming shared immutable vendor sources. This
+ownership model is now available explicitly, through ordinary managed runs:
+
+```text
+cargo heli deps import --store <absolute-new-store> --vendor <vendor-tree> --config <cargo-vendor-output.toml>
+cargo heli --dependency-epoch <printed-epoch-path> --cache off check --offline
+cargo heli --dependency-epoch <printed-epoch-path> test --offline
+cargo heli deps gc --store <absolute-owned-store>
+```
+
+Import accepts the source-only replacement TOML emitted by `cargo vendor` and
+one supplied directory source. It verifies the complete file inventory and
+each Cargo file checksum before and after copying. Original archive checksums
+are preserved for Cargo's lockfile verification; extracted files alone cannot
+authenticate the original archive. Unsupported configuration, links within
+input packages and path escapes are refused. Existing unknown directories
+are never adopted as managed stores.
+Informational checksum-envelope fields such as Cargo's `$comment` are
+accepted, as Cargo accepts them; the raw checksum file remains part of the
+object identity and the actual file inventory is still verified strictly.
+
+The store holds package objects by content identity. Epochs contain source
+configuration, a manifest and cheap views of those objects: NTFS junctions on
+Windows and directory symlinks on Unix. Different epochs can reference the
+same physical object. A complete staged epoch becomes visible by rename;
+partially published or corrupt state is refused, rather than executed.
+This is atomic visibility, not a claim of durability through arbitrary
+power loss. Objects include names, bytes, empty directories and executable
+bits in their identity. Opening an epoch verifies the stored bytes as well
+as its manifest, configuration and link targets.
+
+Each epoch has an external shared lifetime lease. It is acquired before
+reading its manifest, including before result lookup and metadata discovery.
+The daemon holds ownership across queueing, build/test phases and final
+keying; asynchronous metadata learning owns a separate lease. Each selected
+epoch's Cargo metadata subprocess also runs under an independent guardian:
+a daemon-thread lease alone cannot protect an orphaned metadata child after
+the daemon dies. Hooks and daemon maintenance queries preserve a nonempty
+inherited epoch selector too; they must not lose ownership merely because
+they bypass normal client preparation. Discovery capture preserves raw Cargo
+JSON without a runner handshake prefix. The command's
+guardian acquires and validates ownership before spawning Cargo, retaining
+it after client or daemon loss. Direct fallback uses a separate guardian
+too, preserves the prepared execution context and raw stdio, and never
+falls back to the original shared Cargo home. Invalid snapshots are terminal
+errors. Protocol 2 prevents silent execution by a daemon that does not honor
+this contract. A `Preparing` response acknowledges a live daemon before
+potentially expensive validation, without treating validation as a failed
+five-second connection handshake.
+
+Explicit dependency GC tries exclusive epoch leases without waiting for
+builds. It may retire an unleased epoch while another epoch remains active;
+all objects referenced by retained epochs stay live. Publication and GC
+serialize catalog mutations. Staging and GC's object verification happen
+outside that critical section; ready readers do not acquire the catalog
+lock. Duplicate import currently re-verifies reused objects under the catalog
+lock, so concurrent publishers can wait there; active ready consumers do not.
+Selecting an epoch already being retired fails promptly rather than waiting
+for its trash deletion; callers can select a ready epoch or retry publication.
+Epoch lease files are never unlinked, avoiding split-lock identities after
+retirement and republication. Trash deletion does not follow package links.
+This source lifecycle does not weaken the conservative global runtime guard
+used for arbitrary build artifacts in §6.3.
+
+The invoking client prepares a stable private Cargo home for its worktree,
+epoch and original configuration/credential inputs. It publishes rather
+than rewriting an existing home. Cargo 1.99 or newer is required. Original
+`config.toml` is included at home precedence with its original path origin;
+workspace and CLI overrides retain their native higher precedence. The
+original config remains a live file, as in ordinary Cargo. Credentials are
+copied privately outside shared objects: Unix owner-only modes and Windows
+protected owner-only ACLs are established before bytes are written. An
+unsafe existing private home is refused. Nested Heli retains the selected
+home and epoch instead of building recursive include chains. Cargo,
+toolchain and wrapper selection retain the caller's PATH order; the original
+home's bin directory is appended only when absent.
+
+This is an explicit integration milestone, not the complete automatic
+isolation policy. Automatic dependency preparation/selection, capacity
+accounting for sources/staging/private homes/lease metadata and automatic
+private-home reclamation remain required work. Legacy home `config` is
+explicitly refused because Cargo includes require `.toml`; copying it would
+change relative-path semantics. Arbitrary cargo extensions, competing
+home-bin/PATH extension precedence and tools mutating the Cargo home need
+the tool profiles tracked in #38. Native workspace/CLI source overrides can
+select sources outside an epoch; this feature does not claim to lease those
+external directories. The existing artifact budget does not yet include
+this opt-in dependency store. No hard disk or RAM bound follows from enabling
+the profile alone.
+
+Public acceptance cases are in `tests/dependencies.rs`: two live Cargo
+builds under a held baseline package-cache lock; collecting an unrelated
+epoch during those builds; delayed source reads after client/daemon loss
+and during direct fallback; original config origins/precedence and private
+credentials; and refusal of corrupted source objects before execution.
+They also keep a gated metadata child alive after the foreground command and
+daemon end, and switch source values 7 → 8 → 7 with one unchanged lockfile and
+target while retaining both source views. The production concurrency canary
+in `experiments/dependency-epoch-concurrency.py` exercises shared-object GC
+between exits of three consumers across two projects and two Git worktrees.
+Cross-platform results must be reported for the exact tested revision.
 
 ## 7. Result store
 
@@ -2086,6 +2206,65 @@ test survives. This strengthens runtime safety but conservatively defers GC
 until managed activity is idle (§6.3); continuous load has no hard disk cap.
 Exact refs, binary hash, overlapping intervals and cleanup evidence are in
 the research report. Q2 remains repository opt-in, with per-workspace paths.
+
+**FLUI controls, 2026-10-16.** Windows FLUI `70c6a45` through frozen heli
+`3b0a26b` used manually prepared shared vendor sources and private Cargo
+homes, with separate artifacts per worktree. This was not automatic
+production epoch preparation. Of eight original concurrent clients, both
+fmt, clippy and check commands exited 0. A telemetry filesystem TOCTOU
+cancelled the two tests; both resumed full workspace tests later exited 101.
+The observed `flui-material` `failure_cases.rs` test hardcodes its readiness
+marker under the checkout's `target/`. The exact same binary failed 101
+without heli; creating only the missing marker parent made that individual
+native test exit 0. This establishes a consumer fixture path assumption, not
+a heli collision or a successful full-suite rerun.
+
+Managed-build GC acceptance for this lab is **invalid setup**: explicit
+`build/a` and `build/b` do not have the required
+`<store>/<2 hex digits>/<hex digits>` layout. GC was enabled but did not
+own or enumerate the measured 43.1 GB of build trees. Their non-collection
+does not establish a managed-store GC defect or a passed disk acceptance.
+
+A separate small `flui-foundation check --lib --offline --locked` control
+used fresh artifacts, identical manual isolation and `-j 4` in both modes,
+in native/heli then heli/native order. Native pairs took 21.498/17.009 s;
+heli pairs took 18.422/17.133 s. All eight commands exited 0, with actual
+compiler overlap in every pair. A separate ordinary native pair with one
+fresh shared lab Cargo home and default jobs also overlapped and exited 0
+in 13.036 s; each reported one package-cache wait. Different jobs preclude
+a strict ratio with that pair. Manual isolation gets no credit as heli
+behavior; these controls establish no full-suite ratio or general speedup.
+
+**Real download contention, 2026-10-16.** The public CLI fixture
+`experiments/real-download-hol.py` uses a localhost sparse registry and real
+Cargo downloads, without an artificial cache-lock holder. While A waits for
+an HTTP archive response, B has all its dependencies cached and runs
+`check --offline --locked` with fresh artifacts. With a shared home, B
+reports a package-cache lock wait and makes no build-script progress until
+the response is released. Both an ordinary private home with actual
+`cargo vendor` source configuration and Heli's imported dependency epoch
+let B finish while A's response remains gated. Native Windows evidence is
+in `target/real-hol-public-1016-0339/results.json`; all commands succeeded
+and B's lockfile remained unchanged. This establishes a real Cargo
+head-of-line blocking case and the benefit of source isolation, not a
+unique Heli mechanism or a throughput speedup. Heli still requires explicit
+preparation and selection; automatic safe setup remains unfinished. The
+dependency experiment workflow repeats this public fixture on three OSes.
+
+The FLUI marker fixture repair is published in PR #1683 at `8c48ac7a3`:
+runtime scratch now uses a unique temporary path rather than assuming a
+checkout-local `target/`. The same public test is red before and green
+after the change with relocated Cargo outputs. All four library tests and
+the 14-test changed-scope gate through Heli passed locally. This is scoped
+repair evidence, not a successful rerun of both full concurrent suites.
+
+FLUI main still had a common per-user host lock in
+`tools/xtask/src/host_lock.rs` when checked on this date.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683), containing the
+heli integration, was open and unmerged. Direct Cargo runs do not exercise
+that xtask queue. Local evidence is in
+`target/flui-two-3b0a26b-current/REPORT.md`, its `final-summary.json`, and
+`matched-control-20261016T081315547457Z/results.json` beneath that lab.
 
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned

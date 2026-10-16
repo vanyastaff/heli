@@ -35,6 +35,8 @@ mod client;
 mod clock;
 mod config;
 mod daemon;
+mod dependencies;
+mod dependency_home;
 mod direct;
 mod environment;
 mod gc;
@@ -70,8 +72,14 @@ fn main() {
     let depth = nesting::current();
     // This is an implementation process of an existing run, not another
     // nested heli invocation. It must work even at the nesting limit.
-    if let cli::Action::LeaseRun { roots, command } = action {
-        store::runner::main(&roots, &command);
+    if let cli::Action::LeaseRun {
+        roots,
+        command,
+        dependency_epoch,
+        direct,
+    } = action
+    {
+        store::runner::main(&roots, &command, dependency_epoch.as_deref(), direct);
     }
     if depth >= nesting::MAX {
         eprintln!(
@@ -89,6 +97,24 @@ fn main() {
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),
         cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
+        cli::Action::Dependencies(command) => {
+            let result = match command {
+                cli::DependencyCommand::Import {
+                    store,
+                    vendor,
+                    config,
+                } => dependencies::import(&store, &vendor, &config).map(|path| {
+                    println!("{}", path.display());
+                }),
+                cli::DependencyCommand::Gc { store } => dependencies::gc(&store).map(|report| {
+                    println!("{report}");
+                }),
+            };
+            if let Err(reason) = result {
+                eprintln!("cargo-heli: {reason}");
+                std::process::exit(REFUSED);
+            }
+        }
         cli::Action::Recycle => recycle::main(),
         cli::Action::Daemon { detach: false } => daemon::main(),
         cli::Action::Daemon { detach: true } => launch::detach(depth),

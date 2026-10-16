@@ -416,6 +416,30 @@ impl Daemon {
     /// test run: the same key, from any worktree).
     fn run(&self, mut stream: Stream, request: RunRequest) {
         let (serving, retiring) = self.serving();
+        if request.dependency_epoch.is_some()
+            && request.reads_spawned
+            && protocol::write_message(&mut stream, &Reply::Preparing).is_err()
+        {
+            return;
+        }
+        // Own the immutable inputs before result lookup or metadata probes.
+        // Keep ownership through queueing, learning and the final key reread.
+        let epoch = match request.dependency_epoch.as_ref() {
+            Some(path) => match crate::dependencies::Epoch::open(Path::new(&path.0)) {
+                Ok(epoch) => Some(epoch),
+                Err(message) => {
+                    let _ = protocol::write_message(
+                        &mut stream,
+                        &Reply::SpawnFailed {
+                            not_found: false,
+                            message: format!("cannot use dependency epoch: {message}"),
+                        },
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
         // Before the run waits for anything: its key, which a pass may hold
         // already, and which finds the same run in flight.
         let key = match self.results.before(&request) {
@@ -439,7 +463,16 @@ impl Daemon {
             // one just snapshotted.
             Admission::New { id, waits } => {
                 let key = key.filter(|_| !waits);
-                self.start(stream, &request, id, &worktree, key);
+                self.start(
+                    stream,
+                    Inputs {
+                        request: &request,
+                        epoch: epoch.as_ref(),
+                    },
+                    id,
+                    &worktree,
+                    key,
+                );
             }
             Admission::Attached(run) => self.attach(stream, &request, run),
             Admission::Refused(reason) => {
@@ -477,11 +510,12 @@ impl Daemon {
     fn start(
         &self,
         mut stream: Stream,
-        request: &RunRequest,
+        inputs: Inputs<'_>,
         id: RunId,
         worktree: &Path,
         known: Option<Key>,
     ) {
+        let request = inputs.request;
         let argv = request.argv();
         let admission = serde_json::json!({
             "worktree": worktree.to_string_lossy(),
@@ -507,13 +541,15 @@ impl Daemon {
         }
         // Kept until the run has ended (the scope below waits for it), when
         // its directories are counted again.
-        let learning = self.accounts.learn(request);
+        let learning = self
+            .accounts
+            .learn(request, inputs.epoch.map(|epoch| epoch.lease_root()));
         let _pin = self.runlog.pin(id);
         let live = Arc::new(Live::new(self.runlog.dir().to_path_buf(), id));
         self.registry.told(id, Arc::clone(&live));
         // The run goes on whether or not its client follows it to the end.
         std::thread::scope(|scope| {
-            scope.spawn(|| self.execute(id, request, &live, known, learning.as_ref()));
+            scope.spawn(|| self.execute(id, inputs, &live, known, learning.as_ref()));
             self.follow(id, &live, stream, reads(request));
         });
     }
@@ -525,18 +561,22 @@ impl Daemon {
     fn execute(
         &self,
         id: RunId,
-        request: &RunRequest,
+        inputs: Inputs<'_>,
         live: &Live,
         known: Option<Key>,
         learning: Option<&accounts::Learning>,
     ) {
+        let Inputs { request, epoch } = inputs;
         // Shared by all commands, including the gap between build and test
         // phases. A separate runner owns the same guard while each actual
         // child runs, so a daemon crash cannot expose its runtime assets.
         let activity =
             crate::store::lease::directory().and_then(|root| crate::store::lease::shared(&root));
         let _activity = match activity {
-            Ok(activity) => activity,
+            Ok(activity) => RuntimeActivity {
+                guard: Some(activity),
+                accounts: &self.accounts,
+            },
             Err(error) => {
                 self.registry.abandon(id);
                 live.end(Reply::SpawnFailed {
@@ -592,6 +632,7 @@ impl Daemon {
         }
         let mut run = Execution {
             request,
+            epoch,
             id,
             makeflags: &makeflags,
             live,
@@ -642,11 +683,15 @@ impl Daemon {
         run: &mut Execution<'_, '_>,
         argv: &[OsString],
     ) -> Result<(i32, Option<i32>), Reply> {
-        let roots = crate::store::lease::directory().map_err(|error| Reply::SpawnFailed {
+        let activity = crate::store::lease::directory().map_err(|error| Reply::SpawnFailed {
             not_found: false,
             message: error.to_string(),
         })?;
-        let (child, tree) = execute::spawn(run.request, argv, run.id, run.makeflags, &[roots])
+        let mut roots = vec![activity];
+        if let Some(epoch) = run.epoch {
+            roots.push(epoch.lease_root().to_path_buf());
+        }
+        let (child, tree) = execute::spawn(run.request, argv, run.id, run.makeflags, &roots)
             .map_err(|error| Reply::SpawnFailed {
                 not_found: error.kind() == std::io::ErrorKind::NotFound,
                 message: error.to_string(),
@@ -684,6 +729,7 @@ impl Daemon {
             self.registry.set_phase(run.id, Phase::Building);
             let mut phase = Execution {
                 request: &build,
+                epoch: run.epoch,
                 id: run.id,
                 makeflags: run.makeflags,
                 live: run.live,
@@ -823,9 +869,33 @@ impl Drop for Serving<'_> {
 /// The exit code clients of a run cancelled before it started exit with.
 const NEVER_STARTED: i32 = 1;
 
+/// Release protection before asking the accountant to retry, on every exit
+/// path, including cancellation, a reused verdict and a spawn failure.
+struct RuntimeActivity<'a> {
+    guard: Option<File>,
+    accounts: &'a accounts::Accounts,
+}
+
+impl Drop for RuntimeActivity<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.accounts.runtime_ended();
+    }
+}
+
 /// A run being executed: what it runs as, and where its output goes.
+#[derive(Clone, Copy)]
+struct Inputs<'a> {
+    request: &'a RunRequest,
+    /// The validated epoch, owned through the entire logical run.
+    epoch: Option<&'a crate::dependencies::Epoch>,
+}
+
+/// A phase of a run, sharing its immutable inputs.
 struct Execution<'a, 'r> {
     request: &'a RunRequest,
+    /// Also acquired by every phase's guardian before its child starts.
+    epoch: Option<&'a crate::dependencies::Epoch>,
     id: RunId,
     /// `CARGO_MAKEFLAGS` for its processes: its run pool.
     makeflags: &'a OsStr,

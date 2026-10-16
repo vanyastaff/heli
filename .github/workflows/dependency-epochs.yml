@@ -4,13 +4,23 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - experiments/package-epoch-views.py
+      - experiments/real-download-hol.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
   push:
     branches: [main]
     paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
       - experiments/package-epoch-views.py
+      - experiments/real-download-hol.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
 
@@ -34,6 +44,10 @@ jobs:
           python-version: '3.13'
       - name: Test shared package objects and active view retirement
         run: python experiments/package-epoch-views.py --prepare-vendor --toolchain stable --output "${{ runner.temp }}/heli-package-epoch-views"
+      - name: Build the public Heli CLI
+        run: cargo build --locked --bin cargo-heli
+      - name: Test progress during a real Cargo download
+        run: python experiments/real-download-hol.py --run --heli "${{ github.workspace }}/target/debug/cargo-heli${{ matrix.os == 'windows-latest' && '.exe' || '' }}" --output "${{ runner.temp }}/heli-real-download-hol"
       - name: Preserve experiment evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -45,3 +59,5 @@ jobs:
             ${{ runner.temp }}/heli-package-epoch-views/*.json
             ${{ runner.temp }}/heli-package-epoch-views/*.stdout
             ${{ runner.temp }}/heli-package-epoch-views/*.stderr
+            ${{ runner.temp }}/heli-real-download-hol/**/*.json
+            ${{ runner.temp }}/heli-real-download-hol/**/*.log

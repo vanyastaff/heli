@@ -87,6 +87,8 @@ struct Ledger {
     figures: BTreeMap<PathBuf, Figures>,
     /// Directories to scan again: their runs have ended.
     dirty: BTreeSet<PathBuf>,
+    /// A managed runtime ended after a pass may have deferred eviction.
+    gc_requested: bool,
 }
 
 struct Figures {
@@ -147,6 +149,16 @@ impl Accounts {
             .clone()
     }
 
+    /// Retry after releasing a managed runtime guard. Keep the request in
+    /// the wait predicate so a notification before wait cannot be lost.
+    pub(super) fn runtime_ended(&self) {
+        if !self.policy.active() {
+            return;
+        }
+        self.ledger().gc_requested = true;
+        self.wake.notify_all();
+    }
+
     /// The disk the store takes, as last counted.
     pub fn disk(&self) -> Disk {
         let ledger = self.ledger();
@@ -191,7 +203,11 @@ impl Accounts {
         loop {
             // Each run that ended is in `ended` once: after it ended, the
             // survey below sees every directory it built.
-            let ended = std::mem::take(&mut self.ledger().dirty);
+            let ended = {
+                let mut ledger = self.ledger();
+                ledger.gc_requested = false;
+                std::mem::take(&mut ledger.dirty)
+            };
             let registry = Registry::load(&self.state_dir);
             self.look(&registry, &mut looked);
             let dirs = store::survey(&self.config, &registry);
@@ -231,7 +247,7 @@ impl Accounts {
             // A run that ended during this pass, or an eviction, needs
             // another one at once.
             let ledger = self.ledger();
-            if ledger.dirty.is_empty() {
+            if ledger.dirty.is_empty() && !ledger.gc_requested {
                 let _waited = self
                     .wake
                     .wait_timeout(ledger, LOOK)

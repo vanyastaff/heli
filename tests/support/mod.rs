@@ -89,7 +89,7 @@ const ISOLATED_VARS: [&str; 12] = [
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
 /// configuration, or change what it prints.
-const HELI_VARS: [&str; 7] = [
+const HELI_VARS: [&str; 8] = [
     "HELI_STATE_DIR",
     "HELI_ENDPOINT",
     "HELI_DEPTH",
@@ -97,6 +97,7 @@ const HELI_VARS: [&str; 7] = [
     "HELI_CONFIG",
     "HELI_OUTPUT",
     "HELI_ACTIVITY_DIR",
+    "HELI_DEPENDENCY_EPOCH",
 ];
 
 /// Variables that locate the user's own configuration files, which
@@ -893,7 +894,12 @@ pub fn copy_program(from: &Path, to: &Path) {
 
 /// The `cargo-heli` binary under test.
 pub fn heli_binary() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_cargo-heli"))
+    // Cargo can retain a mixed-separator spelling from --target-dir in
+    // this compile-time variable. Match current_exe's native spelling in
+    // registration and protocol assertions without relocating any files.
+    Path::new(env!("CARGO_BIN_EXE_cargo-heli"))
+        .components()
+        .collect()
 }
 
 /// The cargo running the tests, else `cargo` on the search path.

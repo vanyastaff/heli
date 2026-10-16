@@ -75,6 +75,10 @@ impl Accounts {
         };
         let mut pass = evict::plan(&self.config, registry, now, false);
         evict::execute(&mut pass, now);
+        if pass.runtime_busy {
+            self.log
+                .write("eviction deferred: runtime activity interlock is busy or unavailable");
+        }
         for (victim, why) in &pass.skipped {
             self.log.write(&format!(
                 "did not evict {} (tier {}): {why}",

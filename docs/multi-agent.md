@@ -4,6 +4,10 @@ Use one writable worktree per agent. Keep its default checkout-local `target/`;
 do not export a single `CARGO_TARGET_DIR` shared by several worktrees. A shared
 host jobserver cannot remove Cargo's exclusive artifact-directory lock.
 
+The current priority is independent progress across projects and worktrees.
+Disk and RAM caps are secondary; preserve runtime safety without treating
+disk optimization as a demonstrated prerequisite for concurrency.
+
 Give intermediate artifacts a separate path per workspace. For a project on
 Windows drive D, its `.cargo/config.toml` can contain:
 
@@ -14,7 +18,11 @@ build-dir = 'D:\heli-cache\{workspace-path-hash}'
 
 The equivalent command-scoped environment variable is
 `CARGO_BUILD_BUILD_DIR`, with both `BUILD` components. Do not globally override
-projects that use different placement. Configure heli with an explicit store
+projects that use different placement. Keep the `{workspace-path-hash}`
+template: managed build directories have the layout
+`<store>/<2 hex digits>/<hex digits>`. An arbitrary `<store>/agent-a` path
+is not enrolled in that store's inventory or GC.
+Configure heli with an explicit store
 on each relevant volume and one aggregate artifact budget, for example:
 
 ```toml
@@ -46,12 +54,14 @@ a safe cached verdict. It never attaches an unkeyed check to an earlier
 check. Use `--cache on` when verdict reuse is useful. Existing `--no-cache`
 means refresh: it still computes a key and records a successful result.
 
-A project's own machine-wide queue also needs integration. FLUI's corrected
-xtask skips that queue when heli supplies a nonempty `HELI_RUN`, and leaves
-standalone commands protected by their existing lock. Each other task runner
-needs the same explicit integration review. Bare Cargo inheriting the host
-jobserver does not automatically supply this runner handshake. Do not export
-`HELI_RUN` manually or globally disable project locks.
+A project's own machine-wide queue also needs integration. As checked on
+2026-10-16, FLUI main still has a common per-user host lock in
+`tools/xtask/src/host_lock.rs`.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) adds a bypass
+when heli supplies a nonempty `HELI_RUN`, retaining standalone protection;
+the PR was open and unmerged. Check the consumer revision before relying
+on that handshake. Bare Cargo inheriting the host jobserver does not supply
+it. Do not export `HELI_RUN` manually or globally disable project locks.
 
 GC protects the whole lifetime of managed commands, including runtime tests
 reading `OUT_DIR` after Cargo releases its build locks. Compatible shared
@@ -60,6 +70,10 @@ managed command is active. A command parent keeps this protection alive even
 if its daemon dies. This deliberately favors correct independent work over
 evicting caches during a continuously busy workload. Reclamation resumes at
 idle, so continuous managed activity can defer the disk target indefinitely.
+When a daemon's own command releases its runtime guard, it requests another
+GC pass without waiting for the periodic survey, including after `exec`.
+Release by another daemon or a surviving command parent is still detected by
+the periodic survey. Neither path relaxes the shared runtime safety guard.
 
 GC also respects locks in deeply nested build-script caches. It can reclaim completed unknown nested Cargo artifacts
 only inside a verified managed root, after the configured idle age and with
@@ -81,10 +95,37 @@ Cargo's shared package-cache resolver lock still exists, even offline. The
 foreground cache-off path avoids extra result-cache resolutions; it does not
 promise that Cargo itself never briefly waits. Do not give independent lock
 files to multiple Cargo homes that symlink the same mutable registry cache.
-Immutable shared vendor snapshots with private Cargo homes are experimental;
-they are not yet selected automatically by heli. See the
+Immutable shared vendor snapshots with private Cargo homes are available
+through the explicit `deps import` / `--dependency-epoch` profile described in
+[DESIGN §6.5](../DESIGN.md#65-immutable-dependency-epochs-opt-in-integration).
+They are not selected automatically. The dependency store currently has
+explicit GC rather than automatic capacity enforcement, and private homes
+are retained. Its bytes are outside `[store] budget_mb`; enabling the profile
+does not establish a total disk bound. Cargo 1.99+ and home `config.toml` are
+required; legacy `config` and unsafe private homes are refused. Review the
+documented tool/source-override limits before opting in. See the
 [real Heli/FLUI workload and its verification limits](research/real-dependency-epochs.md)
 and [package objects with cheap NTFS epoch views](research/package-epoch-views.md).
+The [production dependency canary](../experiments/dependency-epoch-concurrency.py)
+reproduces three concurrent consumers across two projects and two Git worktrees,
+with a held baseline package-cache lock and source GC between consumer exits.
+
+The 2026-10-16 FLUI control also established actual parallel compilation
+with ordinary Cargo, including a shared lab Cargo home. Manually separating
+artifacts and homes is not a benefit attributable to heli. The small matched
+checks do not establish a general speedup or a full-suite comparison.
+Both full workspace test attempts stopped on a consumer fixture that also
+failed natively with a relocated target; the suite is not claimed green.
+The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
+contains the scopes, timings and invalid GC setup finding.
+
+There is also a real contention case: a Cargo download waiting on an HTTP
+response can block another project's fully cached offline check through the
+shared package-cache lock. The [local registry fixture](../experiments/real-download-hol.py)
+compares that baseline with ordinary manually isolated Cargo and Heli's
+dependency epoch. Both isolated cases finish while the download is waiting.
+This proves the value of isolation for that case; automatic epoch setup is
+still required to remove the manual preparation from the agent workflow.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)

@@ -41,7 +41,7 @@
 use std::convert::Infallible;
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -88,12 +88,40 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {error}");
         std::process::exit(USAGE)
     });
+    let epoch_path = invocation.dependency_epoch.clone().or_else(|| {
+        std::env::var_os("HELI_DEPENDENCY_EPOCH")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    });
+    let prepared = epoch_path
+        .as_ref()
+        .map(|path| {
+            let locations = locations.as_ref().map_err(Clone::clone)?;
+            dependency_cargo(&invocation)?;
+            crate::dependency_home::prepare(path, &locations.state_dir.join("dependency-homes"))
+        })
+        .transpose()
+        .unwrap_or_else(|reason| {
+            eprintln!("cargo-heli: cannot prepare dependency isolation: {reason}");
+            std::process::exit(USAGE);
+        });
+    let dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
+        eprintln!("cargo-heli: {reason}");
+        std::process::exit(USAGE);
+    });
     let reason = match locations {
         Err(error) => error,
         Ok(locations) => match reach(&locations, Some(depth)) {
             Ok(Some(stream)) => {
                 let plan = output::plan(&invocation, mode);
-                match submit(stream, &invocation, &plan, &child_depth) {
+                match submit(
+                    stream,
+                    &invocation,
+                    &plan,
+                    &child_depth,
+                    prepared.as_ref(),
+                    &dependency_env,
+                ) {
                     Ok(never) => match never {},
                     Err(reason) => reason,
                 }
@@ -106,8 +134,75 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
     let mut command = Command::new(&invocation.program);
     command
         .args(&invocation.args)
-        .env(nesting::VAR, child_depth);
+        .env(nesting::VAR, child_depth)
+        .envs(dependency_env.iter().map(|(name, value)| (*name, value)));
+    if let Some(prepared) = &prepared {
+        let activity = crate::store::lease::directory().unwrap_or_else(|error| {
+            eprintln!("cargo-heli: cannot protect direct execution: {error}");
+            std::process::exit(USAGE);
+        });
+        crate::store::runner::direct(
+            command,
+            &[activity, prepared.epoch.lease_root().to_path_buf()],
+            prepared.epoch.path(),
+        );
+    }
     direct::run(command)
+}
+
+/// Configuration includes at home precedence are part of this profile's
+/// compatibility contract, verified with Cargo 1.99 and newer.
+fn dependency_cargo(invocation: &Invocation) -> Result<(), String> {
+    let cargo = if invocation.exec {
+        std::env::var_os("CARGO")
+            .filter(|cargo| !cargo.is_empty())
+            .unwrap_or_else(|| "cargo".into())
+    } else {
+        invocation.program.clone()
+    };
+    let output = Command::new(cargo)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("cannot identify Cargo for dependency isolation: {error}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let version = text.split_whitespace().nth(1).unwrap_or_default();
+    let mut numbers = version.split('.');
+    let major = numbers.next().and_then(|n| n.parse::<u32>().ok());
+    let minor = numbers.next().and_then(|n| n.parse::<u32>().ok());
+    if !output.status.success() || !matches!((major, minor), (Some(1), Some(99..)) | (Some(2..), _))
+    {
+        return Err("dependency isolation requires Cargo 1.99 or newer".into());
+    }
+    Ok(())
+}
+
+fn dependency_environment(
+    prepared: Option<&crate::dependency_home::Prepared>,
+) -> Result<Vec<(&'static str, OsString)>, String> {
+    let Some(prepared) = prepared else {
+        return Ok(Vec::new());
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    // Keep the caller's Cargo/compiler/wrapper selection. A home/bin that
+    // was absent from PATH is appended only for external-tool discovery.
+    let original_bin = prepared.original_home.join("bin");
+    let mut entries: Vec<_> = std::env::split_paths(&path).collect();
+    if !entries
+        .iter()
+        .any(|entry| crate::store::same_path(entry, &original_bin))
+    {
+        entries.push(original_bin);
+    }
+    let path = std::env::join_paths(entries)
+        .map_err(|error| format!("cannot preserve Cargo tool search: {error}"))?;
+    Ok(vec![
+        ("CARGO_HOME", prepared.home.clone().into()),
+        (
+            "HELI_DEPENDENCY_EPOCH",
+            prepared.epoch.path().as_os_str().to_owned(),
+        ),
+        ("PATH", path),
+    ])
 }
 
 /// Prints the daemon's status, as JSON or as text.
@@ -364,11 +459,14 @@ fn submit(
     invocation: &Invocation,
     plan: &Plan,
     child_depth: &OsString,
+    prepared: Option<&crate::dependency_home::Prepared>,
+    dependency_env: &[(&str, OsString)],
 ) -> Result<std::convert::Infallible, String> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the working directory: {error}"))?;
     let mut overrides = vec![(nesting::VAR, child_depth.clone())];
     overrides.extend(plan.env.iter().cloned());
+    overrides.extend(dependency_env.iter().cloned());
     let request = RunRequest {
         cwd: Text(cwd.into()),
         argv: std::iter::once(&invocation.program)
@@ -382,13 +480,23 @@ fn submit(
         class: Some(invocation.class),
         cache: invocation.cache,
         reads_spawned: true,
+        dependency_epoch: prepared
+            .map(|prepared| Text(prepared.epoch.path().as_os_str().to_owned())),
     };
     stream
         .set_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))
         .map_err(|error| format!("cannot bound the daemon's answer: {error}"))?;
     protocol::write_message(&mut stream, &Request::Run(request))
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
-    let reply = protocol::read_message::<Reply>(&mut stream);
+    let mut reply = protocol::read_message::<Reply>(&mut stream);
+    if matches!(reply, Ok(Reply::Preparing)) {
+        // The daemon answered promptly; validating immutable inputs is real
+        // work, whose duration is not the connection handshake deadline.
+        stream
+            .set_deadline(None)
+            .map_err(|error| format!("cannot follow preparation: {error}"))?;
+        reply = protocol::read_message::<Reply>(&mut stream);
+    }
     stream
         .set_deadline(None)
         .map_err(|error| format!("cannot follow the daemon: {error}"))?;
@@ -412,6 +520,9 @@ fn submit(
             follow(stream, invocation, run, started, printer, spawned)
         }
         Ok(Reply::Passed { run, worktree, at }) => already_passed(run, &worktree, at),
+        Ok(Reply::SpawnFailed { not_found, message }) => {
+            direct::report_spawn_failure(&invocation.program, not_found, &message)
+        }
         Ok(Reply::Refused { reason }) => Err(reason),
         Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
         Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),

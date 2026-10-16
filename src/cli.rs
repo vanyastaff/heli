@@ -40,6 +40,8 @@ pub enum Action {
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
+    /// Import or collect managed immutable dependency snapshots.
+    Dependencies(DependencyCommand),
     /// Give the worktree here a removed worktree's build directory, as
     /// git's `post-checkout` hook asks.
     Recycle,
@@ -51,6 +53,8 @@ pub enum Action {
     LeaseRun {
         roots: Vec<std::path::PathBuf>,
         command: Vec<OsString>,
+        dependency_epoch: Option<std::path::PathBuf>,
+        direct: bool,
     },
 }
 
@@ -67,6 +71,8 @@ pub struct Invocation {
     pub cache: Cache,
     /// The output mode heli's flags chose, if they chose one.
     pub output: Option<Mode>,
+    /// Explicit immutable dependency snapshot; inherited by nested Heli.
+    pub dependency_epoch: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -89,6 +95,9 @@ struct Cli {
     /// only), off (skip result lookup, recording and source inventory).
     #[arg(long, value_name = "MODE", value_parser = parse_cache, conflicts_with = "no_cache")]
     cache: Option<Cache>,
+    /// Use an imported immutable dependency snapshot and a private Cargo home.
+    #[arg(long, value_name = "PATH")]
+    dependency_epoch: Option<std::path::PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -121,10 +130,19 @@ impl OutputFlags {
 enum Command {
     #[command(hide = true)]
     LeaseRun {
+        #[arg(long)]
+        direct: bool,
+        #[arg(long)]
+        dependency_epoch: Option<std::path::PathBuf>,
         #[arg(long = "root", required = true)]
         roots: Vec<std::path::PathBuf>,
         #[arg(last = true, required = true)]
         command: Vec<OsString>,
+    },
+    /// Manage immutable Cargo dependency snapshots (opt-in, Cargo 1.99+).
+    Deps {
+        #[command(subcommand)]
+        command: DependencyCommand,
     },
     /// Run any command: `cargo heli exec -- <command> [args...]`.
     Exec {
@@ -221,6 +239,25 @@ enum Command {
     Cargo(Vec<OsString>),
 }
 
+#[derive(Debug, PartialEq, Eq, Subcommand)]
+pub enum DependencyCommand {
+    /// Import a cargo vendor tree; print its immutable snapshot path.
+    Import {
+        #[arg(long)]
+        store: std::path::PathBuf,
+        #[arg(long)]
+        vendor: std::path::PathBuf,
+        /// Source replacement TOML emitted by cargo vendor.
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
+    /// Collect all unleased snapshots and unreferenced package objects.
+    Gc {
+        #[arg(long)]
+        store: std::path::PathBuf,
+    },
+}
+
 /// Parses heli's command line (`args` as the process received it) into what
 /// to do; `cargo` is the cargo program a cargo subcommand runs with.
 ///
@@ -246,7 +283,18 @@ pub fn parse(
     }
     let output = cli.output.mode();
     Ok(match cli.command {
-        Command::LeaseRun { roots, command } => Action::LeaseRun { roots, command },
+        Command::LeaseRun {
+            roots,
+            command,
+            dependency_epoch,
+            direct,
+        } => Action::LeaseRun {
+            roots,
+            command,
+            dependency_epoch,
+            direct,
+        },
+        Command::Deps { command } => Action::Dependencies(command),
         Command::Exec {
             output: own,
             command,
@@ -259,6 +307,7 @@ pub fn parse(
                 exec: true,
                 cache: Cache::Off,
                 output: own.mode().or(output),
+                dependency_epoch: cli.dependency_epoch,
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -308,6 +357,7 @@ pub fn parse(
                 },
                 args,
                 output,
+                dependency_epoch: cli.dependency_epoch,
             })
         }
     })

@@ -95,8 +95,23 @@ impl Accounts {
     /// in, if it is a run of cargo (see the module docs), and recycles a
     /// build directory for it if it has none. Once the run has ended (the
     /// returned value is dropped), its directories are scanned again.
-    pub fn learn(self: &Arc<Self>, request: &RunRequest) -> Option<Learning> {
+    pub fn learn(
+        self: &Arc<Self>,
+        request: &RunRequest,
+        epoch_lease_root: Option<&Path>,
+    ) -> Option<Learning> {
         let probe = Probe::of(request)?;
+        // Discovery can outlive the logical run: ended() waits only a
+        // bounded time. Own immutable inputs in the actual consumer thread,
+        // not merely in the daemon handler which launched it.
+        let epoch_guard = match epoch_lease_root.map(store::lease::shared).transpose() {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.log
+                    .write(&format!("cannot protect dependency discovery: {error}"));
+                return None;
+            }
+        };
         let at = clock::now();
         let (ended, end) = mpsc::channel();
         let (prepared, ready) = mpsc::channel();
@@ -104,6 +119,7 @@ impl Accounts {
         let wait = self.may_recycle(&probe);
         let accounts = Arc::clone(self);
         std::thread::spawn(move || {
+            let _epoch_guard = epoch_guard;
             let Some(learnt) = accounts.discover(&probe, at, prepared) else {
                 return;
             };
