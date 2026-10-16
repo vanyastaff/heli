@@ -166,8 +166,12 @@ five failures across four consumer targets; independent native reproductions
 identified test-fixture problems, rather than establishing a Heli cause.
 [FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) at `d85ab1e73`
 contains repairs with targeted RED/GREEN evidence and a passing scoped gate.
-The full repaired concurrent repeat remains required; no full-suite speedup
-or universal absence of waits is established.
+The repaired repeat at that commit passes all eight commands, including both
+full tests. Actual completed compiler invocations overlap across worktrees;
+both worktrees remain clean and the recorded inputs stay unchanged. Idle
+accounting is 4,771,735,920 bytes under an explicit 8-GiB artifact budget,
+with no pending trash. Native source homes remain outside that budget. This
+does not establish a full-suite speedup or universal absence of waits.
 The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
 contains the scopes, timings and invalid GC setup finding.
 
@@ -181,5 +185,56 @@ preparation; the native private-home profile described above provides automatic
 mutable-cache isolation without requiring an epoch or vendor snapshot.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
-primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
+primary sources and [the scoped spike](../experiments/multi-project-spike.py)
 for actual compiler-overlap, held-runner-lock and GC acceptance checks.
+
+To repeat the full eight-command FLUI workload, use
+[the worktree acceptance driver](../experiments/flui-worktree-acceptance.py).
+It requires Python 3.12+, Cargo/Rust 1.99, Git, a built Heli binary and an
+explicit full FLUI commit already present in a local clone. The following
+PowerShell example only prints the plan; choose a new short output path:
+
+```powershell
+python experiments/flui-worktree-acceptance.py `
+  --heli C:/tools/cargo-heli.exe --flui D:/flui `
+  --flui-ref d85ab1e73575388ba8112c1d86dbc7dd95491717 `
+  --budget-mb 8192 --output E:/heli-lab/new-full-run --instrument
+```
+
+Add `--run` to create two detached worktrees and an isolated daemon, state,
+native homes, activity namespace and managed artifact store. The driver
+submits fmt, clippy, check and the full workspace test command concurrently
+in both worktrees. It records compiler start/end intervals, command exits,
+source/configuration digests, GC decisions and final accounting, and checks
+that both worktrees remain clean at the pinned commit. It removes only its
+still-clean worktrees at that commit after measurement; changed or
+unreadable HEADs and dirty worktrees are retained. Logs and results remain.
+A failed test or unmet artifact budget is reported as failure; a small budget is
+not permission to remove protected runtime outputs. This public driver
+accepts only a fresh lab. The recorded repeat that reused private native
+homes has different cache warmth and does not establish a matched timing
+comparison with a fresh replay. A cold lab downloads dependencies normally.
+
+On Windows, while both full tests remain active, a second terminal can join
+two small independent projects through
+[the mixed-project sidecar](../experiments/flui-mixed-project-sidecar.py):
+
+```powershell
+python experiments/flui-mixed-project-sidecar.py `
+  --live E:/heli-lab/new-full-run --output E:/heli-lab/new-sidecar
+```
+
+Again add `--run` to execute. This bounded std-only workload discovers and
+checks the owned live daemon and pool, selects two more native homes, and
+requires four active worktrees across three repositories. It invokes GC
+while its tests hold build-script assets, then requires both projects to
+finish successfully while the FLUI tests are still active. It preserves
+its project sources and evidence, never stops the main daemon and cancels
+only its own matching runs if necessary. The sidecar currently requires
+Windows; it is a progress and runtime-safety check, not an authenticated
+registry or throughput comparison. Start it after the full driver's setup
+has completed and while both full test runs are still active.
+
+The experiment CI checks syntax, five small driver safety regressions and
+the full driver's prepare-only path on all three OSes. It does not launch
+the heavy FLUI acceptance workload automatically.

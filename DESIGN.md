@@ -80,6 +80,23 @@ itself establish a need for disk optimization or prove a resource bound.
   verdict, and on failure the failures. Everything else stays retrievable
   without running the command again.
 
+**Acceptance status, 2026-10-16.** G1, G3 and G4 above are design goals,
+not unconditional properties established by the current acceptance runs.
+Independent projects can complete beside long-running work (§12), but
+cold preparation and Cargo's own waits can delay the first compiler. The
+recorded full FLUI run took 184.677/210.297 seconds to that point; these
+are end-to-end delays, not separately measured download times. That run
+does not pass §12's strict ten-second first-compiler criterion.
+An existing worktree's retained home and an eligible orphan build directory
+can be reused; an entirely new worktree without a donor is not guaranteed
+to start warm. Artifact GC reclaims eligible regenerable data, protects
+active consumers and resumes at idle. Continuous activity can defer it
+indefinitely, protected residual outputs can exceed the budget even at
+idle, and native source homes are outside that budget (§6.3, §6.6).
+The recorded 2-GiB FLUI acceptance remains a failed budget check. These
+limits must not be advertised as solved merely because concurrent commands
+or narrower acceptance tests pass.
+
 Non-goals:
 
 - Changing cargo's freshness rules, or sharing one build directory between
@@ -2413,13 +2430,71 @@ while both FLUI tests remained active. The original Cargo configuration
 digest was unchanged; no original credential file was present in this
 sidecar's input manifest, so this is not an authentication check. Evidence is in
 `target/multi-project-d85-sidecar`; the full FLUI repeat is in
-`target/flui-native-d85ab1e73-2` and is still pending at this observation.
+`target/flui-native-d85ab1e73-2`. Its terminal result follows below.
 This establishes independent completion of short projects alongside long
 FLUI tests, not a matched throughput improvement or multiple full gates
 on three large projects. Busy accounted usage exceeded the 8-GiB budget;
 the global runtime guard deliberately postpones reclamation (§6.3).
-Idle-budget acceptance remains separate and unproven until the full
-repeat and final GC finish. Native source homes remain outside that budget.
+Busy preservation is separate from the idle-budget acceptance below.
+Native source homes remain outside that budget.
+
+**Completed repaired repeat, 2026-10-16: PASS.** Driver session 57174
+terminated with exit 0. All eight normal built-in commands succeeded at
+FLUI `d85ab1e73575388ba8112c1d86dbc7dd95491717`, using frozen Heli
+`c86d15376091cb0d802a77c6e5dc1d443aace678` (binary SHA-256
+`7a7925dcd4e8be4df9451c4423dafb82fd1e9292a31e17bd2c258dfe37c59721`).
+The native source homes were reused at their prior canonical paths; this
+is not a cold-source-cache timing comparison. Command wall times include
+their own worktree's Cargo locks and scheduling, not just compiler time:
+
+| Command | Worktree A, seconds | Worktree B, seconds |
+|---|---:|---:|
+| `fmt --all` | 6.7 | 6.9 |
+| `clippy --workspace --all-targets --locked` | 640.6 | 202.5 |
+| `check --workspace --all-targets --locked` | 659.9 | 696.2 |
+| `test --workspace --locked --no-fail-fast` | 3628.8 | 3630.8 |
+
+Both full tests include their normal nested Cargo, trybuild and doctest
+work. All five cases that failed in the prior run now pass in both
+worktrees. An independent audit reparsed all 40,408 raw compiler events
+into 20,204 complete pairs: no malformed, unpaired, ambiguous or invalid
+records. The union of successful compiler invocation lifetimes from each
+worktree overlaps for 2,356.5887101 seconds across 380 disjoint segments.
+This is actual simultaneous in-flight compiler work, not CPU utilization
+or a speedup against native Cargo. Nonzero internal compiler exits include
+compile-fail cases; the eight outer command exits determine test success.
+Seven before/after input digests match, and both worktrees were clean at
+the pinned commit before their removal.
+
+All 136 during-run GC surveys reported runtime busy and selected no
+victims; 78 managed build directories were observed. The sampled store
+peak was 133,582,046,287 bytes, or 140,652,790,817 bytes when including
+native homes and checkout targets. After activity became idle, GC reclaimed
+the build directories, leaving 75 administrative bytes in the store.
+Accounted artifacts, measured before removing the worktrees, were
+**4,771,735,920 bytes under B = 8,589,934,592 bytes**, with F = 0 and no
+pending trash. No deletion retry was needed. The retained native homes
+were another 2,299,008,964 bytes outside B. The original 2-GiB acceptance
+failure remains valid; this explicit larger-budget result does not
+retroactively pass it or establish a hard limit during activity.
+
+Across 2,028 system-memory samples, available physical memory never fell
+below 26,192,412,672 bytes and available commit never fell below
+15,231,492,096 bytes. These are host observations, including other host
+activity, not per-agent RAM quotas or proof of an enforced hard cap. Both
+clean worktrees were removed after measurement; the owned daemon exited,
+and the audit found no cleanup error. Exact receipts, the raw events and
+`FINAL-AUDIT.md` remain in the full-repeat evidence directory.
+
+The checked-in `experiments/flui-worktree-acceptance.py` reproduces the
+same eight-command workload in a fresh lab; it deliberately does not
+adopt old labs. `experiments/flui-mixed-project-sidecar.py` reproduces the
+short-project progress/GC check on Windows. Their dry-run and cleanup
+safety checks run in the three-OS experiment workflow; the heavy FLUI run
+is explicit, not an automatic CI job. See `docs/multi-agent.md` for the
+commands and cache-warmth limits. This is a passed workload acceptance,
+not a claim that every strict phase criterion or every external Cargo
+tool profile is complete.
 
 FLUI main still had a common per-user host lock in
 `tools/xtask/src/host_lock.rs` when checked on this date.

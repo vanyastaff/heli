@@ -11,6 +11,9 @@ on:
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
       - experiments/isolated-home-concurrency.py
+      - experiments/flui-worktree-acceptance.py
+      - experiments/flui-mixed-project-sidecar.py
+      - experiments/test_flui_worktree_acceptance.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
   push:
@@ -23,6 +26,9 @@ on:
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
       - experiments/isolated-home-concurrency.py
+      - experiments/flui-worktree-acceptance.py
+      - experiments/flui-mixed-project-sidecar.py
+      - experiments/test_flui_worktree_acceptance.py
       - docs/research/package-epoch-views.md
       - .github/workflows/dependency-epochs.yml
 
@@ -44,6 +50,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Syntax-check worktree acceptance drivers
+        run: python -c "from pathlib import Path; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in (Path('experiments/flui-worktree-acceptance.py'), Path('experiments/flui-mixed-project-sidecar.py'), Path('experiments/test_flui_worktree_acceptance.py'))]"
+      - name: Test worktree acceptance driver safety
+        run: python experiments/test_flui_worktree_acceptance.py
+      - name: Inspect the full-worktree plan without starting a workload
+        run: python experiments/flui-worktree-acceptance.py --heli "${{ runner.temp }}/unused-heli" --flui "${{ runner.temp }}/unused-flui" --flui-ref "0000000000000000000000000000000000000000" --budget-mb 8192 --output "${{ runner.temp }}/heli-acceptance-prepare-only" --instrument
+      - name: Verify the plan created no lab
+        run: python -c "import os; from pathlib import Path; assert not (Path(os.environ['RUNNER_TEMP']) / 'heli-acceptance-prepare-only').exists()"
+      - name: Inspect mixed-project driver arguments
+        run: python experiments/flui-mixed-project-sidecar.py --help
       - name: Test shared package objects and active view retirement
         run: python experiments/package-epoch-views.py --prepare-vendor --toolchain stable --output "${{ runner.temp }}/heli-package-epoch-views"
       - name: Build the public Heli CLI
