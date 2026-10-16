@@ -1477,6 +1477,14 @@ Safety rules:
   unavailable interlock conservatively prevents proving idle. Failure to
   acquire a run's guard refuses that managed command rather than executing
   it without runtime protection (the narrow G5 exception above).
+  A daemon-owned runtime guard releases its file before requesting another
+  accounting/GC pass on every exit path. The request is retained under the
+  accountant's condition-variable mutex, so an idle transition cannot be lost
+  before the accountant starts waiting. This also covers `exec`, which has no
+  Cargo learning worker. Shared activity still prevents eviction while another
+  managed command runs. Activity released only by another daemon, a surviving
+  command guardian or an external participant is observed by the existing
+  periodic survey; this local notification is not a cross-process broadcast.
 - **Never wait on a lock.** heli tries to lock `.cargo-build-lock` (build
   directory) or `.cargo-lock` and `.cargo-artifact-lock` (artifact
   directory) exclusively, in every profile directory of the victim's

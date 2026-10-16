@@ -1003,6 +1003,71 @@ fn the_daemon_evicts_when_over_budget() {
     });
 }
 
+/// A pass deferred by managed runtime must be retried when the last run
+/// ends, including an exec which has no Cargo learning worker to wake GC.
+#[test]
+fn runtime_becoming_idle_retries_a_deferred_eviction() {
+    let fixture = Fixture::new("basic");
+    set_clock(&fixture, now() + 100 * HOUR);
+    configure(
+        &fixture,
+        "budget_mb = 0\nidle_hours = 1000\ndir_hours = 1000\n",
+    );
+    let workspace = fixture.workspace();
+    use_store(&fixture, &workspace);
+    let activity = fixture.path("activity");
+    std::fs::create_dir_all(&activity).unwrap();
+    let guard = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(activity.join(".heli-runtime.lock"))
+        .unwrap();
+    guard.lock_shared().unwrap();
+    let build = build_in(&fixture, &workspace, "echo-args");
+    wait_for("a pass deferred by runtime activity", || {
+        fixture
+            .daemon_log()
+            .contains("eviction deferred: runtime activity interlock is busy or unavailable")
+            .then_some(())
+    });
+    assert!(fixture.events_named("evict").is_empty());
+    let ready = fixture.path("exec-started");
+    let release = fixture.path("exec-release");
+    let echo = workspace
+        .join("target/debug")
+        .join(format!("echo-args{}", std::env::consts::EXE_SUFFIX));
+    assert!(echo.is_file(), "{}", echo.display());
+    let mut child = fixture
+        .heli(["exec", "--"])
+        .arg(echo)
+        .env("ECHO_STARTS", &ready)
+        .env("ECHO_WAIT_FOR", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the last managed run to start", || {
+        ready.is_file().then_some(())
+    });
+    drop(guard);
+    std::fs::write(&release, "go").unwrap();
+    assert!(child.wait().unwrap().success());
+    let until = Instant::now() + Duration::from_secs(3);
+    while fixture.events_named("evict").is_empty() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !fixture.events_named("evict").is_empty(),
+        "idle transition did not retry deferred GC; status {}; log {}; build {}; current GC plan {}",
+        fixture.status(),
+        fixture.daemon_log(),
+        build.display(),
+        gc(&fixture, &["gc", "--dry-run"])
+    );
+}
+
 /// A trash that is a link is never used: nothing is renamed into it, and
 /// nothing it points to is deleted. The victim is skipped, and says why.
 #[test]

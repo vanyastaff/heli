@@ -60,6 +60,10 @@ managed command is active. A command parent keeps this protection alive even
 if its daemon dies. This deliberately favors correct independent work over
 evicting caches during a continuously busy workload. Reclamation resumes at
 idle, so continuous managed activity can defer the disk target indefinitely.
+When a daemon's own command releases its runtime guard, it requests another
+GC pass without waiting for the periodic survey, including after `exec`.
+Release by another daemon or a surviving command parent is still detected by
+the periodic survey. Neither path relaxes the shared runtime safety guard.
 
 GC also respects locks in deeply nested build-script caches. It can reclaim completed unknown nested Cargo artifacts
 only inside a verified managed root, after the configured idle age and with

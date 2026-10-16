@@ -573,7 +573,10 @@ impl Daemon {
         let activity =
             crate::store::lease::directory().and_then(|root| crate::store::lease::shared(&root));
         let _activity = match activity {
-            Ok(activity) => activity,
+            Ok(activity) => RuntimeActivity {
+                guard: Some(activity),
+                accounts: &self.accounts,
+            },
             Err(error) => {
                 self.registry.abandon(id);
                 live.end(Reply::SpawnFailed {
@@ -865,6 +868,20 @@ impl Drop for Serving<'_> {
 
 /// The exit code clients of a run cancelled before it started exit with.
 const NEVER_STARTED: i32 = 1;
+
+/// Release protection before asking the accountant to retry, on every exit
+/// path, including cancellation, a reused verdict and a spawn failure.
+struct RuntimeActivity<'a> {
+    guard: Option<File>,
+    accounts: &'a accounts::Accounts,
+}
+
+impl Drop for RuntimeActivity<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.accounts.runtime_ended();
+    }
+}
 
 /// A run being executed: what it runs as, and where its output goes.
 #[derive(Clone, Copy)]
