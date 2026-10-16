@@ -749,9 +749,19 @@ fn inherited_epoch_protects_recycle_metadata_after_its_parent_is_killed() {
     // Without one the hook correctly avoids starting Cargo metadata at all.
     let artifacts = fixture.path("artifacts");
     fixture.configure(&format!("[store]\npaths=[{}]\n", quoted(&artifacts)));
+    // Git resolves aliases such as macOS /var -> /private/var. Owners
+    // produced by discovery carry Git's repository identity, not the
+    // spelling used to create this temporary workspace.
+    let repository = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(&workspace)
+        .output()
+        .unwrap();
+    assert_success(&repository, "identify the fixture repository");
+    let repository = PathBuf::from(String::from_utf8(repository.stdout).unwrap().trim());
     let owner = serde_json::json!({
         "workspace": fixture.path("removed-worktree"),
-        "repository": workspace.join(".git"),
+        "repository": repository,
         "created_at": 1,
         "last_run": 1,
     });
