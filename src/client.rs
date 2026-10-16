@@ -134,7 +134,11 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
             dependency_cargo(&invocation)?;
             crate::dependency_home::prepare(
                 epoch_path.as_deref(),
-                &locations.state_dir.join("dependency-homes"),
+                &locations.state_dir.join(if epoch_path.is_some() {
+                    "dependency-homes"
+                } else {
+                    "h"
+                }),
             )
         })
         .transpose()

@@ -1924,6 +1924,23 @@ changes select a new generation for a new outer command. Already running
 commands and their nested Heli invocations retain their exact parent home,
 including in generated directories outside the parent's repository.
 
+Native generations use the compact `<state>/h/<32 hexadecimal digits>`
+layout. The directory name is a prefix, not the authority for ownership:
+the schema-3 marker records the complete 256-bit home identity and reuse
+must compare that identity. A prefix collision or an inconsistent marker
+is an error; it must never attach a command to another worktree's mutable
+cache. Existing epoch layouts and inherited schema-1/2 homes retain their
+paths. New layout selection does not move or delete an active generation.
+
+The short layout is a native-tool compatibility requirement. In the real
+two-worktree FLUI acceptance, an existing aws-lc C source reached 268 path
+characters and MSVC reported C1083, even though Rust could create and read
+the file. A regression compiles a C source at that dependency's actual
+registry depth with the installed MSVC compiler. Shortening only the test
+checkout would conceal this defect. An arbitrarily deep custom state root
+or dependency can still exceed a native tool's path limit; use a short
+`HELI_STATE_DIR` on Windows when selecting a custom root.
+
 Cold `--offline` runs can fail because the private home has no dependencies
 yet. Heli must not hide that failure by retrying through the original shared
 cache. Warm offline runs reuse their worktree's cache. No hidden step creates

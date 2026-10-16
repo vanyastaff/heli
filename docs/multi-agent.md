@@ -39,6 +39,13 @@ retained; their bytes are outside the artifact GC budget. Original home
 `config.toml` keeps its relative path origins; legacy home `config` is
 refused rather than silently rebased. Cargo 1.99+ is required.
 
+Native homes use a compact directory under `<state>/h/` so dependencies with
+deep C source trees remain usable by Windows native compilers. Full home
+identities are verified independently of the shortened directory names;
+an ownership mismatch is an error. Keep a custom `HELI_STATE_DIR` short on
+Windows: native tools can still reject sufficiently long paths. Existing
+inherited homes keep their paths until their commands finish.
+
 Perform Cargo-home maintenance such as install/login/logout from an outer
 shared command. The isolated profile refuses known home-maintenance
 commands and refuses an explicit switch to shared inside an already

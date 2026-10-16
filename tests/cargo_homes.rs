@@ -618,6 +618,199 @@ fn invalid_daemon_memory_settings_keep_native_isolation_during_direct_fallback()
     assert!(!diagnostics.contains("fallback-private-native-canary"));
 }
 
+#[test]
+fn mismatched_native_home_full_identity_refuses_reuse_without_replacing_live_data() {
+    let fixture = Fixture::new("basic");
+    let root = fixture.path("identity-consumer");
+    project(&root);
+    let original = fixture.path("original/.cargo");
+    std::fs::create_dir_all(&original).unwrap();
+    let first_report = fixture.path("identity-first-home");
+    let output = bounded_output(selected(&fixture, &root, &original, &first_report).args([
+        "--cargo-home",
+        "isolated",
+        "check",
+        "--offline",
+    ]));
+    assert_success(&output, "prepare a legitimate native Cargo home");
+    let home = reported(&first_report).0;
+    let marker_path = home.join(".heli-private-home.json");
+    let original_marker = std::fs::read(&marker_path).unwrap();
+    let original_config = std::fs::read(home.join("config.toml")).unwrap();
+    let persistent = home.join("acceptance-persistent-cache");
+    write(
+        &persistent,
+        "private cached bytes must survive a collision refusal",
+    );
+    let mut marker: serde_json::Value = serde_json::from_slice(&original_marker).unwrap();
+    let mut full_identity = marker["home_identity"]
+        .as_str()
+        .expect("native private home records its complete identity")
+        .as_bytes()
+        .to_vec();
+    // Change only the trailing digest byte. The directory's compact prefix
+    // still matches; accepting that prefix alone must not authorize reuse.
+    let last = full_identity.last_mut().unwrap();
+    *last = if *last == b'0' { b'1' } else { b'0' };
+    marker["home_identity"] = String::from_utf8(full_identity).unwrap().into();
+    let tampered_marker = serde_json::to_vec(&marker).unwrap();
+    std::fs::write(&marker_path, &tampered_marker).unwrap();
+
+    let refused_report = fixture.path("identity-must-not-run");
+    let output = bounded_output(selected(&fixture, &root, &original, &refused_report).args([
+        "--cargo-home",
+        "isolated",
+        "check",
+        "--offline",
+    ]));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "mismatched full identity was reused: {output:?}"
+    );
+    assert!(
+        !refused_report.exists(),
+        "Cargo's build script ran after identity validation failed"
+    );
+    assert!(
+        !refused_report.with_extension("target").exists(),
+        "a native build was started after identity refusal"
+    );
+    assert_eq!(std::fs::read(&marker_path).unwrap(), tampered_marker);
+    assert_eq!(
+        std::fs::read(home.join("config.toml")).unwrap(),
+        original_config
+    );
+    assert_eq!(
+        std::fs::read_to_string(&persistent).unwrap(),
+        "private cached bytes must survive a collision refusal"
+    );
+
+    // The caller repairs its own deliberate tamper. Heli must retain the
+    // legitimate existing cache instead of silently replacing the directory.
+    std::fs::write(&marker_path, original_marker).unwrap();
+    let restored_report = fixture.path("identity-restored-home");
+    let output = bounded_output(
+        selected(&fixture, &root, &original, &restored_report).args([
+            "--cargo-home",
+            "isolated",
+            "check",
+            "--offline",
+        ]),
+    );
+    assert_success(
+        &output,
+        "reuse the legitimate home after explicit marker restoration",
+    );
+    assert_eq!(reported(&restored_report).0, home);
+    assert_eq!(
+        std::fs::read_to_string(persistent).unwrap(),
+        "private cached bytes must survive a collision refusal"
+    );
+}
+
+/// Real aws-lc sources reach this depth in Cargo's native registry cache.
+/// Rust can create/read a long path while MSVC still refuses to open it.
+#[cfg(windows)]
+#[test]
+fn isolated_native_home_can_compile_real_msvc_source_at_aws_lc_depth() {
+    let fixture = Fixture::new("basic");
+    let root = fixture.path("msvc-consumer");
+    project(&root);
+    write(
+        &root.join("build.rs"),
+        r#"
+use std::{env, fs, path::PathBuf, process::Command};
+fn main() {
+    let home = PathBuf::from(env::var_os("CARGO_HOME").unwrap());
+    let source = home.join("registry/src/index.crates.io-1949cf8c6b5b557f/aws-lc-sys-0.45.0/aws-lc/third_party/jitterentropy/jitterentropy-library/src/jitterentropy-base.c");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
+    assert!(source.is_file());
+    assert_eq!(fs::read_to_string(&source).unwrap(), "int answer(void) { return 42; }\n");
+    fs::write(env::var_os("HOME_REPORT").unwrap(), format!("{}\n", home.display())).unwrap();
+    println!("cargo:warning=MSVC native source exists at {}", source.display());
+    let object = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("probe.obj");
+    let output = Command::new(env::var_os("HOME_TEST_CL").unwrap())
+        .args(["/nologo", "/c"])
+        .arg(format!("/Fo{}", object.display()))
+        .arg(&source).env_remove("CL").env_remove("_CL_")
+        .output().expect("run the installed native MSVC compiler");
+    assert!(output.status.success(), "MSVC could not compile existing native cache source {}:\n{}\n{}",
+        source.display(), String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(object.is_file(), "MSVC did not produce its object file");
+}
+"#,
+    );
+    let original = fixture.path("original/.cargo");
+    std::fs::create_dir_all(&original).unwrap();
+    let report = fixture.path("msvc-home");
+    let output = bounded_output(
+        selected(&fixture, &root, &original, &report)
+            .args(["--cargo-home", "isolated", "check", "--offline"])
+            .env("HOME_TEST_CL", installed_msvc()),
+    );
+    assert_success(
+        &output,
+        "isolated native Cargo-home sources remain consumable by MSVC",
+    );
+    assert_ne!(reported(&report).0, original);
+}
+
+#[cfg(windows)]
+fn installed_msvc() -> PathBuf {
+    let mut candidates = Vec::new();
+    for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(root) = std::env::var_os(variable) {
+            candidates
+                .push(PathBuf::from(root).join("Microsoft Visual Studio/Installer/vswhere.exe"));
+        }
+    }
+    candidates.push("vswhere.exe".into());
+    for candidate in candidates {
+        let output = match Command::new(candidate)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                "-find",
+                r"VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe",
+            ])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => panic!("cannot locate native MSVC with vswhere: {error}"),
+        };
+        assert_success(
+            &output,
+            "locate installed MSVC for the Windows native source-path acceptance",
+        );
+        if let Some(path) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+        {
+            return path;
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+        .map(|directory| directory.join("cl.exe"))
+        .find(|path| path.is_file())
+    {
+        return path;
+    }
+    panic!(
+        "Windows native Cargo-home acceptance requires installed MSVC C++ tools (vswhere or cl.exe on PATH); this required platform check cannot be silently skipped"
+    );
+}
+
 #[cfg(unix)]
 fn assert_private(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
