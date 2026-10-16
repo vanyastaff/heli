@@ -1,6 +1,8 @@
 # Concurrent agents on one host
 
-Use one writable worktree per agent. Keep its default checkout-local `target/`;
+Use one worktree per group making independent source changes. Read-only roles
+planning from the same checkout can share it and one test run. Keep the
+default checkout-local `target/`;
 do not export a single `CARGO_TARGET_DIR` shared by several worktrees. A shared
 host jobserver cannot remove Cargo's exclusive artifact-directory lock.
 
@@ -45,14 +47,33 @@ For foreground checks and tests, use:
 ```text
 cargo heli --cache off check --locked
 cargo heli --cache off test --locked
-cargo heli exec -- cargo xtask check-changed
+cargo heli build --locked
+cargo heli exec --verify -- cargo xtask check-changed
 ```
 
-`--cache off` keeps host scheduling and test phases, while skipping result
-reuse, result recording and the full dependency/source inventory needed for
-a safe cached verdict. It never attaches an unkeyed check to an earlier
-check. Use `--cache on` when verdict reuse is useful. Existing `--no-cache`
+`--cache off` keeps host scheduling, test phases and source-keyed live sharing,
+while skipping saved-result lookup, recording and invalidation. Two identical
+requests on unchanged inputs use one run; both clients receive its full output
+and exit code. A source or configuration change starts a new run. A completed
+run is not reused. Complete dependency/source inventory is required even with
+the result cache off; a missing inventory disables sharing, not the command.
+Use `--cache on` when saved verdict reuse is useful. Existing `--no-cache`
 means refresh: it still computes a key and records a successful result.
+It forces a new run rather than attaching. `exec --verify` is the explicit
+read-only wrapper interface and defaults to live-only sharing. Ordinary exec
+still attaches by command identity, which is unsuitable for asking whether
+changed sources pass. Neither interface isolates files from concurrent edits.
+Within one worktree, different keyed source states wait for earlier runs to
+finish before rebuilding, then refresh their input key. This protects live
+Windows test executables from linker overwrite errors. Different checks of
+the same source state retain shared access; separate worktrees stay independent.
+
+Builds use live sharing too, including with the default cache setting. Their
+key includes the worktree and artifact locations: another worktree or target
+directory gets its own build outputs. Changing sources starts a new build,
+and no saved build verdict can stand in for missing artifacts. A live-only
+client follows a cache-enabled run only once real execution has started,
+so it cannot inherit a queued run's saved-result hit.
 
 A project's own machine-wide queue also needs integration. As checked on
 2026-10-16, FLUI main still has a common per-user host lock in
@@ -91,8 +112,8 @@ Keep all participants on the same heli version. Do not override
 activity namespace for isolated tests and experiments, independent of daemon
 state directories and pools.
 
-Cargo's shared package-cache resolver lock still exists, even offline. The
-foreground cache-off path avoids extra result-cache resolutions; it does not
+Cargo's shared package-cache resolver lock still exists, even offline. Source
+inventory for live sharing can also wait there; cache-off does not
 promise that Cargo itself never briefly waits. Do not give independent lock
 files to multiple Cargo homes that symlink the same mutable registry cache.
 Immutable shared vendor snapshots with private Cargo homes are available

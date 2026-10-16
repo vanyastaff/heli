@@ -490,8 +490,8 @@ fn submit(
         .map_err(|error| format!("cannot hand the run to the heli daemon: {error}"))?;
     let mut reply = protocol::read_message::<Reply>(&mut stream);
     if matches!(reply, Ok(Reply::Preparing)) {
-        // The daemon answered promptly; validating immutable inputs is real
-        // work, whose duration is not the connection handshake deadline.
+        // The daemon answered promptly; preparing execution inputs (source
+        // keys or immutable epochs) is not the connection handshake deadline.
         stream
             .set_deadline(None)
             .map_err(|error| format!("cannot follow preparation: {error}"))?;
