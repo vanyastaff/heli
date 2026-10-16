@@ -530,6 +530,22 @@ impl Daemon {
         known: Option<Key>,
         learning: Option<&accounts::Learning>,
     ) {
+        // Shared by all commands, including the gap between build and test
+        // phases. A separate runner owns the same guard while each actual
+        // child runs, so a daemon crash cannot expose its runtime assets.
+        let activity =
+            crate::store::lease::directory().and_then(|root| crate::store::lease::shared(&root));
+        let _activity = match activity {
+            Ok(activity) => activity,
+            Err(error) => {
+                self.registry.abandon(id);
+                live.end(Reply::SpawnFailed {
+                    not_found: false,
+                    message: format!("cannot protect command runtime from GC: {error}"),
+                });
+                return;
+            }
+        };
         // The worktree lock: its clients hear which runs it waits for, if
         // any.
         self.registry
@@ -614,6 +630,7 @@ impl Daemon {
         }
         let exit = self.registry.end(id, code, signal);
         drop(record);
+        drop(_activity);
         live.end(Reply::exited(exit));
     }
 
@@ -625,12 +642,14 @@ impl Daemon {
         run: &mut Execution<'_, '_>,
         argv: &[OsString],
     ) -> Result<(i32, Option<i32>), Reply> {
-        let (child, tree) =
-            execute::spawn(run.request, argv, run.id, run.makeflags).map_err(|error| {
-                Reply::SpawnFailed {
-                    not_found: error.kind() == std::io::ErrorKind::NotFound,
-                    message: error.to_string(),
-                }
+        let roots = crate::store::lease::directory().map_err(|error| Reply::SpawnFailed {
+            not_found: false,
+            message: error.to_string(),
+        })?;
+        let (child, tree) = execute::spawn(run.request, argv, run.id, run.makeflags, &[roots])
+            .map_err(|error| Reply::SpawnFailed {
+                not_found: error.kind() == std::io::ErrorKind::NotFound,
+                message: error.to_string(),
             })?;
         let tree = Arc::new(tree);
         // From here on its clients never run the command themselves.

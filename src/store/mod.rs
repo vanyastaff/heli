@@ -23,12 +23,15 @@
 
 pub mod evict;
 pub mod ladder;
+pub mod lease;
+pub mod managed;
 pub mod orphan;
 pub mod owner;
 pub mod probe;
 pub mod record;
 pub mod recycle;
 pub mod registry;
+pub mod runner;
 pub mod scan;
 pub mod sizes;
 pub mod trash;
@@ -225,17 +228,52 @@ pub fn busy(dir: &Path) -> bool {
 }
 
 /// Whether eviction counts `dir` busy at `now` (seconds since 1970): a
-/// cargo builds in it ([`busy`]), or its lock layout is unknown and it
+/// Cargo holds a known lock (at any depth for a build directory), or its lock layout is unknown and it
 /// changed within the last [`RECENT`] seconds.
 ///
 /// **Unknown layout.** Lock names change between cargo versions. A profile
 /// directory that holds cargo's intermediates (`deps/`, `incremental/`,
 /// `.fingerprint/`, `build/`) but none of the [`LOCKS`] was laid out by a
 /// cargo heli does not know.
-pub fn busy_for_eviction(dir: &Path, now: u64) -> bool {
-    let profiles = lock_dirs(dir);
-    profiles.iter().any(|profile| held(profile))
-        || (unknown_layout(&profiles) && recently_changed(dir, now))
+pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
+    if lease::busy() {
+        return true;
+    }
+    let profiles = lock_dirs(&dir.path);
+    let busy = if dir.kind == Kind::Build {
+        locks_inside(&dir.path).map_or(true, |locks| {
+            locks
+                .iter()
+                .any(|path| matches!(try_lock(path), Lock::Held))
+        })
+    } else {
+        // A nested tool cache protects its own victim at eviction; it does
+        // not prevent reclaiming unrelated caches in this target directory.
+        profiles.iter().any(|profile| held(profile))
+    };
+    busy || (unknown_layout(&profiles) && recently_changed(&dir.path, now))
+}
+
+/// Known Cargo locks at any depth, without following links. An unreadable
+/// subtree cannot prove that a whole-directory eviction is safe.
+pub fn locks_inside(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if std::fs::symlink_metadata(dir)?.is_file() {
+        return Ok(Vec::new());
+    }
+    let mut locks = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() && LOCKS.iter().any(|name| entry.file_name() == *name) {
+                locks.push(entry.path());
+            }
+        }
+    }
+    Ok(locks)
 }
 
 /// Within this many seconds, a change makes a directory of an unknown lock

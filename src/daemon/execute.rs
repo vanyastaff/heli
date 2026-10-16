@@ -54,13 +54,26 @@ pub fn spawn(
     argv: &[OsString],
     id: RunId,
     makeflags: &OsStr,
+    roots: &[PathBuf],
 ) -> io::Result<(Child, Tree)> {
     let cwd = request.cwd();
     let mut argv = argv.iter().cloned();
     let program = argv.next().unwrap_or_default();
-    let mut command = Command::new(resolve(&cwd, program));
+    let resolved = resolve(&cwd, program);
+    let mut command = if roots.is_empty() {
+        let mut command = Command::new(&resolved);
+        command.args(argv);
+        command
+    } else {
+        let mut command = Command::new(std::env::current_exe()?);
+        command.arg("lease-run");
+        for root in roots {
+            command.arg("--root").arg(root);
+        }
+        command.arg("--").arg(&resolved).args(argv);
+        command
+    };
     command
-        .args(argv)
         .current_dir(&cwd)
         .env_clear()
         .envs(request.env.iter().map(|(name, value)| (&name.0, &value.0)))
@@ -69,7 +82,34 @@ pub fn spawn(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    tree::spawn(&mut command)
+    let (mut child, tree) = tree::spawn(&mut command)?;
+    if !roots.is_empty() {
+        let handshake = crate::protocol::read_message::<crate::store::runner::Handshake>(
+            child
+                .stdout
+                .as_mut()
+                .expect("the lease runner has piped stdout"),
+        );
+        let failure = match handshake {
+            Ok(crate::store::runner::Handshake::Spawned) => return Ok((child, tree)),
+            Ok(crate::store::runner::Handshake::SpawnFailed { not_found, message }) => {
+                io::Error::new(
+                    if not_found {
+                        io::ErrorKind::NotFound
+                    } else {
+                        io::ErrorKind::Other
+                    },
+                    message,
+                )
+            }
+            Err(error) => error,
+        };
+        // A malformed handshake must not leave an unobserved command running.
+        let _ = tree.kill();
+        let _ = child.wait();
+        return Err(failure);
+    }
+    Ok((child, tree))
 }
 
 /// A program given as a relative path (`./script`, `bin\tool`) is relative

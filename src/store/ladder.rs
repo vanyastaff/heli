@@ -27,8 +27,8 @@
 //!
 //! **Which directories.** A busy directory has no victims. A build
 //! directory without an owner manifest (`unknown`, which only bare cargo
-//! built in) has only tiers 1 and 3: heli cannot tell whether its workspace
-//! lives, so it never counts as an orphan and is never deleted whole. A
+//! built in) has tiers 1 and 3, plus tier 5 inside a verified exclusively
+//! regenerable cache root (`super::managed`). It never counts as an orphan. A
 //! registered `target/` directory has tiers 1, 3 and 4, and is never
 //! deleted whole: it is in the user's worktree.
 //!
@@ -204,7 +204,7 @@ impl Surveyed {
     /// `dir` as it is at `now`; `orphaned_since` says since when an orphan
     /// is unclaimed.
     pub fn of(dir: Dir, now: u64, orphaned_since: impl FnOnce(&Dir) -> Option<u64>) -> Self {
-        let state = if super::busy_for_eviction(&dir.path, now) {
+        let state = if super::busy_for_eviction(&dir, now) {
             State::Busy
         } else {
             dir.state()
@@ -340,7 +340,11 @@ pub fn candidates(
                     );
                 }
             }
-            (Kind::Build, State::Live) => {
+            (Kind::Build, state)
+                if state == State::Live
+                    || (state == State::Unknown
+                        && super::managed::unknown_is_reclaimable(&surveyed.dir)) =>
+            {
                 if idle >= policy.dir_age {
                     victim(
                         Tier::BuildDir,

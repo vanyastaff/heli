@@ -194,6 +194,9 @@ pub enum Cache {
     /// Neither looked up nor recorded: compile, mutate and exec runs.
     #[default]
     Off,
+    /// Explicitly uncached checks/tests: no key, record or single-flight.
+    /// A distinct wire value makes older daemons refuse this new contract.
+    Disabled,
     /// Looked up first, and recorded when it passes: verify and test runs.
     On,
     /// Run whatever is recorded (`--no-cache`), and recorded when it passes.

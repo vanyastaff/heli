@@ -59,6 +59,7 @@ const SCHEMA: u32 = 1;
 struct Listing<'a> {
     schema: u32,
     dry_run: bool,
+    runtime_busy: bool,
     dirs: Vec<Entry>,
     used: u64,
     budget: Option<u64>,
@@ -74,6 +75,8 @@ struct Entry {
     path: String,
     store: Option<String>,
     state: State,
+    /// The store was created by heli as an exclusively regenerable cache.
+    managed_cache_root: bool,
     workspace: Option<String>,
     repository: Option<String>,
     created_at: Option<u64>,
@@ -99,6 +102,10 @@ impl Entry {
             path: text(&dir.path),
             store: dir.store.as_deref().map(text),
             state,
+            managed_cache_root: dir
+                .store
+                .as_deref()
+                .is_some_and(crate::store::managed::owns),
             workspace: dir.workspace.as_deref().map(text),
             repository: dir
                 .owner
@@ -142,6 +149,7 @@ pub fn main(dry_run: bool, json: bool) -> ! {
     let listing = Listing {
         schema: SCHEMA,
         dry_run,
+        runtime_busy: pass.runtime_busy,
         dirs,
         used: pass.used,
         budget: pass.policy.budget,

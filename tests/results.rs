@@ -162,6 +162,9 @@ impl Verifier {
         let mut command = self.fixture.heli(args.iter().copied());
         command
             .env("CARGO", &self.cargo)
+            // The host may pin a real compiler for its own builds. This
+            // verifier selects its fake compiler from the PATH below.
+            .env_remove("RUSTC")
             .env("CARGO_HOME", self.cargo_home())
             .env("ECHO_VERSION", self.fixture.path("versions"))
             .env("PATH", path);
@@ -855,6 +858,44 @@ fn no_cache_runs_and_records_a_pass() {
     assert_eq!(outcome(&mut forced()), Outcome::Ran, "forced again");
 }
 
+/// Fully disabling result reuse must also skip its expensive source inventory.
+/// Existing cached verdicts remain available to other clients.
+#[test]
+fn cache_off_runs_without_inventorying_or_recording_results() {
+    let verifier = Verifier::new();
+    let log = verifier.fixture.path("source-metadata-log");
+    let run = |args: &[&str]| {
+        let mut command = verifier.heli(args);
+        command.env("ECHO_SOURCE_METADATA_LOG", &log);
+        command
+    };
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Ran);
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
+    assert!(
+        !std::fs::read(&log)
+            .expect("source metadata logged")
+            .is_empty()
+    );
+    std::fs::write(&log, "").expect("clear metadata log");
+    let before = markers(&verifier.fixture);
+    for _ in 0..2 {
+        assert_eq!(
+            outcome(&mut run(&["--cache", "off", "check"])),
+            Outcome::Ran
+        );
+    }
+    assert!(
+        std::fs::read(&log).expect("metadata log").is_empty(),
+        "cache-off performed source inventory"
+    );
+    assert_eq!(
+        markers(&verifier.fixture),
+        before,
+        "cache-off wrote a verdict"
+    );
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
+}
+
 /// A run that fails drops the pass recorded for its key, so a flaky pass is
 /// no longer reused once a forced run has failed.
 #[test]
@@ -1207,4 +1248,178 @@ fn a_file_changed_in_the_second_of_the_index_is_keyed_by_its_content() {
         Outcome::Ran,
         "other content is a miss"
     );
+}
+
+/// A configuration include outside the Git worktree is still an input to
+/// the real Cargo verdict, whether reached from Cargo home or --config.
+#[test]
+fn transitive_cargo_config_includes_invalidate_cached_verdicts() {
+    for mode in ["home", "cli-file", "cli-inline", "cli-inline-relative"] {
+        let fixture = Fixture::new("basic");
+        std::fs::write(
+            fixture.workspace().join("crates/tests-mixed/src/lib.rs"),
+            "#[cfg(heli_include_broken)] compile_error!(\"changed included configuration\");\n",
+        )
+        .expect("write source");
+        init_repo(&fixture);
+        let home = fixture.path("include-home");
+        std::fs::create_dir_all(home.join("nested")).expect("create include directories");
+        let entry = home.join(if mode == "home" {
+            "config.toml"
+        } else {
+            "selected.toml"
+        });
+        std::fs::write(&entry, "include = ['nested/middle.toml']\n").expect("write entry");
+        std::fs::write(
+            home.join("nested/middle.toml"),
+            "include = ['../leaf.toml']\n",
+        )
+        .expect("write middle include");
+        let leaf = home.join("leaf.toml");
+        std::fs::write(&leaf, "[build]\nrustflags = []\n").expect("write leaf");
+        let check = || {
+            let mut command = fixture.heli(["check", "-p", "tests-mixed"]);
+            command.env("CARGO_HOME", &home);
+            match mode {
+                "home" => {}
+                "cli-file" => {
+                    command.arg("--config").arg(&entry);
+                }
+                "cli-inline" => {
+                    let path = serde_json::to_string(&entry.to_string_lossy()).unwrap();
+                    command.arg("--config").arg(format!("include=[{path}]"));
+                }
+                _ => {
+                    command
+                        .arg("--config")
+                        .arg("include=['../include-home/selected.toml']");
+                }
+            }
+            command.output().expect("run configured check")
+        };
+        assert_success(&check(), "first included check");
+        assert!(
+            hit_line(&check()).is_some(),
+            "unchanged includes should hit"
+        );
+        std::fs::write(
+            &leaf,
+            "[build]\nrustflags = ['--cfg=heli_include_broken']\n",
+        )
+        .expect("change included compiler input");
+        let changed = check();
+        assert_eq!(
+            changed.status.code(),
+            Some(101),
+            "changed transitive configuration returned a false green ({mode}): {changed:?}"
+        );
+        std::fs::write(&leaf, "[build]\nrustflags = []\n").expect("restore leaf");
+        assert!(
+            hit_line(&check()).is_some(),
+            "restoring the original input should recover its pass"
+        );
+    }
+}
+
+#[test]
+fn optional_cargo_config_include_creation_and_removal_are_keyed() {
+    let fixture = Fixture::new("basic");
+    std::fs::write(
+        fixture.workspace().join("crates/tests-mixed/src/lib.rs"),
+        "#[cfg(heli_include_broken)] compile_error!(\"optional configuration appeared\");\n",
+    )
+    .expect("write source");
+    init_repo(&fixture);
+    let home = fixture.path("include-home");
+    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::write(
+        home.join("config.toml"),
+        "include = [{ path = 'optional.toml', optional = true }]\n",
+    )
+    .expect("write config");
+    let check = || {
+        fixture
+            .heli(["check", "-p", "tests-mixed"])
+            .env("CARGO_HOME", &home)
+            .output()
+            .expect("run check")
+    };
+    assert_success(&check(), "optional include absent");
+    assert!(hit_line(&check()).is_some());
+    let optional = home.join("optional.toml");
+    std::fs::write(
+        &optional,
+        "[build]\nrustflags = ['--cfg=heli_include_broken']\n",
+    )
+    .expect("create optional configuration");
+    let changed = check();
+    assert_eq!(
+        changed.status.code(),
+        Some(101),
+        "created optional input returned a false green: {changed:?}"
+    );
+    std::fs::remove_file(optional).expect("remove optional configuration");
+    assert!(
+        hit_line(&check()).is_some(),
+        "absence recovers the original pass"
+    );
+}
+
+/// Even a wrapper reporting success on invalid Cargo configuration cannot
+/// make an incomplete/cyclic include inventory certify a later run.
+#[test]
+fn invalid_cargo_config_include_graphs_are_not_recorded() {
+    let verifier = Verifier::new();
+    let home = verifier.cargo_home();
+    let entry = home.join("config.toml");
+    std::fs::write(home.join("cycle.toml"), "include = ['config.toml']\n").unwrap();
+    std::fs::write(home.join("malformed.toml"), "not valid [toml").unwrap();
+    std::fs::create_dir(home.join("directory.toml")).unwrap();
+    for content in [
+        "include = ['cycle.toml']\n",
+        "include = ['required.toml']\n",
+        "include = ['invalid-extension.txt']\n",
+        "include = 'not-an-array.toml'\n",
+        "include = [{path = 'optional.toml', optional = 'yes'}]\n",
+        "include = ['malformed.toml']\n",
+        "include = [{path = 'directory.toml', optional = true}]\n",
+        "include = [{path = 'glob*.toml', optional = true}]\n",
+        "include = [{path = '{template}.toml', optional = true}]\n",
+    ] {
+        std::fs::write(&entry, content).expect("write invalid graph");
+        assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+        assert_eq!(
+            outcome(&mut verifier.check()),
+            Outcome::Ran,
+            "an invalid include graph was cached: {content}"
+        );
+    }
+    assert!(markers(&verifier.fixture).is_empty());
+    std::fs::write(&entry, "[build]\nincremental = false\n").unwrap();
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+    assert_eq!(
+        outcome(&mut verifier.check()),
+        Outcome::Hit,
+        "valid configuration recovers caching"
+    );
+}
+
+#[test]
+fn repeated_cargo_config_includes_decline_caching_like_cargo_cycles() {
+    let verifier = Verifier::new();
+    let home = verifier.cargo_home();
+    std::fs::write(home.join("shared.toml"), "[build]\nincremental = false\n").unwrap();
+    for branch in ["left.toml", "right.toml"] {
+        std::fs::write(home.join(branch), "include = ['shared.toml']\n").unwrap();
+    }
+    std::fs::write(
+        home.join("config.toml"),
+        "include = ['left.toml', 'right.toml']\n",
+    )
+    .unwrap();
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+    std::fs::write(home.join("shared.toml"), "[build]\nincremental = true\n").unwrap();
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
+    assert_eq!(outcome(&mut verifier.check()), Outcome::Ran);
 }

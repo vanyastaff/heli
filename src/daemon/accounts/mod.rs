@@ -106,6 +106,16 @@ impl Accounts {
         log: Log,
         events: Arc<Events>,
     ) -> Arc<Self> {
+        // Only creating the final directory ourselves proves exclusive cache
+        // ownership. Existing/default stores keep their previous policy.
+        for path in &config.paths {
+            if let Err(error) = store::managed::prepare_new(path) {
+                log.write(&format!(
+                    "cannot prepare cache store {}: {error}",
+                    path.display()
+                ));
+            }
+        }
         let accounts = Arc::new(Self {
             policy: Policy::of(&config),
             config,

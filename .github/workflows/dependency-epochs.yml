@@ -1,0 +1,47 @@
+name: Dependency epoch experiment
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - experiments/package-epoch-views.py
+      - docs/research/package-epoch-views.md
+      - .github/workflows/dependency-epochs.yml
+  push:
+    branches: [main]
+    paths:
+      - experiments/package-epoch-views.py
+      - docs/research/package-epoch-views.md
+      - .github/workflows/dependency-epochs.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package-views:
+    name: Package views (${{ matrix.os }})
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Test shared package objects and active view retirement
+        run: python experiments/package-epoch-views.py --prepare-vendor --toolchain stable --output "${{ runner.temp }}/heli-package-epoch-views"
+      - name: Preserve experiment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-epoch-views-${{ matrix.os }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/heli-package-epoch-views/*.json
+            ${{ runner.temp }}/heli-package-epoch-views/*.stdout
+            ${{ runner.temp }}/heli-package-epoch-views/*.stderr

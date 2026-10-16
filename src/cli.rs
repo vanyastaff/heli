@@ -3,7 +3,7 @@
 //! subcommand and its arguments also give the run its class
 //! (`crate::class`). heli's flags choose the output mode (`crate::output`):
 //! `--output <mode>` or `-q`, before a cargo subcommand, or before or after
-//! `exec`; and `--no-cache`, before a cargo subcommand.
+//! `exec`; and `--cache` / `--no-cache`, before a cargo subcommand.
 
 use std::ffi::OsString;
 
@@ -47,6 +47,11 @@ pub enum Action {
     Daemon { detach: bool },
     /// Be the daemon's pool warden.
     Warden,
+    /// Internal parent retaining runtime leases while the actual command runs.
+    LeaseRun {
+        roots: Vec<std::path::PathBuf>,
+        command: Vec<OsString>,
+    },
 }
 
 /// The program heli runs, its arguments, the class of the run, and how to
@@ -80,6 +85,10 @@ struct Cli {
     /// when it passes.
     #[arg(long)]
     no_cache: bool,
+    /// Result cache for checks/tests: on (reuse and record), refresh (record
+    /// only), off (skip result lookup, recording and source inventory).
+    #[arg(long, value_name = "MODE", value_parser = parse_cache, conflicts_with = "no_cache")]
+    cache: Option<Cache>,
     #[command(subcommand)]
     command: Command,
 }
@@ -110,6 +119,13 @@ impl OutputFlags {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(hide = true)]
+    LeaseRun {
+        #[arg(long = "root", required = true)]
+        roots: Vec<std::path::PathBuf>,
+        #[arg(last = true, required = true)]
+        command: Vec<OsString>,
+    },
     /// Run any command: `cargo heli exec -- <command> [args...]`.
     Exec {
         #[command(flatten)]
@@ -230,6 +246,7 @@ pub fn parse(
     }
     let output = cli.output.mode();
     Ok(match cli.command {
+        Command::LeaseRun { roots, command } => Action::LeaseRun { roots, command },
         Command::Exec {
             output: own,
             command,
@@ -285,12 +302,24 @@ pub fn parse(
                 program: cargo,
                 class,
                 exec: false,
-                cache: Cache::of(class, &args, cli.no_cache),
+                cache: match Cache::of(class, &args, cli.no_cache) {
+                    Cache::Off => Cache::Off,
+                    default => cli.cache.unwrap_or(default),
+                },
                 args,
                 output,
             })
         }
     })
+}
+
+fn parse_cache(text: &str) -> Result<Cache, String> {
+    match text {
+        "on" => Ok(Cache::On),
+        "refresh" => Ok(Cache::Refresh),
+        "off" => Ok(Cache::Disabled),
+        _ => Err("cache mode must be on, refresh or off".to_owned()),
+    }
 }
 
 /// A run id as the user gives it, `r17` or `17`, as heli writes it: `r17`.

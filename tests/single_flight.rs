@@ -125,6 +125,9 @@ impl Twins {
         command
             .current_dir(dir)
             .env("CARGO", &self.cargo)
+            // This fixture selects its fake compiler through PATH, even
+            // when the real suite was launched with an explicit RUSTC.
+            .env_remove("RUSTC")
             .env("CARGO_HOME", self.fixture.path("cargo-home"))
             .env("ECHO_VERSION", self.fixture.path("versions"))
             .env("PATH", &self.path)
@@ -510,6 +513,37 @@ fn no_cache_runs_anew() {
     assert_eq!(run_of(&check), first_run);
     assert!(notice(&check).is_some_and(|notice| notice.contains(&first_run)));
     assert_ne!(run_of(&again), first_run);
+    assert_eq!(notice(&again), None);
+    assert_eq!(twins.starts(), 2);
+}
+
+#[test]
+fn cache_off_never_attaches_to_a_check_of_earlier_sources() {
+    let twins = Twins::new();
+    let command = || twins.heli(&twins.workspace(), &["--cache", "off", "check"]);
+    let first = start(&mut command());
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &first_run);
+    edit(&twins.workspace());
+    let again = start(&mut command());
+    let status = twins
+        .fixture
+        .wait_for_status("second client's admission", |status| {
+            let listed = runs(status);
+            listed.len() == 2 || listed.iter().any(|run| run["attached_clients"] == 2)
+        });
+    let listed = runs(&status);
+    twins.open_gate();
+    let first = finish(first);
+    let again = finish(again);
+    assert_success(&first, "first check");
+    assert_success(&again, "changed check");
+    assert_eq!(
+        listed.len(),
+        2,
+        "uncached check reused an older verdict: {status}"
+    );
+    assert_ne!(run_of(&first), run_of(&again));
     assert_eq!(notice(&again), None);
     assert_eq!(twins.starts(), 2);
 }

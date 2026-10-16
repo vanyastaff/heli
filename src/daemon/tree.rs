@@ -10,7 +10,7 @@
 //! - **Unix**: a session of its own (`setsid`). A process group would not
 //!   do: nextest puts each test in a process group of its own. A process
 //!   leaves the session only by starting a session of its own, as daemons
-//!   do.
+//!   do. The runtime guardian leads it and the actual command is its child.
 //!
 //! [`Tree::kill`]: on Windows, `TerminateJobObject`; on Unix, SIGTERM to
 //! every process of the session, so that cargo and nextest can stop their
