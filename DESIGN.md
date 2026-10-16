@@ -1,6 +1,6 @@
 # heli: one machine, many agents, one cargo budget
 
-Status: design draft, updated 2026-10-15. "heli" is a working name.
+Status: design draft, updated 2026-10-16. "heli" is a working name.
 
 This document is the single source of truth for heli's mechanisms and
 contracts. Issue #1 states the problem, the user stories and the testing
@@ -52,6 +52,11 @@ None of the cargo issues that would fix this is close to landing as a whole
 ## 2. Goals and non-goals
 
 Goals:
+
+The current acceptance priority is independent progress across projects and
+worktrees. Disk and RAM caps are secondary to that goal. Their safety
+contracts still apply, but an experiment showing concurrency does not by
+itself establish a need for disk optimization or prove a resource bound.
 
 - **G1, no head-of-line blocking.** A run starts compiling at once, with at
   least one job, whatever else runs. The only places a run can wait at all are
@@ -2201,6 +2206,42 @@ test survives. This strengthens runtime safety but conservatively defers GC
 until managed activity is idle (§6.3); continuous load has no hard disk cap.
 Exact refs, binary hash, overlapping intervals and cleanup evidence are in
 the research report. Q2 remains repository opt-in, with per-workspace paths.
+
+**FLUI controls, 2026-10-16.** Windows FLUI `70c6a45` through frozen heli
+`3b0a26b` used manually prepared shared vendor sources and private Cargo
+homes, with separate artifacts per worktree. This was not automatic
+production epoch preparation. Of eight original concurrent clients, both
+fmt, clippy and check commands exited 0. A telemetry filesystem TOCTOU
+cancelled the two tests; both resumed full workspace tests later exited 101.
+The observed `flui-material` `failure_cases.rs` test hardcodes its readiness
+marker under the checkout's `target/`. The exact same binary failed 101
+without heli; creating only the missing marker parent made that individual
+native test exit 0. This establishes a consumer fixture path assumption, not
+a heli collision or a successful full-suite rerun.
+
+Managed-build GC acceptance for this lab is **invalid setup**: explicit
+`build/a` and `build/b` do not have the required
+`<store>/<2 hex digits>/<hex digits>` layout. GC was enabled but did not
+own or enumerate the measured 43.1 GB of build trees. Their non-collection
+does not establish a managed-store GC defect or a passed disk acceptance.
+
+A separate small `flui-foundation check --lib --offline --locked` control
+used fresh artifacts, identical manual isolation and `-j 4` in both modes,
+in native/heli then heli/native order. Native pairs took 21.498/17.009 s;
+heli pairs took 18.422/17.133 s. All eight commands exited 0, with actual
+compiler overlap in every pair. A separate ordinary native pair with one
+fresh shared lab Cargo home and default jobs also overlapped and exited 0
+in 13.036 s; each reported one package-cache wait. Different jobs preclude
+a strict ratio with that pair. Manual isolation gets no credit as heli
+behavior; these controls establish no full-suite ratio or general speedup.
+
+FLUI main still had a common per-user host lock in
+`tools/xtask/src/host_lock.rs` when checked on this date.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683), containing the
+heli integration, was open and unmerged. Direct Cargo runs do not exercise
+that xtask queue. Local evidence is in
+`target/flui-two-3b0a26b-current/REPORT.md`, its `final-summary.json`, and
+`matched-control-20261016T081315547457Z/results.json` beneath that lab.
 
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned

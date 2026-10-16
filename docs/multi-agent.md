@@ -4,6 +4,10 @@ Use one writable worktree per agent. Keep its default checkout-local `target/`;
 do not export a single `CARGO_TARGET_DIR` shared by several worktrees. A shared
 host jobserver cannot remove Cargo's exclusive artifact-directory lock.
 
+The current priority is independent progress across projects and worktrees.
+Disk and RAM caps are secondary; preserve runtime safety without treating
+disk optimization as a demonstrated prerequisite for concurrency.
+
 Give intermediate artifacts a separate path per workspace. For a project on
 Windows drive D, its `.cargo/config.toml` can contain:
 
@@ -14,7 +18,11 @@ build-dir = 'D:\heli-cache\{workspace-path-hash}'
 
 The equivalent command-scoped environment variable is
 `CARGO_BUILD_BUILD_DIR`, with both `BUILD` components. Do not globally override
-projects that use different placement. Configure heli with an explicit store
+projects that use different placement. Keep the `{workspace-path-hash}`
+template: managed build directories have the layout
+`<store>/<2 hex digits>/<hex digits>`. An arbitrary `<store>/agent-a` path
+is not enrolled in that store's inventory or GC.
+Configure heli with an explicit store
 on each relevant volume and one aggregate artifact budget, for example:
 
 ```toml
@@ -46,12 +54,14 @@ a safe cached verdict. It never attaches an unkeyed check to an earlier
 check. Use `--cache on` when verdict reuse is useful. Existing `--no-cache`
 means refresh: it still computes a key and records a successful result.
 
-A project's own machine-wide queue also needs integration. FLUI's corrected
-xtask skips that queue when heli supplies a nonempty `HELI_RUN`, and leaves
-standalone commands protected by their existing lock. Each other task runner
-needs the same explicit integration review. Bare Cargo inheriting the host
-jobserver does not automatically supply this runner handshake. Do not export
-`HELI_RUN` manually or globally disable project locks.
+A project's own machine-wide queue also needs integration. As checked on
+2026-10-16, FLUI main still has a common per-user host lock in
+`tools/xtask/src/host_lock.rs`.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) adds a bypass
+when heli supplies a nonempty `HELI_RUN`, retaining standalone protection;
+the PR was open and unmerged. Check the consumer revision before relying
+on that handshake. Bare Cargo inheriting the host jobserver does not supply
+it. Do not export `HELI_RUN` manually or globally disable project locks.
 
 GC protects the whole lifetime of managed commands, including runtime tests
 reading `OUT_DIR` after Cargo releases its build locks. Compatible shared
@@ -99,6 +109,15 @@ and [package objects with cheap NTFS epoch views](research/package-epoch-views.m
 The [production dependency canary](../experiments/dependency-epoch-concurrency.py)
 reproduces three concurrent consumers across two projects and two Git worktrees,
 with a held baseline package-cache lock and source GC between consumer exits.
+
+The 2026-10-16 FLUI control also established actual parallel compilation
+with ordinary Cargo, including a shared lab Cargo home. Manually separating
+artifacts and homes is not a benefit attributable to heli. The small matched
+checks do not establish a general speedup or a full-suite comparison.
+Both full workspace test attempts stopped on a consumer fixture that also
+failed natively with a relocated target; the suite is not claimed green.
+The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
+contains the scopes, timings and invalid GC setup finding.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
 primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
