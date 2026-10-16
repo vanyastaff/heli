@@ -2327,8 +2327,9 @@ let B finish while A's response remains gated. Native Windows evidence is
 in `target/real-hol-public-1016-0339/results.json`; all commands succeeded
 and B's lockfile remained unchanged. This establishes a real Cargo
 head-of-line blocking case and the benefit of source isolation, not a
-unique Heli mechanism or a throughput speedup. Heli still requires explicit
-preparation and selection; automatic safe setup remains unfinished. The
+unique Heli mechanism or a throughput speedup. Imported epochs require
+explicit preparation and selection; the native private-home profile in
+§6.6 prepares an isolated home automatically after explicit selection. The
 dependency experiment workflow repeats this public fixture on three OSes.
 
 The FLUI marker fixture repair is published in PR #1683 at `8c48ac7a3`:
@@ -2337,6 +2338,50 @@ checkout-local `target/`. The same public test is red before and green
 after the change with relocated Cargo outputs. All four library tests and
 the 14-test changed-scope gate through Heli passed locally. This is scoped
 repair evidence, not a successful rerun of both full concurrent suites.
+
+**Native private-home FLUI repeat, 2026-10-16.** Frozen Heli `c86d153`
+and FLUI `8c48ac7a3` run eight commands across two real Git worktrees:
+`fmt --all`, `clippy --workspace --all-targets --locked`,
+`check --workspace --all-targets --locked`, and
+`test --workspace --locked --no-fail-fast` in each worktree. Each worktree
+has its own native Cargo home and managed build directory; no vendor import
+or source-cache seeding precedes the commands. Both fmt, clippy and check
+runs exited 0. Paired compiler start/end records prove actual compiler
+overlap across worktrees, not merely overlapping command lifetimes.
+
+The B test run exited 101 after 3259.7 seconds; A passed its full test
+command, including trybuild and doctests, after 3630.1 seconds. Seven of
+the eight commands therefore passed. B reported five failing tests across four
+targets: the CLI HTTP server contract (Windows connection reset), two
+hot-reload host-wake tests, Windows text-services COM teardown, and the
+runtime sampling diagnostic-event assertion. The existing hot-reload
+binary reproduced the same two failures with parallel test threads but
+passed 30 serial repetitions; two hook tests omit the existing lock for
+their process-global rebuild callback. A test-only repair is prepared but
+not yet validated. The original runtime test binary also reproduces its
+same diagnostic assertion without Heli: one failure in 12 parallel
+repetitions, versus 20 passing serial repetitions. A standalone tracing
+probe reproduces a missing event when another thread without a subscriber
+first registers its callsite; reinstalling the subscriber restores delivery.
+No runtime repair has yet been validated. CLI and COM failure causes remain
+under investigation. These observations do not establish cross-worktree
+interference or a Heli defect.
+
+Final evidence contains 20,199 completed compiler intervals, with no orphan,
+ambiguous or malformed events, and a successful cross-worktree overlap pair.
+Nonzero compiler exits include expected compile-fail tests; command results
+remain the authority for test success. Original configuration, credentials
+and project lockfile digests stayed unchanged. Idle GC reclaimed the managed
+build directories. An initial 6,394,047,229-byte trash debt settled to zero
+after one retry. The two live checkout targets retained 4,771,850,254 bytes
+of final artifacts, above the configured 2-GiB budget: this is an unmet budget,
+not permission to remove protected outputs. Native source homes are outside
+that budget. The driver removed both clean worktrees after measurement,
+with no reported cleanup error. The whole run is `FAIL`, rather than full
+concurrent-suite or resource-budget acceptance.
+Evidence is retained in `target/flui-native-c86d153-1` and the isolated
+consumer-repair checkout. This run does not supersede the full xtask and
+nested-Cargo compatibility scope in §6.1 or the repository opt-in Q2 decision.
 
 FLUI main still had a common per-user host lock in
 `tools/xtask/src/host_lock.rs` when checked on this date.
