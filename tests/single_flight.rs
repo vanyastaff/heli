@@ -367,9 +367,18 @@ fn markers(fixture: &Fixture) -> Vec<PathBuf> {
 /// runs again.
 #[test]
 fn a_failure_reaches_every_client_and_is_not_recorded() {
+    failure_reaches_every_client("on");
+}
+
+#[test]
+fn cache_off_failure_reaches_every_client_and_is_not_recorded() {
+    failure_reaches_every_client("off");
+}
+
+fn failure_reaches_every_client(cache: &str) {
     let twins = Twins::new();
     let failing = |dir: &Path| {
-        let mut command = twins.check(dir);
+        let mut command = twins.heli(dir, &["--cache", cache, "check"]);
         command.env("ECHO_EXIT", "1");
         command
     };
@@ -438,8 +447,18 @@ fn killing_one_client_leaves_the_run_to_the_others() {
 /// then, from any worktree.
 #[test]
 fn a_run_waiting_for_its_worktree_is_keyed_again() {
+    waiting_run_is_keyed_again("on");
+}
+
+#[test]
+fn cache_off_waiting_for_its_worktree_is_keyed_again() {
+    waiting_run_is_keyed_again("off");
+}
+
+fn waiting_run_is_keyed_again(cache: &str) {
     let twins = Twins::new();
     let workspace = twins.workspace();
+    let check = |dir: &Path| twins.heli(dir, &["--cache", cache, "check"]);
     let build_gate = twins.fixture.path("build-gate");
     let mut build = twins.heli(&workspace, &["build"]);
     build.env("ECHO_WAIT_FOR", &build_gate);
@@ -452,28 +471,28 @@ fn a_run_waiting_for_its_worktree_is_keyed_again() {
         .env_remove("ECHO_WAIT_FOR");
     let fmt = start(&mut fmt);
     wait_for_runs(&twins.fixture, 2);
-    let check = start(&mut twins.check(&workspace));
+    let checked = start(&mut check(&workspace));
     let listed = wait_for_runs(&twins.fixture, 3);
     assert!(listed[2]["waiting_since"].is_u64(), "{listed:?}");
     let check_run = id(&listed[2]);
 
-    let here = start(&mut twins.check(&workspace));
+    let here = start(&mut check(&workspace));
     wait_for_clients(&twins.fixture, &check_run, 2);
-    let there = start(&mut twins.check(&twins.other));
+    let there = start(&mut check(&twins.other));
     wait_for_runs(&twins.fixture, 4);
 
     std::fs::write(&build_gate, "").expect("open the build's gate");
     wait_for_output(&twins.fixture, &check_run);
     edit(&twins.other);
-    let changed = start(&mut twins.check(&twins.other));
+    let changed = start(&mut check(&twins.other));
     wait_for_clients(&twins.fixture, &check_run, 3);
 
     twins.open_gate();
     assert_success(&finish(build), "the build");
     assert_success(&finish(fmt), "fmt");
-    let check = finish(check);
-    assert_success(&check, "the check");
-    assert_eq!(run_of(&check), check_run);
+    let checked = finish(checked);
+    assert_success(&checked, "the check");
+    assert_eq!(run_of(&checked), check_run);
     let here = finish(here);
     assert_success(&here, "the check in the same worktree");
     assert_eq!(run_of(&here), check_run);
@@ -518,6 +537,496 @@ fn no_cache_runs_anew() {
 }
 
 #[test]
+fn exec_verification_shares_only_unchanged_inputs() {
+    let twins = Twins::new();
+    let command = || {
+        twins.heli(
+            &twins.workspace(),
+            &[
+                "exec",
+                "--verify",
+                "--",
+                twins.cargo.to_str().expect("cargo path"),
+                "check",
+            ],
+        )
+    };
+    let first = start(&mut command());
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &run);
+    let second = start(&mut command());
+    wait_for_clients(&twins.fixture, &run, 2);
+    edit(&twins.workspace());
+    let changed = start(&mut command());
+    wait_for_runs(&twins.fixture, 2);
+    let different = start(command().env("VERIFICATION_INPUT", "different"));
+    wait_for_runs(&twins.fixture, 3);
+    twins.open_gate();
+    let first = finish(first);
+    let second = finish(second);
+    let changed = finish(changed);
+    let different = finish(different);
+    for output in [&first, &second, &changed, &different] {
+        assert_success(output, "explicit verification wrapper");
+        assert_eq!(
+            text(&output.stdout),
+            "arg: \"check\"\n",
+            "arguments stay verbatim"
+        );
+    }
+    assert_eq!(run_of(&first), run_of(&second));
+    assert_ne!(run_of(&changed), run);
+    assert_ne!(run_of(&different), run_of(&changed));
+    assert_eq!(twins.starts(), 3);
+    assert!(
+        markers(&twins.fixture).is_empty(),
+        "wrappers default to live sharing only"
+    );
+}
+
+#[test]
+fn real_tests_share_then_verify_a_new_source_generation() {
+    for wrapper in [false, true] {
+        let fixture = Fixture::new("basic");
+        let project = fixture.path("real-test-project");
+        let home = fixture.path("real-cargo-home");
+        let receipts = fixture.path("test-receipts");
+        let gate = fixture.path("test-gate");
+        for path in [project.join("src"), home.clone(), receipts.clone()] {
+            std::fs::create_dir_all(path).expect("create real test fixture");
+        }
+        std::fs::write(project.join("Cargo.toml"),
+            "[workspace]\n[package]\nname='shared-verification-proof'\nversion='0.0.0'\nedition='2024'\n").unwrap();
+        std::fs::write(project.join(".gitignore"), "/target/\n").unwrap();
+        let source = r#"
+const REVISION: &str = "one";
+#[test]
+fn verifies() {
+    let root = std::path::PathBuf::from(std::env::var_os("SHARED_TEST_RECEIPTS").unwrap());
+    std::fs::write(root.join(std::process::id().to_string()), REVISION).unwrap();
+    println!("revision={REVISION}");
+    let gate = std::path::PathBuf::from(std::env::var_os("SHARED_TEST_GATE").unwrap());
+    let start = std::time::Instant::now();
+    while !gate.exists() {
+        assert!(start.elapsed().as_secs() < 60);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+"#;
+        std::fs::write(project.join("src/lib.rs"), source).unwrap();
+        let lock = fixture
+            .cargo(["generate-lockfile", "--offline"])
+            .current_dir(&project)
+            .env("CARGO_HOME", &home)
+            .output()
+            .unwrap();
+        assert_success(&lock, "generate real fixture lockfile");
+        git(&project, &["init", "--quiet"]);
+        git(&project, &["config", "core.autocrlf", "false"]);
+        git(&project, &["add", "-A"]);
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=heli",
+                "-c",
+                "user.email=heli@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "--no-verify",
+                "-m",
+                "real test fixture",
+            ],
+        );
+        let command = || {
+            let mut command = fixture.heli(["--cache", "off", "--output", "full"]);
+            if wrapper {
+                command
+                    .args(["exec", "--verify", "--"])
+                    .arg(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+            }
+            command
+                .args(["test", "--offline", "--lib", "--", "--nocapture"])
+                .current_dir(&project)
+                .env("CARGO_HOME", &home)
+                .env("SHARED_TEST_RECEIPTS", &receipts)
+                .env("SHARED_TEST_GATE", &gate);
+            command
+        };
+        let first = start(&mut command());
+        let run = id(&wait_for_runs(&fixture, 1)[0]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::fs::read_dir(&receipts).unwrap().count() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real test did not start"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let second = start(&mut command());
+        wait_for_clients(&fixture, &run, 2);
+        assert_eq!(std::fs::read_dir(&receipts).unwrap().count(), 1);
+        std::fs::write(
+            project.join("src/lib.rs"),
+            source.replace("\"one\"", "\"two\""),
+        )
+        .unwrap();
+        let changed = start(&mut command());
+        let listed = wait_for_runs(&fixture, 2);
+        std::fs::write(gate, "").unwrap();
+        let outputs = [finish(first), finish(second), finish(changed)];
+        for output in &outputs {
+            assert_success(output, "real source-aware shared tests");
+        }
+        assert_eq!(listed[1]["waiting_for"], serde_json::json!([run]));
+        assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
+        assert_ne!(run_of(&outputs[0]), run_of(&outputs[2]));
+        assert_eq!(outputs[0].stdout, outputs[1].stdout);
+        assert!(text(&outputs[0].stdout).contains("revision=one"));
+        assert!(text(&outputs[2].stdout).contains("revision=two"));
+        let mut revisions = std::fs::read_dir(receipts)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>();
+        revisions.sort();
+        assert_eq!(revisions, ["one", "two"]);
+        assert!(markers(&fixture).is_empty());
+    }
+}
+
+#[test]
+fn source_generation_barrier_survives_rekey_after_fmt() {
+    let twins = Twins::new();
+    let workspace = twins.workspace();
+    let build_gate = twins.fixture.path("build-gate");
+    let fmt_gate = twins.fixture.path("fmt-gate");
+    let mut build = twins.heli(&workspace, &["build"]);
+    build.env("ECHO_WAIT_FOR", &build_gate);
+    let build = start(&mut build);
+    wait_for_runs(&twins.fixture, 1);
+    let mut fmt = twins.heli(&workspace, &["fmt"]);
+    fmt.env("ECHO_WAIT_FOR", &fmt_gate)
+        .env("ECHO_STARTS", library(&workspace));
+    let fmt = start(&mut fmt);
+    let fmt_run = id(&wait_for_runs(&twins.fixture, 2)[1]);
+    let first = start(&mut twins.heli(&workspace, &["--cache", "off", "check"]));
+    let first_run = id(&wait_for_runs(&twins.fixture, 3)[2]);
+    std::fs::write(build_gate, "").expect("release build");
+    wait_for_output(&twins.fixture, &fmt_run);
+    let later = start(&mut twins.heli(&workspace, &["--cache", "off", "check", "--all-targets"]));
+    let later_run_id = id(&wait_for_runs(&twins.fixture, 3)[2]);
+    std::fs::write(fmt_gate, "").expect("release formatter");
+    wait_for_output(&twins.fixture, &first_run);
+    let status = twins.fixture.status();
+    let later_run = runs(&status)
+        .into_iter()
+        .find(|run| run["id"] == later_run_id)
+        .expect("later check");
+    twins.open_gate();
+    assert_success(&finish(build), "build");
+    assert_success(&finish(fmt), "formatter");
+    assert_success(&finish(first), "first check after rekey");
+    assert_success(&finish(later), "later check after rekey");
+    assert_eq!(
+        later_run["waiting_for"],
+        serde_json::json!([first_run]),
+        "source barriers fixed at admission must not disappear during rekey: {status}"
+    );
+}
+
+#[test]
+fn same_source_different_checks_do_not_wait_in_one_worktree() {
+    let twins = Twins::new();
+    let first = start(&mut twins.heli(&twins.workspace(), &["--cache", "off", "check"]));
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &run);
+    let second = start(&mut twins.heli(
+        &twins.workspace(),
+        &["--cache", "off", "check", "--all-targets"],
+    ));
+    let listed = wait_for_runs(&twins.fixture, 2);
+    twins.open_gate();
+    assert_success(&finish(first), "first check");
+    assert_success(&finish(second), "other check of the same source state");
+    assert!(
+        listed[1]["waiting_for"]
+            .as_array()
+            .expect("blockers")
+            .is_empty(),
+        "{listed:?}"
+    );
+    assert_eq!(twins.starts(), 2);
+}
+
+#[test]
+fn builds_share_only_current_sources_and_the_same_artifact_owner() {
+    let twins = Twins::new();
+    let command = || twins.heli(&twins.workspace(), &["--cache", "on", "build"]);
+    let first = start(&mut command());
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &first_run);
+    let same = start(&mut command());
+    wait_for_clients(&twins.fixture, &first_run, 2);
+    let other = start(&mut twins.heli(&twins.other, &["build"]));
+    wait_for_runs(&twins.fixture, 2);
+    let mut targets = Vec::new();
+    for name in [
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+    ] {
+        let mut target = command();
+        target.env(name, twins.fixture.path(name));
+        targets.push(start(&mut target));
+        wait_for_runs(&twins.fixture, targets.len() + 2);
+    }
+    let features = start(&mut twins.heli(&twins.workspace(), &["build", "--features", "another"]));
+    wait_for_runs(&twins.fixture, 6);
+    edit(&twins.workspace());
+    let changed = start(&mut command());
+    let status = twins
+        .fixture
+        .wait_for_status("changed build admitted", |status| {
+            let listed = runs(status);
+            listed.len() == 7 || listed.iter().any(|run| run["attached_clients"] == 3)
+        });
+    twins.open_gate();
+    let outputs = [finish(first), finish(same), finish(other), finish(changed)];
+    for output in &outputs {
+        assert_success(output, "build");
+    }
+    assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
+    assert_ne!(
+        run_of(&outputs[0]),
+        run_of(&outputs[2]),
+        "other worktree needs artifacts"
+    );
+    assert_ne!(
+        run_of(&outputs[0]),
+        run_of(&outputs[3]),
+        "new sources need a new build: {status}"
+    );
+    for target in targets {
+        let output = finish(target);
+        assert_success(&output, "separate build output location");
+        assert_ne!(run_of(&outputs[0]), run_of(&output));
+    }
+    let features = finish(features);
+    assert_success(&features, "separate features");
+    assert_ne!(run_of(&outputs[0]), run_of(&features));
+    assert_eq!(twins.starts(), 7);
+    assert!(
+        markers(&twins.fixture).is_empty(),
+        "builds never save verdicts"
+    );
+    assert_success(
+        &command().output().expect("repeat build"),
+        "completed build repetition",
+    );
+    assert_eq!(
+        twins.starts(),
+        8,
+        "a build must check artifact existence again"
+    );
+    assert!(markers(&twins.fixture).is_empty());
+}
+
+#[test]
+fn a_live_client_cannot_inherit_a_queued_runs_saved_verdict() {
+    let twins = Twins::new();
+    let format_gate = twins.fixture.path("format-gate");
+    let mut fmt = twins.heli(&twins.workspace(), &["fmt"]);
+    fmt.env("ECHO_WAIT_FOR", &format_gate);
+    let fmt = start(&mut fmt);
+    let format_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &format_run);
+    let queued = start(&mut twins.check(&twins.workspace()));
+    let queued_id = id(&wait_for_runs(&twins.fixture, 2)[1]);
+    // The twin completes while the first worktree is still blocked. The
+    // queued run will find this saved verdict at its second lookup.
+    twins.open_gate();
+    assert_success(
+        &twins.check(&twins.other).output().expect("twin check"),
+        "twin check",
+    );
+    assert_eq!(markers(&twins.fixture).len(), 1);
+    let live = start(&mut twins.heli(&twins.workspace(), &["--cache", "off", "check"]));
+    twins
+        .fixture
+        .wait_for_status("live client's admission", |status| {
+            let listed = runs(status);
+            listed.len() == 3 || listed.iter().any(|run| run["attached_clients"] == 2)
+        });
+    std::fs::write(format_gate, "").expect("release formatter");
+    assert_success(&finish(fmt), "formatter");
+    assert_success(&finish(queued), "queued cached check");
+    let live = finish(live);
+    assert_success(&live, "live check");
+    assert_ne!(
+        run_of(&live),
+        queued_id,
+        "live request inherited a saved verdict"
+    );
+    assert_eq!(twins.starts(), 3, "formatter, twin, and actual live check");
+}
+
+#[test]
+fn real_builds_produce_artifacts_in_each_worktree() {
+    let twins = Twins::new();
+    let gate = twins.fixture.path("real-build-gate");
+    let command = |dir: &Path, target: &Path| {
+        let mut command =
+            twins
+                .fixture
+                .heli(["--output", "full", "build", "--offline", "-p", "gated"]);
+        command
+            .current_dir(dir)
+            .env("CARGO_TARGET_DIR", target)
+            .env("HELI_FIXTURE_GATE", &gate);
+        command
+    };
+    let target = twins.fixture.path("real-build-target");
+    let other_target = twins.fixture.path("other-real-build-target");
+    let first = start(&mut command(&twins.workspace(), &target));
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let log = twins.fixture.heli(["log", &run]).output().unwrap();
+        if text(&log.stderr).contains("Compiling gated") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "real build did not start: {log:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let same = start(&mut command(&twins.workspace(), &target));
+    wait_for_clients(&twins.fixture, &run, 2);
+    let other = start(&mut command(&twins.other, &other_target));
+    let listed = wait_for_runs(&twins.fixture, 2);
+    std::fs::write(gate, "").unwrap();
+    let outputs = [finish(first), finish(same), finish(other)];
+    for output in &outputs {
+        assert_success(output, "real independent artifact owner");
+    }
+    assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
+    assert_ne!(run_of(&outputs[0]), run_of(&outputs[2]));
+    assert_eq!(listed[1]["waiting_for"], serde_json::json!([]));
+    for target in [&target, &other_target] {
+        assert!(
+            target.join("debug/libgated.rlib").is_file(),
+            "missing build artifact in {}",
+            target.display()
+        );
+    }
+    assert!(markers(&twins.fixture).is_empty());
+}
+
+#[test]
+fn different_source_states_wait_within_one_worktree() {
+    for cache in ["off", "refresh"] {
+        let twins = Twins::new();
+        let first = start(&mut twins.heli(&twins.workspace(), &["--cache", cache, "check"]));
+        let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+        wait_for_output(&twins.fixture, &run);
+        edit(&twins.workspace());
+        let changed = start(&mut twins.heli(
+            &twins.workspace(),
+            &["--cache", cache, "check", "--all-targets"],
+        ));
+        let listed = wait_for_runs(&twins.fixture, 2);
+        twins.open_gate();
+        assert_success(&finish(first), "old source check");
+        assert_success(&finish(changed), "new source check");
+        assert_eq!(
+            listed[1]["waiting_for"],
+            serde_json::json!([run]),
+            "different source generations must not rewrite live binaries: {listed:?}"
+        );
+        assert_eq!(twins.starts(), 2);
+    }
+}
+
+#[test]
+fn cache_off_source_preparation_is_not_a_dead_daemon_timeout() {
+    let twins = Twins::new();
+    let metadata_gate = twins.fixture.path("metadata-gate");
+    let metadata_pid = twins.fixture.path("metadata-pid");
+    let mut command = twins.heli(&twins.workspace(), &["--cache", "off", "check"]);
+    command
+        .env("ECHO_METADATA_WAIT_FOR", &metadata_gate)
+        .env("ECHO_METADATA_PID", &metadata_pid);
+    let first = start(&mut command);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !metadata_pid.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "metadata did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The client bounds its first answer to five seconds. A live daemon
+    // preparing a source key must acknowledge it, not trigger direct fallback.
+    std::thread::sleep(Duration::from_secs(6));
+    let premature_starts = twins.starts();
+    std::fs::write(metadata_gate, "").expect("release source inventory");
+    twins.open_gate();
+    let output = finish(first);
+    assert_success(&output, "source-keyed uncached check");
+    assert_eq!(
+        premature_starts, 0,
+        "command ran before its source key was ready"
+    );
+    assert!(
+        !text(&output.stderr).contains("running the command directly"),
+        "{output:?}"
+    );
+    assert_eq!(twins.starts(), 1);
+}
+
+#[test]
+fn cache_off_shares_the_same_check_without_recording_a_verdict() {
+    let twins = Twins::new();
+    let command = || twins.heli(&twins.workspace(), &["--cache", "off", "check"]);
+    let first = start(&mut command());
+    let first_run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    wait_for_output(&twins.fixture, &first_run);
+    let second = start(&mut command());
+    let status = twins
+        .fixture
+        .wait_for_status("second request admitted", |status| {
+            let listed = runs(status);
+            listed.len() == 2 || listed.iter().any(|run| run["attached_clients"] == 2)
+        });
+    twins.open_gate();
+    let outputs = [finish(first), finish(second)];
+    for output in &outputs {
+        assert_success(output, "uncached check");
+    }
+    assert_eq!(
+        runs(&status).len(),
+        1,
+        "identical uncached checks must share: {status}"
+    );
+    assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
+    assert_eq!(outputs[0].stdout, outputs[1].stdout);
+    assert_eq!(twins.starts(), 1);
+    assert!(markers(&twins.fixture).is_empty(), "no persistent verdict");
+    let again = command().output().expect("repeat after completion");
+    assert_success(&again, "uncached repetition");
+    assert_ne!(
+        run_of(&again),
+        first_run,
+        "completed verdict must not be reused"
+    );
+    assert_eq!(twins.starts(), 2);
+    assert!(markers(&twins.fixture).is_empty());
+}
+
+#[test]
 fn cache_off_never_attaches_to_a_check_of_earlier_sources() {
     let twins = Twins::new();
     let command = || twins.heli(&twins.workspace(), &["--cache", "off", "check"]);
@@ -552,10 +1061,19 @@ fn cache_off_never_attaches_to_a_check_of_earlier_sources() {
 /// tree is the same as a run's in flight, so it attaches to none.
 #[test]
 fn a_check_without_a_key_attaches_to_no_run() {
+    check_without_a_key_attaches_to_no_run("on");
+}
+
+#[test]
+fn cache_off_without_a_key_attaches_to_no_run() {
+    check_without_a_key_attaches_to_no_run("off");
+}
+
+fn check_without_a_key_attaches_to_no_run(cache: &str) {
     let fixture = Fixture::new("basic");
     let echo = fixture.echo_args();
     let check = || {
-        let mut check = fixture.heli(["check"]);
+        let mut check = fixture.heli(["--cache", cache, "check"]);
         check
             .env("CARGO", &echo)
             .env("ECHO_WAIT_FOR", fixture.path("gate"))
@@ -583,9 +1101,18 @@ fn a_check_without_a_key_attaches_to_no_run() {
 /// run's whole output and its exit code.
 #[test]
 fn the_same_check_in_two_worktrees_runs_once() {
+    same_check_in_two_worktrees_runs_once("on");
+}
+
+#[test]
+fn cache_off_same_check_in_two_worktrees_runs_once() {
+    same_check_in_two_worktrees_runs_once("off");
+}
+
+fn same_check_in_two_worktrees_runs_once(cache: &str) {
     let twins = Twins::new();
-    let first = start(&mut twins.check(&twins.workspace()));
-    let second = start(&mut twins.check(&twins.other));
+    let first = start(&mut twins.heli(&twins.workspace(), &["--cache", cache, "check"]));
+    let second = start(&mut twins.heli(&twins.other, &["--cache", cache, "check"]));
     let status = twins
         .fixture
         .wait_for_status("one run with two clients", |status| {

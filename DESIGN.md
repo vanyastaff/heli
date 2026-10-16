@@ -653,10 +653,14 @@ How a command line is read:
 - `clippy` is mutate when `--fix` comes before `--`; what follows `--` is the
   compiler's.
 - `cargo heli exec -- <cmd>` is exec whatever the command, even `cargo fmt`.
+  `exec --verify` explicitly declares a read-only verification instead. It
+  uses verify's complete input key and defaults to live sharing without
+  persisted verdicts. Only use it for commands whose result is a verification,
+  such as `cargo xtask check-changed`; it does not classify a wrapper's steps.
 
 ### Lifecycle
 
-1. **Key** (verify and test runs only). The key covers the worktree's tree,
+1. **Key** (compile, verify and test runs). The key covers the worktree's tree,
    the normalized argv, the toolchain, the Cargo configuration and the
    environment; §7 lists exactly what goes in and how.
 2. **Result store.** On a hit, heli prints "already passed: <run>, <when>"
@@ -674,8 +678,15 @@ How a command line is read:
      change its tree; until then it takes clients from its own worktree
      only, whose tree such a change reaches too. A run that waits for
      nothing keeps its key.
-   - A `--no-cache` run attaches to no run, and is keyed only once
-     admitted; from then on others attach to it.
+   - A `--no-cache` run attaches to no run. Its key is prepared before
+     admission to identify its source generation; it takes clients of the
+     key only once admitted and rekeyed after any conflicting wait.
+   - Compile keys additionally include the worktree and selected artifact
+     directories. Identical builds in one worktree share; another worktree
+     or output directory must build its own artifacts. No complete source
+     inventory means no build sharing. Compile runs never reuse saved verdicts.
+   - A live-only request can follow a cached request only after its process
+     starts: a queued cached request may still resolve to a saved verdict.
 4. **Detach.** The daemon spawns the command as the first process of a
    process tree of its own, and the client follows its output.
    - **The tree.** On Windows, a Job Object per run: the process starts
@@ -710,13 +721,14 @@ How a command line is read:
      (its exit, a pass found in the result store meanwhile, or a command
      that could not start). A retiring daemon starts no run but still
      attaches.
-     - This holds for runs without a key: compile, mutate and exec runs,
+     - This holds for runs using command identity: mutate and ordinary exec runs,
        and requests for help. The same command may have started before the
        agent's last edit; the notice's age tells.
-     - A verify or test run attaches by key instead (single-flight, step
+     - A compile, verify or test run attaches by key instead (single-flight, step
        3): the same tree too, and from any worktree. The same command after
-       an edit is a run of its own. One without a key (outside git,
-       `--no-cache`, a key that cannot be computed) attaches to no run.
+       an edit is a run of its own. Compile additionally keys artifact
+       ownership, so its outputs belong to the requesting worktree. A
+       force-new request or one without a complete key attaches to no run.
    - **Cancel.** `cargo heli cancel <run>` kills the whole tree and answers
      once none of its processes is left. On Windows, `TerminateJobObject`,
      waiting on the processes themselves too (a job stops counting a
@@ -811,7 +823,13 @@ the rule "one writing agent per worktree" stays.
   is the same worktree.
 - **Order.** Runs take their turns in the order the daemon admitted them: a
   run waits for the runs admitted before it in the same worktree that
-  conflict with it, two runs conflicting when either is exclusive. So a
+  conflict with it. Two runs conflict when either is exclusive, or when
+  their complete verification source inventories at admission identify
+  different source states. These barriers stay fixed through rekeying, so
+  a run cannot gain a new wait after deciding to keep its input key.
+  The latter prevents rebuilding a test executable still running
+  on Windows; equal source states keep shared access. Separate worktrees
+  do not wait on this guard. So a
   waiting `fmt` is never overtaken, and a stream of builds cannot starve it.
 - **Saying so.** A run that waits prints one line on stderr before anything
   else, naming the runs it waits for:
@@ -831,7 +849,9 @@ These are the only waits; nothing else makes a heli run wait for another run.
 1. **Test slots:** up to 5 s before the test phase, after which it proceeds
    with one thread.
 2. **The worktree lock:** a mutate run waits for heli runs using the same
-   worktree, and they wait for it, in the order they came.
+   worktree, and they wait for it, in the order they came. Keyed verification
+   runs of different source states in that worktree also wait in admission
+   order, then rekey before starting; this prevents replacing live binaries.
 3. **Cargo's own build-directory lock:** two runs building the same worktree
    at once are serialized by cargo. The waiting cargo holds no pool slot.
 4. **Recycling:** the first run from a directory, while a store holds an
@@ -846,13 +866,15 @@ These are the only waits; nothing else makes a heli run wait for another run.
 5. **The source-state record:** as a run ends, its clients hear the end
    once the record of its build directory is written (§6.4), at most 10 s
    later. This waits for no other run.
-6. **Cargo resolution and optional verdict preparation:** Cargo serializes
+6. **Cargo resolution and verification preparation:** Cargo serializes
    dependency resolution on its package-cache lock, including offline runs.
-   The full metadata and source inventory of `--cache on` / `refresh` add
+   The full metadata and source inventory of keyed verification modes add
    preparation before compilation; they are not bounded by the scheduler's
-   first-job latency target. Foreground concurrency checks use `--cache off`
-   to omit this optional work, while preserving safe complete inventories
-   whenever a verdict is cached. This does not remove Cargo's own resolver
+   first-job latency target. `--cache off` also inventories inputs, to share
+   only current checks. The daemon acknowledges this preparation before the
+   client's five-second first-answer deadline; preparation is not a command
+   start and loss before start still permits direct fallback.
+   This does not remove Cargo's own resolver
    lock or promise zero startup work. See `docs/multi-agent.md` and the
    pinned Cargo-source analysis in `docs/research/multi-project-resource-isolation.md`.
 
@@ -861,6 +883,7 @@ These are the only waits; nothing else makes a heli run wait for another run.
 ```
 cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cache] <subcommand> [tool args…]
 cargo heli exec [heli flags] -- <command…>
+cargo heli [--cache on|refresh|off | --no-cache] exec --verify [output flags] -- <verification command…>
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
 cargo heli cancel <run>
@@ -2006,14 +2029,24 @@ fails.
 
 **Caveats**, printed on every hit: a flaky test that passed once stays green
 for that key (`--no-cache` runs it again), and ignored files are not part of
-the key. `--cache off` skips result lookups, recording, single-flight reuse
-and their full source inventory; it retains host scheduling, test phases,
-directory isolation and GC. This mode suits foreground multi-agent runs
-where predictable startup matters more than reusing a verdict. Full source
-inventory uses Cargo's resolver lock even offline; a large workspace can
-otherwise delay its own first compiler. `--cache on` is the default for
-checks/tests; `--cache refresh` is equivalent to `--no-cache`. Compile,
-mutate and exec commands remain uncached regardless of this option.
+the key. `--cache off` skips persistent result lookups, recording and
+invalidation, but shares matching checks/tests already in flight using the
+same complete source/configuration/toolchain/environment key. After an edit,
+the next request starts a different run; after a conflicting worktree wait,
+the key is recomputed. No complete key means no sharing. This policy has its
+own wire value (`live`), so older daemons refuse it instead of silently
+discarding freshness. The legacy `disabled` value retains its old no-sharing
+semantics for older clients. Full source inventory uses Cargo's resolver lock
+even offline and can delay the first compiler. `--cache on` is the default
+for checks/tests; `--cache refresh` is equivalent to `--no-cache`. Compile
+commands always use source-keyed live sharing, regardless of this option;
+mutate and ordinary exec commands retain command-based sharing.
+`exec --verify` is verify and defaults to `off`; an explicit cache policy can
+opt this declared verification into persistent verdicts. Its output and tool
+arguments retain exec's behavior. Source inventory currently requires a Cargo
+workspace and its complete local Git source graph; a wrapper that cannot
+supply that inventory runs independently. It does not snapshot-isolate files
+from concurrent editor writes.
 `--no-cache` skips both lookups, not the recording, and attaches to
 no run in flight (§5, step 3).
 
@@ -2265,6 +2298,40 @@ heli integration, was open and unmerged. Direct Cargo runs do not exercise
 that xtask queue. Local evidence is in
 `target/flui-two-3b0a26b-current/REPORT.md`, its `final-summary.json`, and
 `matched-control-20261016T081315547457Z/results.json` beneath that lab.
+
+**Shared verification acceptance, 2026-10-16.** Heli `7326ac9` and FLUI
+`bf23bf57f` passed a fresh three-mode comparison using two pinned worktrees,
+ordinary checkout-local targets, and one shared owned Cargo home per mode.
+All 18 client commands exited 0. The pair's cold changed-scope gate took
+728.9 s with the stock xtask host lock, 505.5 s with that lock disabled,
+and 334.7 s through `exec --verify` with Heli's saved verdicts disabled.
+The exact repeats hit xtask's cache in all modes (6.7/7.2/7.7 s).
+The native nested group took 616.6/536.9/304.4 s, respectively; its 11 tests
+passed in every executed group. Heli served each matching pair from one
+actual run, rather than compiling and testing both worktrees. Ordinary
+unlocked Cargo also compiled concurrently; parallelism alone is not a
+benefit unique to Heli. The measured Heli benefit here is live sharing of
+identical verification, with xtask's managed-result cache restored.
+
+The frozen release's same-worktree counter separately passed all 12 clients:
+native Cargo executed identical tests twice; live-only direct and wrapped
+Heli executed once. An edit required a second source generation, queued
+behind the first before rebuilding. Real Cargo regression tests also prove
+that compile commands produce an artifact for each independent worktree.
+Cargo already reuses up-to-date artifacts for ordinary repeated builds;
+Heli does not claim to eliminate a second compilation that Cargo would skip.
+
+Four busy GC surveys reclaimed nothing; an idle survey resumed afterward.
+Minimum system-available RAM was 22.3/20.9/27.2 GiB across the three modes.
+This was not a pressure or hard-quota test. Heli's complete local suite
+passed 393 tests, Clippy passed with warnings denied, and FLUI's scoped
+gate passed all 61 xtask tests. The FLUI experiment covers the changed-scope
+gate and native nested group, not full platform/feature CI parity. It was
+one fixed-order Windows run; Linux/macOS execution remains unverified here.
+See [the acceptance report](docs/research/shared-verification-acceptance.md)
+for pins, regression mapping, the excluded prototype-profile preparation,
+retained receipts and remaining interference boundaries. Q2 stays opt-in;
+this ordinary-layout experiment does not change its build-dir acceptance.
 
 - **Phase 0**, no code, one day, tracked as its own issue. A semaphore kept
   open, `CARGO_MAKEFLAGS` in the agents' environment, flui's host lock turned

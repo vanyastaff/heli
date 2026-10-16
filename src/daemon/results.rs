@@ -24,6 +24,8 @@
 //! `--no-cache` skips the lookups, not the recording. Every part is best
 //! effort: a key that cannot be computed, or a store that cannot be written,
 //! costs the saving, never the run.
+//! `--cache off` computes a key for single-flight only: it never reads,
+//! records or invalidates persistent verdicts.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,19 +100,21 @@ impl Store {
     }
 
     /// Before `request` waits for anything: its key, and the pass of that
-    /// key if one is recorded. Only a run that looks the store up is keyed
-    /// here; one that does not (`--no-cache`, or no verdict) is not.
+    /// key if persistent reuse is enabled. Live-only and forced-new runs
+    /// are keyed too, to protect their source generation during admission.
     pub fn before(&self, request: &RunRequest) -> Before {
-        if request.cache != Cache::On {
+        if !matches!(request.cache, Cache::On | Cache::Live | Cache::Refresh) {
             return Before::Miss(None);
         }
         let Some(key) = key::compute(request, &self.scratch).ok().flatten() else {
             return Before::Miss(None);
         };
-        match self.lookup(&key) {
-            Some(record) => Before::Passed(record),
-            None => Before::Miss(Some(key)),
+        if request.cache == Cache::On
+            && let Some(record) = self.lookup(&key)
+        {
+            return Before::Passed(record);
         }
+        Before::Miss(Some(key))
     }
 
     /// Once `request` is admitted: its key, and its pass if one is recorded
@@ -131,7 +135,7 @@ impl Store {
                     return Admitted::Run {
                         key: None,
                         note: Some(format!(
-                            "cannot key this run, so it is not recorded: {error}"
+                            "cannot key this run, so it is not shared or recorded: {error}"
                         )),
                     };
                 }
@@ -158,6 +162,11 @@ impl Store {
         run: RunId,
         passed: bool,
     ) -> Option<String> {
+        // A Live key identifies running work only. Neither success nor
+        // failure may modify a verdict independently saved by another run.
+        if request.cache == Cache::Live {
+            return None;
+        }
         if !passed {
             let _ = std::fs::remove_file(self.marker(key));
             return None;

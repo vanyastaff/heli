@@ -1,5 +1,5 @@
-//! A run's key in the result store (DESIGN.md §7): a digest of everything
-//! that decides the verdict of a verify or test run.
+//! A source-aware run's key (DESIGN.md §7): a digest of everything that
+//! decides a verification verdict, with artifact ownership for compile runs.
 //!
 //! **Encoding.** Every input is a field, fed to SHA-256 as its name's length,
 //! the name, its value's length and the value, so no two lists of fields
@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::class::Class;
 use crate::protocol::RunRequest;
 use crate::store::probe::Probe;
 use crate::{environment, source, worktree};
@@ -83,6 +84,20 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }
     fields.push(b"tree", &snapshot.tree);
     fields.push(b"dir", &relative(&cwd, &worktree));
+    if request.class == Some(Class::Compile) {
+        // Sharing a verdict across worktrees is safe; sharing a build
+        // would leave the second owner without its requested artifacts.
+        fields.push(b"artifact-owner", &spelled(worktree.as_os_str()));
+        for name in [
+            "CARGO_TARGET_DIR",
+            "CARGO_BUILD_TARGET_DIR",
+            "CARGO_BUILD_BUILD_DIR",
+        ] {
+            if let Some(value) = request.var(name) {
+                fields.push(name.as_bytes(), value.as_encoded_bytes());
+            }
+        }
+    }
     for arg in request.argv.iter().skip(1) {
         fields.push(b"arg", arg.0.as_encoded_bytes());
     }

@@ -858,10 +858,10 @@ fn no_cache_runs_and_records_a_pass() {
     assert_eq!(outcome(&mut forced()), Outcome::Ran, "forced again");
 }
 
-/// Fully disabling result reuse must also skip its expensive source inventory.
+/// Disabling saved results still inventories sources for live sharing.
 /// Existing cached verdicts remain available to other clients.
 #[test]
-fn cache_off_runs_without_inventorying_or_recording_results() {
+fn cache_off_inventories_sources_without_reading_or_recording_results() {
     let verifier = Verifier::new();
     let log = verifier.fixture.path("source-metadata-log");
     let run = |args: &[&str]| {
@@ -885,14 +885,39 @@ fn cache_off_runs_without_inventorying_or_recording_results() {
         );
     }
     assert!(
-        std::fs::read(&log).expect("metadata log").is_empty(),
-        "cache-off performed source inventory"
+        !std::fs::read(&log).expect("metadata log").is_empty(),
+        "cache-off must establish source identity before sharing"
     );
     assert_eq!(
         markers(&verifier.fixture),
         before,
         "cache-off wrote a verdict"
     );
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
+}
+
+#[test]
+fn cache_off_failure_does_not_invalidate_a_saved_verdict() {
+    let verifier = Verifier::new();
+    let exit = verifier.fixture.path("exit-code");
+    let run = |args: &[&str]| {
+        let mut command = verifier.heli(args);
+        command.env("ECHO_EXIT_FILE", &exit);
+        command
+    };
+    assert_eq!(outcome(&mut run(&["check"])), Outcome::Ran);
+    let before = markers(&verifier.fixture);
+    std::fs::write(&exit, "1").expect("set failing result");
+    let failed = run(&["--cache", "off", "check"])
+        .output()
+        .expect("uncached failure");
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        markers(&verifier.fixture),
+        before,
+        "live sharing never changes saved verdicts"
+    );
+    std::fs::remove_file(&exit).expect("restore passing result");
     assert_eq!(outcome(&mut run(&["check"])), Outcome::Hit);
 }
 

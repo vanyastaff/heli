@@ -416,7 +416,13 @@ impl Daemon {
     /// test run: the same key, from any worktree).
     fn run(&self, mut stream: Stream, request: RunRequest) {
         let (serving, retiring) = self.serving();
-        if request.dependency_epoch.is_some()
+        if (request.dependency_epoch.is_some()
+            || matches!(
+                request.cache,
+                crate::protocol::Cache::On
+                    | crate::protocol::Cache::Live
+                    | crate::protocol::Cache::Refresh
+            ))
             && request.reads_spawned
             && protocol::write_message(&mut stream, &Reply::Preparing).is_err()
         {
@@ -602,8 +608,10 @@ impl Daemon {
         // of the tree is the one the run starts on.
         let keep = known.is_some();
         let admitted = self.results.admitted(request, known);
-        if !keep && let Admitted::Run { key, .. } = &admitted {
-            self.registry.keyed(id, key.as_ref());
+        if (!keep || request.cache == crate::protocol::Cache::Refresh)
+            && let Admitted::Run { key, .. } = &admitted
+        {
+            self.registry.keyed(id, key.as_ref(), request.cache);
         }
         let key = match admitted {
             Admitted::Passed(passed) => {

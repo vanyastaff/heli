@@ -24,6 +24,8 @@
 //!   follows `--` is for the compiler).
 //! - Any other subcommand is exec, and so is `cargo heli exec -- <command>`
 //!   whatever the command, `cargo fmt` included: heli does not look inside.
+//!   `exec --verify` explicitly declares a read-only verification instead;
+//!   the CLI assigns its verify class without inspecting the wrapped command.
 
 use std::ffi::OsString;
 
