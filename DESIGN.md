@@ -2357,14 +2357,12 @@ hot-reload host-wake tests, Windows text-services COM teardown, and the
 runtime sampling diagnostic-event assertion. The existing hot-reload
 binary reproduced the same two failures with parallel test threads but
 passed 30 serial repetitions; two hook tests omit the existing lock for
-their process-global rebuild callback. A test-only repair is prepared but
-not yet validated. The original runtime test binary also reproduces its
+their process-global rebuild callback. The original runtime test binary also reproduces its
 same diagnostic assertion without Heli: one failure in 12 parallel
 repetitions, versus 20 passing serial repetitions. A standalone tracing
 probe reproduces a missing event when another thread without a subscriber
 first registers its callsite; reinstalling the subscriber restores delivery.
-No runtime repair has yet been validated. CLI and COM failure causes remain
-under investigation. These observations do not establish cross-worktree
+These observations do not by themselves establish cross-worktree
 interference or a Heli defect.
 
 Final evidence contains 20,199 completed compiler intervals, with no orphan,
@@ -2382,6 +2380,46 @@ concurrent-suite or resource-budget acceptance.
 Evidence is retained in `target/flui-native-c86d153-1` and the isolated
 consumer-repair checkout. This run does not supersede the full xtask and
 nested-Cargo compatibility scope in §6.1 or the repository opt-in Q2 decision.
+
+**Consumer repairs and multi-project progress, 2026-10-16.** FLUI PR #1683
+at `d85ab1e73575388ba8112c1d86dbc7dd95491717` repairs the observed test
+fixtures. Both missing rebuild-hook guards now use the existing process
+lock. Runtime diagnostic tests retain a dormant tracing dispatcher to
+avoid upstream tracing callsite-interest issue #3611; a fresh-child
+regression reproduces the missing event before that repair. Each affected
+hot-reload and runtime target passed 50 parallel repetitions. Native
+Windows platform tests passed 26 tests, with one interactive test ignored:
+the COM oracle distinguishes an owned STA lease from an implicit MTA, and
+the window oracle enumerates the owning thread's windows instead of
+mistaking another worktree's same-title window for a leak. Deliberate
+lease, shutdown and foreign-window negative controls still fail. The
+test-only HTTP reader accepts a connection reset only after a complete,
+unambiguously length-framed response; the native CLI target passed 12
+repetitions of all 17 tests. The changed-scope gate through Heli passed
+formatting, strict Clippy and 106 tests, with seven configured skips. This
+does not change production COM or HTTP behavior or substitute for the
+full concurrent repeat.
+
+That repeat uses frozen Heli `c86d153` and two clean FLUI worktrees at
+`d85ab1e73`, with automatic native homes and an explicit 8-GiB artifact
+budget. During its two full workspace test commands, two additional,
+independent Git projects submitted ordinary `heli test --offline --locked`
+commands through the same daemon, pool, store and activity namespace.
+Both std-only canaries reached their gated tests while both FLUI tests
+were active: four worktrees across three repositories, with four distinct
+native homes. An explicit GC reported `runtime_busy=true` and no victims.
+Both canaries then read their build-script assets after GC and exited 0
+while both FLUI tests remained active. The original Cargo configuration
+digest was unchanged; no original credential file was present in this
+sidecar's input manifest, so this is not an authentication check. Evidence is in
+`target/multi-project-d85-sidecar`; the full FLUI repeat is in
+`target/flui-native-d85ab1e73-2` and is still pending at this observation.
+This establishes independent completion of short projects alongside long
+FLUI tests, not a matched throughput improvement or multiple full gates
+on three large projects. Busy accounted usage exceeded the 8-GiB budget;
+the global runtime guard deliberately postpones reclamation (§6.3).
+Idle-budget acceptance remains separate and unproven until the full
+repeat and final GC finish. Native source homes remain outside that budget.
 
 FLUI main still had a common per-user host lock in
 `tools/xtask/src/host_lock.rs` when checked on this date.
