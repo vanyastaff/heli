@@ -146,6 +146,8 @@ fn hit(output: &Output) -> Option<String> {
 fn require(tool: &str) {
     let listed = Command::new("cargo")
         .arg("--list")
+        // Plain names: CI sets CARGO_TERM_COLOR=always.
+        .env("CARGO_TERM_COLOR", "never")
         .stdin(Stdio::null())
         .output()
         .expect("run cargo --list");
