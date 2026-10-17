@@ -70,6 +70,15 @@ CI runs the complete suite and `cargo doc --no-deps --locked` with
 It also checks all targets with the minimum supported Rust, pinned to 1.99.0,
 on each OS; `Cargo.toml` declares `rust-version = "1.99"`.
 
+A separate workflow runs popular cargo tools through heli on the three OSes:
+cargo-hack, machete, shear, deny, audit, llvm-cov, mutants and insta. It
+runs weekly and on changes to classes, profiles or the daemon. With the
+tools installed, run it locally:
+
+```text
+cargo test --locked --test tool_compatibility -- --ignored
+```
+
 Windows native path acceptance requires installed Visual Studio C++ tools.
 The test locates `vswhere.exe` through environment roots, Windows Known
 Folders and PATH, then tries `cl.exe` on PATH. Omitting `ProgramFiles` in a

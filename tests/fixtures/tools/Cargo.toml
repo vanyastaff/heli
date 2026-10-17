@@ -1,0 +1,11 @@
+# A tiny workspace the tool compatibility tests (tests/tool_compatibility.rs)
+# run popular cargo tools in. No dependencies outside it, so it builds offline.
+[workspace]
+resolver = "3"
+members = ["app", "util"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false

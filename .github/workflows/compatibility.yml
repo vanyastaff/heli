@@ -1,0 +1,63 @@
+name: Tool compatibility
+
+# Popular cargo tools, run through heli on every OS (spec #38): each keeps
+# its exit code and output, gets its profile's class, and the cached
+# verifications hit the second time. A separate workflow, so the main suite
+# stays fast; tests/tool_compatibility.rs holds the checks.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, so a new release of a tool that breaks under heli shows up.
+    - cron: '17 4 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - src/**
+      - tests/tool_compatibility.rs
+      - tests/fixtures/tools/**
+      - tests/support/**
+      - .github/workflows/compatibility.yml
+  pull_request:
+    paths:
+      - src/class.rs
+      - src/profiles.rs
+      - src/client.rs
+      - src/daemon/**
+      - src/store/**
+      - tests/tool_compatibility.rs
+      - tests/fixtures/tools/**
+      - .github/workflows/compatibility.yml
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  tools:
+    name: tools (${{ matrix.os }})
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov needs llvm-profdata and llvm-cov.
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack,cargo-machete,cargo-shear,cargo-deny,cargo-audit,cargo-llvm-cov,cargo-mutants,cargo-insta
+      - name: Tool versions
+        shell: bash
+        run: |
+          for tool in hack machete shear deny audit llvm-cov mutants insta; do
+            printf '%s: ' "$tool"; cargo "$tool" --version 2>&1 | head -n 1 || true
+          done
+      - name: Run the tools through heli
+        run: cargo test --locked --test tool_compatibility -- --ignored
