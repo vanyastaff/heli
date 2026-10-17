@@ -80,6 +80,9 @@ pub struct Invocation {
     pub cargo_home: Option<CargoHome>,
     /// heli's `--no-cache` and `--cache` flags, for [`Invocation::reclassify`].
     pub cache_flags: (bool, Option<Cache>),
+    /// Where its class came from, once the client has read the profiles
+    /// (`crate::profiles::Source::name`).
+    pub profile: Option<&'static str>,
 }
 
 impl Invocation {
@@ -367,6 +370,7 @@ pub fn parse(
                 dependency_epoch: cli.dependency_epoch,
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
+                profile: None,
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -417,6 +421,7 @@ pub fn parse(
                 dependency_epoch: cli.dependency_epoch,
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
+                profile: None,
             })
         }
     })

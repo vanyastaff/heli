@@ -169,6 +169,11 @@ pub struct RunRequest {
     /// older than it, which is never sent one.
     #[serde(default)]
     pub reads_spawned: bool,
+    /// Where the run's class came from (`crate::profiles`): `cargo`,
+    /// `built-in`, `user`, `repository`, `unknown` or `exec`; absent from a
+    /// client older than profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
 }
 
 impl RunRequest {

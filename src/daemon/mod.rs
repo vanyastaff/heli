@@ -464,7 +464,10 @@ impl Daemon {
             worktree.clone(),
             Command::of(&request),
             Same::of(&request, key.as_ref()),
-            request.class.unwrap_or(Class::Exec),
+            registry::Kind {
+                class: request.class.unwrap_or(Class::Exec),
+                profile: request.profile.clone(),
+            },
             nested(&request),
             retiring,
         );
@@ -530,6 +533,8 @@ impl Daemon {
         let admission = serde_json::json!({
             "worktree": worktree.to_string_lossy(),
             "argv": argv.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+            "class": request.class.map(Class::name),
+            "profile": request.profile,
         });
         // Nothing starts unless the client knows it started: a client that
         // never hears of it runs the command itself. One that reads it also

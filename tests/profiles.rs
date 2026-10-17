@@ -54,10 +54,9 @@ fn user_and_repository_profiles_give_runs_their_class() {
                 .iter()
                 .map(|arg| arg.as_str().expect("a string"))
                 .collect();
-            (
-                args.join(" "),
-                run["class"].as_str().expect("a class").to_owned(),
-            )
+            let class = run["class"].as_str().expect("a class");
+            let profile = run["profile"].as_str().expect("a profile");
+            (args.join(" "), format!("{class} {profile}"))
         })
         .collect();
     std::fs::write(&gate, "").expect("open the gate");
@@ -66,10 +65,10 @@ fn user_and_repository_profiles_give_runs_their_class() {
         assert_success(&output, "a profiled run");
     }
     let expected: BTreeMap<String, String> = [
-        ("xtask check-changed", "verify"),
+        ("xtask check-changed", "verify user"),
         // The repository may take the lock, not make a tool cacheable.
-        ("xtask gen", "mutate"),
-        ("xtask lint", "exec"),
+        ("xtask gen", "mutate repository"),
+        ("xtask lint", "exec unknown"),
     ]
     .into_iter()
     .map(|(args, class)| (args.to_owned(), class.to_owned()))

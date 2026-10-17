@@ -40,7 +40,9 @@
 //! is also `null` while the daemon cannot read the machine's memory. A run
 //! waiting for its worktree's lock has `waiting_since` and, in
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
-//! empty. `class` is `null` only from a daemon older than run classes. A
+//! empty. `class` is `null` only from a daemon older than run classes.
+//! `profile` says where the class came from (`crate::profiles::Source::
+//! name`), `null` from a client or daemon older than profiles. A
 //! run's `slots` are the host pool's slots it uses, and `share` its share of
 //! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
 //! last runs that ended while no client followed them (`daemon::registry`),
@@ -193,6 +195,10 @@ pub struct Run {
     /// build does not know (a newer daemon's).
     #[serde(default, deserialize_with = "known_class")]
     pub class: Option<Class>,
+    /// Where its class came from (`crate::profiles::Source::name`); `None`
+    /// from a client or daemon older than profiles.
+    #[serde(default)]
+    pub profile: Option<String>,
     pub phase: Phase,
     pub started_at: u64,
     /// Since when the run waits for its worktree's lock, if it does.
@@ -372,7 +378,7 @@ impl Status {
                 run.id,
                 run.worktree,
                 run.argv.join(" "),
-                run.class.map_or("-", Class::name),
+                class_of(run),
                 run.slots,
                 if run.slots == 1 { "" } else { "s" },
                 slots(run.share),
@@ -444,5 +450,15 @@ fn used(used: u64, by_category: &Sizes) -> String {
         sizes::human(used)
     } else {
         format!("{} ({})", sizes::human(used), parts.join(", "))
+    }
+}
+
+/// A run's class as the text form shows it, with the profile that gave it
+/// when that is not cargo's own: `verify (user)`, `exec (unknown)`.
+fn class_of(run: &Run) -> String {
+    let class = run.class.map_or("-", Class::name);
+    match run.profile.as_deref() {
+        None | Some("cargo" | "exec") => class.to_owned(),
+        Some(profile) => format!("{class} ({profile})"),
     }
 }

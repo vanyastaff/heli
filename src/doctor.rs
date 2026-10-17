@@ -7,6 +7,12 @@
 //! up), and the variables that override it. Each finding says what happens
 //! and what to do about it.
 //!
+//! **Usage memory.** The daemon's event log records each run's profile
+//! (`admit`, and `direct` for the runs a client makes itself in the pool).
+//! doctor counts the runs of tools no profile names (`unknown`), so that a
+//! profile gets written for the ones used most: in the user's
+//! configuration, the repository's `.config/heli.toml`, or heli itself.
+//!
 //! **`--json`**, a versioned document (`schema`, now 1) whose fields are only
 //! added:
 //!
@@ -14,7 +20,8 @@
 //! {"schema":1,
 //!  "tools":[{"name":"insta","profile":"accept/reject mutate …"},
 //!           {"name":"zigbuild","profile":null}],
-//!  "findings":[{"id":"jobs","level":"note","message":"…","action":"…"}]}
+//!  "findings":[{"id":"jobs","level":"note","message":"…","action":"…"}],
+//!  "unknown_tools":[{"name":"zigbuild","runs":12}]}
 //! ```
 //!
 //! `profile` is `null` for a tool heli has no built-in profile for. `level`
@@ -54,6 +61,9 @@ pub struct Inputs {
     pub env: BTreeMap<String, String>,
     /// The Cargo home, where cargo-audit keeps its advisory database.
     pub cargo_home: Option<PathBuf>,
+    /// The event log's lines, oldest first (the rotated file, then the
+    /// current one).
+    pub events: Vec<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -70,11 +80,54 @@ pub struct Finding {
     pub action: String,
 }
 
+/// How often a tool no profile names ran.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Usage {
+    pub name: String,
+    pub runs: u64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub schema: u32,
     pub tools: Vec<Tool>,
     pub findings: Vec<Finding>,
+    /// The tools no profile names, most used first, ten at most.
+    pub unknown_tools: Vec<Usage>,
+}
+
+/// How many unknown tools doctor lists.
+const UNKNOWN_SHOWN: usize = 10;
+
+/// The tools of the runs in `events` that no profile named, by runs, most
+/// first (then by name), [`UNKNOWN_SHOWN`] at most.
+fn unknown_usage(events: &[String]) -> Vec<Usage> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for line in events {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if !matches!(event["event"].as_str(), Some("admit" | "direct"))
+            || event["profile"].as_str() != Some("unknown")
+        {
+            continue;
+        }
+        let words: Vec<&str> = event["argv"]
+            .as_array()
+            .map(|argv| argv.iter().skip(1).filter_map(|arg| arg.as_str()).collect())
+            .unwrap_or_default();
+        let tool = words.iter().find(|word| !word.starts_with('+'));
+        if let Some(tool) = tool {
+            *counts.entry((*tool).to_owned()).or_default() += 1;
+        }
+    }
+    let mut usage: Vec<Usage> = counts
+        .into_iter()
+        .map(|(name, runs)| Usage { name, runs })
+        .collect();
+    usage.sort_by(|a, b| b.runs.cmp(&a.runs).then_with(|| a.name.cmp(&b.name)));
+    usage.truncate(UNKNOWN_SHOWN);
+    usage
 }
 
 /// Reads the real environment, from `cwd`.
@@ -96,6 +149,16 @@ pub fn gather(cwd: &Path) -> Inputs {
             && let Ok(table) = text.parse::<toml::Table>()
         {
             inputs.configs.push((file, table));
+        }
+    }
+    if let Ok(locations) = crate::locations::Locations::resolve() {
+        let log = locations.event_log();
+        let mut rotated = log.clone().into_os_string();
+        rotated.push(".1");
+        for file in [PathBuf::from(rotated), log] {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                inputs.events.extend(text.lines().map(str::to_owned));
+            }
         }
     }
     for var in VARS {
@@ -310,6 +373,7 @@ pub fn diagnose(inputs: &Inputs) -> Report {
         schema: SCHEMA,
         tools,
         findings,
+        unknown_tools: unknown_usage(&inputs.events),
     }
 }
 
@@ -344,6 +408,19 @@ pub fn main(json: bool) {
             "  [{}] {}\n         -> {}",
             finding.level, finding.message, finding.action
         );
+    }
+    if !report.unknown_tools.is_empty() {
+        println!(
+            "\nTools without a profile, most used (write one under [profiles] or in .config/heli.toml, or contribute it to heli):"
+        );
+        for usage in &report.unknown_tools {
+            println!(
+                "  {:<12} {} run{}",
+                usage.name,
+                usage.runs,
+                if usage.runs == 1 { "" } else { "s" }
+            );
+        }
     }
 }
 
@@ -406,6 +483,43 @@ mod tests {
         assert_eq!(ids(&diagnose(&inputs)), ["advisory-db"]);
         std::fs::create_dir_all(db.join(".git")).expect("dir");
         assert!(ids(&diagnose(&inputs)).is_empty());
+    }
+
+    #[test]
+    fn counts_the_runs_of_unknown_tools() {
+        let line = |event: &str, argv: &str, profile: &str| {
+            format!(r#"{{"at":1,"event":"{event}","argv":{argv},"profile":"{profile}"}}"#)
+        };
+        let events = vec![
+            line("admit", r#"["cargo","zigbuild"]"#, "unknown"),
+            line(
+                "direct",
+                r#"["cargo","+nightly","zigbuild","--release"]"#,
+                "unknown",
+            ),
+            line("admit", r#"["cargo","expand"]"#, "unknown"),
+            line("admit", r#"["cargo","build"]"#, "cargo"),
+            line("admit", r#"["cargo","xtask"]"#, "user"),
+            line("evict", r#"[]"#, "unknown"),
+            "not json".to_owned(),
+        ];
+        let report = diagnose(&Inputs {
+            events,
+            ..Inputs::default()
+        });
+        assert_eq!(
+            report.unknown_tools,
+            [
+                Usage {
+                    name: "zigbuild".into(),
+                    runs: 2
+                },
+                Usage {
+                    name: "expand".into(),
+                    runs: 1
+                },
+            ]
+        );
     }
 
     #[test]

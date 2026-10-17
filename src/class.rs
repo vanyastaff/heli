@@ -180,6 +180,11 @@ const CARGO_BUILTINS: &[&str] = &[
     "nextest",
 ];
 
+/// Whether `tool` is one of cargo's own subcommands that run as exec.
+pub fn is_cargo_builtin(tool: &str) -> bool {
+    CARGO_BUILTINS.contains(&tool)
+}
+
 /// Whether `cargo <args>` runs in the client, but drawing from the host pool
 /// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: interactive
 /// and long-running tools (`insta review`, `dx serve`, `trunk serve`,

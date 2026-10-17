@@ -1002,6 +1002,7 @@ mod advisory_tests {
             class: None,
             cache: Default::default(),
             reads_spawned: false,
+            profile: None,
         }
     }
 
@@ -1094,6 +1095,7 @@ mod advisory_fetch_tests {
             class: None,
             cache: Default::default(),
             reads_spawned: false,
+            profile: None,
         };
         for _ in 0..2 {
             let mut fields = Fields::default();

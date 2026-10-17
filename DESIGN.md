@@ -682,7 +682,17 @@ cargo tools (spec #38). They apply to everyone who installs heli, with no
 configuration; `src/class.rs` is the one place that reads them. A tool that
 is missing gets a profile in heli itself, so every user gets it, not only
 one project. Users and repositories add profiles of their own (below). Not
-yet implemented: `caches` and the usage memory.
+yet implemented: `caches`.
+
+**Usage memory.** Every run carries where its class came from, its
+`profile`: `cargo` (cargo's own subcommands), `built-in`, `user`,
+`repository`, `unknown` (a tool no profile names) or `exec`.
+`cargo heli status` shows it after the class, as in `exec (unknown)`, for all
+but `cargo` and `exec`. The event log records it with each admission, and
+with each run a client makes directly in the pool (`direct`).
+`cargo heli doctor` counts the `unknown` runs by tool and lists the ten used
+most (`unknown_tools` in `--json`). That shows which profile is worth
+writing, for the user, the repository, or heli itself.
 
 | Tool | Profile |
 |---|---|
@@ -2349,7 +2359,11 @@ drains and evictions, and `cargo heli gc --dry-run`.
 (`events-<session>.log` on Windows), one JSON object per line, each with `at`
 (seconds since 1970, UTC) and `event`:
 
-- `admit`: `run`, `worktree`, `argv`;
+- `admit`: `run`, `worktree`, `argv`, `class` and `profile` (where the class
+  came from: `cargo`, `built-in`, `user`, `repository`, `unknown` or `exec`;
+  §5, "Tool profiles");
+- `direct`, written by the client for a run it makes itself in the pool:
+  `worktree`, `argv` and `profile`;
 - `withhold`: `withheld` (after it), `available`, `commit_available` and
   `low_watermark`;
 - `return`: `slots`, `available`, `commit_available` and `high_watermark`;

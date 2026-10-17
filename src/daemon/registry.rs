@@ -177,6 +177,13 @@ impl Same {
 }
 
 /// What the registry knows of a run.
+/// What kind of run a client asks for: its class, and where the class came
+/// from (`crate::profiles::Source::name`), as the client said.
+pub struct Kind {
+    pub class: Class,
+    pub profile: Option<String>,
+}
+
 struct Entry {
     worktree: PathBuf,
     /// The worktree as the lock tells worktrees apart: its canonical path.
@@ -193,6 +200,8 @@ struct Entry {
     /// any worktree, and not only from its own.
     settled: bool,
     class: Class,
+    /// Where its class came from, as the client said.
+    profile: Option<String>,
     /// Its phase while in flight; once it has ended, it is done.
     phase: Phase,
     started_at: SystemTime,
@@ -360,17 +369,18 @@ impl Registry {
 
     /// Attaches a client to a run in flight that is the same as `same`
     /// says, if there is one; else admits a new run of `command`, of
-    /// `class`, in `worktree`, unless the daemon is `retiring`. A `nested`
+    /// `kind`, in `worktree`, unless the daemon is `retiring`. A `nested`
     /// run was asked for from inside another heli run.
     pub fn admit(
         &self,
         worktree: PathBuf,
         command: Command,
         same: Same,
-        class: Class,
+        kind: Kind,
         nested: bool,
         retiring: bool,
     ) -> Admission {
+        let Kind { class, profile } = kind;
         let lock = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
         let deadline = Instant::now() + TELLING_WAIT;
         let mut inner = self.lock();
@@ -430,6 +440,7 @@ impl Registry {
                 same,
                 settled: false,
                 class,
+                profile,
                 phase: Phase::Running,
                 started_at: SystemTime::now(),
                 // The client that asked for it.
@@ -670,6 +681,7 @@ impl Inner {
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect(),
             class: Some(entry.class),
+            profile: entry.profile.clone(),
             phase,
             started_at: clock::unix_seconds(entry.started_at),
             waiting_since: (!waiting_for.is_empty()).then(|| clock::unix_seconds(entry.started_at)),
