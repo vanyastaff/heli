@@ -76,6 +76,10 @@ struct Tool {
     valued: &'static [&'static str],
     rules: &'static [(When, Then)],
     otherwise: Then,
+    /// For a tool that deletes build output itself, what heli says before
+    /// it runs: such a run holds heli's eviction lock throughout, so that
+    /// heli's own eviction and the tool never delete at the same time.
+    cleaner: Option<&'static str>,
 }
 
 /// A condition on a tool's arguments, all before any `--`.
@@ -121,6 +125,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[],
         otherwise: Run(Class::Mutate),
+        cleaner: None,
     },
     Tool {
         names: &["sort"],
@@ -128,6 +133,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Arg(&["--check", "-c"]), Run(Class::Verify))],
         otherwise: Run(Class::Mutate),
+        cleaner: None,
     },
     Tool {
         names: &["machete", "shear"],
@@ -135,6 +141,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Arg(&["--fix"]), Run(Class::Mutate))],
         otherwise: Run(Class::Verify),
+        cleaner: None,
     },
     Tool {
         // Miri interprets the tests: a verdict on the tree and the nightly
@@ -145,6 +152,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Word(&["test", "nextest"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["udeps", "public-api"],
@@ -152,6 +160,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[],
         otherwise: Run(Class::Verify),
+        cleaner: None,
     },
     Tool {
         names: &["hakari"],
@@ -162,6 +171,7 @@ const TOOLS: &[Tool] = &[
             (When::Word(&["verify"]), Run(Class::Verify)),
         ],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["insta"],
@@ -172,6 +182,7 @@ const TOOLS: &[Tool] = &[
             (When::Word(&["review"]), Direct),
         ],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["sqlx"],
@@ -179,14 +190,32 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Word(&["prepare"]), Run(Class::Mutate))],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
-        // They delete build output by themselves.
-        names: &["sweep", "clean-all"],
-        summary: "mutate (exclusive lock); bypasses heli's build store",
+        names: &["sweep"],
+        summary: "mutate (exclusive lock), never alongside heli's eviction; sees only target/",
         valued: &[],
         rules: &[],
         otherwise: Run(Class::Mutate),
+        cleaner: Some(
+            "cargo-sweep sees only target/: heli keeps the intermediates in its build store, \
+             which `cargo heli gc` evicts by age and budget. heli's own eviction waits until \
+             this run ends.",
+        ),
+    },
+    Tool {
+        names: &["clean-all"],
+        summary: "mutate (exclusive lock), never alongside heli's eviction; deletes other worktrees' target/",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Mutate),
+        cleaner: Some(
+            "cargo-clean-all deletes whole target/ directories, those of other worktrees heli \
+             may be building in right now included: heli holds only this worktree's lock. \
+             `cargo heli gc` evicts only what no build uses. heli's own eviction waits until \
+             this run ends.",
+        ),
     },
     Tool {
         // A verdict on the tree and the advisory database, whose commit is
@@ -217,6 +246,7 @@ const TOOLS: &[Tool] = &[
             (When::AnyWord, Run(Class::Exec)),
         ],
         otherwise: Run(Class::Verify),
+        cleaner: None,
     },
     Tool {
         names: &["deny"],
@@ -224,6 +254,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Arg(&["check"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         // It runs check or clippy over feature combinations.
@@ -232,6 +263,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Arg(&["check", "clippy"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["dx", "trunk"],
@@ -239,6 +271,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Word(&["serve"]), Direct)],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["leptos"],
@@ -246,6 +279,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Word(&["watch", "serve"]), Direct)],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["tauri"],
@@ -253,6 +287,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[(When::Word(&["dev"]), Direct)],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
     Tool {
         names: &["watch"],
@@ -260,6 +295,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[],
         otherwise: Direct,
+        cleaner: None,
     },
     Tool {
         names: &["outdated", "semver-checks", "vet", "geiger"],
@@ -267,6 +303,7 @@ const TOOLS: &[Tool] = &[
         valued: &[],
         rules: &[],
         otherwise: Run(Class::Exec),
+        cleaner: None,
     },
 ];
 
@@ -378,6 +415,14 @@ pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {
                 && !is_cargo_builtin(tool)
         }
     }
+}
+
+/// For `cargo <args>` whose tool deletes build output itself (cargo-sweep,
+/// cargo-clean-all), what heli says before it runs; such a run holds heli's
+/// eviction lock throughout (`crate::client`). `None` for any other.
+pub fn cleaner_note(args: &[OsString]) -> Option<&'static str> {
+    let (tool, _) = subcommand(args)?;
+    Tool::named(tool.to_str()?)?.cleaner
 }
 
 /// What heli's built-in profile does with the cargo tool `cargo-<name>`, for
