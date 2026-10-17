@@ -93,6 +93,8 @@ fn status_shows_each_runs_class() {
         (&["hack", "test"], "exec"),
         (&["+nightly", "udeps"], "verify"),
         (&["public-api"], "verify"),
+        (&["+nightly", "miri", "test", "-p", "a"], "verify"),
+        (&["+nightly", "miri", "setup"], "exec"),
         (&["audit"], "verify"),
         (&["deny", "check"], "verify"),
         (&["audit", "--no-fetch"], "verify"),

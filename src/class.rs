@@ -137,6 +137,16 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Verify),
     },
     Tool {
+        // Miri interprets the tests: a verdict on the tree and the nightly
+        // toolchain, which the `+toolchain` puts in the key. `run` runs a
+        // program, `setup` builds Miri's standard library.
+        names: &["miri"],
+        summary: "test/nextest verify cached (toolchain is part of the key); others exec",
+        valued: &[],
+        rules: &[(When::Word(&["test", "nextest"]), Run(Class::Verify))],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
         names: &["udeps", "public-api"],
         summary: "verify cached (toolchain is part of the key)",
         valued: &[],

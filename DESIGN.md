@@ -703,6 +703,7 @@ writing, for the user, the repository, or heli itself.
 | `hakari` | `generate`, `manage-deps` mutate; `verify` verify; else exec |
 | `machete`, `shear` | verify; mutate with `--fix` |
 | `udeps`, `public-api` | verify (the `+toolchain` is in the argv, so in the key) |
+| `miri` | `test`, `nextest` verify, keyed by the toolchain; else exec |
 | `hack` | verify when `check` or `clippy` is among its arguments; else exec |
 | `insta` | `accept`, `reject` mutate; `review` runs directly in the pool |
 | `sqlx` | `prepare` mutate; else exec |
@@ -790,9 +791,17 @@ must exit as it does without heli. The cached verifications (`hack check`,
 second time. `mutants --list` must print the same mutants, `llvm-cov` must
 build in `target/llvm-cov-target`, and `insta review` must run directly. It
 runs weekly, so a tool release that breaks under heli shows up, and on
-changes to classes, profiles, the client, the daemon and the store. Not yet
-covered: nightly-only tools (`udeps`, `miri`, `public-api`) and `hakari`,
-which needs a workspace-hack crate.
+changes to classes, profiles, the client, the daemon and the store. `hakari`
+runs in the same job against a workspace-hack crate it creates (`generate`
+must mutate as directly, `verify` must hit). A nightly job runs `udeps`,
+`public-api` and `miri test` through `cargo heli +nightly`, each a cached
+verification keyed by the toolchain.
+
+`cargo heli +<toolchain> ...` is honoured however heli was started. Cargo
+hands an external subcommand its toolchain's own binary in `CARGO`
+(`.../toolchains/<name>/bin/cargo`), which does not take `+toolchain`. heli
+then runs rustup's proxy, `cargo` on the search path, instead. Any other
+`CARGO` is kept.
 
 `cargo heli doctor [--json]` lists the installed `cargo-*` tools with their
 profile, and explains `jobs`, a global `target-dir`, a user's own `build-dir`

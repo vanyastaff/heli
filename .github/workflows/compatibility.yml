@@ -52,12 +52,43 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-hack,cargo-machete,cargo-shear,cargo-deny,cargo-audit,cargo-llvm-cov,cargo-mutants,cargo-insta
+          tool: cargo-hack,cargo-machete,cargo-shear,cargo-deny,cargo-audit,cargo-llvm-cov,cargo-mutants,cargo-insta,cargo-hakari
       - name: Tool versions
         shell: bash
         run: |
-          for tool in hack machete shear deny audit llvm-cov mutants insta; do
+          for tool in hack machete shear deny audit llvm-cov mutants insta hakari; do
             printf '%s: ' "$tool"; cargo "$tool" --version 2>&1 | head -n 1 || true
           done
       - name: Run the tools through heli
-        run: cargo test --locked --test tool_compatibility -- --ignored
+        run: cargo test --locked --test tool_compatibility -- --ignored --skip nightly_
+
+  nightly:
+    name: nightly tools (${{ matrix.os }})
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      HELI_NIGHTLY: nightly
+    steps:
+      - uses: actions/checkout@v4
+      # Nightly first, for the tools; stable last, so it stays the default
+      # that builds heli and its tests.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-udeps,cargo-public-api
+      - name: Tool versions
+        shell: bash
+        run: |
+          cargo +nightly --version
+          cargo +nightly miri --version
+          cargo udeps --version
+          cargo public-api --version
+      - name: Run the nightly tools through heli
+        run: cargo test --locked --test tool_compatibility -- --ignored nightly_

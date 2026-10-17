@@ -51,6 +51,56 @@ placement, budgets, credentials, fallback and supported-tool limits.
 
 The contracts and dated acceptance evidence are in [DESIGN.md](DESIGN.md).
 
+## Cargo tools
+
+Start with `cargo heli doctor` (or `--json`). It lists your installed
+`cargo-*` tools with what heli does with each. It also explains how your
+Cargo configuration interacts with heli: `jobs`, a global `target-dir`,
+your own `build-dir`, an sccache wrapper, mold or lld, rust-analyzer and a
+broken advisory database. Finally it shows the tools without a profile that
+you run most.
+
+heli ships built-in profiles for popular tools, so they work without
+configuration:
+
+- **Tools that rewrite the worktree** take its lock exclusively, so they
+  never run under a build: `cargo add`/`remove`/`update`, `upgrade`,
+  `set-version`, `release`, `sort`, `hakari generate`, `machete --fix`,
+  `shear --fix`, `insta accept`, `sqlx prepare`, `sweep`, `clean-all`.
+- **Read-only checks** are cached and shared like `check` while nothing
+  changed: `hack check`, `machete`, `shear`, `sort --check`,
+  `hakari verify`, `udeps`, `public-api`, `miri test`. `audit` and
+  `deny check` are cached too: heli fetches the advisory database first and
+  keys the check by it, so a new advisory is never hidden behind a cached
+  pass.
+- **Interactive and long-running tools** run in your terminal while still
+  drawing from the shared pool: `insta review`, `cargo watch`, `dx serve`,
+  `trunk serve`, `leptos watch|serve`, `tauri dev`. At a terminal, so does
+  any tool heli has no profile for.
+- **A toolchain** given as `cargo heli +nightly <tool>` is honoured, and is
+  part of the cache key.
+
+To describe your own tools, add profiles in heli's user configuration, or
+commit them for everyone in your repository's `.config/heli.toml`:
+
+```toml
+[[profiles.tool]]
+tool = "xtask"
+args = ["check-changed"]
+class = "verify"     # compile, verify, mutate or exec
+```
+
+A repository's profiles can only make a tool stricter (take the lock, stop
+caching), unless you set `trust_repository = true` under `[profiles]` in
+your own configuration. Machine settings stay in your configuration:
+
+```toml
+[advisories]
+fetch_interval_minutes = 10   # reuse audit/deny passes without the network
+```
+
+`cargo heli status` shows each run's class and the profile that gave it.
+
 ## Contributing
 
 The full test suite requires `cargo-nextest` in addition to Rust/Cargo.
@@ -71,12 +121,15 @@ It also checks all targets with the minimum supported Rust, pinned to 1.99.0,
 on each OS; `Cargo.toml` declares `rust-version = "1.99"`.
 
 A separate workflow runs popular cargo tools through heli on the three OSes:
-cargo-hack, machete, shear, deny, audit, llvm-cov, mutants and insta. It
-runs weekly and on changes to classes, profiles or the daemon. With the
-tools installed, run it locally:
+cargo-hack, machete, shear, deny, audit, llvm-cov, mutants, insta and
+hakari, and in a nightly job udeps, public-api and Miri. It runs weekly and
+on changes to classes, profiles, the client, the daemon or the store. With
+the tools installed, run it locally; the nightly tests take their toolchain
+from `HELI_NIGHTLY` (default `nightly`):
 
 ```text
-cargo test --locked --test tool_compatibility -- --ignored
+cargo test --locked --test tool_compatibility -- --ignored --skip nightly_
+cargo test --locked --test tool_compatibility -- --ignored nightly_
 ```
 
 Windows native path acceptance requires installed Visual Studio C++ tools.
