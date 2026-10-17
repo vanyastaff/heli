@@ -78,7 +78,7 @@ const USAGE: i32 = 2;
 /// Runs `invocation` through the daemon, or directly when it cannot; this
 /// process's nesting depth is `depth`. Isolation is prepared before either
 /// path; a daemon failure never falls back to the original mutable Cargo home.
-pub fn run(invocation: Invocation, depth: u32) -> ! {
+pub fn run(mut invocation: Invocation, depth: u32) -> ! {
     let child_depth = OsString::from((depth + 1).to_string());
     let locations = Locations::resolve();
     // Isolation is a client policy, including direct fallback. A malformed
@@ -102,6 +102,11 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         // With neither a discoverable default config nor an explicit path,
         // ordinary shared-mode commands retain direct fallback.
         Err(_) => ClientConfig::default(),
+    };
+    let source = if invocation.exec {
+        crate::profiles::Source::BuiltIn
+    } else {
+        profile(&mut invocation, &config.profiles)
     };
     let configured = || config.output.mode;
     let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
@@ -150,8 +155,10 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
-    let in_pool =
-        !invocation.exec && class::runs_directly(&invocation.args, std::io::stdin().is_terminal());
+    // A tool a profile names is no unknown tool.
+    let in_pool = !invocation.exec
+        && source == crate::profiles::Source::BuiltIn
+        && class::runs_directly(&invocation.args, std::io::stdin().is_terminal());
     let mut pooled = None;
     let reason = match locations {
         Err(error) => error,
@@ -212,6 +219,26 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         );
     }
     direct::run(command)
+}
+
+/// Gives a cargo subcommand's run the class its tool profile says
+/// (`crate::profiles`): the user's `profiles`, and the repository's
+/// `.config/heli.toml` in the worktree here. Returns where the class came
+/// from.
+fn profile(
+    invocation: &mut Invocation,
+    profiles: &crate::profiles::Profiles,
+) -> crate::profiles::Source {
+    let worktree = std::env::current_dir()
+        .map(|cwd| crate::worktree::of(&cwd))
+        .unwrap_or_default();
+    let repository = crate::profiles::repository(&worktree).unwrap_or_else(|reason| {
+        eprintln!("cargo-heli: warning: {reason}; ignoring the repository's tool profiles");
+        Vec::new()
+    });
+    let (class, source) = crate::profiles::resolve(&invocation.args, profiles, &repository);
+    invocation.reclassify(class);
+    source
 }
 
 fn isolated_home(

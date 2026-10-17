@@ -49,6 +49,7 @@ mod nesting;
 mod output;
 mod pool;
 mod processes;
+mod profiles;
 mod protocol;
 mod recycle;
 mod run_id;

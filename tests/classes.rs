@@ -95,6 +95,12 @@ fn status_shows_each_runs_class() {
         (&["public-api"], "verify"),
         (&["audit"], "exec"),
         (&["deny", "check"], "exec"),
+        (&["upgrade"], "mutate"),
+        (&["set-version", "1.2.0"], "mutate"),
+        (&["release", "patch"], "mutate"),
+        (&["sort", "--check"], "verify"),
+        (&["sort", "-w"], "mutate"),
+        (&["outdated"], "exec"),
     ];
     let gate = fixture.path("gate");
     let start = |args: &[&str], exec: bool| -> Child {

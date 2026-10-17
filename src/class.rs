@@ -69,8 +69,13 @@ fn third_party(tool: &str, rest: &[OsString]) -> Class {
     let before_separator = || rest.iter().take_while(|arg| *arg != "--");
     let first_word = || first_word(rest);
     match tool {
-        // Edit Cargo.toml / Cargo.lock.
-        "add" | "remove" | "rm" | "update" => Class::Mutate,
+        // Edit Cargo.toml / Cargo.lock (cargo's own, cargo-edit's, and
+        // cargo-release, which also bumps versions and commits).
+        "add" | "remove" | "rm" | "update" | "upgrade" | "set-version" | "release"
+        | "autoinherit" => Class::Mutate,
+        // cargo-sort sorts manifests, or only checks them.
+        "sort" if before_separator().any(|arg| arg == "--check" || arg == "-c") => Class::Verify,
+        "sort" => Class::Mutate,
         // Rewrite sources or generated files when asked to.
         "machete" | "shear" if before_separator().any(|arg| arg == "--fix") => Class::Mutate,
         "machete" | "shear" | "udeps" | "public-api" => Class::Verify,
@@ -127,7 +132,8 @@ const CARGO_BUILTINS: &[&str] = &[
 
 /// Whether `cargo <args>` runs in the client, but drawing from the host pool
 /// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: interactive
-/// and long-running tools (`insta review`, `dx serve`, `trunk serve`), which
+/// and long-running tools (`insta review`, `dx serve`, `trunk serve`,
+/// `leptos watch|serve`, `tauri dev`, `cargo watch`), which
 /// need a terminal and hold a slot for hours, and, when stdin is a terminal,
 /// every other exec command of a tool heli has no profile for.
 pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {
@@ -137,7 +143,11 @@ pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {
     let tool = tool.to_str().unwrap_or_default();
     let word = first_word(rest);
     match (tool, word) {
-        ("insta", Some("review")) | ("dx" | "trunk", Some("serve")) => return true,
+        ("insta", Some("review"))
+        | ("dx" | "trunk", Some("serve"))
+        | ("leptos", Some("watch" | "serve"))
+        | ("tauri", Some("dev"))
+        | ("watch", _) => return true,
         _ => {}
     }
     stdin_is_terminal
@@ -160,7 +170,15 @@ fn first_word(args: &[OsString]) -> Option<&str> {
 /// as exec).
 pub fn tool_profile(name: &str) -> Option<&'static str> {
     Some(match name {
-        "add" | "remove" | "rm" | "update" => "mutate: exclusive worktree lock",
+        "add" | "remove" | "rm" | "update" | "upgrade" | "set-version" | "release"
+        | "autoinherit" => "mutate: exclusive worktree lock",
+        "sort" => "--check verify cached; else mutate (exclusive lock)",
+        "watch" => "runs directly in the pool, never attached to",
+        "leptos" => "watch/serve run directly in the pool; others exec",
+        "tauri" => "dev runs directly in the pool; others exec",
+        "outdated" | "semver-checks" | "vet" | "geiger" => {
+            "exec: never cached, the result depends on the registry"
+        }
         "hakari" => "generate/manage-deps mutate (exclusive lock), verify cached",
         "insta" => {
             "accept/reject mutate (exclusive lock); review runs directly in the pool, test as exec"
@@ -255,6 +273,9 @@ mod tests {
     #[test]
     fn interactive_tools_run_directly_with_or_without_a_terminal() {
         for words in [
+            &["watch", "-x", "check"][..],
+            &["leptos", "serve"],
+            &["tauri", "dev"],
             &["insta", "review"][..],
             &["dx", "serve"],
             &["+nightly", "trunk", "serve"],

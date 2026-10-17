@@ -78,6 +78,34 @@ pub struct Invocation {
     /// Explicit immutable dependency snapshot; inherited by nested Heli.
     pub dependency_epoch: Option<std::path::PathBuf>,
     pub cargo_home: Option<CargoHome>,
+    /// heli's `--no-cache` and `--cache` flags, for [`Invocation::reclassify`].
+    pub cache_flags: (bool, Option<Cache>),
+}
+
+impl Invocation {
+    /// Gives a cargo subcommand's run `class`, as a tool profile says
+    /// (`crate::profiles`), and the result-store use that follows from it
+    /// and heli's flags.
+    pub fn reclassify(&mut self, class: Class) {
+        if self.exec || class == self.class {
+            return;
+        }
+        self.class = class;
+        let (no_cache, flag) = self.cache_flags;
+        self.cache = cargo_cache(class, &self.args, no_cache, flag);
+    }
+}
+
+/// How a run of `class`, `cargo <args>`, uses the result store, from heli's
+/// `--no-cache` and `--cache` flags.
+fn cargo_cache(class: Class, args: &[OsString], no_cache: bool, flag: Option<Cache>) -> Cache {
+    match Cache::of(class, args, no_cache) {
+        Cache::Off => Cache::Off,
+        // A successful build is not a reusable verdict: each
+        // artifact owner must get its actual outputs.
+        _ if class == Class::Compile => Cache::Live,
+        default => flag.unwrap_or(default),
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -338,6 +366,7 @@ pub fn parse(
                 output: own.mode().or(output),
                 dependency_epoch: cli.dependency_epoch,
                 cargo_home: cli.cargo_home,
+                cache_flags: (cli.no_cache, cli.cache),
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -382,17 +411,12 @@ pub fn parse(
                 program: cargo,
                 class,
                 exec: false,
-                cache: match Cache::of(class, &args, cli.no_cache) {
-                    Cache::Off => Cache::Off,
-                    // A successful build is not a reusable verdict: each
-                    // artifact owner must get its actual outputs.
-                    _ if class == Class::Compile => Cache::Live,
-                    default => cli.cache.unwrap_or(default),
-                },
+                cache: cargo_cache(class, &args, cli.no_cache, cli.cache),
                 args,
                 output,
                 dependency_epoch: cli.dependency_epoch,
                 cargo_home: cli.cargo_home,
+                cache_flags: (cli.no_cache, cli.cache),
             })
         }
     })
