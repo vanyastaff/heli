@@ -342,14 +342,25 @@ fn cargo_arguments(invocation: &Invocation) -> Option<&[OsString]> {
 }
 
 fn isolated_command(invocation: &Invocation) -> Result<(), String> {
-    let command = cargo_arguments(invocation)
-        .map(isolated_subcommand)
-        .transpose()?
-        .flatten();
-    if let Some(command) = command
-        && ["install", "uninstall", "login", "logout", "publish"]
+    let Some(args) = cargo_arguments(invocation) else {
+        return Ok(());
+    };
+    let Some(command) = isolated_subcommand(args)? else {
+        return Ok(());
+    };
+    // `install --list` only reads the home's record of installed tools.
+    let lists_only = command == "install"
+        && args
+            .iter()
+            .skip_while(|arg| arg.as_os_str() != command)
+            .skip(1)
+            .take_while(|arg| *arg != "--")
+            .any(|arg| arg == "--list");
+    if !lists_only
+        && (["install", "uninstall", "login", "logout", "publish"]
             .iter()
             .any(|name| command == *name)
+            || command.to_str().is_some_and(class::writes_home))
     {
         return Err(format!(
             "cargo {} is not supported with an isolated Cargo home; use bare Cargo with the original home or --cargo-home shared at the outer command boundary",
