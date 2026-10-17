@@ -1,13 +1,26 @@
 [package]
 name = "cargo-heli"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.99"
 description = "Host-level scheduling for cargo on machines shared by many agents"
 repository = "https://github.com/vanyastaff/heli"
-# Not published until the first release decides the name and the license.
-publish = false
-exclude = ["/experiments", "/tests/fixtures"]
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["cargo", "jobserver", "agents", "worktree", "build"]
+categories = ["development-tools::cargo-plugins", "command-line-utilities"]
+exclude = ["/experiments", "/tests", "/.github", "/.claude", "/AGENTS.md", "/docs/agents", "/docs/research"]
+
+# `cargo binstall cargo-heli` downloads the release archive the release
+# workflow (`.github/workflows/release.yml`) attaches to `v<version>`.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
