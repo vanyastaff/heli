@@ -23,6 +23,13 @@
 //! [cargo]
 //! home = "isolated"    # shared (default), or a full private home per worktree
 //!
+//! [profiles]                  # tool profiles (crate::profiles)
+//! trust_repository = false    # let .config/heli.toml loosen them
+//! [[profiles.tool]]
+//! tool = "xtask"
+//! args = ["check-changed"]
+//! class = "verify"
+//!
 //! [store]
 //! paths = ['D:\.heli\build']        # build stores, the first on a volume
 //!                                   # serves it; default <volume>/.heli/build
@@ -40,7 +47,7 @@
 //! this build does not know are ignored, so a file written for a newer heli
 //! still works with an older one.
 //!
-//! The client reads `[output]` and `[cargo]` before preparing a run.
+//! The client reads `[output]`, `[cargo]` and `[profiles]` before preparing a run.
 //! Invalid Cargo policy or TOML is terminal: neither may silently disable
 //! isolation. Invalid daemon-owned settings still permit direct fallback,
 //! preserving the selected home; an invalid output setting uses the default.
@@ -79,6 +86,7 @@ pub struct Config {
 pub struct ClientConfig {
     pub cargo: CargoConfig,
     pub output: OutputConfig,
+    pub profiles: crate::profiles::Profiles,
 }
 
 impl ClientConfig {
@@ -98,7 +106,18 @@ impl ClientConfig {
             .cloned()
             .and_then(|value| value.try_into().ok())
             .unwrap_or_default();
-        Ok(Self { cargo, output })
+        let profiles = value
+            .get("profiles")
+            .cloned()
+            .map(toml::Value::try_into)
+            .transpose()
+            .map_err(|error: toml::de::Error| format!("[profiles]: {error}"))?
+            .unwrap_or_default();
+        Ok(Self {
+            cargo,
+            output,
+            profiles,
+        })
     }
 }
 

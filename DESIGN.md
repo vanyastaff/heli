@@ -678,14 +678,17 @@ How a command line is read:
 ### Tool profiles
 
 Beyond cargo's own subcommands, heli ships built-in profiles for popular
-cargo tools (spec #38). A profile maps a tool to a class, or to a run mode;
-`src/class.rs` is the one place that reads them. Not yet implemented: user and
-repository profiles (`.config/heli.toml`), cache keys with extra inputs,
-`caches` and the usage memory.
+cargo tools (spec #38). They apply to everyone who installs heli, with no
+configuration; `src/class.rs` is the one place that reads them. A tool that
+is missing gets a profile in heli itself, so every user gets it, not only
+one project. Users and repositories add profiles of their own (below). Not
+yet implemented: cache keys with extra inputs, `caches` and the usage
+memory.
 
 | Tool | Profile |
 |---|---|
-| `add`, `remove`, `rm`, `update` | mutate |
+| `add`, `remove`, `rm`, `update`; cargo-edit's `upgrade`, `set-version`; `release`, `autoinherit` | mutate |
+| `sort` | verify with `--check` or `-c`; else mutate |
 | `hakari` | `generate`, `manage-deps` mutate; `verify` verify; else exec |
 | `machete`, `shear` | verify; mutate with `--fix` |
 | `udeps`, `public-api` | verify (the `+toolchain` is in the argv, so in the key) |
@@ -694,14 +697,40 @@ repository profiles (`.config/heli.toml`), cache keys with extra inputs,
 | `sqlx` | `prepare` mutate; else exec |
 | `sweep`, `clean-all` | mutate (they delete build output themselves, bypassing the store) |
 | `dx`, `trunk` | `serve` runs directly in the pool; else exec |
+| `leptos` | `watch`, `serve` run directly in the pool; else exec |
+| `tauri` | `dev` runs directly in the pool; else exec |
+| `watch` | runs directly in the pool |
+| `outdated`, `semver-checks`, `vet`, `geiger` | exec, never cached: the result depends on the registry |
 | `audit`, `deny` | exec, never cached: the advisory database is not in the key |
+
+**Profiles from configuration.** A user writes profiles in heli's
+configuration file, and any repository that uses heli commits its own in
+`.config/heli.toml` at its worktree root. Both use the same table:
+
+```toml
+[[profiles.tool]]
+tool = "xtask"              # the word after `cargo`
+args = ["check-changed"]    # optional: the arguments it starts with
+class = "verify"            # compile, verify, mutate or exec
+```
+
+Resolution is built-in, then the user's, then the repository's. Within one
+source the rule with the longest `args` prefix wins. `test` cannot be given:
+a test run needs a runner heli knows. A repository only narrows: its rule
+applies only when it caches no more and locks no less than the user's or
+built-in class, so it may make a tool mutate or exec, never verify. With
+`trust_repository = true` under `[profiles]`, the user lets the repository's
+rules apply as they are. An invalid repository file is a warning and is
+ignored; an invalid user `[profiles]` table is a usage error. A tool that a
+profile names is not unknown, so it never runs directly at a terminal.
 
 **Direct in the pool.** The client runs the command itself, as the direct
 fallback does, but with the host pool in `CARGO_MAKEFLAGS` (the daemon is
 reached first, so the pool exists). No run is registered, cached or
 attached to, and the worktree lock is not taken. Interactive and service
-tools (`insta review`, `dx serve`, `trunk serve`) always run this way. So does
-any other command heli has no profile for, when stdin is a terminal; cargo's
+tools (`insta review`, `dx serve`, `trunk serve`, `leptos watch|serve`,
+`tauri dev`, `cargo watch`) always run this way. So does
+any other command no profile names, when stdin is a terminal; cargo's
 own exec subcommands (`bench`, `tree`, `install`, ...) stay in the daemon.
 Without a terminal an unknown tool is exec in the daemon, as before.
 
