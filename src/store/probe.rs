@@ -37,6 +37,11 @@ pub struct Workspace {
     pub build: Option<PathBuf>,
     #[serde(default)]
     pub packages: Vec<Package>,
+    /// Local crates that `[patch]` or `[replace]` put in place of
+    /// dependencies, when cargo did not resolve them as packages itself
+    /// ([`Probe::sources_at`]'s fallback): each one's directory.
+    #[serde(skip)]
+    pub patches: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,17 +199,55 @@ impl Probe {
     /// The local dependency declarations of a selected manifest, without
     /// resolving or downloading registry dependencies.
     pub fn workspace_at(&self, manifest: Option<&Path>) -> Option<Workspace> {
-        self.metadata(manifest, false)
+        self.metadata(manifest, false).ok()
     }
 
-    /// Resolve local sources, including registry/git patches, without network
-    /// access. All features expose optional path dependencies as well. Failure
-    /// disables result caching; it must never certify an incomplete inventory.
-    pub fn sources_at(&self, manifest: Option<&Path>) -> Option<Workspace> {
-        self.metadata(manifest, true)
+    /// The local sources of a workspace, without network access: its
+    /// packages that have no registry or git source, each with its declared
+    /// path dependencies, and the local crates its patches put in place.
+    /// Failure disables result caching; it must never certify an incomplete
+    /// inventory.
+    ///
+    /// First a resolution of every feature for every platform, which also
+    /// names the packages patches select. It needs every package of the
+    /// lockfile in the Cargo home, which a private home (`[cargo] home =
+    /// "isolated"`) lacks for optional and other-platform dependencies it
+    /// never built (#66). Then, should that fail, the manifests alone
+    /// (`--no-deps`): they declare every path dependency, optional and
+    /// platform-specific ones included, and [`local_patches`] reads the
+    /// patches. Registry and git sources are in the lockfile, which is in
+    /// the tree. The error is the fallback's, with cargo's own first error.
+    pub fn sources_at(&self, manifest: Option<&Path>) -> Result<Workspace, String> {
+        let resolved = match self.metadata(manifest, true) {
+            Ok(workspace) => return Ok(workspace),
+            Err(why) => why,
+        };
+        let mut workspace = self
+            .metadata(manifest, false)
+            .map_err(|why| format!("{why} (resolving every feature: {resolved})"))?;
+        workspace.patches = local_patches(&workspace.root, &self.cwd, self.cargo_home().as_deref());
+        Ok(workspace)
     }
 
-    fn metadata(&self, manifest: Option<&Path>, sources: bool) -> Option<Workspace> {
+    /// The Cargo home as cargo finds it for the run: `CARGO_HOME` (relative
+    /// to the working directory), else `.cargo` in the user's home.
+    fn cargo_home(&self) -> Option<PathBuf> {
+        let var = |name: &str| {
+            self.env
+                .iter()
+                .rev()
+                .find(|(candidate, _)| environment::same_name(candidate, name))
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty())
+        };
+        if let Some(home) = var("CARGO_HOME") {
+            return Some(self.cwd.join(home));
+        }
+        let user = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        var(user).map(|home| Path::new(home).join(".cargo"))
+    }
+
+    fn metadata(&self, manifest: Option<&Path>, sources: bool) -> Result<Workspace, String> {
         let mut args = self.args.clone();
         if sources {
             args.retain(|arg| arg != "--no-deps");
@@ -245,11 +288,18 @@ impl Probe {
             Some(epoch) => super::runner::capture(command, epoch),
             None => command.output(),
         }
-        .ok()?;
+        .map_err(|error| format!("cannot run cargo metadata: {error}"))?;
         if !output.status.success() {
-            return None;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let first = stderr
+                .lines()
+                .find(|line| line.trim_start().starts_with("error"))
+                .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+                .unwrap_or("no message");
+            return Err(format!("cargo metadata failed: {}", first.trim()));
         }
-        serde_json::from_slice(&output.stdout).ok()
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("cargo metadata printed no workspace: {error}"))
     }
 
     /// The git common directory of the repository holding `dir`, if any.
@@ -292,6 +342,55 @@ impl Probe {
         }
         worktrees
     }
+}
+
+/// The directories of the local crates that patches of the workspace at
+/// `root` put in place, as cargo reads them: `[patch.<source>.<name>]` and
+/// `[replace."<spec>"]` with a `path` in its root manifest (relative to the
+/// root), and `[patch...]` with a `path` in the Cargo configuration of
+/// `cwd` and every directory above it, then of the Cargo home (relative to
+/// the directory holding that `.cargo/`, or the home itself). An unreadable
+/// file adds nothing: cargo, which read it to list the workspace, would have
+/// failed on it.
+fn local_patches(root: &Path, cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    fn paths(table: Option<&toml::Value>, base: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+        let Some(table) = table.and_then(toml::Value::as_table) else {
+            return;
+        };
+        for value in table.values() {
+            match (depth, value.get("path").and_then(toml::Value::as_str)) {
+                (0, Some(path)) => found.push(base.join(path)),
+                (0, None) => {}
+                _ => paths(Some(value), base, depth - 1, found),
+            }
+        }
+    }
+    let read = |file: &Path| {
+        std::fs::read_to_string(file)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .map(toml::Value::Table)
+    };
+    let mut found = Vec::new();
+    if let Some(manifest) = read(&root.join("Cargo.toml")) {
+        paths(manifest.get("patch"), root, 1, &mut found);
+        paths(manifest.get("replace"), root, 0, &mut found);
+    }
+    let configs = cwd
+        .ancestors()
+        .map(|dir| (dir.join(".cargo"), dir.to_path_buf()))
+        .chain(home.map(|home| (home.to_path_buf(), home.to_path_buf())));
+    for (dir, base) in configs {
+        for name in ["config.toml", "config"] {
+            if let Some(config) = read(&dir.join(name)) {
+                paths(config.get("patch"), &base, 1, &mut found);
+                break;
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Only options Cargo metadata understands. --target-dir has no metadata
@@ -366,4 +465,40 @@ fn target_override(args: &[OsString], cwd: &Path) -> Option<PathBuf> {
         }
     }
     target
+}
+
+#[cfg(test)]
+mod tests {
+    use super::local_patches;
+
+    /// Patches with a path, in the root manifest (relative to the root) and
+    /// in a Cargo configuration (relative to the directory holding its
+    /// `.cargo/`); patches without one are not local.
+    #[test]
+    fn local_patches_come_from_the_manifest_and_the_configuration() {
+        let dir = tempfile::tempdir().expect("dir");
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join(".cargo")).expect("dirs");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"ws\"\n\n\
+             [patch.crates-io]\nlocal = { path = \"vendor/local\" }\nremote = { git = \"https://x\" }\n\n\
+             [replace]\n\"old:1.0.0\" = { path = \"old\" }\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join(".cargo").join("config.toml"),
+            "[patch.'https://github.com/a/b']\nfrom-git = { path = \"../fork\" }\n",
+        )
+        .expect("config");
+        let found = local_patches(&root, &root, None);
+        assert_eq!(
+            found,
+            [
+                root.join("../fork"),
+                root.join("old"),
+                root.join("vendor/local")
+            ]
+        );
+    }
 }
