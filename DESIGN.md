@@ -681,8 +681,10 @@ Beyond cargo's own subcommands, heli ships built-in profiles for popular
 cargo tools (spec #38). They apply to everyone who installs heli, with no
 configuration; `src/class.rs` is the one place that reads them. A tool that
 is missing gets a profile in heli itself, so every user gets it, not only
-one project. Users and repositories add profiles of their own (below). Not
-yet implemented: `caches`.
+one project. Users and repositories add profiles of their own (below).
+Tools' caches are the build store's: cargo-mutants' scratch copies are the
+ladder's tier 0, and cargo-llvm-cov's `target/llvm-cov-target` a built-in
+tool cache (§6.3).
 
 **Usage memory.** Every run carries where its class came from, its
 `profile`: `cargo` (cargo's own subcommands), `built-in`, `user`,
@@ -1558,17 +1560,27 @@ without them, nothing is evicted. Over budget, heli evicts down to 85 % of
 B. Under the floor, it evicts on that volume until F is free there,
 counting what its trash still holds as free. It evicts what is cheapest to
 regenerate first, oldest first within each tier (the ages are `[store]
-unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
+scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
 
+0. Scratch copies cargo tools left in the temporary directory, untouched for
+   1 h. cargo-mutants copies the workspace there for its builds
+   (`mutants-*` on Windows, `cargo-mutants-<dir>-*` elsewhere) and deletes
+   each copy when done. A cancelled or killed run leaves them behind, each
+   a whole source tree with a `target/` of its own, used by nothing. A
+   directory there with such a name and a `Cargo.toml` counts
+   (`src/store/scratch.rs`). A cargo lock held anywhere inside makes it
+   busy. Its trash is `.heli-trash` beside it, on its volume. It counts
+   toward B, and `status` and `gc` list it as `scratch`.
 1. `incremental/<unit>` directories untouched for 24 h, oldest first across
    the store. Each unit ever built leaves one; in the example they make up
    114 GB of one worktree.
 2. Orphans that no new worktree claimed within 24 h (§6.4), longest
    unclaimed first.
 3. All of a profile's `incremental/` in directories idle for 6 h.
-4. Tool caches in the `target/` of worktrees idle for 6 h, named by patterns
-   in the configuration and nowhere else: for example `tests/trybuild`, and
-   for flui `cli-template-check` and `facade-consumer-check`.
+4. Tool caches in the `target/` of worktrees idle for 6 h: cargo-llvm-cov's
+   `llvm-cov-target`, built in, and patterns in the configuration, for
+   example `tests/trybuild`, and for flui `cli-template-check` and
+   `facade-consumer-check`.
 5. Whole build directories of live workspaces idle for 7 days.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7

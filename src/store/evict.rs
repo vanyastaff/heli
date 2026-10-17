@@ -117,7 +117,7 @@ pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) 
     if !goals.any() {
         return pass;
     }
-    let candidates = ladder::candidates(&pass.dirs, &policy, &config.tool_caches, now);
+    let candidates = ladder::candidates(&pass.dirs, &policy, &config.tool_cache_patterns(), now);
     pass.victims = ladder::plan(candidates, &pass.dirs, goals);
     pass
 }

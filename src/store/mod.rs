@@ -33,6 +33,7 @@ pub mod recycle;
 pub mod registry;
 pub mod runner;
 pub mod scan;
+pub mod scratch;
 pub mod sizes;
 pub mod trash;
 pub mod volume;
@@ -62,6 +63,9 @@ pub enum Kind {
     Build,
     /// A registered `target/` directory.
     Target,
+    /// A scratch copy a cargo tool left in the temporary directory
+    /// ([`scratch`]).
+    Scratch,
 }
 
 /// Whether a directory is in use, and whether its workspace still exists.
@@ -108,11 +112,11 @@ impl Dir {
     /// The sizes of its files, by category (`sizes`): the configuration's
     /// tool-cache patterns apply to a `target/` directory.
     pub fn scan(&self, config: &StoreConfig) -> Sizes {
-        let patterns: &[String] = match self.kind {
-            Kind::Build => &[],
-            Kind::Target => &config.tool_caches,
+        let patterns = match self.kind {
+            Kind::Build | Kind::Scratch => Vec::new(),
+            Kind::Target => config.tool_cache_patterns(),
         };
-        sizes::scan(&self.path, patterns)
+        sizes::scan(&self.path, &patterns)
     }
 
     /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
@@ -174,6 +178,15 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
                 owner: None,
             });
         }
+    }
+    for path in scratch::find() {
+        dirs.push(Dir {
+            kind: Kind::Scratch,
+            path,
+            store: None,
+            workspace: None,
+            owner: None,
+        });
     }
     dirs
 }
@@ -240,7 +253,7 @@ pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
         return true;
     }
     let profiles = lock_dirs(&dir.path);
-    let busy = if dir.kind == Kind::Build {
+    let busy = if matches!(dir.kind, Kind::Build | Kind::Scratch) {
         locks_inside(&dir.path).map_or(true, |locks| {
             locks
                 .iter()

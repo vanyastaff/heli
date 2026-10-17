@@ -11,13 +11,16 @@
 //!
 //! **What, in this order** (a tier's ages are configurable, `[store]`):
 //!
+//! 0. scratch copies cargo tools left in the temporary directory
+//!    (`super::scratch`) untouched for 1 h (`scratch_hours`), oldest first;
 //! 1. `incremental/<unit>` directories untouched for 24 h (`unit_hours`),
 //!    oldest first across every directory;
 //! 2. orphans no worktree claimed for 24 h (`orphan_hours`), longest
 //!    unclaimed first (`super::orphan`);
 //! 3. all of a profile's `incremental/` in directories idle for 6 h
 //!    (`idle_hours`), longest idle first;
-//! 4. the tool caches (`[store] tool_caches`) of registered `target/`
+//! 4. the tool caches (`[store] tool_caches`, and the built-in
+//!    `llvm-cov-target`) of registered `target/`
 //!    directories idle for 6 h, longest idle first;
 //! 5. whole build directories of live workspaces idle for 7 days
 //!    (`dir_hours`, 168), longest idle first.
@@ -67,6 +70,8 @@ pub struct Policy {
     pub idle_age: u64,
     /// Tier 5: how long a build directory is idle.
     pub dir_age: u64,
+    /// Tier 0: how long a scratch copy is untouched.
+    pub scratch_age: u64,
 }
 
 impl Policy {
@@ -80,6 +85,7 @@ impl Policy {
             orphan_age: hours(config.orphan_hours, 24),
             idle_age: hours(config.idle_hours, 6),
             dir_age: hours(config.dir_hours, 168),
+            scratch_age: hours(config.scratch_hours, 1),
         }
     }
 
@@ -95,6 +101,23 @@ impl Policy {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::config::StoreConfig;
+
+    #[test]
+    fn llvm_cov_target_is_a_built_in_tool_cache() {
+        let config = StoreConfig {
+            tool_caches: vec!["tests/trybuild".to_owned()],
+            ..StoreConfig::default()
+        };
+        assert_eq!(
+            config.tool_cache_patterns(),
+            ["llvm-cov-target", "tests/trybuild"]
+        );
+    }
+}
+
 /// The time now, in seconds since 1970: the seam's clock when it has one.
 pub fn now(seam: Option<&Seam>) -> u64 {
     seam.and_then(|seam| seam.clock_ms)
@@ -104,6 +127,7 @@ pub fn now(seam: Option<&Seam>) -> u64 {
 /// A rung of the ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
+    Scratch = 0,
     Unit = 1,
     Orphan = 2,
     Incremental = 3,
@@ -352,6 +376,21 @@ pub fn candidates(
                         surveyed.measure.bytes,
                         idle,
                         format!("build directory idle for {}", hours(idle)),
+                    );
+                }
+            }
+            (Kind::Scratch, _) => {
+                let untouched = now.saturating_sub(surveyed.measure.newest.unwrap_or(0));
+                if untouched >= policy.scratch_age {
+                    victim(
+                        Tier::Scratch,
+                        root.clone(),
+                        surveyed.measure.bytes,
+                        untouched,
+                        format!(
+                            "scratch copy left by a cargo tool, untouched for {}",
+                            hours(untouched)
+                        ),
                     );
                 }
             }

@@ -37,7 +37,8 @@
 //! [store]
 //! paths = ['D:\.heli\build']        # build stores, the first on a volume
 //!                                   # serves it; default <volume>/.heli/build
-//! tool_caches = ["tests/trybuild"]  # tool caches inside target/; default none
+//! tool_caches = ["tests/trybuild"]  # tool caches inside target/, besides the
+//!                                   # built-in llvm-cov-target; default none
 //! budget_mb = 153600   # B, for every build directory and registered
 //!                      # target/ directory together; default none
 //! floor_mb = 51200     # F, the free space kept on each volume; default none
@@ -45,6 +46,7 @@
 //! orphan_hours = 24    # these are the defaults
 //! idle_hours = 6
 //! dir_hours = 168
+//! scratch_hours = 1    # tier 0: scratch copies cargo-mutants left behind
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -165,6 +167,25 @@ pub struct StoreConfig {
     pub idle_hours: Option<u64>,
     /// Tier 5: whole build directories idle this many hours; default 168.
     pub dir_hours: Option<u64>,
+    /// Tier 0: scratch copies cargo tools left behind, untouched this many
+    /// hours; default 1 (`crate::store::scratch`).
+    pub scratch_hours: Option<u64>,
+}
+
+/// Tool caches heli knows without configuration: cargo-llvm-cov's own
+/// target directory inside `target/`.
+pub const BUILTIN_TOOL_CACHES: [&str; 1] = ["llvm-cov-target"];
+
+impl StoreConfig {
+    /// The tool-cache patterns of a `target/` directory: the built-in ones
+    /// ([`BUILTIN_TOOL_CACHES`]), then the configuration's.
+    pub fn tool_cache_patterns(&self) -> Vec<String> {
+        BUILTIN_TOOL_CACHES
+            .iter()
+            .map(|pattern| (*pattern).to_owned())
+            .chain(self.tool_caches.iter().cloned())
+            .collect()
+    }
 }
 
 /// `[pool]`: the host pool (`crate::pool`).
