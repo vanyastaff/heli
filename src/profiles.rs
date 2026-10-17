@@ -84,6 +84,36 @@ pub enum Source {
     Repository,
 }
 
+impl Source {
+    /// How `status` and the event log name where the class of `cargo
+    /// <args>` came from: `user` or `repository` for their profiles; for the
+    /// built-in ones `cargo` (cargo's own subcommands), `built-in` (a tool
+    /// heli has a profile for) or `unknown` (any other tool, which a profile
+    /// should be written for).
+    pub fn name(self, args: &[OsString]) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Repository => "repository",
+            Self::BuiltIn => {
+                let tool = class::subcommand(args)
+                    .and_then(|(tool, _)| tool.to_str())
+                    .unwrap_or_default();
+                if class::tool_profile(tool).is_some() {
+                    "built-in"
+                } else if tool.is_empty()
+                    || tool.starts_with('-')
+                    || Class::of_cargo(args) != Class::Exec
+                    || class::is_cargo_builtin(tool)
+                {
+                    "cargo"
+                } else {
+                    "unknown"
+                }
+            }
+        }
+    }
+}
+
 /// The repository file's `[profiles]` table.
 #[derive(Debug, Default, Deserialize)]
 struct RepositoryFile {

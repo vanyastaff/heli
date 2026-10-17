@@ -104,9 +104,12 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         Err(_) => ClientConfig::default(),
     };
     let source = if invocation.exec {
+        invocation.profile = Some("exec");
         crate::profiles::Source::BuiltIn
     } else {
-        profile(&mut invocation, &config.profiles)
+        let source = profile(&mut invocation, &config.profiles);
+        invocation.profile = Some(source.name(&invocation.args));
+        source
     };
     let configured = || config.output.mode;
     let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
@@ -166,6 +169,7 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
             // An interactive or unknown tool runs here, with the host pool.
             Ok(Some(stream)) if in_pool => {
                 drop(stream);
+                record_direct(&locations, &invocation);
                 match crate::pool::makeflags(&locations.pool) {
                     Ok(makeflags) => {
                         pooled = Some(makeflags);
@@ -219,6 +223,28 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         );
     }
     direct::run(command)
+}
+
+/// Logs a run the client makes itself in the pool (`crate::class::
+/// runs_directly`) in the daemon's event log, as `direct`, with its
+/// `worktree`, `argv` and `profile`, which `cargo heli doctor` counts.
+fn record_direct(locations: &Locations, invocation: &Invocation) {
+    let worktree = std::env::current_dir()
+        .map(|cwd| crate::worktree::of(&cwd))
+        .unwrap_or_default();
+    let argv: Vec<String> = std::iter::once(&invocation.program)
+        .chain(&invocation.args)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    crate::daemon::events::Events::new(locations.event_log(), crate::daemon::events::DEFAULT_MAX)
+        .record(
+            "direct",
+            serde_json::json!({
+                "worktree": worktree.to_string_lossy(),
+                "argv": argv,
+                "profile": invocation.profile,
+            }),
+        );
 }
 
 /// Gives a cargo subcommand's run the class its tool profile says
@@ -665,6 +691,7 @@ fn submit(
         class: Some(invocation.class),
         cache: invocation.cache,
         reads_spawned: true,
+        profile: invocation.profile.map(str::to_owned),
         dependency_epoch: prepared
             .and_then(|prepared| prepared.epoch.as_ref())
             .map(|epoch| Text(epoch.path().as_os_str().to_owned())),

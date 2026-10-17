@@ -167,6 +167,7 @@ impl TestRun {
             class: request.class,
             cache: request.cache,
             reads_spawned: request.reads_spawned,
+            profile: request.profile.clone(),
         })
     }
 

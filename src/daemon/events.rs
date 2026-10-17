@@ -5,7 +5,11 @@
 //! Each event has `at` (seconds since 1970, UTC) and `event`, then fields of
 //! its own:
 //!
-//! - `admit`: a run was admitted: `run`, `worktree`, `argv`;
+//! - `admit`: a run was admitted: `run`, `worktree`, `argv`, `class` and
+//!   `profile` (`crate::profiles::Source::name`);
+//! - `direct`: a client ran a command itself in the pool
+//!   (`crate::class::runs_directly`): `worktree`, `argv` and `profile`. The
+//!   client writes it itself;
 //! - `withhold`: the memory governor withheld a slot: `withheld` (after
 //!   it), `available`, `commit_available` (bytes) and `low_watermark`;
 //! - `return`: it returned every withheld slot: `slots`, `available`,
