@@ -10,6 +10,50 @@ The current priority is independent progress across projects and worktrees.
 Disk and RAM caps are secondary; preserve runtime safety without treating
 disk optimization as a demonstrated prerequisite for concurrency.
 
+To automatically isolate Cargo's mutable dependency caches, select this once
+in heli's user configuration (`%APPDATA%\heli\config.toml` on Windows,
+`$XDG_CONFIG_HOME/heli/config.toml` or `~/.config/heli/config.toml` on Unix):
+
+```toml
+[cargo]
+home = "isolated"
+```
+
+Each worktree then gets a persistent private Cargo home when a managed
+command starts. No vendor, import or explicit fetch preparation is required:
+Cargo downloads and resolves dependencies itself. For a command-scoped
+choice, use `cargo heli --cargo-home isolated --cache off check --locked`.
+The default is `shared`; an outer `--cargo-home shared` keeps the caller's
+original home. An explicit epoch selection still uses its isolated profile.
+
+This trades duplicate downloads and storage for independence. A cold
+isolated home cannot build offline just because another home has the
+dependencies; run the ordinary online check first, then subsequent offline
+commands can reuse that worktree's cache. Heli never retries through the
+shared home after an isolated failure. Keep native `--locked`/`--offline`
+flags as needed; Heli does not insert a lockfile-generation step.
+
+Nested Cargo and nested Heli retain the parent's chosen home, including
+generated projects with additional dependencies. Credentials/configuration
+changes select a new home generation for a new outer invocation, while live
+nested consumers retain the existing generation. Homes are protected and
+retained; their bytes are outside the artifact GC budget. Original home
+`config.toml` keeps its relative path origins; legacy home `config` is
+refused rather than silently rebased. Cargo 1.99+ is required.
+
+Native homes use a compact directory under `<state>/h/` so dependencies with
+deep C source trees remain usable by Windows native compilers. Full home
+identities are verified independently of the shortened directory names;
+an ownership mismatch is an error. Keep a custom `HELI_STATE_DIR` short on
+Windows: native tools can still reject sufficiently long paths. Existing
+inherited homes keep their paths until their commands finish.
+
+Perform Cargo-home maintenance such as install/login/logout from an outer
+shared command. The isolated profile refuses known home-maintenance
+commands and refuses an explicit switch to shared inside an already
+isolated invocation. Arbitrary external tools can have their own Cargo-home
+assumptions; the full tool compatibility work remains open in #38.
+
 Give intermediate artifacts a separate path per workspace. For a project on
 Windows drive D, its `.cargo/config.toml` can contain:
 
@@ -79,14 +123,15 @@ The [2026-10-16 acceptance report](research/shared-verification-acceptance.md)
 records real Cargo same-worktree counters and the matched FLUI comparison
 against both stock xtask and its lock-disabled control, including limits.
 
-A project's own machine-wide queue also needs integration. As checked on
-2026-10-16, FLUI main still has a common per-user host lock in
-`tools/xtask/src/host_lock.rs`.
-[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) adds a bypass
-when heli supplies a nonempty `HELI_RUN`, retaining standalone protection;
-the PR was open and unmerged. Check the consumer revision before relying
-on that handshake. Bare Cargo inheriting the host jobserver does not supply
-it. Do not export `HELI_RUN` manually or globally disable project locks.
+A project's own machine-wide queue also needs integration.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683), merged on
+2026-10-16, bypasses its host lock when heli supplies a nonempty `HELI_RUN`,
+retaining standalone protection.
+[FLUI PR #1684](https://github.com/vanyastaff/flui/pull/1684) also preserves
+xtask's verified-result cache across managed run IDs. Check the consumer
+revision before relying on that handshake. Bare Cargo inheriting the host
+jobserver does not supply it. Do not export `HELI_RUN` manually or globally
+disable project locks.
 
 GC protects the whole lifetime of managed commands, including runtime tests
 reading `OUT_DIR` after Cargo releases its build locks. Compatible shared
@@ -139,8 +184,20 @@ The 2026-10-16 FLUI control also established actual parallel compilation
 with ordinary Cargo, including a shared lab Cargo home. Manually separating
 artifacts and homes is not a benefit attributable to heli. The small matched
 checks do not establish a general speedup or a full-suite comparison.
-Both full workspace test attempts stopped on a consumer fixture that also
-failed natively with a relocated target; the suite is not claimed green.
+Earlier full workspace test attempts stopped on a consumer fixture that also
+failed natively with a relocated target. After that fixture repair, the native
+private-home repeat at Heli `c86d153` and FLUI `8c48ac7a3` passed seven of eight
+commands: both fmt/clippy/check runs and A's full workspace test. B's test had
+five failures across four consumer targets; independent native reproductions
+identified test-fixture problems, rather than establishing a Heli cause.
+[FLUI PR #1683](https://github.com/vanyastaff/flui/pull/1683) at `d85ab1e73`
+contains repairs with targeted RED/GREEN evidence and a passing scoped gate.
+The repaired repeat at that commit passes all eight commands, including both
+full tests. Actual completed compiler invocations overlap across worktrees;
+both worktrees remain clean and the recorded inputs stay unchanged. Idle
+accounting is 4,771,735,920 bytes under an explicit 8-GiB artifact budget,
+with no pending trash. Native source homes remain outside that budget. This
+does not establish a full-suite speedup or universal absence of waits.
 The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
 contains the scopes, timings and invalid GC setup finding.
 
@@ -149,9 +206,61 @@ response can block another project's fully cached offline check through the
 shared package-cache lock. The [local registry fixture](../experiments/real-download-hol.py)
 compares that baseline with ordinary manually isolated Cargo and Heli's
 dependency epoch. Both isolated cases finish while the download is waiting.
-This proves the value of isolation for that case; automatic epoch setup is
-still required to remove the manual preparation from the agent workflow.
+This proves the value of isolation for that case. Explicit epochs still need
+preparation; the native private-home profile described above provides automatic
+mutable-cache isolation without requiring an epoch or vendor snapshot.
 
 See [the research](research/multi-project-resource-isolation.md) for pinned
-primary sources and [the reproducible harness](../experiments/multi-project-spike.py)
+primary sources and [the scoped spike](../experiments/multi-project-spike.py)
 for actual compiler-overlap, held-runner-lock and GC acceptance checks.
+
+To repeat the full eight-command FLUI workload, use
+[the worktree acceptance driver](../experiments/flui-worktree-acceptance.py).
+It requires Python 3.12+, Cargo/Rust 1.99, Git, a built Heli binary and an
+explicit full FLUI commit already present in a local clone. The following
+PowerShell example only prints the plan; choose a new short output path:
+
+```powershell
+python experiments/flui-worktree-acceptance.py `
+  --heli C:/tools/cargo-heli.exe --flui D:/flui `
+  --flui-ref d85ab1e73575388ba8112c1d86dbc7dd95491717 `
+  --budget-mb 8192 --output E:/heli-lab/new-full-run --instrument
+```
+
+Add `--run` to create two detached worktrees and an isolated daemon, state,
+native homes, activity namespace and managed artifact store. The driver
+submits fmt, clippy, check and the full workspace test command concurrently
+in both worktrees. It records compiler start/end intervals, command exits,
+source/configuration digests, GC decisions and final accounting, and checks
+that both worktrees remain clean at the pinned commit. It removes only its
+still-clean worktrees at that commit after measurement; changed or
+unreadable HEADs and dirty worktrees are retained. Logs and results remain.
+A failed test or unmet artifact budget is reported as failure; a small budget is
+not permission to remove protected runtime outputs. This public driver
+accepts only a fresh lab. The recorded repeat that reused private native
+homes has different cache warmth and does not establish a matched timing
+comparison with a fresh replay. A cold lab downloads dependencies normally.
+
+On Windows, while both full tests remain active, a second terminal can join
+two small independent projects through
+[the mixed-project sidecar](../experiments/flui-mixed-project-sidecar.py):
+
+```powershell
+python experiments/flui-mixed-project-sidecar.py `
+  --live E:/heli-lab/new-full-run --output E:/heli-lab/new-sidecar
+```
+
+Again add `--run` to execute. This bounded std-only workload discovers and
+checks the owned live daemon and pool, selects two more native homes, and
+requires four active worktrees across three repositories. It invokes GC
+while its tests hold build-script assets, then requires both projects to
+finish successfully while the FLUI tests are still active. It preserves
+its project sources and evidence, never stops the main daemon and cancels
+only its own matching runs if necessary. The sidecar currently requires
+Windows; it is a progress and runtime-safety check, not an authenticated
+registry or throughput comparison. Start it after the full driver's setup
+has completed and while both full test runs are still active.
+
+The experiment CI checks syntax, five small driver safety regressions and
+the full driver's prepare-only path on all three OSes. It does not launch
+the heavy FLUI acceptance workload automatically.

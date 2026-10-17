@@ -586,6 +586,15 @@ fn exec_verification_shares_only_unchanged_inputs() {
 
 #[test]
 fn real_tests_share_then_verify_a_new_source_generation() {
+    real_tests_share_then_verify(false);
+}
+
+#[test]
+fn isolated_real_tests_share_then_verify_a_new_source_generation() {
+    real_tests_share_then_verify(true);
+}
+
+fn real_tests_share_then_verify(isolated: bool) {
     for wrapper in [false, true] {
         let fixture = Fixture::new("basic");
         let project = fixture.path("real-test-project");
@@ -642,6 +651,9 @@ fn verifies() {
         );
         let command = || {
             let mut command = fixture.heli(["--cache", "off", "--output", "full"]);
+            if isolated {
+                command.args(["--cargo-home", "isolated"]);
+            }
             if wrapper {
                 command
                     .args(["exec", "--verify", "--"])
@@ -874,21 +886,35 @@ fn a_live_client_cannot_inherit_a_queued_runs_saved_verdict() {
 
 #[test]
 fn real_builds_produce_artifacts_in_each_worktree() {
+    real_builds_produce_artifacts(false);
+}
+
+#[test]
+fn isolated_real_builds_produce_artifacts_in_each_worktree() {
+    real_builds_produce_artifacts(true);
+}
+
+fn real_builds_produce_artifacts(isolated: bool) {
     let twins = Twins::new();
     let gate = twins.fixture.path("real-build-gate");
+    let home = twins.fixture.path("real-build-home");
+    std::fs::create_dir_all(&home).unwrap();
     let command = |dir: &Path, target: &Path| {
-        let mut command =
-            twins
-                .fixture
-                .heli(["--output", "full", "build", "--offline", "-p", "gated"]);
+        let mut command = twins.fixture.heli(["--output", "full"]);
+        if isolated {
+            command.args(["--cargo-home", "isolated"]);
+        }
         command
+            .args(["build", "--offline", "-p", "gated"])
             .current_dir(dir)
+            .env("CARGO_HOME", &home)
             .env("CARGO_TARGET_DIR", target)
             .env("HELI_FIXTURE_GATE", &gate);
         command
     };
     let target = twins.fixture.path("real-build-target");
     let other_target = twins.fixture.path("other-real-build-target");
+    let alternate_target = twins.fixture.path("alternate-real-build-target");
     let first = start(&mut command(&twins.workspace(), &target));
     let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
@@ -906,22 +932,80 @@ fn real_builds_produce_artifacts_in_each_worktree() {
     let same = start(&mut command(&twins.workspace(), &target));
     wait_for_clients(&twins.fixture, &run, 2);
     let other = start(&mut command(&twins.other, &other_target));
-    let listed = wait_for_runs(&twins.fixture, 2);
+    let alternate = start(&mut command(&twins.workspace(), &alternate_target));
+    let listed = wait_for_runs(&twins.fixture, 3);
     std::fs::write(gate, "").unwrap();
-    let outputs = [finish(first), finish(same), finish(other)];
+    let outputs = [
+        finish(first),
+        finish(same),
+        finish(other),
+        finish(alternate),
+    ];
     for output in &outputs {
         assert_success(output, "real independent artifact owner");
     }
     assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
     assert_ne!(run_of(&outputs[0]), run_of(&outputs[2]));
-    assert_eq!(listed[1]["waiting_for"], serde_json::json!([]));
-    for target in [&target, &other_target] {
+    assert_ne!(run_of(&outputs[0]), run_of(&outputs[3]));
+    assert_ne!(run_of(&outputs[2]), run_of(&outputs[3]));
+    for run in &listed[1..] {
+        assert_eq!(run["waiting_for"], serde_json::json!([]));
+    }
+    for target in [&target, &other_target, &alternate_target] {
         assert!(
             target.join("debug/libgated.rlib").is_file(),
             "missing build artifact in {}",
             target.display()
         );
     }
+    assert!(markers(&twins.fixture).is_empty());
+}
+
+#[test]
+fn isolated_real_checks_share_across_worktrees_without_saved_verdicts() {
+    let twins = Twins::new();
+    let gate = twins.fixture.path("real-check-gate");
+    let home = twins.fixture.path("real-check-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let command = |dir: &Path, target: &Path| {
+        let mut command = twins.fixture.heli([
+            "--cargo-home",
+            "isolated",
+            "--cache",
+            "off",
+            "--output",
+            "full",
+            "check",
+            "--offline",
+            "-p",
+            "gated",
+        ]);
+        command
+            .current_dir(dir)
+            .env("CARGO_HOME", &home)
+            .env("CARGO_TARGET_DIR", target)
+            .env("HELI_FIXTURE_GATE", &gate);
+        command
+    };
+    let target = twins.fixture.path("real-check-target");
+    let other_target = twins.fixture.path("other-real-check-target");
+    let first = start(&mut command(&twins.workspace(), &target));
+    let run = id(&wait_for_runs(&twins.fixture, 1)[0]);
+    twins
+        .fixture
+        .wait_for_status("running real check", |status| {
+            runs(status).iter().any(|run| run["phase"] == "running")
+        });
+    let second = start(&mut command(&twins.other, &other_target));
+    wait_for_clients(&twins.fixture, &run, 2);
+    std::fs::write(gate, "").unwrap();
+    let outputs = [finish(first), finish(second)];
+    for output in &outputs {
+        assert_success(output, "live verification across isolated homes");
+    }
+    assert_eq!(run_of(&outputs[0]), run_of(&outputs[1]));
+    assert_eq!(outputs[0].stdout, outputs[1].stdout);
+    assert!(!other_target.join("debug/deps").exists());
     assert!(markers(&twins.fixture).is_empty());
 }
 

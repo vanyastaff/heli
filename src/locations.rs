@@ -78,16 +78,21 @@ impl Locations {
             Some(pool) => absolute(PathBuf::from(pool))?.into(),
             None => default_pool(&state_dir)?,
         };
-        let config = match var(CONFIG_VAR) {
-            Some(config) => absolute(PathBuf::from(config))?,
-            None => default_config()?,
-        };
+        let config = Self::config_path()?;
         Ok(Self {
             state_dir,
             endpoint,
             pool,
             config,
         })
+    }
+
+    /// Resolves client policy independently of daemon state and pool locations.
+    pub fn config_path() -> Result<PathBuf, String> {
+        match var(CONFIG_VAR) {
+            Some(config) => absolute(PathBuf::from(config)),
+            None => default_config(),
+        }
     }
 
     /// The lock the daemon holds while it runs: one daemon per user (and,

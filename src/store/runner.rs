@@ -159,16 +159,15 @@ fn failed(error: io::Error) -> ! {
 }
 
 /// A separate guardian survives abrupt client loss during direct fallback.
-pub fn direct(command: Command, roots: &[PathBuf], epoch: &std::path::Path) -> ! {
+pub fn direct(command: Command, roots: &[PathBuf], epoch: Option<&std::path::Path>) -> ! {
     let executable = std::env::current_exe().unwrap_or_else(|error| {
         crate::direct::report_spawn_failure(command.get_program(), false, &error.to_string())
     });
     let mut guardian = Command::new(executable);
-    guardian
-        .arg("lease-run")
-        .arg("--direct")
-        .arg("--dependency-epoch")
-        .arg(epoch);
+    guardian.arg("lease-run").arg("--direct");
+    if let Some(epoch) = epoch {
+        guardian.arg("--dependency-epoch").arg(epoch);
+    }
     for root in roots {
         guardian.arg("--root").arg(root);
     }

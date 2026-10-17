@@ -1,4 +1,4 @@
-//! Private Cargo homes for an explicitly selected immutable dependency epoch.
+//! Private writable Cargo homes, optionally selecting immutable dependencies.
 //!
 //! The caller verifies that the selected Cargo supports config includes
 //! (the supported profile is Cargo 1.99+). Includes keep the original home
@@ -19,8 +19,8 @@ const MARKER: &str = ".heli-private-home.json";
 const CREDENTIALS: [&str; 2] = ["credentials", "credentials.toml"];
 
 pub struct Prepared {
-    /// Keeps the selected source epoch leased until the run is handed off.
-    pub epoch: Epoch,
+    /// Keeps an optional source epoch leased until the run is handed off.
+    pub epoch: Option<Epoch>,
     pub home: PathBuf,
     /// The caller preserves Cargo's external-tool search using this bin dir.
     pub original_home: PathBuf,
@@ -30,46 +30,78 @@ pub struct Prepared {
 struct Marker {
     schema: u32,
     original_home: PathBuf,
-    epoch_path: PathBuf,
-    epoch_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    epoch_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    home_identity: Option<String>,
     config_digest: String,
 }
 
 /// Prepare with the invoking client's environment, before replacing Cargo
 /// home. `home_base` belongs to heli's private state, outside epoch GC.
-pub fn prepare(epoch_path: &Path, home_base: &Path) -> Result<Prepared, String> {
-    let epoch = Epoch::open(epoch_path)?;
+pub fn prepare(epoch_path: Option<&Path>, home_base: &Path) -> Result<Prepared, String> {
     let home_base = absolute(home_base)?;
     let cwd = std::env::current_dir().map_err(|error| format!("cannot read cwd: {error}"))?;
     let current = current_home(&cwd)?;
     let marker = read_marker(&current)?;
-    // Nested heli invocations retain their parent's exact home, even from
-    // a generated workspace or after the original credentials are rotated.
     if let Some(marker) = &marker {
         validate_home(&current, marker)?;
-        if marker.epoch_path == epoch.path() && marker.epoch_identity == epoch.identity() {
-            return Ok(Prepared {
-                original_home: marker.original_home.clone(),
-                home: current,
-                epoch,
-            });
-        }
+    }
+    let selected = epoch_path.or_else(|| {
+        marker
+            .as_ref()
+            .and_then(|marker| marker.epoch_path.as_deref())
+    });
+    let epoch = selected.map(Epoch::open).transpose()?;
+    // Nested heli invocations retain their parent's exact home, even from
+    // a generated workspace or after the original credentials are rotated.
+    if let Some(marker) = &marker
+        && marker.epoch_path.as_deref() == epoch.as_ref().map(Epoch::path)
+        && marker.epoch_identity.as_deref() == epoch.as_ref().map(Epoch::identity)
+    {
+        return Ok(Prepared {
+            original_home: marker.original_home.clone(),
+            home: current,
+            epoch,
+        });
     }
     let original = marker.map_or(current, |marker| marker.original_home);
     let workspace = absolute(&crate::worktree::of(&cwd))?;
-    let home = publish(
-        &original,
-        &workspace,
-        epoch.path(),
-        epoch.identity(),
-        epoch.config(),
-        &home_base,
-    )?;
+    let home = match &epoch {
+        Some(epoch) => publish(
+            &original,
+            &workspace,
+            epoch.path(),
+            epoch.identity(),
+            epoch.config(),
+            &home_base,
+        )?,
+        None => publish_context(&original, &workspace, None, &home_base)?,
+    };
     Ok(Prepared {
         epoch,
         home,
         original_home: original,
     })
+}
+
+/// Detect a validated context inherited from a managed parent. Its exact home
+/// takes precedence over changed defaults and a generated child's directory.
+pub fn inherited() -> Result<bool, String> {
+    if std::env::var_os("CARGO_HOME").is_none_or(|home| home.is_empty()) {
+        return Ok(false);
+    }
+    let cwd = std::env::current_dir().map_err(|error| format!("cannot read cwd: {error}"))?;
+    let current = current_home(&cwd)?;
+    match read_marker(&current)? {
+        Some(marker) => {
+            validate_home(&current, &marker)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 fn current_home(cwd: &Path) -> Result<PathBuf, String> {
@@ -115,7 +147,19 @@ fn read_marker(home: &Path) -> Result<Option<Marker>, String> {
         .map_err(|error| format!("cannot read private Cargo home metadata: {error}"))?;
     let marker: Marker = serde_json::from_slice(&bytes)
         .map_err(|_| format!("invalid private Cargo home metadata in {}", home.display()))?;
-    if marker.schema != 1 || !marker.original_home.is_absolute() {
+    let compact_identity_valid = marker.home_identity.as_deref().is_some_and(|identity| {
+        identity.len() == 64
+            && identity
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            && home.file_name().and_then(|name| name.to_str()) == Some(&identity[..32])
+    });
+    if !matches!(marker.schema, 1..=3)
+        || !marker.original_home.is_absolute()
+        || marker.epoch_path.is_some() != marker.epoch_identity.is_some()
+        || (marker.schema == 1 && marker.epoch_path.is_none())
+        || (marker.schema == 3 && (marker.epoch_path.is_some() || !compact_identity_valid))
+    {
         return Err(format!(
             "unsupported private Cargo home metadata in {}",
             home.display()
@@ -134,13 +178,16 @@ fn optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-fn config(original: &Path, epoch_config: &Path) -> Result<(String, Option<Vec<u8>>), String> {
+fn config(
+    original: &Path,
+    epoch_config: Option<&Path>,
+) -> Result<(String, Option<Vec<u8>>), String> {
     // Cargo prefers legacy config over config.toml, but includes accept
     // only .toml. Copying/rebasing a legacy file would change path origins.
     match fs::symlink_metadata(original.join("config")) {
         Ok(_) => {
             return Err(format!(
-                "dependency epochs cannot preserve legacy Cargo home config {}; \
+                "isolated Cargo homes cannot preserve legacy Cargo home config {}; \
                  migrate it to config.toml (keeping its directory) before opting in",
                 original.join("config").display()
             ));
@@ -154,7 +201,9 @@ fn config(original: &Path, epoch_config: &Path) -> Result<(String, Option<Vec<u8
     if original_bytes.is_some() {
         included.push(path_text(&original_config)?);
     }
-    included.push(path_text(epoch_config)?);
+    if let Some(epoch_config) = epoch_config {
+        included.push(path_text(epoch_config)?);
+    }
     let array = serde_json::to_string(&included).expect("paths serialize");
     Ok((format!("include = {array}\n"), original_bytes))
 }
@@ -163,7 +212,7 @@ fn path_text(path: &Path) -> Result<String, String> {
     plain_path(path)
         .into_os_string()
         .into_string()
-        .map_err(|_| "dependency epoch configuration paths must be valid Unicode".to_owned())
+        .map_err(|_| "isolated Cargo home configuration paths must be valid Unicode".to_owned())
 }
 
 /// Strip only a verbatim prefix: canonicalizing a symlinked config file or
@@ -203,19 +252,51 @@ fn publish(
     epoch_config: &Path,
     home_base: &Path,
 ) -> Result<PathBuf, String> {
-    let (generated, original_config) = config(original, epoch_config)?;
+    publish_context(
+        original,
+        workspace,
+        Some(EpochSource {
+            path: epoch_path,
+            identity: epoch_identity,
+            config: epoch_config,
+        }),
+        home_base,
+    )
+}
+
+struct EpochSource<'a> {
+    path: &'a Path,
+    identity: &'a str,
+    config: &'a Path,
+}
+
+fn publish_context(
+    original: &Path,
+    workspace: &Path,
+    epoch: Option<EpochSource<'_>>,
+    home_base: &Path,
+) -> Result<PathBuf, String> {
+    let (generated, original_config) = config(original, epoch.as_ref().map(|epoch| epoch.config))?;
     let credentials = CREDENTIALS
         .iter()
         .map(|name| optional(&original.join(name)))
         .collect::<Result<Vec<_>, _>>()?;
-    let epoch_bytes = fs::read(epoch_config)
-        .map_err(|error| format!("cannot read dependency epoch configuration: {error}"))?;
+    let epoch_bytes = epoch
+        .as_ref()
+        .map(|epoch| fs::read(epoch.config))
+        .transpose()
+        .map_err(|error| format!("cannot read dependency epoch configuration: {error}"))?
+        .unwrap_or_default();
     let mut identity = Sha256::new();
     for bytes in [
-        b"heli-private-cargo-home-v1".as_slice(),
+        if epoch.is_some() {
+            b"heli-private-cargo-home-v1".as_slice()
+        } else {
+            b"heli-private-native-cargo-home-v1".as_slice()
+        },
         original.as_os_str().as_encoded_bytes(),
         workspace.as_os_str().as_encoded_bytes(),
-        epoch_identity.as_bytes(),
+        epoch.as_ref().map_or("", |epoch| epoch.identity).as_bytes(),
         generated.as_bytes(),
         &epoch_bytes,
     ] {
@@ -225,21 +306,32 @@ fn publish(
         field(&mut identity, &[u8::from(bytes.is_some())]);
         field(&mut identity, bytes.as_deref().unwrap_or_default());
     }
-    let name = hex(&identity.finalize());
+    let full_identity = hex(&identity.finalize());
+    let name = if epoch.is_some() {
+        full_identity.as_str()
+    } else {
+        &full_identity[..32]
+    };
     private_dir(home_base)?;
-    let home = home_base.join(&name);
+    // The first invocation may resolve a not-yet-created base lexically
+    // (for example /var on macOS); subsequent invocations canonicalize it.
+    // Expose the same physical spelling from the first publication onward.
+    // Original config paths above deliberately retain their lexical origin.
+    let home_base = absolute(home_base)?;
+    let home = home_base.join(name);
     let marker = Marker {
-        schema: 1,
+        schema: if epoch.is_some() { 2 } else { 3 },
         original_home: original.to_path_buf(),
-        epoch_path: epoch_path.to_path_buf(),
-        epoch_identity: epoch_identity.to_owned(),
+        epoch_path: epoch.as_ref().map(|epoch| epoch.path.to_path_buf()),
+        epoch_identity: epoch.as_ref().map(|epoch| epoch.identity.to_owned()),
+        home_identity: epoch.is_none().then_some(full_identity),
         config_digest: digest(generated.as_bytes()),
     };
     if home.exists() {
         validate_home(&home, &marker)?;
         return Ok(home);
     }
-    let stage = Stage::create(home_base)?;
+    let stage = Stage::create(&home_base)?;
     private_file(&stage.0.join("config.toml"), generated.as_bytes())?;
     private_file(
         &stage.0.join(MARKER),
@@ -280,6 +372,7 @@ fn validate_home(home: &Path, expected: &Marker) -> Result<(), String> {
         || actual.epoch_path != expected.epoch_path
         || actual.epoch_identity != expected.epoch_identity
         || actual.config_digest != expected.config_digest
+        || actual.home_identity != expected.home_identity
     {
         return Err("private Cargo home publication does not match its selected inputs".to_owned());
     }
@@ -718,6 +811,163 @@ mod tests {
         let first = select(&original, &epoch, &homes, &temp.path().join("first"));
         let second = select(&original, &epoch, &homes, &temp.path().join("second"));
         assert_ne!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_publication_and_reuse_expose_the_same_home_through_a_parent_alias() {
+        let (temp, original, _, _) = setup();
+        let real = temp.path().join("real-state");
+        fs::create_dir(&real).unwrap();
+        let alias = temp.path().join("state-alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let base = alias.join("dependency-homes");
+        assert!(!base.exists());
+        let first =
+            publish_context(&original, temp.path(), None, &absolute(&base).unwrap()).unwrap();
+        let reused =
+            publish_context(&original, temp.path(), None, &absolute(&base).unwrap()).unwrap();
+        assert_eq!(first, reused);
+        assert_eq!(
+            first,
+            crate::store::simplified(&fs::canonicalize(&first).unwrap())
+        );
+        let config: toml::Table =
+            toml::from_str(&fs::read_to_string(first.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(
+            Path::new(config["include"][0].as_str().unwrap()),
+            original.join("config.toml")
+        );
+    }
+
+    #[test]
+    fn native_homes_reuse_private_writable_cache_without_touching_original() {
+        let (temp, original, _, homes) = setup();
+        let home = publish_context(&original, temp.path(), None, &homes).unwrap();
+        let cache = home.join("registry/cache/local-cache-entry");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, "private cached bytes").unwrap();
+        let reused = publish_context(&original, temp.path(), None, &homes).unwrap();
+        assert_eq!(home, reused);
+        assert_eq!(fs::read_to_string(cache).unwrap(), "private cached bytes");
+        assert!(!original.join("registry").exists());
+        assert!(!original.join(".package-cache").exists());
+        let marker = read_marker(&home).unwrap().unwrap();
+        assert!(marker.epoch_path.is_none());
+        assert!(marker.epoch_identity.is_none());
+        assert_eq!(marker.schema, 3);
+        assert_eq!(marker.home_identity.as_ref().unwrap().len(), 64);
+        assert_eq!(home.file_name().unwrap().len(), 32);
+        let config: toml::Table =
+            toml::from_str(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(config["include"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            Path::new(config["include"][0].as_str().unwrap()),
+            original.join("config.toml")
+        );
+        for name in CREDENTIALS {
+            check_private(&home.join(name)).unwrap();
+            assert_eq!(
+                fs::read(home.join(name)).unwrap(),
+                fs::read(original.join(name)).unwrap()
+            );
+        }
+        let other =
+            publish_context(&original, &temp.path().join("other-worktree"), None, &homes).unwrap();
+        assert_ne!(home, other);
+        assert!(!other.join("registry").exists());
+    }
+
+    #[test]
+    fn native_credential_rotation_publishes_without_overwriting_live_home() {
+        let (temp, original, _, homes) = setup();
+        let previous = publish_context(&original, temp.path(), None, &homes).unwrap();
+        let before = fs::read(previous.join("credentials.toml")).unwrap();
+        fs::write(
+            original.join("credentials.toml"),
+            "[registry]\ntoken='rotated'\n",
+        )
+        .unwrap();
+        let next = publish_context(&original, temp.path(), None, &homes).unwrap();
+        assert_ne!(previous, next);
+        assert_eq!(fs::read(previous.join("credentials.toml")).unwrap(), before);
+        assert_eq!(
+            fs::read(next.join("credentials.toml")).unwrap(),
+            fs::read(original.join("credentials.toml")).unwrap()
+        );
+        validate_home(&previous, &read_marker(&previous).unwrap().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn version_one_epoch_homes_remain_readable_and_reusable() {
+        let (temp, original, epoch, homes) = setup();
+        let home = select(&original, &epoch, &homes, temp.path());
+        let path = home.join(MARKER);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        marker["schema"] = 1.into();
+        fs::write(path, marker.to_string()).unwrap();
+        assert_eq!(read_marker(&home).unwrap().unwrap().schema, 1);
+        assert_eq!(select(&original, &epoch, &homes, temp.path()), home);
+    }
+
+    #[test]
+    fn compact_home_prefix_collisions_refuse_reuse_without_overwriting() {
+        let (temp, original, _, homes) = setup();
+        let home = publish_context(&original, temp.path(), None, &homes).unwrap();
+        let path = home.join(MARKER);
+        let mut marker = read_marker(&home).unwrap().unwrap();
+        let identity = marker.home_identity.as_mut().unwrap();
+        let last = if identity.ends_with('0') { "1" } else { "0" };
+        identity.replace_range(63..64, last);
+        let changed = serde_json::to_vec(&marker).unwrap();
+        fs::write(&path, &changed).unwrap();
+        // Valid compact spelling, but another complete identity: the
+        // preparer must compare all 256 bits before trusting cached files.
+        assert!(read_marker(&home).is_ok());
+        let error = publish_context(&original, temp.path(), None, &homes).unwrap_err();
+        assert!(error.contains("does not match"), "{error}");
+        assert_eq!(fs::read(path).unwrap(), changed);
+    }
+
+    #[test]
+    fn compact_homes_require_a_complete_identity_and_matching_prefix() {
+        let (temp, original, _, homes) = setup();
+        let home = publish_context(&original, temp.path(), None, &homes).unwrap();
+        let path = home.join(MARKER);
+        let marker = read_marker(&home).unwrap().unwrap();
+        let valid = marker.home_identity.unwrap();
+        for invalid in [
+            None,
+            Some("a".repeat(63)),
+            Some("G".repeat(64)),
+            Some(format!(
+                "{}{}",
+                if valid.starts_with('0') { "1" } else { "0" },
+                &valid[1..]
+            )),
+        ] {
+            let mut marker: Marker = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            marker.home_identity = invalid;
+            fs::write(&path, serde_json::to_vec(&marker).unwrap()).unwrap();
+            assert!(read_marker(&home).is_err());
+        }
+    }
+
+    #[test]
+    fn version_two_native_homes_remain_valid_at_their_original_path() {
+        let (temp, original, _, homes) = setup();
+        let compact = publish_context(&original, temp.path(), None, &homes).unwrap();
+        let mut marker = read_marker(&compact).unwrap().unwrap();
+        let legacy = homes.join(marker.home_identity.take().unwrap());
+        marker.schema = 2;
+        fs::write(compact.join(MARKER), serde_json::to_vec(&marker).unwrap()).unwrap();
+        fs::rename(compact, &legacy).unwrap();
+        let inherited = read_marker(&legacy).unwrap().unwrap();
+        validate_home(&legacy, &inherited).unwrap();
+        assert_eq!(inherited.schema, 2);
+        assert!(inherited.home_identity.is_none());
+        assert!(legacy.exists());
     }
 
     #[cfg(windows)]

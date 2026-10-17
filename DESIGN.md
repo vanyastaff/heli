@@ -80,6 +80,23 @@ itself establish a need for disk optimization or prove a resource bound.
   verdict, and on failure the failures. Everything else stays retrievable
   without running the command again.
 
+**Acceptance status, 2026-10-16.** G1, G3 and G4 above are design goals,
+not unconditional properties established by the current acceptance runs.
+Independent projects can complete beside long-running work (§12), but
+cold preparation and Cargo's own waits can delay the first compiler. The
+recorded full FLUI run took 184.677/210.297 seconds to that point; these
+are end-to-end delays, not separately measured download times. That run
+does not pass §12's strict ten-second first-compiler criterion.
+An existing worktree's retained home and an eligible orphan build directory
+can be reused; an entirely new worktree without a donor is not guaranteed
+to start warm. Artifact GC reclaims eligible regenerable data, protects
+active consumers and resumes at idle. Continuous activity can defer it
+indefinitely, protected residual outputs can exceed the budget even at
+idle, and native source homes are outside that budget (§6.3, §6.6).
+The recorded 2-GiB FLUI acceptance remains a failed budget check. These
+limits must not be advertised as solved merely because concurrent commands
+or narrower acceptance tests pass.
+
 Non-goals:
 
 - Changing cargo's freshness rules, or sharing one build directory between
@@ -1892,10 +1909,12 @@ home and epoch instead of building recursive include chains. Cargo,
 toolchain and wrapper selection retain the caller's PATH order; the original
 home's bin directory is appended only when absent.
 
-This is an explicit integration milestone, not the complete automatic
-isolation policy. Automatic dependency preparation/selection, capacity
-accounting for sources/staging/private homes/lease metadata and automatic
-private-home reclamation remain required work. Legacy home `config` is
+This immutable-source profile requires explicit preparation and selection.
+The native home profile in §6.6 needs no epoch publisher or vendor prepass;
+automatic epoch publication is an optional storage optimization, not a
+prerequisite for independent Cargo downloads. Capacity accounting for
+sources/staging/private homes/lease metadata and automatic private-home
+reclamation remain unfinished. Legacy home `config` is
 explicitly refused because Cargo includes require `.toml`; copying it would
 change relative-path semantics. Arbitrary cargo extensions, competing
 home-bin/PATH extension precedence and tools mutating the Cargo home need
@@ -1916,6 +1935,118 @@ target while retaining both source views. The production concurrency canary
 in `experiments/dependency-epoch-concurrency.py` exercises shared-object GC
 between exits of three consumers across two projects and two Git worktrees.
 Cross-platform results must be reported for the exact tested revision.
+
+### 6.6 Automatic worktree Cargo homes
+
+The independence profile uses ordinary writable Cargo homes, one per
+worktree, rather than requiring a vendor snapshot before a command can run.
+With `[cargo] home = "isolated"` in the user configuration, or
+`--cargo-home isolated` on a command, the invoking client prepares the home
+before submitting the command. Default `shared` preserves the caller's
+Cargo home. Explicit epochs remain an optional source-storage optimization;
+an explicit shared-home request conflicts with an epoch selection.
+
+Preparation creates configuration and private credentials, not a dependency
+resolution pass. Cargo itself downloads, resolves and builds with its native
+flags. Each worktree owns its mutable registry, index, extracted sources and
+git cache. None are links to another worktree's or the original home's
+mutable cache. Concurrent cold worktrees may download the same crate twice;
+avoiding their mutual package-cache lock takes priority over storage savings.
+Home preparation does not wait for another worktree to download its
+dependencies. Live verification sharing still follows the complete input-key
+policy in §5.
+
+The secure publication mechanism in §6.5 also applies without an epoch:
+original home configuration is included at home precedence with its relative
+origins intact, credentials are copied only into protected files, and a
+stable generation is published rather than rewritten under active commands.
+Worktree identity is the canonical nearest checkout root, not Git's common
+directory; outside Git it is the invoking directory. Config or credential
+changes select a new generation for a new outer command. Already running
+commands and their nested Heli invocations retain their exact parent home,
+including in generated directories outside the parent's repository.
+
+Native generations use the compact `<state>/h/<32 hexadecimal digits>`
+layout. The directory name is a prefix, not the authority for ownership:
+the schema-3 marker records the complete 256-bit home identity and reuse
+must compare that identity. A prefix collision or an inconsistent marker
+is an error; it must never attach a command to another worktree's mutable
+cache. Existing epoch layouts and inherited schema-1/2 homes retain their
+paths. New layout selection does not move or delete an active generation.
+
+The short layout is a native-tool compatibility requirement. In the real
+two-worktree FLUI acceptance, an existing aws-lc C source reached 268 path
+characters and MSVC reported C1083, even though Rust could create and read
+the file. A regression compiles a C source at that dependency's actual
+registry depth with the installed MSVC compiler. Shortening only the test
+checkout would conceal this defect. An arbitrarily deep custom state root
+or dependency can still exceed a native tool's path limit; use a short
+`HELI_STATE_DIR` on Windows when selecting a custom root.
+
+Cold `--offline` runs can fail because the private home has no dependencies
+yet. Heli must not hide that failure by retrying through the original shared
+cache. Warm offline runs reuse their worktree's cache. No hidden step creates
+or updates `Cargo.lock`; `--locked` retains Cargo's normal meaning. Interrupted
+downloads are recovered by Cargo in that home. Selected isolation survives
+daemon loss and direct fallback rather than silently becoming shared.
+
+Home-mutating Cargo commands need an explicit destination policy. This
+profile refuses known install/login/logout-style operations instead of
+silently changing their original destination. An explicit shared request
+inside an inherited isolated command is refused rather than escaping its
+parent's context. Use an outer shared command for home maintenance. Arbitrary
+extensions and executables may interpret Cargo home themselves; their full
+compatibility remains part of #38. Existing Cargo 1.99+ and legacy home
+`config` limitations apply. Private native homes are retained and are outside
+artifact-store accounting; automatic retirement requires lifetime ownership
+before deletion. No hard resource bound follows from this profile.
+
+Acceptance must exercise the public CLI with two actual Git worktrees and
+a localhost registry: delay A's real download and observe B's build-script
+and compiler progress before releasing it; resolve a nested generated
+project whose dependency is outside the parent's graph; preserve original
+home/config/credential and project lockfile bytes; distinguish cold and warm
+offline runs; and verify configuration origins, private credentials, unsafe
+home refusal and direct fallback. `tests/cargo_homes.rs` covers the public
+home policy, config/credential semantics, simultaneous worktrees and a real
+fallback command surviving client loss with its GC guard. The local registry
+fixture `experiments/isolated-home-concurrency.py` covers actual cold downloads,
+nested resolution, offline behavior and optional authenticated access through
+Cargo's token provider. Native Windows runs pass; cross-platform verification
+must be reported for the exact tested revision. This is not a completion
+claim for #38 or the overall multi-agent acceptance.
+
+**Isolation and live-sharing integration, 2026-10-16.** The native-home
+profile is integrated with the source-aware live policy from §5. Home
+selection happens before submission and inventory uses the selected home.
+The generated home's location alone does not prevent equivalent verification
+from sharing; its Cargo configuration and all other keyed inputs still count.
+Incomplete offline source discovery disables sharing rather than certifying
+an unknown dependency graph.
+
+Public real-Cargo tests in `tests/single_flight.rs` cover both shared and
+isolated modes: two same-worktree test clients execute one test process,
+then a source edit executes the new revision after the old executable exits.
+Both direct tests and `exec --verify` wrappers exercise that transition.
+Equivalent checks can share across isolated worktrees with result caching
+off, while builds in another worktree or output directory produce their own
+actual `.rlib` files. No persistent verdict marker is created by those runs.
+
+The native-home registry experiment now uses `exec --verify`, exercising
+source-key preparation as well as isolation. Local Windows integration
+runs pass its ten unauthenticated and thirteen authenticated checks: B
+finishes with real compiler output while both A's download and a shared-home
+control remain blocked; nested resolution retains B's home; original
+configuration, credentials and lockfile bytes remain unchanged. These are
+mechanism checks, not a throughput comparison or a hard disk bound. They do
+not remove Cargo's artifact lock for distinct commands sharing one target,
+the nested-run admission bypass, or the need for separate worktrees for
+independent editors.
+
+The integrated Windows revision passes the full 419-test suite across 38
+targets, strict all-target Clippy and formatting. Five acceptance-driver
+safety tests also pass. Cross-platform results must refer to the integrated
+revision, rather than the earlier private-home or live-sharing CI alone.
 
 ## 7. Result store
 
@@ -2280,8 +2411,9 @@ let B finish while A's response remains gated. Native Windows evidence is
 in `target/real-hol-public-1016-0339/results.json`; all commands succeeded
 and B's lockfile remained unchanged. This establishes a real Cargo
 head-of-line blocking case and the benefit of source isolation, not a
-unique Heli mechanism or a throughput speedup. Heli still requires explicit
-preparation and selection; automatic safe setup remains unfinished. The
+unique Heli mechanism or a throughput speedup. Imported epochs require
+explicit preparation and selection; the native private-home profile in
+§6.6 prepares an isolated home automatically after explicit selection. The
 dependency experiment workflow repeats this public fixture on three OSes.
 
 The FLUI marker fixture repair is published in PR #1683 at `8c48ac7a3`:
@@ -2290,6 +2422,146 @@ checkout-local `target/`. The same public test is red before and green
 after the change with relocated Cargo outputs. All four library tests and
 the 14-test changed-scope gate through Heli passed locally. This is scoped
 repair evidence, not a successful rerun of both full concurrent suites.
+
+**Native private-home FLUI repeat, 2026-10-16.** Frozen Heli `c86d153`
+and FLUI `8c48ac7a3` run eight commands across two real Git worktrees:
+`fmt --all`, `clippy --workspace --all-targets --locked`,
+`check --workspace --all-targets --locked`, and
+`test --workspace --locked --no-fail-fast` in each worktree. Each worktree
+has its own native Cargo home and managed build directory; no vendor import
+or source-cache seeding precedes the commands. Both fmt, clippy and check
+runs exited 0. Paired compiler start/end records prove actual compiler
+overlap across worktrees, not merely overlapping command lifetimes.
+
+The B test run exited 101 after 3259.7 seconds; A passed its full test
+command, including trybuild and doctests, after 3630.1 seconds. Seven of
+the eight commands therefore passed. B reported five failing tests across four
+targets: the CLI HTTP server contract (Windows connection reset), two
+hot-reload host-wake tests, Windows text-services COM teardown, and the
+runtime sampling diagnostic-event assertion. The existing hot-reload
+binary reproduced the same two failures with parallel test threads but
+passed 30 serial repetitions; two hook tests omit the existing lock for
+their process-global rebuild callback. The original runtime test binary also reproduces its
+same diagnostic assertion without Heli: one failure in 12 parallel
+repetitions, versus 20 passing serial repetitions. A standalone tracing
+probe reproduces a missing event when another thread without a subscriber
+first registers its callsite; reinstalling the subscriber restores delivery.
+These observations do not by themselves establish cross-worktree
+interference or a Heli defect.
+
+Final evidence contains 20,199 completed compiler intervals, with no orphan,
+ambiguous or malformed events, and a successful cross-worktree overlap pair.
+Nonzero compiler exits include expected compile-fail tests; command results
+remain the authority for test success. Original configuration, credentials
+and project lockfile digests stayed unchanged. Idle GC reclaimed the managed
+build directories. An initial 6,394,047,229-byte trash debt settled to zero
+after one retry. The two live checkout targets retained 4,771,850,254 bytes
+of final artifacts, above the configured 2-GiB budget: this is an unmet budget,
+not permission to remove protected outputs. Native source homes are outside
+that budget. The driver removed both clean worktrees after measurement,
+with no reported cleanup error. The whole run is `FAIL`, rather than full
+concurrent-suite or resource-budget acceptance.
+Evidence is retained in `target/flui-native-c86d153-1` and the isolated
+consumer-repair checkout. This run does not supersede the full xtask and
+nested-Cargo compatibility scope in §6.1 or the repository opt-in Q2 decision.
+
+**Consumer repairs and multi-project progress, 2026-10-16.** FLUI PR #1683
+at `d85ab1e73575388ba8112c1d86dbc7dd95491717` repairs the observed test
+fixtures. Both missing rebuild-hook guards now use the existing process
+lock. Runtime diagnostic tests retain a dormant tracing dispatcher to
+avoid upstream tracing callsite-interest issue #3611; a fresh-child
+regression reproduces the missing event before that repair. Each affected
+hot-reload and runtime target passed 50 parallel repetitions. Native
+Windows platform tests passed 26 tests, with one interactive test ignored:
+the COM oracle distinguishes an owned STA lease from an implicit MTA, and
+the window oracle enumerates the owning thread's windows instead of
+mistaking another worktree's same-title window for a leak. Deliberate
+lease, shutdown and foreign-window negative controls still fail. The
+test-only HTTP reader accepts a connection reset only after a complete,
+unambiguously length-framed response; the native CLI target passed 12
+repetitions of all 17 tests. The changed-scope gate through Heli passed
+formatting, strict Clippy and 106 tests, with seven configured skips. This
+does not change production COM or HTTP behavior or substitute for the
+full concurrent repeat.
+
+That repeat uses frozen Heli `c86d153` and two clean FLUI worktrees at
+`d85ab1e73`, with automatic native homes and an explicit 8-GiB artifact
+budget. During its two full workspace test commands, two additional,
+independent Git projects submitted ordinary `heli test --offline --locked`
+commands through the same daemon, pool, store and activity namespace.
+Both std-only canaries reached their gated tests while both FLUI tests
+were active: four worktrees across three repositories, with four distinct
+native homes. An explicit GC reported `runtime_busy=true` and no victims.
+Both canaries then read their build-script assets after GC and exited 0
+while both FLUI tests remained active. The original Cargo configuration
+digest was unchanged; no original credential file was present in this
+sidecar's input manifest, so this is not an authentication check. Evidence is in
+`target/multi-project-d85-sidecar`; the full FLUI repeat is in
+`target/flui-native-d85ab1e73-2`. Its terminal result follows below.
+This establishes independent completion of short projects alongside long
+FLUI tests, not a matched throughput improvement or multiple full gates
+on three large projects. Busy accounted usage exceeded the 8-GiB budget;
+the global runtime guard deliberately postpones reclamation (§6.3).
+Busy preservation is separate from the idle-budget acceptance below.
+Native source homes remain outside that budget.
+
+**Completed repaired repeat, 2026-10-16: PASS.** Driver session 57174
+terminated with exit 0. All eight normal built-in commands succeeded at
+FLUI `d85ab1e73575388ba8112c1d86dbc7dd95491717`, using frozen Heli
+`c86d15376091cb0d802a77c6e5dc1d443aace678` (binary SHA-256
+`7a7925dcd4e8be4df9451c4423dafb82fd1e9292a31e17bd2c258dfe37c59721`).
+The native source homes were reused at their prior canonical paths; this
+is not a cold-source-cache timing comparison. Command wall times include
+their own worktree's Cargo locks and scheduling, not just compiler time:
+
+| Command | Worktree A, seconds | Worktree B, seconds |
+|---|---:|---:|
+| `fmt --all` | 6.7 | 6.9 |
+| `clippy --workspace --all-targets --locked` | 640.6 | 202.5 |
+| `check --workspace --all-targets --locked` | 659.9 | 696.2 |
+| `test --workspace --locked --no-fail-fast` | 3628.8 | 3630.8 |
+
+Both full tests include their normal nested Cargo, trybuild and doctest
+work. All five cases that failed in the prior run now pass in both
+worktrees. An independent audit reparsed all 40,408 raw compiler events
+into 20,204 complete pairs: no malformed, unpaired, ambiguous or invalid
+records. The union of successful compiler invocation lifetimes from each
+worktree overlaps for 2,356.5887101 seconds across 380 disjoint segments.
+This is actual simultaneous in-flight compiler work, not CPU utilization
+or a speedup against native Cargo. Nonzero internal compiler exits include
+compile-fail cases; the eight outer command exits determine test success.
+Seven before/after input digests match, and both worktrees were clean at
+the pinned commit before their removal.
+
+All 136 during-run GC surveys reported runtime busy and selected no
+victims; 78 managed build directories were observed. The sampled store
+peak was 133,582,046,287 bytes, or 140,652,790,817 bytes when including
+native homes and checkout targets. After activity became idle, GC reclaimed
+the build directories, leaving 75 administrative bytes in the store.
+Accounted artifacts, measured before removing the worktrees, were
+**4,771,735,920 bytes under B = 8,589,934,592 bytes**, with F = 0 and no
+pending trash. No deletion retry was needed. The retained native homes
+were another 2,299,008,964 bytes outside B. The original 2-GiB acceptance
+failure remains valid; this explicit larger-budget result does not
+retroactively pass it or establish a hard limit during activity.
+
+Across 2,028 system-memory samples, available physical memory never fell
+below 26,192,412,672 bytes and available commit never fell below
+15,231,492,096 bytes. These are host observations, including other host
+activity, not per-agent RAM quotas or proof of an enforced hard cap. Both
+clean worktrees were removed after measurement; the owned daemon exited,
+and the audit found no cleanup error. Exact receipts, the raw events and
+`FINAL-AUDIT.md` remain in the full-repeat evidence directory.
+
+The checked-in `experiments/flui-worktree-acceptance.py` reproduces the
+same eight-command workload in a fresh lab; it deliberately does not
+adopt old labs. `experiments/flui-mixed-project-sidecar.py` reproduces the
+short-project progress/GC check on Windows. Their dry-run and cleanup
+safety checks run in the three-OS experiment workflow; the heavy FLUI run
+is explicit, not an automatic CI job. See `docs/multi-agent.md` for the
+commands and cache-warmth limits. This is a passed workload acceptance,
+not a claim that every strict phase criterion or every external Cargo
+tool profile is complete.
 
 FLUI main still had a common per-user host lock in
 `tools/xtask/src/host_lock.rs` when checked on this date.

@@ -233,23 +233,30 @@ fn independent_homes_and_live_epoch_survive_collection_of_another_epoch() {
     }
     // Discovery's captured stdout must remain raw Cargo JSON. A guardian
     // handshake prefix would silently disable target registration.
-    let status = fixture.status();
-    for index in 0..2 {
-        let expected =
-            std::fs::canonicalize(fixture.path(&format!("consumer-{index}/target"))).unwrap();
-        assert!(
-            status["disk"]["targets"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|entry| {
-                    std::fs::canonicalize(entry["path"].as_str().unwrap_or_default()).ok()
-                        == Some(expected.clone())
-                }),
-            "metadata discovery did not register {}: {status}",
-            expected.display()
-        );
-    }
+    // Disk status is the accountant's scanned view, which updates after
+    // learning signals the run's end; client completion is not a scan barrier.
+    let expected: Vec<_> = (0..2)
+        .map(|index| {
+            std::fs::canonicalize(fixture.path(&format!("consumer-{index}/target"))).unwrap()
+        })
+        .collect();
+    fixture.wait_for_status(
+        "both isolated consumers' metadata targets to be accounted",
+        |status| {
+            let Some(targets) = status["disk"]["targets"].as_array() else {
+                return false;
+            };
+            expected.iter().all(|expected| {
+                targets.iter().any(|entry| {
+                    entry["path"]
+                        .as_str()
+                        .and_then(|path| std::fs::canonicalize(path).ok())
+                        .as_ref()
+                        == Some(expected)
+                })
+            })
+        },
+    );
     assert!(
         control.try_wait().unwrap().is_none(),
         "control lock was released during the isolated workload"
