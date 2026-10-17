@@ -16,24 +16,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use super::kind::{STORE_TRASH, TARGET_TRASH};
 use super::registry::Registry;
-use super::{Dir, Kind};
 use crate::config::StoreConfig;
-
-/// A store's trash, in the store.
-pub const STORE_TRASH: &str = ".trash";
-
-/// A registered `target/` directory's trash, in it.
-pub const TARGET_TRASH: &str = ".heli-trash";
-
-/// The trash of `dir`.
-pub fn of(dir: &Dir) -> Option<PathBuf> {
-    match dir.kind {
-        Kind::Build => dir.store.as_ref().map(|store| store.join(STORE_TRASH)),
-        Kind::Target => Some(dir.path.join(TARGET_TRASH)),
-        Kind::Scratch => Some(super::scratch::trash()),
-    }
-}
 
 /// Every trash there may be: each store's, each registered `target/`
 /// directory's, and the scratch copies' (`super::scratch::trash`).

@@ -203,11 +203,7 @@ fn fail(reason: &str) -> ! {
 fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
     let mut text = String::new();
     for entry in &listing.dirs {
-        let kind = match entry.kind {
-            Kind::Build => "build",
-            Kind::Target => "target",
-            Kind::Scratch => "scratch",
-        };
+        let kind = entry.kind.name();
         text.push_str(&format!(
             "{kind:<6}  {:<7}  {:>10}  {}",
             entry.state.name(),

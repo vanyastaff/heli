@@ -22,6 +22,7 @@
 //! [`orphan`] counts as unclaimed from the first pass that finds it.
 
 pub mod evict;
+pub mod kind;
 pub mod ladder;
 pub mod lease;
 pub mod managed;
@@ -55,18 +56,7 @@ use sizes::Sizes;
 /// is the target directory, all three are in one place.
 pub const LOCKS: [&str; 3] = [".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock"];
 
-/// What a directory is to the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Kind {
-    /// A build directory in a store.
-    Build,
-    /// A registered `target/` directory.
-    Target,
-    /// A scratch copy a cargo tool left in the temporary directory
-    /// ([`scratch`]).
-    Scratch,
-}
+pub use kind::Kind;
 
 /// Whether a directory is in use, and whether its workspace still exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -109,14 +99,10 @@ pub struct Dir {
 }
 
 impl Dir {
-    /// The sizes of its files, by category (`sizes`): the configuration's
-    /// tool-cache patterns apply to a `target/` directory.
+    /// The sizes of its files, by category (`sizes`), with the tool caches
+    /// of its kind ([`kind`]).
     pub fn scan(&self, config: &StoreConfig) -> Sizes {
-        let patterns = match self.kind {
-            Kind::Build | Kind::Scratch => Vec::new(),
-            Kind::Target => config.tool_cache_patterns(),
-        };
-        sizes::scan(&self.path, &patterns)
+        sizes::scan(&self.path, &self.tool_caches(config))
     }
 
     /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
@@ -241,8 +227,9 @@ pub fn busy(dir: &Path) -> bool {
 }
 
 /// Whether eviction counts `dir` busy at `now` (seconds since 1970): a
-/// Cargo holds a known lock (at any depth for a build directory), or its lock layout is unknown and it
-/// changed within the last [`RECENT`] seconds.
+/// Cargo holds a known lock where its kind looks for one
+/// ([`Kind::lock_scope`]), or its lock layout is unknown and it changed
+/// within the last [`RECENT`] seconds.
 ///
 /// **Unknown layout.** Lock names change between cargo versions. A profile
 /// directory that holds cargo's intermediates (`deps/`, `incremental/`,
@@ -253,16 +240,13 @@ pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
         return true;
     }
     let profiles = lock_dirs(&dir.path);
-    let busy = if matches!(dir.kind, Kind::Build | Kind::Scratch) {
-        locks_inside(&dir.path).map_or(true, |locks| {
+    let busy = match dir.kind.lock_scope() {
+        kind::LockScope::Anywhere => locks_inside(&dir.path).map_or(true, |locks| {
             locks
                 .iter()
                 .any(|path| matches!(try_lock(path), Lock::Held))
-        })
-    } else {
-        // A nested tool cache protects its own victim at eviction; it does
-        // not prevent reclaiming unrelated caches in this target directory.
-        profiles.iter().any(|profile| held(profile))
+        }),
+        kind::LockScope::Profiles => profiles.iter().any(|profile| held(profile)),
     };
     busy || (unknown_layout(&profiles) && recently_changed(&dir.path, now))
 }
