@@ -4,11 +4,25 @@ Host scheduling for Cargo on machines shared by multiple agents. Each agent
 works in its own Git worktree; heli shares compiler capacity while keeping
 worktrees' mutable dependency caches separate when isolation is selected.
 
-Build from source with Rust/Cargo 1.99 or newer:
+Install a prebuilt binary with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or build it
+from crates.io or from source with Rust/Cargo 1.99 or newer:
 
 ```text
+cargo binstall cargo-heli
+cargo install cargo-heli --locked
 cargo install --path . --locked
+```
+
+Prebuilt binaries for Linux (x86_64 and aarch64, glibc; x86_64 musl),
+macOS (Intel and Apple silicon) and Windows (x86_64) are attached to each
+[release](https://github.com/vanyastaff/heli/releases), with their SHA-256
+sums. Then start the daemon, and see what heli makes of your tools and
+configuration:
+
+```text
 cargo heli ensure
+cargo heli doctor
 ```
 
 In each agent's worktree, keep Cargo's checkout-local `target/` and run:
@@ -140,3 +154,11 @@ The test locates `vswhere.exe` through environment roots, Windows Known
 Folders and PATH, then tries `cl.exe` on PATH. Omitting `ProgramFiles` in a
 shell does not hide a normal Visual Studio installation. Missing tools
 remain a test failure with discovery details, never a silent skip.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution intentionally submitted for inclusion in heli by
+you, as defined in the Apache-2.0 license, shall be dual licensed as above,
+without any additional terms or conditions.
