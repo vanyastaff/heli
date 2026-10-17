@@ -127,14 +127,14 @@ const SURVIVOR_START: Duration = Duration::from_secs(5);
 /// runs makes `--start-server` fail, which is the answer wanted; failures
 /// never fail the run, whose own sccache starts a server as it would anyway.
 fn keep_sccache_server(request: &RunRequest, cwd: &Path) {
-    let Some(wrapper) = request.var("RUSTC_WRAPPER").filter(|wrapper| {
-        Path::new(wrapper)
+    let Some(wrapper) = wrappers(request, cwd).into_iter().find(|wrapper| {
+        wrapper
             .file_stem()
-            .is_some_and(|stem| stem == "sccache")
+            .is_some_and(|stem| stem.eq_ignore_ascii_case("sccache"))
     }) else {
         return;
     };
-    let mut command = Command::new(resolve(cwd, wrapper.to_owned()));
+    let mut command = Command::new(wrapper);
     command
         .arg("--start-server")
         .current_dir(cwd)
@@ -161,6 +161,64 @@ fn keep_sccache_server(request: &RunRequest, cwd: &Path) {
     }
     let _ = starter.kill();
     let _ = starter.wait();
+}
+
+/// The compiler wrappers cargo uses for `request`: `rustc-wrapper` and
+/// `rustc-workspace-wrapper`, each from its variable (`RUSTC_WRAPPER`, else
+/// `CARGO_BUILD_RUSTC_WRAPPER`, and the same for the workspace wrapper), else
+/// from the nearest Cargo configuration that sets it under `[build]`: the
+/// `.cargo/` of the working directory and every directory above it, then the
+/// Cargo home. A path there with a separator is relative to the directory
+/// holding that `.cargo/` (cargo's rule); a bare name is left to the search
+/// path. A variable set empty turns the wrapper off.
+fn wrappers(request: &RunRequest, cwd: &Path) -> Vec<PathBuf> {
+    let homes = cwd
+        .ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(super::key::cargo_home(request, cwd));
+    let mut configs = Vec::new();
+    for dir in homes {
+        for file in ["config.toml", "config"] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(file))
+                && let Ok(table) = text.parse::<toml::Table>()
+            {
+                configs.push((dir.clone(), table));
+                break;
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for (key, vars) in [
+        (
+            "rustc-wrapper",
+            ["RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WRAPPER"],
+        ),
+        (
+            "rustc-workspace-wrapper",
+            [
+                "RUSTC_WORKSPACE_WRAPPER",
+                "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            ],
+        ),
+    ] {
+        if let Some(value) = vars.iter().find_map(|var| request.var(var)) {
+            if !value.is_empty() {
+                found.push(resolve(cwd, value.to_owned()));
+            }
+            continue;
+        }
+        let configured = configs.iter().find_map(|(dir, table)| {
+            let value = table.get("build")?.as_table()?.get(key)?.as_str()?;
+            let path = PathBuf::from(value);
+            Some(if path.is_relative() && path.components().count() > 1 {
+                dir.parent().unwrap_or(dir).join(path)
+            } else {
+                path
+            })
+        });
+        found.extend(configured);
+    }
+    found
 }
 
 /// A program given as a relative path (`./script`, `bin\tool`) is relative
@@ -265,5 +323,65 @@ fn forward(channel: Channel, mut pipe: Box<dyn Read + Send>, events: mpsc::SyncS
     }
     if listening {
         let _ = events.send(Event::Closed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::Path;
+
+    use super::wrappers;
+    use crate::protocol::{RunRequest, Text};
+
+    fn request(cwd: &Path, env: &[(&str, &str)], home: &Path) -> RunRequest {
+        let mut env: Vec<(Text, Text)> = env
+            .iter()
+            .map(|(name, value)| (Text(OsString::from(name)), Text(OsString::from(value))))
+            .collect();
+        env.push((Text("CARGO_HOME".into()), Text(home.as_os_str().to_owned())));
+        RunRequest {
+            cwd: Text(cwd.as_os_str().to_owned()),
+            argv: vec![Text("cargo".into()), Text("build".into())],
+            env,
+            dependency_epoch: None,
+            class: None,
+            cache: Default::default(),
+            reads_spawned: false,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn wrappers_come_from_variables_then_the_nearest_configuration() {
+        let root = tempfile::tempdir().expect("dir");
+        let home = root.path().join("home");
+        let work = root.path().join("ws").join("crate");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(work.join(".cargo")).expect("work");
+        std::fs::write(
+            home.join("config.toml"),
+            "[build]\nrustc-wrapper = \"sccache\"\n",
+        )
+        .expect("home config");
+        // The Cargo home's configuration applies when nothing nearer does.
+        assert_eq!(
+            wrappers(&request(&work, &[], &home), &work),
+            [Path::new("sccache")]
+        );
+        std::fs::write(
+            work.join(".cargo").join("config.toml"),
+            "[build]\nrustc-wrapper = \"tools/sccache\"\nrustc-workspace-wrapper = \"clippy-ish\"\n",
+        )
+        .expect("config");
+        assert_eq!(
+            wrappers(&request(&work, &[], &home), &work),
+            [work.join("tools").join("sccache"), "clippy-ish".into()]
+        );
+        // A variable wins; set empty, it turns the wrapper off.
+        let set = request(&work, &[("RUSTC_WRAPPER", "my-wrapper")], &home);
+        assert_eq!(wrappers(&set, &work)[0], Path::new("my-wrapper"));
+        let off = request(&work, &[("RUSTC_WRAPPER", "")], &home);
+        assert_eq!(wrappers(&off, &work), [Path::new("clippy-ish")]);
     }
 }

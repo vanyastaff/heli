@@ -54,3 +54,34 @@ fn an_interactive_tool_runs_directly_in_the_pool() {
         "no fallback warning"
     );
 }
+
+/// The same for a wrapper the Cargo configuration sets, not a variable.
+#[test]
+fn a_configured_sccache_wrapper_is_started_too() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let bin = fixture.path("bin");
+    std::fs::create_dir_all(&bin).expect("create bin");
+    let sccache = bin.join(format!("sccache{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(&echo, &sccache).expect("copy echo-args as sccache");
+    let config = fixture.workspace().join(".cargo");
+    std::fs::create_dir_all(&config).expect("create .cargo");
+    std::fs::write(
+        config.join("config.toml"),
+        format!("[build]\nrustc-wrapper = '{}'\n", sccache.display()),
+    )
+    .expect("write the configuration");
+    let starts = fixture.path("starts");
+
+    let output = fixture
+        .heli(["xtask", "go"])
+        .env("CARGO", &echo)
+        .env("ECHO_STARTS", &starts)
+        .env("HELI_OUTPUT", "full")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run heli");
+    assert_success(&output, "a run with a configured sccache wrapper");
+    let started = std::fs::read_to_string(&starts).expect("starts");
+    assert_eq!(started.lines().count(), 2, "{started}");
+}
