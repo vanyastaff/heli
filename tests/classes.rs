@@ -79,6 +79,23 @@ fn status_shows_each_runs_class() {
         (&["bench"], "exec"),
         (&["nextest", "list"], "exec"),
         (&["xtask", "fmt"], "exec"),
+        (&["add", "serde"], "mutate"),
+        (&["remove", "serde"], "mutate"),
+        (&["update"], "mutate"),
+        (&["hakari", "generate"], "mutate"),
+        (&["hakari", "verify"], "verify"),
+        (&["machete", "--fix"], "mutate"),
+        (&["machete"], "verify"),
+        (&["shear", "--fix"], "mutate"),
+        (&["insta", "accept"], "mutate"),
+        (&["insta", "review"], "exec"),
+        (&["sqlx", "prepare"], "mutate"),
+        (&["hack", "--each-feature", "check"], "verify"),
+        (&["hack", "test"], "exec"),
+        (&["+nightly", "udeps"], "verify"),
+        (&["public-api"], "verify"),
+        (&["audit"], "exec"),
+        (&["deny", "check"], "exec"),
     ];
     let gate = fixture.path("gate");
     let start = |args: &[&str], exec: bool| -> Child {

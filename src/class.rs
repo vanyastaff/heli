@@ -60,6 +60,44 @@ pub enum Runner {
     Nextest,
 }
 
+/// The class of the built-in profile for a cargo subcommand heli does not
+/// run itself (`DESIGN.md` §5, "Tool profiles"): tools that rewrite the
+/// worktree are mutate runs, so that they never run under a build; tools
+/// that only read it and report are verify runs, shared when nothing changed.
+/// Anything not listed is exec.
+fn third_party(tool: &str, rest: &[OsString]) -> Class {
+    let before_separator = || rest.iter().take_while(|arg| *arg != "--");
+    let first_word = || {
+        rest.iter()
+            .filter_map(|arg| arg.to_str())
+            .find(|arg| !arg.starts_with('-'))
+    };
+    match tool {
+        // Edit Cargo.toml / Cargo.lock.
+        "add" | "remove" | "rm" | "update" => Class::Mutate,
+        // Rewrite sources or generated files when asked to.
+        "machete" | "shear" if before_separator().any(|arg| arg == "--fix") => Class::Mutate,
+        "machete" | "shear" | "udeps" | "public-api" => Class::Verify,
+        "hakari" => match first_word() {
+            Some("generate" | "manage-deps") => Class::Mutate,
+            Some("verify") => Class::Verify,
+            _ => Class::Exec,
+        },
+        "insta" => match first_word() {
+            Some("accept" | "reject") => Class::Mutate,
+            _ => Class::Exec,
+        },
+        "sqlx" if first_word() == Some("prepare") => Class::Mutate,
+        // Delete build output or manifests' dependencies by themselves.
+        "sweep" | "clean-all" => Class::Mutate,
+        // cargo-hack runs check or clippy over feature combinations.
+        "hack" if before_separator().any(|arg| arg == "check" || arg == "clippy") => {
+            Class::Verify
+        }
+        _ => Class::Exec,
+    }
+}
+
 /// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
 /// rustup's cargo takes it), and the arguments after it.
 pub fn subcommand(args: &[OsString]) -> Option<(&OsString, &[OsString])> {
@@ -103,7 +141,7 @@ impl Class {
             "clippy" => Self::Verify,
             "fmt" if rest.iter().any(|arg| arg == "--check") => Self::Verify,
             "fmt" | "fix" => Self::Mutate,
-            _ => Self::Exec,
+            tool => third_party(tool, rest),
         }
     }
 
