@@ -24,6 +24,9 @@
 //!  "unknown_tools":[{"name":"zigbuild","runs":12}]}
 //! ```
 //!
+//! The helper programs of a multi-binary tool (`cargo-ndk-env` beside
+//! `cargo-ndk`) are not listed when the tool itself is installed.
+//!
 //! `profile` is `null` for a tool heli has no built-in profile for. `level`
 //! is `note` (how heli behaves) or `warn` (something the user likely
 //! expects to work and will not).
@@ -34,19 +37,31 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::class;
+use crate::config::CargoHome;
 
 /// The version of the `--json` document.
 const SCHEMA: u32 = 1;
 
 /// Variables that override the Cargo configuration doctor explains.
-const VARS: [&str; 6] = [
+const VARS: [&str; 7] = [
     "CARGO_BUILD_JOBS",
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
     "CARGO_BUILD_BUILD_DIR",
     "RUSTC_WRAPPER",
     "CARGO_HOME",
+    "RUST_TEST_THREADS",
 ];
+
+/// What heli does with `cargo nextest …`. nextest is cargo's own
+/// classification (`class::test_runner`), not a built-in tool profile.
+const NEXTEST_PROFILE: &str = "nextest run: test run with test slots; other commands exec";
+
+/// Tools that install helper programs named `cargo-<tool>-<helper>`
+/// (cargo-ndk's `cargo-ndk-env`, `cargo-ndk-runner`, `cargo-ndk-test`). The
+/// helpers are not commands a user runs, so doctor leaves them out of the
+/// list when the tool itself is installed.
+const MULTI_BINARY: [&str; 1] = ["ndk"];
 
 /// What doctor looks at; built from the real environment by [`gather`], and
 /// from fakes by the tests.
@@ -61,6 +76,11 @@ pub struct Inputs {
     pub env: BTreeMap<String, String>,
     /// The Cargo home, where cargo-audit keeps its advisory database.
     pub cargo_home: Option<PathBuf>,
+    /// `[cargo] home` of heli's configuration.
+    pub home_mode: CargoHome,
+    /// The build store that serves the working directory, when it exists:
+    /// a configured `[store] paths` entry or the volume's default store.
+    pub store: Option<PathBuf>,
     /// The event log's lines, oldest first (the rotated file, then the
     /// current one).
     pub events: Vec<String>,
@@ -151,6 +171,20 @@ pub fn gather(cwd: &Path) -> Inputs {
             inputs.configs.push((file, table));
         }
     }
+    if let Ok(path) = crate::locations::Locations::config_path() {
+        if let Ok(client) = crate::config::Config::load_client(&path) {
+            inputs.home_mode = client.cargo.home;
+        }
+        let store = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|table| table.get("store").cloned())
+            .and_then(|value| value.try_into::<crate::config::StoreConfig>().ok())
+            .unwrap_or_default();
+        inputs.store = crate::store::serving(&store, cwd)
+            .ok()
+            .filter(|store| store.is_dir());
+    }
     if let Ok(locations) = crate::locations::Locations::resolve() {
         let log = locations.event_log();
         let mut rotated = log.clone().into_os_string();
@@ -205,6 +239,18 @@ fn installed_tools(dirs: &[PathBuf]) -> BTreeSet<String> {
     names
 }
 
+/// The value of `RUST_TEST_THREADS` in a Cargo `[env]` table of `configs`:
+/// a string, or a table with `value`.
+fn env_table_test_threads(configs: &[(PathBuf, toml::Table)]) -> Option<String> {
+    configs.iter().find_map(|(_, table)| {
+        match table.get("env")?.as_table()?.get("RUST_TEST_THREADS")? {
+            toml::Value::String(text) => Some(text.clone()),
+            toml::Value::Table(entry) => entry.get("value")?.as_str().map(str::to_owned),
+            _ => None,
+        }
+    })
+}
+
 /// `build.<key>` from the nearest file that sets it as a string or number.
 fn build_setting(configs: &[(PathBuf, toml::Table)], key: &str) -> Option<String> {
     configs.iter().find_map(
@@ -236,10 +282,24 @@ fn names_linker(value: &toml::Value, linker: &str, in_setting: bool) -> bool {
 
 /// Explains `inputs`.
 pub fn diagnose(inputs: &Inputs) -> Report {
-    let tools: Vec<Tool> = installed_tools(&inputs.bin_dirs)
-        .into_iter()
+    let installed = installed_tools(&inputs.bin_dirs);
+    let tools: Vec<Tool> = installed
+        .iter()
+        .filter(|name| {
+            !MULTI_BINARY.iter().any(|tool| {
+                installed.contains(*tool)
+                    && name
+                        .strip_prefix(tool)
+                        .is_some_and(|helper| helper.starts_with('-'))
+            })
+        })
+        .cloned()
         .map(|name| Tool {
-            profile: class::tool_profile(&name),
+            profile: if name == "nextest" {
+                Some(NEXTEST_PROFILE)
+            } else {
+                class::tool_profile(&name)
+            },
             name,
         })
         .collect();
@@ -332,13 +392,52 @@ pub fn diagnose(inputs: &Inputs) -> Report {
         }
     }
     if let Some(home) = env("CARGO_HOME") {
+        match inputs.home_mode {
+            CargoHome::Isolated => add(
+                "cargo-home",
+                "note",
+                format!(
+                    "heli's configuration has [cargo] home = \"isolated\": managed runs use a private Cargo home per worktree. CARGO_HOME ({home}) is only the original home they start from."
+                ),
+                "Nothing to do; set `home = \"shared\"` under [cargo] to use CARGO_HOME as is.",
+            ),
+            CargoHome::Shared => add(
+                "cargo-home",
+                "note",
+                format!(
+                    "CARGO_HOME is {home}, and heli's [cargo] home is shared (the default): managed runs use it as is."
+                ),
+                "Nothing to do; `--cargo-home isolated`, or `home = \"isolated\"` under [cargo], gives managed runs a private home per worktree instead.",
+            ),
+        }
+    }
+    if let Some(store) = &inputs.store
+        && env("CARGO_BUILD_BUILD_DIR")
+            .or_else(|| setting("build-dir"))
+            .is_none()
+    {
+        let store = store.display();
         add(
-            "cargo-home",
+            "store-unused",
+            "warn",
+            format!(
+                "The build store {store} exists, but no Cargo configuration reaching this workspace sets build.build-dir, so its intermediates stay in target/ and the store is unused."
+            ),
+            &format!(
+                "Run `cargo heli setup`, or add `build-dir = '{store}/{{workspace-path-hash}}'` under [build] in a Cargo configuration (or set CARGO_BUILD_BUILD_DIR)."
+            ),
+        );
+    }
+    if let Some(threads) =
+        env("RUST_TEST_THREADS").or_else(|| env_table_test_threads(&inputs.configs))
+    {
+        add(
+            "test-threads",
             "note",
             format!(
-                "CARGO_HOME is {home}; `--cargo-home isolated` gives managed runs a private home per worktree instead."
+                "RUST_TEST_THREADS = {threads}: in a test run, heli's test slots decide the threads. `cargo heli test` passes `--test-threads=K` after `--`, which overrides the variable, and K is at most the variable's value when the client's environment has it (a Cargo [env] entry is not seen by heli, so it only gets overridden). `cargo heli nextest run` passes `--test-threads K` and ignores the variable. Other commands keep it."
             ),
-            "Nothing to do.",
+            "Nothing to do; to bound the threads of a run, pass --test-threads (or -j for nextest) or size the pool.",
         );
     }
     let analyzer = |dir: &PathBuf| {
@@ -552,5 +651,106 @@ mod tests {
             .map(|tool| (tool.name.as_str(), tool.profile.is_some()))
             .collect();
         assert_eq!(names, [("insta", true), ("zigbuild", false)]);
+    }
+
+    fn installed(names: &[&str]) -> (tempfile::TempDir, Inputs) {
+        let dir = tempfile::tempdir().expect("dir");
+        let exe = std::env::consts::EXE_SUFFIX;
+        for name in names {
+            std::fs::write(dir.path().join(format!("cargo-{name}{exe}")), "").expect("file");
+        }
+        let inputs = Inputs {
+            bin_dirs: vec![dir.path().to_owned()],
+            ..Inputs::default()
+        };
+        (dir, inputs)
+    }
+
+    #[test]
+    fn nextest_llvm_cov_and_mutants_show_what_heli_does() {
+        let (_dir, inputs) = installed(&["nextest", "llvm-cov", "mutants"]);
+        let report = diagnose(&inputs);
+        assert_eq!(report.tools.len(), 3);
+        for tool in &report.tools {
+            assert!(tool.profile.is_some(), "{} has no profile", tool.name);
+        }
+        let nextest = report.tools.iter().find(|tool| tool.name == "nextest");
+        assert!(nextest.unwrap().profile.unwrap().contains("test slots"));
+    }
+
+    #[test]
+    fn helpers_of_an_installed_multi_binary_tool_are_not_listed() {
+        let (_dir, inputs) = installed(&["ndk", "ndk-env", "ndk-runner", "ndk-test", "zigbuild"]);
+        let names: Vec<_> = diagnose(&inputs)
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(names, ["ndk", "zigbuild"]);
+        let (_dir, inputs) = installed(&["ndk-env"]);
+        assert_eq!(diagnose(&inputs).tools.len(), 1);
+    }
+
+    #[test]
+    fn the_home_finding_follows_the_configured_mode() {
+        let mut inputs = Inputs::default();
+        inputs.env.insert("CARGO_HOME".into(), "D:/ch".into());
+        let report = diagnose(&inputs);
+        assert!(report.findings[0].message.contains("shared"));
+        inputs.home_mode = CargoHome::Isolated;
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["cargo-home"]);
+        assert!(report.findings[0].message.contains("private Cargo home"));
+        assert!(report.findings[0].message.contains("original home"));
+    }
+
+    #[test]
+    fn a_store_the_workspace_does_not_use_is_reported() {
+        let mut inputs = Inputs {
+            store: Some(PathBuf::from("D:/cache")),
+            ..Inputs::default()
+        };
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["store-unused"]);
+        assert!(report.findings[0].action.contains("{workspace-path-hash}"));
+        assert!(report.findings[0].action.contains("cargo heli setup"));
+        inputs.configs = vec![config(
+            "[build]
+build-dir = \"D:/cache/{workspace-path-hash}\"
+",
+        )];
+        assert_eq!(ids(&diagnose(&inputs)), ["build-dir"]);
+        inputs.configs.clear();
+        inputs
+            .env
+            .insert("CARGO_BUILD_BUILD_DIR".into(), "D:/b".into());
+        assert_eq!(ids(&diagnose(&inputs)), ["build-dir"]);
+    }
+
+    #[test]
+    fn a_fixed_test_thread_count_is_reported() {
+        let mut inputs = Inputs::default();
+        inputs.env.insert("RUST_TEST_THREADS".into(), "16".into());
+        assert_eq!(ids(&diagnose(&inputs)), ["test-threads"]);
+        let inputs = Inputs {
+            configs: vec![config(
+                "[env]
+RUST_TEST_THREADS = \"16\"
+",
+            )],
+            ..Inputs::default()
+        };
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["test-threads"]);
+        assert!(report.findings[0].message.contains("= 16"));
+        let inputs = Inputs {
+            configs: vec![config(
+                "[env]
+RUST_TEST_THREADS = { value = \"8\", force = true }
+",
+            )],
+            ..Inputs::default()
+        };
+        assert_eq!(ids(&diagnose(&inputs)), ["test-threads"]);
     }
 }
