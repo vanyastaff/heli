@@ -40,7 +40,7 @@
 
 use std::convert::Infallible;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -57,7 +57,7 @@ use crate::protocol::{
 use crate::run_id::RunId;
 use crate::runlog::{self, select::Select};
 use crate::status::{self, Exit, Status};
-use crate::{clock, direct, environment, launch, nesting};
+use crate::{class, clock, direct, environment, launch, nesting};
 
 /// How long a daemon may take to answer the handshake, and to take the
 /// connection when its endpoint is busy.
@@ -150,9 +150,23 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
+    let in_pool =
+        !invocation.exec && class::runs_directly(&invocation.args, std::io::stdin().is_terminal());
+    let mut pooled = None;
     let reason = match locations {
         Err(error) => error,
         Ok(locations) => match reach(&locations, Some(depth)) {
+            // An interactive or unknown tool runs here, with the host pool.
+            Ok(Some(stream)) if in_pool => {
+                drop(stream);
+                match crate::pool::makeflags(&locations.pool) {
+                    Ok(makeflags) => {
+                        pooled = Some(makeflags);
+                        String::new()
+                    }
+                    Err(error) => error.to_string(),
+                }
+            }
             Ok(Some(stream)) => {
                 let plan = output::plan(&invocation, mode);
                 match submit(
@@ -171,12 +185,17 @@ pub fn run(invocation: Invocation, depth: u32) -> ! {
             Err(reason) => reason,
         },
     };
-    eprintln!("cargo-heli: warning: {reason}; running the command directly");
+    if pooled.is_none() {
+        eprintln!("cargo-heli: warning: {reason}; running the command directly");
+    }
     let mut command = Command::new(&invocation.program);
     command
         .args(&invocation.args)
         .env(nesting::VAR, child_depth)
         .envs(dependency_env.iter().map(|(name, value)| (*name, value)));
+    if let Some(makeflags) = &pooled {
+        command.env("CARGO_MAKEFLAGS", makeflags);
+    }
     if let Some(prepared) = &prepared {
         let activity = crate::store::lease::directory().unwrap_or_else(|error| {
             eprintln!("cargo-heli: cannot protect direct execution: {error}");

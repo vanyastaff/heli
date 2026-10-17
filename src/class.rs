@@ -67,11 +67,7 @@ pub enum Runner {
 /// Anything not listed is exec.
 fn third_party(tool: &str, rest: &[OsString]) -> Class {
     let before_separator = || rest.iter().take_while(|arg| *arg != "--");
-    let first_word = || {
-        rest.iter()
-            .filter_map(|arg| arg.to_str())
-            .find(|arg| !arg.starts_with('-'))
-    };
+    let first_word = || first_word(rest);
     match tool {
         // Edit Cargo.toml / Cargo.lock.
         "add" | "remove" | "rm" | "update" => Class::Mutate,
@@ -96,6 +92,69 @@ fn third_party(tool: &str, rest: &[OsString]) -> Class {
     }
 }
 
+/// Cargo's own subcommands that are not mutate, verify, compile or test runs:
+/// they run in the daemon as exec whatever the terminal.
+const CARGO_BUILTINS: &[&str] = &[
+    "bench",
+    "tree",
+    "metadata",
+    "install",
+    "uninstall",
+    "search",
+    "publish",
+    "package",
+    "clean",
+    "fetch",
+    "vendor",
+    "generate-lockfile",
+    "locate-project",
+    "pkgid",
+    "rustc",
+    "rustdoc",
+    "init",
+    "new",
+    "config",
+    "login",
+    "logout",
+    "owner",
+    "yank",
+    "report",
+    "help",
+    "version",
+    "verify-project",
+    "nextest",
+];
+
+/// Whether `cargo <args>` runs in the client, but drawing from the host pool
+/// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: interactive
+/// and long-running tools (`insta review`, `dx serve`, `trunk serve`), which
+/// need a terminal and hold a slot for hours, and, when stdin is a terminal,
+/// every other exec command of a tool heli has no profile for.
+pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {
+    let Some((tool, rest)) = subcommand(args) else {
+        return false;
+    };
+    let tool = tool.to_str().unwrap_or_default();
+    let word = first_word(rest);
+    match (tool, word) {
+        ("insta", Some("review")) | ("dx" | "trunk", Some("serve")) => return true,
+        _ => {}
+    }
+    stdin_is_terminal
+        && !tool.is_empty()
+        && !tool.starts_with('-')
+        && Class::of_cargo(args) == Class::Exec
+        && !CARGO_BUILTINS.contains(&tool)
+        && tool_profile(tool).is_none()
+}
+
+/// The first of `args` that is not a flag.
+fn first_word(args: &[OsString]) -> Option<&str> {
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .find(|arg| !arg.starts_with('-'))
+}
+
 /// What heli's built-in profile does with the cargo tool `cargo-<name>`, for
 /// `cargo heli doctor`; `None` for a tool heli has no profile for (it runs
 /// as exec).
@@ -103,12 +162,15 @@ pub fn tool_profile(name: &str) -> Option<&'static str> {
     Some(match name {
         "add" | "remove" | "rm" | "update" => "mutate: exclusive worktree lock",
         "hakari" => "generate/manage-deps mutate (exclusive lock), verify cached",
-        "insta" => "accept/reject mutate (exclusive lock); review and test run as exec",
+        "insta" => {
+            "accept/reject mutate (exclusive lock); review runs directly in the pool, test as exec"
+        }
         "machete" | "shear" => "verify cached; --fix mutate (exclusive lock)",
         "udeps" | "public-api" => "verify cached (toolchain is part of the key)",
         "hack" => "check/clippy verify cached; other commands exec",
         "sqlx" => "prepare mutate (exclusive lock); others exec",
         "sweep" | "clean-all" => "mutate (exclusive lock); bypasses heli's build store",
+        "dx" | "trunk" => "serve runs directly in the pool, never attached to; others exec",
         "audit" | "deny" => "exec: never cached, the advisory database is not in the key",
         _ => return None,
     })
@@ -178,6 +240,50 @@ impl Class {
         match self {
             Self::Mutate => Access::Exclusive,
             Self::Compile | Self::Verify | Self::Test | Self::Exec => Access::Shared,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn interactive_tools_run_directly_with_or_without_a_terminal() {
+        for words in [
+            &["insta", "review"][..],
+            &["dx", "serve"],
+            &["+nightly", "trunk", "serve"],
+        ] {
+            assert!(runs_directly(&args(words), false), "{words:?}");
+        }
+        assert!(!runs_directly(&args(&["insta", "accept"]), true));
+    }
+
+    #[test]
+    fn unknown_tools_run_directly_only_at_a_terminal() {
+        let zig = args(&["zigbuild", "--release"]);
+        assert!(runs_directly(&zig, true));
+        assert!(!runs_directly(&zig, false));
+    }
+
+    #[test]
+    fn known_commands_stay_in_the_daemon_at_a_terminal() {
+        for words in [
+            &["build"][..],
+            &["bench"],
+            &["tree"],
+            &["audit"],
+            &["hack", "test"],
+            &["nextest", "list"],
+            &["--version"],
+            &[],
+        ] {
+            assert!(!runs_directly(&args(words), true), "{words:?}");
         }
     }
 }
