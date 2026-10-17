@@ -1183,13 +1183,20 @@ mod tests {
         assert!(first.exists());
         let lease = epoch.lease_root().join(LEASE);
         drop(epoch);
-        assert_eq!(
-            gc(&store).unwrap()["retired_epochs"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
-        );
+        // A child another test spawns holds a copy of the lease's descriptor
+        // (and with it the flock) until it execs: until then the epoch is
+        // busy, as GC rightly says. Only a lease that stays held fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let report = loop {
+            let report = gc(&store).unwrap();
+            if report["busy_epochs"].as_array().unwrap().is_empty()
+                || std::time::Instant::now() >= deadline
+            {
+                break report;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(report["retired_epochs"].as_array().unwrap().len(), 1);
         assert!(!first.exists());
         assert!(lease.is_file());
         assert!(sorted_entries(&store.join("objects")).unwrap().is_empty());

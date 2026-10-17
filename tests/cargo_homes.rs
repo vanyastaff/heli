@@ -40,9 +40,12 @@ fn project(root: &Path) {
 use std::{env, fs, path::Path, process::Command, thread, time::{Duration, Instant}};
 fn main() {
     println!("cargo:rerun-if-env-changed=HOME_REPORT");
-    let report = env::var_os("HOME_REPORT").unwrap();
-    fs::write(report, format!("{}\n{}", env::var("CARGO_HOME").unwrap(),
+    // Whole or not at all: the test reads the report once it exists.
+    let report = Path::new(&env::var_os("HOME_REPORT").unwrap()).to_owned();
+    let partial = report.with_extension("partial");
+    fs::write(&partial, format!("{}\n{}", env::var("CARGO_HOME").unwrap(),
         env::var("HELI_HOME_CANARY").unwrap_or_default())).unwrap();
+    fs::rename(&partial, &report).unwrap();
     if let Some(release) = env::var_os("HOME_RELEASE") {
         let start = Instant::now();
         while !Path::new(&release).is_file() {
