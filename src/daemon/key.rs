@@ -105,7 +105,7 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }
     fields.push(b"machine", &machine());
     toolchain(request, &mut fields);
-    advisory_databases(request, &cwd, &mut fields)?;
+    advisory_databases(request, &cwd, scratch, &mut fields)?;
     cargo_config(request, &mut fields)?;
     environment(request, &worktree, &mut fields);
     Ok(Some(Key {
@@ -403,14 +403,20 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
     }
 }
 
-/// Keys the advisory databases a `cargo audit` or `cargo deny` run reads
-/// (`crate::class`: only runs that cannot fetch are verify runs), by the
+/// Keys the advisory databases a `cargo audit` or `cargo deny` run reads,
+/// fetched first by the daemon for a run that fetches
+/// (`super::advisory`), by the
 /// commit each is at: the `--db` of cargo-audit, else `advisory-db` in the
 /// Cargo home; `advisory-dbs/*` there for cargo-deny. A database that is not
 /// there is keyed as absent. Settings that move a database where heli cannot
 /// see it (an `audit.toml` `[database]` table, a `deny.toml` `db-path` or
 /// `db-urls`) make the run unkeyed, so never cached.
-fn advisory_databases(request: &RunRequest, cwd: &Path, fields: &mut Fields) -> Result<(), String> {
+fn advisory_databases(
+    request: &RunRequest,
+    cwd: &Path,
+    scratch: &Path,
+    fields: &mut Fields,
+) -> Result<(), String> {
     let args: Vec<std::ffi::OsString> = request
         .argv
         .iter()
@@ -444,6 +450,10 @@ fn advisory_databases(request: &RunRequest, cwd: &Path, fields: &mut Fields) -> 
         _ => return Ok(()),
     };
     let home = cargo_home(request, cwd);
+    let tool = tool.to_str().unwrap_or_default();
+    if super::advisory::fetches(tool, rest) {
+        super::advisory::refresh(request, tool, at.as_deref(), home.as_deref(), scratch)?;
+    }
     let worktree = worktree::of(cwd);
     let mut places: Vec<PathBuf> = cwd
         .ancestors()
@@ -997,7 +1007,8 @@ mod advisory_tests {
 
     fn digest(request: &RunRequest) -> Result<String, String> {
         let mut fields = Fields::default();
-        advisory_databases(request, &request.cwd(), &mut fields)?;
+        let scratch = tempfile::tempdir().expect("scratch");
+        advisory_databases(request, &request.cwd(), scratch.path(), &mut fields)?;
         Ok(fields.finish())
     }
 
@@ -1053,5 +1064,41 @@ mod advisory_tests {
         assert!(digest(&deny).is_ok());
         let build = request(root.path(), &home, &["cargo", "build"]);
         assert_eq!(digest(&build), Ok(Fields::default().finish()));
+    }
+}
+
+#[cfg(test)]
+mod advisory_fetch_tests {
+    use std::ffi::OsString;
+
+    use super::{Fields, advisory_databases};
+    use crate::protocol::{RunRequest, Text};
+
+    /// A run that fetches, whose fetch fails, is not keyed: it would check a
+    /// database newer than any key could name.
+    #[test]
+    fn a_failed_fetch_leaves_the_run_unkeyed() {
+        let root = tempfile::tempdir().expect("dir");
+        let missing = root.path().join("no-such-cargo");
+        let request = RunRequest {
+            cwd: Text(root.path().as_os_str().to_owned()),
+            argv: [missing.as_os_str(), "deny".as_ref(), "check".as_ref()]
+                .into_iter()
+                .map(|arg| Text(OsString::from(arg)))
+                .collect(),
+            env: vec![(
+                Text("CARGO_HOME".into()),
+                Text(root.path().join("home").into_os_string()),
+            )],
+            dependency_epoch: None,
+            class: None,
+            cache: Default::default(),
+            reads_spawned: false,
+        };
+        for _ in 0..2 {
+            let mut fields = Fields::default();
+            let keyed = advisory_databases(&request, root.path(), root.path(), &mut fields);
+            assert!(keyed.is_err_and(|error| error.contains("advisory database")));
+        }
     }
 }

@@ -40,6 +40,7 @@
 //! Windows), since it has no terminal.
 
 pub mod accounts;
+pub mod advisory;
 pub mod events;
 pub mod execute;
 pub mod governor;
@@ -129,6 +130,9 @@ pub fn main() -> ! {
         }
     }
     let config = Config::load(&locations.config).unwrap_or_else(|error| fail(Some(&log), &error));
+    advisory::set_interval(std::time::Duration::from_secs(
+        config.advisories.fetch_interval_minutes.saturating_mul(60),
+    ));
     let pool = Arc::new(open_pool(&locations, &config, &log));
     let governor = Governor::new(&config, locations.config.clone())
         .unwrap_or_else(|error| fail(Some(&log), &error));

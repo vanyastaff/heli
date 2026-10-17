@@ -91,44 +91,60 @@ fn third_party(tool: &str, rest: &[OsString]) -> Class {
         "sqlx" if first_word() == Some("prepare") => Class::Mutate,
         // Delete build output or manifests' dependencies by themselves.
         "sweep" | "clean-all" => Class::Mutate,
-        // Advisory checks are verdicts on the tree and the advisory database
-        // only when they do not fetch a newer database while they run:
-        // otherwise a cached pass could hide an advisory published since.
-        // The database's version is then in the key (`crate::daemon::key`).
-        "audit" if before_separator().any(|arg| arg == "--no-fetch" || arg == "-n") => {
-            Class::Verify
-        }
-        "deny" if deny_is_reproducible(rest) => Class::Verify,
+        // Advisory checks are verdicts on the tree and the advisory
+        // database, whose commit is in the key; the daemon fetches the
+        // database first for a run that would (`crate::daemon::advisory`).
+        "audit" => audit_class(rest),
+        "deny" if first_word() == Some("check") || deny_checks(rest) => Class::Verify,
         // cargo-hack runs check or clippy over feature combinations.
         "hack" if before_separator().any(|arg| arg == "check" || arg == "clippy") => Class::Verify,
         _ => Class::Exec,
     }
 }
 
-/// Whether `cargo deny <rest>` is a `check` whose verdict the tree and the
-/// local advisory databases decide: one that cannot fetch
-/// (`--disable-fetch`, `--offline`), or that checks only bans, licenses or
-/// sources, which need no database at all.
-fn deny_is_reproducible(rest: &[OsString]) -> bool {
-    let args: Vec<&str> = rest
-        .iter()
-        .take_while(|arg| *arg != "--")
-        .filter_map(|arg| arg.to_str())
-        .collect();
-    let Some(check) = args.iter().position(|arg| *arg == "check") else {
-        return false;
-    };
-    if args
-        .iter()
-        .any(|arg| matches!(*arg, "--disable-fetch" | "--offline"))
-    {
-        return true;
+/// The class of `cargo audit <rest>`: a check of the lockfile is verify,
+/// `fix` rewrites manifests (mutate), and `bin`, which scans binaries outside
+/// the tree, or anything heli cannot read, is exec.
+fn audit_class(rest: &[OsString]) -> Class {
+    // cargo-audit's options that take a value.
+    const VALUED: &[&str] = &[
+        "--db",
+        "-d",
+        "--deny",
+        "-D",
+        "--ignore",
+        "--target-arch",
+        "--target-os",
+        "--file",
+        "-f",
+        "--url",
+        "-u",
+        "--color",
+        "-c",
+        "--format",
+        "-F",
+    ];
+    let mut args = rest.iter().take_while(|arg| *arg != "--");
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            return Class::Exec;
+        };
+        if VALUED.contains(&arg) {
+            args.next();
+        } else if arg == "fix" {
+            return Class::Mutate;
+        } else if !arg.starts_with('-') {
+            return Class::Exec;
+        }
     }
-    let which = &args[check + 1..];
-    !which.is_empty()
-        && which
-            .iter()
-            .all(|word| matches!(*word, "bans" | "licenses" | "sources"))
+    Class::Verify
+}
+
+/// Whether `cargo deny <rest>` runs `check`, after its global options.
+fn deny_checks(rest: &[OsString]) -> bool {
+    rest.iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "check")
 }
 
 /// Cargo's own subcommands that are not mutate, verify, compile or test runs:
@@ -223,10 +239,8 @@ pub fn tool_profile(name: &str) -> Option<&'static str> {
         "sqlx" => "prepare mutate (exclusive lock); others exec",
         "sweep" | "clean-all" => "mutate (exclusive lock); bypasses heli's build store",
         "dx" | "trunk" => "serve runs directly in the pool, never attached to; others exec",
-        "audit" => "--no-fetch verify cached, keyed by the advisory database; else exec",
-        "deny" => {
-            "check with --disable-fetch/--offline, or of bans/licenses/sources only, verify cached; else exec"
-        }
+        "audit" => "verify cached, keyed by the advisory database heli fetches first; fix mutate",
+        "deny" => "check verify cached, keyed by the advisory database heli fetches first",
         _ => return None,
     })
 }

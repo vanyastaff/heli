@@ -16,6 +16,10 @@
 //! [event_log]
 //! max_kb = 1024   # the event log's size before it rotates
 //!
+//! [advisories]
+//! fetch_interval_minutes = 10   # how stale cargo audit / deny's database
+//!                               # may be before a check fetches; default 0
+//!
 //! [output]
 //! mode = "compact"     # full, compact or quiet; default: full on a
 //!                      # terminal, compact without
@@ -76,6 +80,7 @@ pub struct Config {
     pub memory: MemoryConfig,
     pub event_log: EventLogConfig,
     pub store: StoreConfig,
+    pub advisories: AdvisoriesConfig,
     #[cfg(debug_assertions)]
     test: Seam,
 }
@@ -197,6 +202,16 @@ pub struct MemoryConfig {
     pub low_watermark_mb: Option<u64>,
     /// Above it, they are returned; it must be above the low watermark.
     pub high_watermark_mb: Option<u64>,
+}
+
+/// `[advisories]`: how often the daemon fetches the advisory databases of
+/// `cargo audit` and `cargo deny` (`crate::daemon::advisory`).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub struct AdvisoriesConfig {
+    /// A fetch younger than this is fresh: checks in between reuse a pass
+    /// without asking the network. Default 0: every check fetches first.
+    pub fetch_interval_minutes: u64,
 }
 
 /// `[event_log]`: the daemon's event log.

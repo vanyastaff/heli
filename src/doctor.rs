@@ -52,6 +52,8 @@ pub struct Inputs {
     pub configs: Vec<(PathBuf, toml::Table)>,
     /// The variables of [`VARS`] that are set and not empty.
     pub env: BTreeMap<String, String>,
+    /// The Cargo home, where cargo-audit keeps its advisory database.
+    pub cargo_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -82,6 +84,7 @@ pub fn gather(cwd: &Path) -> Inputs {
         inputs.bin_dirs.extend(std::env::split_paths(&path));
     }
     let home = crate::setup::cargo_home(cwd);
+    inputs.cargo_home.clone_from(&home);
     if let Some(home) = &home {
         inputs.bin_dirs.push(home.join("bin"));
     }
@@ -115,7 +118,18 @@ fn installed_tools(dirs: &[PathBuf]) -> BTreeSet<String> {
         };
         for entry in entries.flatten() {
             let file = entry.file_name().to_string_lossy().into_owned();
-            let stem = file.strip_suffix(".exe").unwrap_or(&file);
+            // A program: `.exe` on Windows (not the `.pdb` beside it), no
+            // extension elsewhere.
+            let stem = if cfg!(windows) {
+                match file.strip_suffix(".exe") {
+                    Some(stem) => stem,
+                    None => continue,
+                }
+            } else if file.contains('.') {
+                continue;
+            } else {
+                &file
+            };
             if let Some(name) = stem.strip_prefix("cargo-")
                 && !name.is_empty()
                 && !matches!(name, "heli" | "clippy" | "fmt" | "miri")
@@ -276,6 +290,22 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Set rust-analyzer.cargo.extraEnv in the editor to the CARGO_MAKEFLAGS that `cargo heli setup --print` shows.",
         );
     }
+    if let Some(db) = inputs
+        .cargo_home
+        .as_ref()
+        .map(|home| home.join("advisory-db"))
+        .filter(|db| db.is_dir() && !db.join(".git").exists() && !db.join("HEAD").is_file())
+    {
+        add(
+            "advisory-db",
+            "warn",
+            format!(
+                "{} is not a git clone of the advisory database: cargo audit cannot fetch into it, and heli cannot key (so never caches) its checks.",
+                db.display()
+            ),
+            "Move it aside and let `cargo audit` clone the database again.",
+        );
+    }
     Report {
         schema: SCHEMA,
         tools,
@@ -365,6 +395,20 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_advisory_database_is_reported() {
+        let home = tempfile::tempdir().expect("dir");
+        let db = home.path().join("advisory-db");
+        std::fs::create_dir_all(db.join("advisory-db-3157b0e258782691")).expect("dir");
+        let inputs = Inputs {
+            cargo_home: Some(home.path().to_owned()),
+            ..Inputs::default()
+        };
+        assert_eq!(ids(&diagnose(&inputs)), ["advisory-db"]);
+        std::fs::create_dir_all(db.join(".git")).expect("dir");
+        assert!(ids(&diagnose(&inputs)).is_empty());
+    }
+
+    #[test]
     fn environment_overrides_count() {
         let mut inputs = Inputs::default();
         inputs.env.insert("CARGO_TARGET_DIR".into(), "/x".into());
@@ -374,7 +418,14 @@ mod tests {
     #[test]
     fn lists_tools_with_their_profiles() {
         let dir = tempfile::tempdir().expect("dir");
-        for name in ["cargo-insta.exe", "cargo-zigbuild", "cargo-heli", "other"] {
+        let exe = std::env::consts::EXE_SUFFIX;
+        for name in [
+            format!("cargo-insta{exe}"),
+            format!("cargo-zigbuild{exe}"),
+            format!("cargo-heli{exe}"),
+            "cargo-fmt.pdb".to_owned(),
+            "other".to_owned(),
+        ] {
             std::fs::write(dir.path().join(name), "").expect("file");
         }
         let report = diagnose(&Inputs {
