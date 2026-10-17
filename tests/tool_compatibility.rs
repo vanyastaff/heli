@@ -6,10 +6,13 @@
 //!
 //! Every test here needs its real tool installed, so they are ignored by the
 //! main suite. The `compatibility` workflow installs the tools and runs them
-//! on Linux, macOS and Windows:
+//! on Linux, macOS and Windows; those named `nightly_` need a nightly
+//! toolchain (`HELI_NIGHTLY`, default `nightly`) and run in a job of their
+//! own:
 //!
 //! ```text
-//! cargo test --locked --test tool_compatibility -- --ignored
+//! cargo test --locked --test tool_compatibility -- --ignored --skip nightly_
+//! cargo test --locked --test tool_compatibility -- --ignored nightly_
 //! ```
 //!
 //! A missing tool fails its test with how to install it, never skips it.
@@ -72,11 +75,15 @@ impl Repo {
         assert_success(&output, &format!("git {}", args.join(" ")));
     }
 
-    /// `cargo <args>` as the tool runs without heli.
+    /// `cargo <args>` as the tool runs without heli: through rustup's
+    /// proxy for a `+toolchain`, as a user's shell runs it.
     fn direct(&self, args: &[&str]) -> Output {
-        as_a_user(self.fixture.cargo(args.iter().copied()))
-            .output()
-            .expect("run cargo")
+        let command = if args.first().is_some_and(|first| first.starts_with('+')) {
+            self.fixture.command("cargo", args.iter().copied())
+        } else {
+            self.fixture.cargo(args.iter().copied())
+        };
+        as_a_user(command).output().expect("run cargo")
     }
 
     /// `cargo heli <args>`, with the tool's own output (`--output full`).
@@ -239,6 +246,74 @@ fn insta_review_runs_directly() {
         "no fallback warning: {}",
         text(&output.stderr)
     );
+}
+
+/// The nightly toolchain the `nightly_` tests use: `HELI_NIGHTLY`, else
+/// `nightly`. Fails, with how to install it, unless its cargo answers.
+fn nightly() -> String {
+    let toolchain = std::env::var("HELI_NIGHTLY")
+        .ok()
+        .filter(|toolchain| !toolchain.is_empty())
+        .unwrap_or_else(|| "nightly".to_owned());
+    let answers = Command::new("cargo")
+        .arg(format!("+{toolchain}"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|output| output.status.success());
+    assert!(
+        answers,
+        "toolchain {toolchain} has no cargo; install it \
+         (`rustup toolchain install {toolchain}`) or set HELI_NIGHTLY"
+    );
+    toolchain
+}
+
+/// cargo-hakari: `generate` rewrites the workspace-hack crate (mutate),
+/// `verify` is a cached verification.
+#[test]
+#[ignore = "needs cargo-hakari; run by the compatibility workflow"]
+fn hakari_generate_mutates_and_verify_is_cached() {
+    require("hakari");
+    let repo = Repo::new();
+    let init = repo.direct(&["hakari", "init", "workspace-hack", "--yes"]);
+    assert_success(&init, "cargo hakari init");
+    repo.same_as_direct(&["hakari", "generate"]);
+    repo.cached(&["hakari", "verify"]);
+}
+
+#[test]
+#[ignore = "needs cargo-udeps and a nightly toolchain; run by the compatibility workflow"]
+fn nightly_udeps_is_a_cached_verification() {
+    require("udeps");
+    let toolchain = format!("+{}", nightly());
+    Repo::new().cached(&[&toolchain, "udeps", "--workspace"]);
+}
+
+#[test]
+#[ignore = "needs cargo-public-api and a nightly toolchain; run by the compatibility workflow"]
+fn nightly_public_api_is_a_cached_verification() {
+    require("public-api");
+    let toolchain = format!("+{}", nightly());
+    let repo = Repo::new();
+    let direct = repo.direct(&[&toolchain, "public-api", "-p", "util"]);
+    assert!(
+        text(&direct.stdout).contains("pub fn util::base() -> u32"),
+        "{}",
+        text(&direct.stdout)
+    );
+    repo.cached(&[&toolchain, "public-api", "-p", "util"]);
+}
+
+/// `miri test`, a cached verification keyed by the nightly toolchain.
+#[test]
+#[ignore = "needs Miri on a nightly toolchain; run by the compatibility workflow"]
+fn nightly_miri_test_is_a_cached_verification() {
+    let toolchain = format!("+{}", nightly());
+    let repo = Repo::new();
+    let setup = repo.direct(&[&toolchain, "miri", "setup"]);
+    assert_success(&setup, "cargo miri setup");
+    repo.cached(&[&toolchain, "miri", "test", "-p", "util"]);
 }
 
 /// `cargo remove` and `cargo add`, mutate runs, edit the manifest as they do

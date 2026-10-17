@@ -412,7 +412,7 @@ pub fn parse(
         Command::Cargo(args) => {
             let class = Class::of_cargo(&args);
             Action::Run(Invocation {
-                program: cargo,
+                program: cargo_for(&args, cargo),
                 class,
                 exec: false,
                 cache: cargo_cache(class, &args, cli.no_cache, cli.cache),
@@ -425,6 +425,26 @@ pub fn parse(
             })
         }
     })
+}
+
+/// The cargo that runs `cargo <args>`: `cargo`, the one that started heli,
+/// unless `args` start with a `+toolchain` and `cargo` is a toolchain's own
+/// binary (`.../toolchains/<name>/bin/cargo`), as cargo hands its external
+/// subcommands: that binary does not take `+toolchain`, rustup's proxy does,
+/// so `cargo` on the search path runs it. Any other `cargo` is kept.
+fn cargo_for(args: &[OsString], cargo: OsString) -> OsString {
+    let pinned = args
+        .first()
+        .is_some_and(|first| first.as_encoded_bytes().starts_with(b"+"));
+    let components: Vec<_> = std::path::Path::new(&cargo).components().collect();
+    let in_a_toolchain = components
+        .windows(4)
+        .any(|parts| parts[0].as_os_str() == "toolchains" && parts[2].as_os_str() == "bin");
+    if pinned && in_a_toolchain {
+        OsString::from("cargo")
+    } else {
+        cargo
+    }
 }
 
 fn parse_cache(text: &str) -> Result<Cache, String> {
@@ -466,4 +486,31 @@ fn parse_mode(text: &str) -> Result<Mode, String> {
 /// A regular expression, checked here so that a bad one is a usage error.
 fn parse_pattern(text: &str) -> Result<String, regex::Error> {
     regex::bytes::Regex::new(text).map(|_| text.to_owned())
+}
+
+#[cfg(test)]
+mod cargo_tests {
+    use std::ffi::OsString;
+
+    use super::cargo_for;
+
+    fn args(words: &[&str]) -> Vec<OsString> {
+        words.iter().map(OsString::from).collect()
+    }
+
+    /// A `+toolchain` goes to rustup's proxy when heli was started by a
+    /// toolchain's own cargo, which cannot take it; otherwise the cargo is
+    /// kept.
+    #[test]
+    fn a_pinned_toolchain_goes_through_rustups_proxy() {
+        let own =
+            OsString::from("/home/u/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin/cargo");
+        assert_eq!(
+            cargo_for(&args(&["+nightly", "udeps"]), own.clone()),
+            "cargo"
+        );
+        assert_eq!(cargo_for(&args(&["udeps"]), own.clone()), own);
+        let fake = OsString::from("/tmp/fixture/fake-cargo/cargo");
+        assert_eq!(cargo_for(&args(&["+pinned", "clippy"]), fake.clone()), fake);
+    }
 }
