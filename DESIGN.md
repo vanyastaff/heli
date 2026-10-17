@@ -682,8 +682,7 @@ cargo tools (spec #38). They apply to everyone who installs heli, with no
 configuration; `src/class.rs` is the one place that reads them. A tool that
 is missing gets a profile in heli itself, so every user gets it, not only
 one project. Users and repositories add profiles of their own (below). Not
-yet implemented: cache keys with extra inputs, `caches` and the usage
-memory.
+yet implemented: `caches` and the usage memory.
 
 | Tool | Profile |
 |---|---|
@@ -701,7 +700,33 @@ memory.
 | `tauri` | `dev` runs directly in the pool; else exec |
 | `watch` | runs directly in the pool |
 | `outdated`, `semver-checks`, `vet`, `geiger` | exec, never cached: the result depends on the registry |
-| `audit`, `deny` | exec, never cached: the advisory database is not in the key |
+| `audit` | verify, keyed by the advisory database; `fix` mutate; `bin` exec |
+| `deny` | `check` verify, keyed by the advisory database; else exec |
+
+**Advisory checks.** A verdict of `cargo audit` or `cargo deny check` is a
+verdict on the lockfile and on the advisory database, which gains advisories
+for unchanged dependencies every day. A pass cached by the tree alone would
+hide them, so the key also holds the commit of each database the run reads:
+cargo-audit's `--db`, else `advisory-db` in the Cargo home, and every
+`advisory-dbs/*` there for cargo-deny. It also holds the `audit.toml` and
+`deny.toml` contents and the tool's version.
+
+A run that would fetch the database as it starts has the daemon fetch it
+first, before the key (`src/daemon/advisory.rs`). cargo-deny fetches with
+`cargo deny fetch db`. cargo-audit has no fetch-only command, so the daemon
+runs `cargo audit --file <a lockfile without packages>`. The key then names
+the database the run checks against: unchanged dependencies and an unchanged
+database reuse the pass, and a new advisory misses. The daemon fetches one at
+a time per tool and Cargo home, so agents checking together share one fetch.
+A fetch stays fresh for `[advisories] fetch_interval_minutes` (default 0),
+and for 30 s at least, since a run computes its key more than once. Within
+the interval a check reuses a pass without the network, at the price of
+seeing an advisory up to that late. A fetch that fails leaves the run
+unkeyed, so not cached. Runs that cannot fetch (`--no-fetch`,
+`--disable-fetch`, `--offline`, a `deny check` of bans, licenses or sources
+only) key the database as it is. A configuration that moves the database or
+forces fetching (an `audit.toml` `[database]` table, `db-path`, `db-urls`)
+makes the run unkeyed.
 
 **Profiles from configuration.** A user writes profiles in heli's
 configuration file, and any repository that uses heli commits its own in
