@@ -1549,7 +1549,11 @@ Safety rules:
   `gc` before it exits, and by a thread of the daemon's, which also deletes
   what a `gc` that was stopped left there. A cargo that starts meanwhile
   finds its directory without the victim and rebuilds it; it never waits
-  for the deletion. A trash counts in no directory's size.
+  for the deletion. If a file in the trash is temporarily undeletable (for
+  example, a Windows handle denies deletion), `gc` reports the failed
+  cleanup and retains it for a later pass; the daemon also retries its
+  trash cleanup. This does not restore the victim or hold Cargo's locks.
+  A trash counts in no directory's size.
 - **Narrow scope.** heli deletes only below registered roots (the stores'
   build directories and the registered `target/` directories), only the
   subpaths listed above, and never through a symlink or a junction: no path
