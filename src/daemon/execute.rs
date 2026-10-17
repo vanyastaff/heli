@@ -57,6 +57,7 @@ pub fn spawn(
     roots: &[PathBuf],
 ) -> io::Result<(Child, Tree)> {
     let cwd = request.cwd();
+    keep_sccache_server(request, &cwd);
     let mut argv = argv.iter().cloned();
     let program = argv.next().unwrap_or_default();
     let resolved = resolve(&cwd, program);
@@ -114,6 +115,52 @@ pub fn spawn(
         return Err(failure);
     }
     Ok((child, tree))
+}
+
+/// How long the daemon waits for `sccache --start-server` to return.
+const SURVIVOR_START: Duration = Duration::from_secs(5);
+
+/// Survivors (`DESIGN.md` §5, "Tool profiles"): a compiler cache server that
+/// a run's `RUSTC_WRAPPER=sccache` would start inside the run ends with the
+/// run's process tree, so cancelling one build cold-starts everyone's cache.
+/// The daemon starts it first, outside any run's tree. A server that already
+/// runs makes `--start-server` fail, which is the answer wanted; failures
+/// never fail the run, whose own sccache starts a server as it would anyway.
+fn keep_sccache_server(request: &RunRequest, cwd: &Path) {
+    let Some(wrapper) = request.var("RUSTC_WRAPPER").filter(|wrapper| {
+        Path::new(wrapper)
+            .file_stem()
+            .is_some_and(|stem| stem == "sccache")
+    }) else {
+        return;
+    };
+    let mut command = Command::new(resolve(cwd, wrapper.to_owned()));
+    command
+        .arg("--start-server")
+        .current_dir(cwd)
+        .env_clear()
+        .envs(request.env.iter().map(|(name, value)| (&name.0, &value.0)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the daemon has no console to share.
+        command.creation_flags(0x0800_0000);
+    }
+    let Ok(mut starter) = command.spawn() else {
+        return;
+    };
+    let deadline = Instant::now() + SURVIVOR_START;
+    while Instant::now() < deadline {
+        match starter.try_wait() {
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            _ => return,
+        }
+    }
+    let _ = starter.kill();
+    let _ = starter.wait();
 }
 
 /// A program given as a relative path (`./script`, `bin\tool`) is relative

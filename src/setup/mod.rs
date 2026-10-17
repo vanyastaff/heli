@@ -47,6 +47,16 @@ use crate::config::Config;
 use crate::locations::Locations;
 use crate::{pool, store};
 
+/// The user's Cargo home, for `cargo heli doctor`.
+pub fn cargo_home(cwd: &Path) -> Option<PathBuf> {
+    cargo::home(cwd)
+}
+
+/// The configuration file cargo reads in `dir`, for `cargo heli doctor`.
+pub fn cargo_config_file(dir: &Path) -> PathBuf {
+    cargo::file(dir)
+}
+
 /// The variable that hands a cargo the host pool.
 pub const VAR: &str = "CARGO_MAKEFLAGS";
 

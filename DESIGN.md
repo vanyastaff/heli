@@ -675,6 +675,49 @@ How a command line is read:
   persisted verdicts. Only use it for commands whose result is a verification,
   such as `cargo xtask check-changed`; it does not classify a wrapper's steps.
 
+### Tool profiles
+
+Beyond cargo's own subcommands, heli ships built-in profiles for popular
+cargo tools (spec #38). A profile maps a tool to a class, or to a run mode;
+`src/class.rs` is the one place that reads them. Not yet implemented: user and
+repository profiles (`.config/heli.toml`), cache keys with extra inputs,
+`caches` and the usage memory.
+
+| Tool | Profile |
+|---|---|
+| `add`, `remove`, `rm`, `update` | mutate |
+| `hakari` | `generate`, `manage-deps` mutate; `verify` verify; else exec |
+| `machete`, `shear` | verify; mutate with `--fix` |
+| `udeps`, `public-api` | verify (the `+toolchain` is in the argv, so in the key) |
+| `hack` | verify when `check` or `clippy` is among its arguments; else exec |
+| `insta` | `accept`, `reject` mutate; `review` runs directly in the pool |
+| `sqlx` | `prepare` mutate; else exec |
+| `sweep`, `clean-all` | mutate (they delete build output themselves, bypassing the store) |
+| `dx`, `trunk` | `serve` runs directly in the pool; else exec |
+| `audit`, `deny` | exec, never cached: the advisory database is not in the key |
+
+**Direct in the pool.** The client runs the command itself, as the direct
+fallback does, but with the host pool in `CARGO_MAKEFLAGS` (the daemon is
+reached first, so the pool exists). No run is registered, cached or
+attached to, and the worktree lock is not taken. Interactive and service
+tools (`insta review`, `dx serve`, `trunk serve`) always run this way. So does
+any other command heli has no profile for, when stdin is a terminal; cargo's
+own exec subcommands (`bench`, `tree`, `install`, ...) stay in the daemon.
+Without a terminal an unknown tool is exec in the daemon, as before.
+
+**Survivors.** A `sccache` server started inside a run would end with the
+run's process tree, and `cargo heli cancel` would cold-start everyone's
+cache. When a run's `RUSTC_WRAPPER` is `sccache`, the daemon runs
+`sccache --start-server` before the run, outside any run's tree. It waits at
+most 5 s and ignores failure, including "already running". A wrapper set only
+in a Cargo configuration file is not yet recognized.
+
+`cargo heli doctor [--json]` lists the installed `cargo-*` tools with their
+profile, and explains `jobs`, a global `target-dir`, a user's own `build-dir`
+(never overwritten by `setup`), `RUSTC_WRAPPER`, mold or lld, `CARGO_HOME` and
+rust-analyzer. It reads configuration and changes nothing. The `--json`
+document has `schema` 1, `tools` and `findings`.
+
 ### Lifecycle
 
 1. **Key** (compile, verify and test runs). The key covers the worktree's tree,
