@@ -60,91 +60,255 @@ pub enum Runner {
     Nextest,
 }
 
-/// The class of the built-in profile for a cargo subcommand heli does not
-/// run itself (`DESIGN.md` §5, "Tool profiles"): tools that rewrite the
-/// worktree are mutate runs, so that they never run under a build; tools
-/// that only read it and report are verify runs, shared when nothing changed.
-/// Anything not listed is exec.
-fn third_party(tool: &str, rest: &[OsString]) -> Class {
-    let before_separator = || rest.iter().take_while(|arg| *arg != "--");
-    let first_word = || first_word(rest);
-    match tool {
-        // Edit Cargo.toml / Cargo.lock (cargo's own, cargo-edit's, and
-        // cargo-release, which also bumps versions and commits).
-        "add" | "remove" | "rm" | "update" | "upgrade" | "set-version" | "release"
-        | "autoinherit" => Class::Mutate,
-        // cargo-sort sorts manifests, or only checks them.
-        "sort" if before_separator().any(|arg| arg == "--check" || arg == "-c") => Class::Verify,
-        "sort" => Class::Mutate,
-        // Rewrite sources or generated files when asked to.
-        "machete" | "shear" if before_separator().any(|arg| arg == "--fix") => Class::Mutate,
-        "machete" | "shear" | "udeps" | "public-api" => Class::Verify,
-        "hakari" => match first_word() {
-            Some("generate" | "manage-deps") => Class::Mutate,
-            Some("verify") => Class::Verify,
-            _ => Class::Exec,
-        },
-        "insta" => match first_word() {
-            Some("accept" | "reject") => Class::Mutate,
-            _ => Class::Exec,
-        },
-        "sqlx" if first_word() == Some("prepare") => Class::Mutate,
-        // Delete build output or manifests' dependencies by themselves.
-        "sweep" | "clean-all" => Class::Mutate,
-        // Advisory checks are verdicts on the tree and the advisory
-        // database, whose commit is in the key; the daemon fetches the
-        // database first for a run that would (`crate::daemon::advisory`).
-        "audit" => audit_class(rest),
-        "deny" if first_word() == Some("check") || deny_checks(rest) => Class::Verify,
-        // cargo-hack runs check or clippy over feature combinations.
-        "hack" if before_separator().any(|arg| arg == "check" || arg == "clippy") => Class::Verify,
-        _ => Class::Exec,
-    }
+/// A built-in tool profile (`DESIGN.md` §5, "Tool profiles"): what heli
+/// does with `cargo <name> <args>` for each of `names`, as a declarative
+/// record. The first of `rules` whose condition holds decides, else
+/// `otherwise`. Tools that rewrite the worktree are mutate runs, so that they
+/// never run under a build; tools that only read it and report are verify
+/// runs, shared when nothing changed; interactive and long-running ones run
+/// directly in the pool. A tool not in [`TOOLS`] is exec.
+struct Tool {
+    names: &'static [&'static str],
+    /// What the profile does, as `cargo heli doctor` says it.
+    summary: &'static str,
+    /// The tool's options that take a value: skipped, with it, when looking
+    /// for the first word.
+    valued: &'static [&'static str],
+    rules: &'static [(When, Then)],
+    otherwise: Then,
 }
 
-/// The class of `cargo audit <rest>`: a check of the lockfile is verify,
-/// `fix` rewrites manifests (mutate), and `bin`, which scans binaries outside
-/// the tree, or anything heli cannot read, is exec.
-fn audit_class(rest: &[OsString]) -> Class {
-    // cargo-audit's options that take a value.
-    const VALUED: &[&str] = &[
-        "--db",
-        "-d",
-        "--deny",
-        "-D",
-        "--ignore",
-        "--target-arch",
-        "--target-os",
-        "--file",
-        "-f",
-        "--url",
-        "-u",
-        "--color",
-        "-c",
-        "--format",
-        "-F",
-    ];
-    let mut args = rest.iter().take_while(|arg| *arg != "--");
-    while let Some(arg) = args.next() {
-        let Some(arg) = arg.to_str() else {
-            return Class::Exec;
+/// A condition on a tool's arguments, all before any `--`.
+#[derive(Clone, Copy)]
+enum When {
+    /// The first word (not an option, nor an option's value) is one of these.
+    Word(&'static [&'static str]),
+    /// There is a first word at all.
+    AnyWord,
+    /// One of these arguments is there, anywhere.
+    Arg(&'static [&'static str]),
+}
+
+/// What a profile makes of a run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Then {
+    /// The daemon runs it, as a run of this class.
+    Run(Class),
+    /// The client runs it itself, drawing from the host pool: interactive
+    /// and long-running tools, which need a terminal and hold a slot for
+    /// hours. Its class is exec.
+    Direct,
+}
+
+use Then::{Direct, Run};
+
+/// Every built-in profile. Each name is in one profile only (a test checks).
+const TOOLS: &[Tool] = &[
+    Tool {
+        // Cargo's own manifest editors, cargo-edit's, cargo-release (which
+        // also bumps versions and commits) and cargo-autoinherit.
+        names: &[
+            "add",
+            "remove",
+            "rm",
+            "update",
+            "upgrade",
+            "set-version",
+            "release",
+            "autoinherit",
+        ],
+        summary: "mutate: exclusive worktree lock",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Mutate),
+    },
+    Tool {
+        names: &["sort"],
+        summary: "--check verify cached; else mutate (exclusive lock)",
+        valued: &[],
+        rules: &[(When::Arg(&["--check", "-c"]), Run(Class::Verify))],
+        otherwise: Run(Class::Mutate),
+    },
+    Tool {
+        names: &["machete", "shear"],
+        summary: "verify cached; --fix mutate (exclusive lock)",
+        valued: &[],
+        rules: &[(When::Arg(&["--fix"]), Run(Class::Mutate))],
+        otherwise: Run(Class::Verify),
+    },
+    Tool {
+        names: &["udeps", "public-api"],
+        summary: "verify cached (toolchain is part of the key)",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Verify),
+    },
+    Tool {
+        names: &["hakari"],
+        summary: "generate/manage-deps mutate (exclusive lock), verify cached",
+        valued: &[],
+        rules: &[
+            (When::Word(&["generate", "manage-deps"]), Run(Class::Mutate)),
+            (When::Word(&["verify"]), Run(Class::Verify)),
+        ],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["insta"],
+        summary: "accept/reject mutate (exclusive lock); review runs directly in the pool, test as exec",
+        valued: &[],
+        rules: &[
+            (When::Word(&["accept", "reject"]), Run(Class::Mutate)),
+            (When::Word(&["review"]), Direct),
+        ],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["sqlx"],
+        summary: "prepare mutate (exclusive lock); others exec",
+        valued: &[],
+        rules: &[(When::Word(&["prepare"]), Run(Class::Mutate))],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        // They delete build output by themselves.
+        names: &["sweep", "clean-all"],
+        summary: "mutate (exclusive lock); bypasses heli's build store",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Mutate),
+    },
+    Tool {
+        // A verdict on the tree and the advisory database, whose commit is
+        // in the key; the daemon fetches the database first for a run that
+        // would (`crate::daemon::advisory`). `fix` rewrites manifests; `bin`
+        // scans binaries outside the tree.
+        names: &["audit"],
+        summary: "verify cached, keyed by the advisory database heli fetches first; fix mutate",
+        valued: &[
+            "--db",
+            "-d",
+            "--deny",
+            "-D",
+            "--ignore",
+            "--target-arch",
+            "--target-os",
+            "--file",
+            "-f",
+            "--url",
+            "-u",
+            "--color",
+            "-c",
+            "--format",
+            "-F",
+        ],
+        rules: &[
+            (When::Word(&["fix"]), Run(Class::Mutate)),
+            (When::AnyWord, Run(Class::Exec)),
+        ],
+        otherwise: Run(Class::Verify),
+    },
+    Tool {
+        names: &["deny"],
+        summary: "check verify cached, keyed by the advisory database heli fetches first",
+        valued: &[],
+        rules: &[(When::Arg(&["check"]), Run(Class::Verify))],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        // It runs check or clippy over feature combinations.
+        names: &["hack"],
+        summary: "check/clippy verify cached; other commands exec",
+        valued: &[],
+        rules: &[(When::Arg(&["check", "clippy"]), Run(Class::Verify))],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["dx", "trunk"],
+        summary: "serve runs directly in the pool, never attached to; others exec",
+        valued: &[],
+        rules: &[(When::Word(&["serve"]), Direct)],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["leptos"],
+        summary: "watch/serve run directly in the pool; others exec",
+        valued: &[],
+        rules: &[(When::Word(&["watch", "serve"]), Direct)],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["tauri"],
+        summary: "dev runs directly in the pool; others exec",
+        valued: &[],
+        rules: &[(When::Word(&["dev"]), Direct)],
+        otherwise: Run(Class::Exec),
+    },
+    Tool {
+        names: &["watch"],
+        summary: "runs directly in the pool, never attached to",
+        valued: &[],
+        rules: &[],
+        otherwise: Direct,
+    },
+    Tool {
+        names: &["outdated", "semver-checks", "vet", "geiger"],
+        summary: "exec: never cached, the result depends on the registry",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Exec),
+    },
+];
+
+impl Tool {
+    /// The built-in profile of `cargo <name>`, if heli has one.
+    fn named(name: &str) -> Option<&'static Tool> {
+        TOOLS.iter().find(|tool| tool.names.contains(&name))
+    }
+
+    /// What this profile makes of `cargo <name> <rest>`.
+    fn decide(&self, rest: &[OsString]) -> Then {
+        let args: Vec<&OsString> = rest.iter().take_while(|arg| *arg != "--").collect();
+        let word = self.first_word(&args);
+        let holds = |when: &When| match *when {
+            When::Word(words) => word.is_some_and(|word| words.contains(&word)),
+            When::AnyWord => word.is_some(),
+            When::Arg(wanted) => args
+                .iter()
+                .any(|arg| wanted.iter().any(|want| *arg == want)),
         };
-        if VALUED.contains(&arg) {
-            args.next();
-        } else if arg == "fix" {
-            return Class::Mutate;
-        } else if !arg.starts_with('-') {
-            return Class::Exec;
-        }
+        self.rules
+            .iter()
+            .find(|(when, _)| holds(when))
+            .map_or(self.otherwise, |(_, then)| *then)
     }
-    Class::Verify
+
+    /// The first of `args` that is neither an option nor the value of one
+    /// of [`Tool::valued`]. One that is not Unicode counts as a word no rule
+    /// names.
+    fn first_word<'a>(&self, args: &[&'a OsString]) -> Option<&'a str> {
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            let Some(arg) = arg.to_str() else {
+                return Some("");
+            };
+            if self.valued.contains(&arg) {
+                args.next();
+            } else if !arg.starts_with('-') {
+                return Some(arg);
+            }
+        }
+        None
+    }
 }
 
-/// Whether `cargo deny <rest>` runs `check`, after its global options.
-fn deny_checks(rest: &[OsString]) -> bool {
-    rest.iter()
-        .take_while(|arg| *arg != "--")
-        .any(|arg| arg == "check")
+/// The class of `cargo <tool> <rest>` for a subcommand cargo does not run
+/// itself: its built-in profile's, else exec.
+fn third_party(tool: &str, rest: &[OsString]) -> Class {
+    match Tool::named(tool).map(|profile| profile.decide(rest)) {
+        Some(Run(class)) => class,
+        Some(Direct) | None => Class::Exec,
+    }
 }
 
 /// Cargo's own subcommands that are not mutate, verify, compile or test runs:
@@ -186,68 +350,31 @@ pub fn is_cargo_builtin(tool: &str) -> bool {
 }
 
 /// Whether `cargo <args>` runs in the client, but drawing from the host pool
-/// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: interactive
-/// and long-running tools (`insta review`, `dx serve`, `trunk serve`,
-/// `leptos watch|serve`, `tauri dev`, `cargo watch`), which
-/// need a terminal and hold a slot for hours, and, when stdin is a terminal,
-/// every other exec command of a tool heli has no profile for.
+/// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: what a
+/// built-in profile runs directly ([`TOOLS`]), and, when stdin is a
+/// terminal, every exec command of a tool heli has no profile for.
 pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {
     let Some((tool, rest)) = subcommand(args) else {
         return false;
     };
     let tool = tool.to_str().unwrap_or_default();
-    let word = first_word(rest);
-    match (tool, word) {
-        ("insta", Some("review"))
-        | ("dx" | "trunk", Some("serve"))
-        | ("leptos", Some("watch" | "serve"))
-        | ("tauri", Some("dev"))
-        | ("watch", _) => return true,
-        _ => {}
+    match Tool::named(tool) {
+        Some(profile) => profile.decide(rest) == Direct,
+        None => {
+            stdin_is_terminal
+                && !tool.is_empty()
+                && !tool.starts_with('-')
+                && Class::of_cargo(args) == Class::Exec
+                && !is_cargo_builtin(tool)
+        }
     }
-    stdin_is_terminal
-        && !tool.is_empty()
-        && !tool.starts_with('-')
-        && Class::of_cargo(args) == Class::Exec
-        && !CARGO_BUILTINS.contains(&tool)
-        && tool_profile(tool).is_none()
-}
-
-/// The first of `args` that is not a flag.
-fn first_word(args: &[OsString]) -> Option<&str> {
-    args.iter()
-        .filter_map(|arg| arg.to_str())
-        .find(|arg| !arg.starts_with('-'))
 }
 
 /// What heli's built-in profile does with the cargo tool `cargo-<name>`, for
 /// `cargo heli doctor`; `None` for a tool heli has no profile for (it runs
 /// as exec).
 pub fn tool_profile(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "add" | "remove" | "rm" | "update" | "upgrade" | "set-version" | "release"
-        | "autoinherit" => "mutate: exclusive worktree lock",
-        "sort" => "--check verify cached; else mutate (exclusive lock)",
-        "watch" => "runs directly in the pool, never attached to",
-        "leptos" => "watch/serve run directly in the pool; others exec",
-        "tauri" => "dev runs directly in the pool; others exec",
-        "outdated" | "semver-checks" | "vet" | "geiger" => {
-            "exec: never cached, the result depends on the registry"
-        }
-        "hakari" => "generate/manage-deps mutate (exclusive lock), verify cached",
-        "insta" => {
-            "accept/reject mutate (exclusive lock); review runs directly in the pool, test as exec"
-        }
-        "machete" | "shear" => "verify cached; --fix mutate (exclusive lock)",
-        "udeps" | "public-api" => "verify cached (toolchain is part of the key)",
-        "hack" => "check/clippy verify cached; other commands exec",
-        "sqlx" => "prepare mutate (exclusive lock); others exec",
-        "sweep" | "clean-all" => "mutate (exclusive lock); bypasses heli's build store",
-        "dx" | "trunk" => "serve runs directly in the pool, never attached to; others exec",
-        "audit" => "verify cached, keyed by the advisory database heli fetches first; fix mutate",
-        "deny" => "check verify cached, keyed by the advisory database heli fetches first",
-        _ => return None,
-    })
+    Tool::named(name).map(|profile| profile.summary)
 }
 
 /// The subcommand of `cargo <args>`, first or after a `+toolchain` (as
@@ -346,6 +473,46 @@ mod tests {
         let zig = args(&["zigbuild", "--release"]);
         assert!(runs_directly(&zig, true));
         assert!(!runs_directly(&zig, false));
+    }
+
+    /// Each name is in one profile only, and no profile shadows cargo's own
+    /// subcommands, so lookup order never matters.
+    #[test]
+    fn every_tool_name_has_one_profile() {
+        let mut names: Vec<&str> = TOOLS
+            .iter()
+            .flat_map(|tool| tool.names.iter().copied())
+            .collect();
+        let all = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all, "a name in two profiles");
+        for name in names {
+            assert!(!is_cargo_builtin(name), "{name} shadows cargo's own");
+            assert!(!tool_profile(name).unwrap_or_default().is_empty(), "{name}");
+        }
+    }
+
+    /// Options with values do not count as words; arguments after `--` do
+    /// not count at all.
+    #[test]
+    fn values_and_what_follows_the_separator_are_not_words() {
+        assert_eq!(
+            Class::of_cargo(&args(&["audit", "--db", "x"])),
+            Class::Verify
+        );
+        assert_eq!(
+            Class::of_cargo(&args(&["audit", "bin", "app"])),
+            Class::Exec
+        );
+        assert_eq!(
+            Class::of_cargo(&args(&["machete", "--", "--fix"])),
+            Class::Verify
+        );
+        assert_eq!(
+            Class::of_cargo(&args(&["hakari", "-q", "generate"])),
+            Class::Mutate
+        );
     }
 
     #[test]
