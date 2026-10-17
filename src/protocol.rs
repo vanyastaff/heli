@@ -83,9 +83,11 @@ pub const RETIRE: u8 = b'R';
 
 const MAGIC: [u8; 4] = *b"HELI";
 
-/// The largest message frame accepted: a request carries the client's whole
-/// environment, which stays far below this.
-const MAX_MESSAGE: u32 = 16 << 20;
+/// The largest frame of any kind: a message (a request carries the client's
+/// whole environment, which stays far below this) or a piece of output,
+/// which [`write_output`] splits to fit. A reader refuses a frame that
+/// claims more before it allocates anything for it.
+const MAX_FRAME: u32 = 16 << 20;
 
 const MESSAGE: u8 = 0;
 const STDOUT: u8 = 1;
@@ -354,13 +356,19 @@ pub fn write_message(stream: &mut impl Write, message: &impl Serialize) -> io::R
     write_frame(stream, MESSAGE, &payload)
 }
 
-/// Sends one output frame.
+/// Sends `bytes` of output, as frames of [`MAX_FRAME`] bytes at most.
 pub fn write_output(stream: &mut impl Write, channel: Channel, bytes: &[u8]) -> io::Result<()> {
     let kind = match channel {
         Channel::Stdout => STDOUT,
         Channel::Stderr => STDERR,
     };
-    write_frame(stream, kind, bytes)
+    if bytes.is_empty() {
+        return write_frame(stream, kind, bytes);
+    }
+    for piece in bytes.chunks(MAX_FRAME as usize) {
+        write_frame(stream, kind, piece)?;
+    }
+    Ok(())
 }
 
 fn write_frame(stream: &mut impl Write, kind: u8, payload: &[u8]) -> io::Result<()> {
@@ -382,8 +390,8 @@ pub fn read_frame<T: DeserializeOwned>(stream: &mut impl Read) -> io::Result<Fra
     length.copy_from_slice(&header[1..]);
     let length = u32::from_le_bytes(length);
     let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
-    if header[0] == MESSAGE && length > MAX_MESSAGE {
-        return Err(invalid(format!("message of {length} bytes")));
+    if length > MAX_FRAME {
+        return Err(invalid(format!("frame of {length} bytes")));
     }
     let mut payload = vec![0u8; length as usize];
     stream.read_exact(&mut payload)?;
@@ -468,4 +476,41 @@ fn native_units(text: &OsString) -> Vec<Unit> {
 fn from_native_units(units: Vec<Unit>) -> OsString {
     use std::os::windows::ffi::OsStringExt;
     OsString::from_wide(&units)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame header claiming 4 GiB of output is refused before anything
+    /// is allocated for it.
+    #[test]
+    fn an_oversized_output_frame_is_refused() {
+        let mut frame = vec![STDOUT];
+        frame.extend_from_slice(&u32::MAX.to_le_bytes());
+        let Err(error) = read_frame::<Reply>(&mut frame.as_slice()) else {
+            panic!("an oversized frame is an error");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Output larger than a frame arrives whole, in frames that fit.
+    #[test]
+    fn large_output_is_split_into_frames_that_fit() {
+        let output = vec![7u8; MAX_FRAME as usize + 10];
+        let mut wire = Vec::new();
+        write_output(&mut wire, Channel::Stderr, &output).expect("write");
+        let mut wire = wire.as_slice();
+        let mut received = Vec::new();
+        while !wire.is_empty() {
+            match read_frame::<Reply>(&mut wire).expect("a frame") {
+                Frame::Output(Channel::Stderr, bytes) => {
+                    assert!(bytes.len() <= MAX_FRAME as usize);
+                    received.extend(bytes);
+                }
+                _ => panic!("expected stderr output"),
+            }
+        }
+        assert_eq!(received, output);
+    }
 }

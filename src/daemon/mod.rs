@@ -57,7 +57,7 @@ use std::fs::{File, TryLockError};
 use std::io::Write;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -190,21 +190,58 @@ pub fn main() -> ! {
         protocol::VERSION,
         locations.endpoint.display()
     ));
+    let open = Arc::new(AtomicUsize::new(0));
     loop {
         let accepted = listener.accept();
         if daemon.exiting.load(Ordering::SeqCst) {
             daemon.exit(listener);
         }
         match accepted {
-            Ok(stream) => {
-                let daemon = Arc::clone(&daemon);
-                std::thread::spawn(move || daemon.serve(stream));
-            }
+            Ok(stream) => match Connection::claim(&open) {
+                Some(connection) => {
+                    let daemon = Arc::clone(&daemon);
+                    std::thread::spawn(move || {
+                        let _connection = connection;
+                        daemon.serve(stream);
+                    });
+                }
+                // Closed unanswered: its client runs the command directly,
+                // as with no daemon at all.
+                None => daemon.log.write(&format!(
+                    "refused a connection: {MAX_CONNECTIONS} are open already"
+                )),
+            },
             Err(error) => {
                 daemon.log.write(&format!("accept failed: {error}"));
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+}
+
+/// The most connections the daemon serves at once, each on a thread of its
+/// own: every client in flight holds one (a run's, attached ones, status,
+/// log), so this bounds the daemon's threads without limiting a host's
+/// agents in practice.
+const MAX_CONNECTIONS: usize = 512;
+
+/// A connection's place among [`MAX_CONNECTIONS`]; dropping it frees the
+/// place, however the connection's thread ends.
+struct Connection(Arc<AtomicUsize>);
+
+impl Connection {
+    /// A place for one more connection, unless all are taken.
+    fn claim(open: &Arc<AtomicUsize>) -> Option<Self> {
+        // Taken first, given back if it was one too many: the count never
+        // stays above the bound.
+        let connection = Self(Arc::clone(open));
+        (open.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS).then_some(connection)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1024,5 +1061,25 @@ impl Log {
             let mut file = file.lock().unwrap_or_else(PoisonError::into_inner);
             let _ = writeln!(file, "{} [{}] {line}", clock::now(), std::process::id());
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{Connection, MAX_CONNECTIONS};
+
+    #[test]
+    fn connections_are_bounded_and_freed_when_dropped() {
+        let open = Arc::new(AtomicUsize::new(0));
+        let held: Vec<Connection> = (0..MAX_CONNECTIONS)
+            .map(|_| Connection::claim(&open).expect("a place"))
+            .collect();
+        assert!(Connection::claim(&open).is_none(), "all places are taken");
+        drop(held);
+        assert_eq!(open.load(Ordering::SeqCst), 0);
+        assert!(Connection::claim(&open).is_some());
     }
 }
