@@ -25,7 +25,10 @@
 //! plus a slack ([`written_by`]): 50 ms for a time with a fraction of a
 //! second, which comes from a file system that keeps fractions (10 ms or
 //! finer), and 2.05 s for a whole second, which may come from one that
-//! keeps whole seconds or two.
+//! keeps whole seconds or two. Each time is read from the file itself,
+//! never from a directory listing: on Windows a listing gives what the
+//! file's directory entry holds, which keeps the time of the file's
+//! creation until its writer closes it, and may lag on a loaded host.
 //!
 //! **Writing** ([`write()`]). Never while a build holds one of cargo's locks
 //! in the build directory. It waits first until every file there is a
@@ -246,7 +249,9 @@ fn newest(dir: &Path, top: bool, last: &mut LastBuild) -> io::Result<()> {
                 newest(&entry.path(), false, last)?;
             }
         } else {
-            let modified = nanos(entry.metadata()?.modified()?).unwrap_or(0);
+            // From the file, not its directory entry (see the module docs).
+            let modified = std::fs::symlink_metadata(entry.path())?.modified()?;
+            let modified = nanos(modified).unwrap_or(0);
             last.newest = last.newest.max(modified);
             last.until = last.until.max(written_by(modified));
         }
@@ -487,4 +492,40 @@ fn staged_files(probe: &Probe, worktree: &Path, scratch: &Path) -> Result<Vec<St
 fn nanos(time: SystemTime) -> Option<u64> {
     let since = time.duration_since(UNIX_EPOCH).ok()?;
     u64::try_from(since.as_nanos()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::time::{Duration, SystemTime};
+
+    use super::{last_build, nanos};
+
+    /// A file still open for writing is dated by its last write, not by
+    /// what its directory entry says: on Windows that entry keeps the time
+    /// of its creation until the writer closes it, as a writer that outlives
+    /// cargo (or a slow close on a loaded host) may leave it after a build.
+    #[test]
+    fn a_file_open_for_writing_is_dated_by_its_last_write() {
+        let build = tempfile::tempdir().expect("a build directory");
+        let path = build.path().join("artifact");
+        let mut writer = std::fs::File::create(&path).expect("create an artifact");
+        std::thread::sleep(Duration::from_millis(300));
+        let before = nanos(SystemTime::now()).expect("the clock");
+        writer.write_all(b"built").expect("write the artifact");
+        writer.flush().expect("flush the artifact");
+
+        let last = last_build(build.path()).expect("the last build");
+        let written = std::fs::symlink_metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .map(|modified| nanos(modified).expect("a time"))
+            .expect("the artifact's time");
+        drop(writer);
+        assert_eq!(last.newest, written);
+        assert!(
+            last.newest + super::FINE_SLACK >= before,
+            "dated {} ms before its write",
+            (before - last.newest) / 1_000_000
+        );
+    }
 }
