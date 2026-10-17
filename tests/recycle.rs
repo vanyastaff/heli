@@ -1738,8 +1738,8 @@ fn a_build_after_the_record_makes_recycling_conservative() {
         "leaf changed in a",
     );
     repo.bare_cargo(&a, &["build", "--all-targets"]);
-    repo.remove_worktree("a");
-    let b = repo.add_worktree("b");
+    // b's build would start a daemon whose first look races it.
+    let b = repo.replace_worktree("a", "b");
 
     let (built, _) = repo.build_like_a_clean_build(&b);
     assert_eq!(names(&built, false), CONSERVATIVE_UNITS, "{built:?}");
@@ -1804,8 +1804,8 @@ fn a_build_dated_just_before_the_record_makes_recycling_conservative() {
     repo.bare_cargo(&a, &["build", "--all-targets"]);
     let before = std::time::UNIX_EPOCH + Duration::from_nanos(taken_at - 1_000_000);
     redate_newer(&a_dir, u128::from(taken_at), before);
-    repo.remove_worktree("a");
-    let b = repo.add_worktree("b");
+    // b's build would start a daemon whose first look races it.
+    let b = repo.replace_worktree("a", "b");
 
     let (built, _) = repo.build_like_a_clean_build(&b);
     assert_eq!(names(&built, false), CONSERVATIVE_UNITS, "{built:?}");
