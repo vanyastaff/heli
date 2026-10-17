@@ -347,6 +347,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Exec),
         cleaner: None,
+        writes_home: false,
     },
     Tool {
         // Its scratch copies of the workspace are eviction tier 0
@@ -357,6 +358,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Exec),
         cleaner: None,
+        writes_home: false,
     },
 ];
 
