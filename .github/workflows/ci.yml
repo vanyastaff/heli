@@ -12,6 +12,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  msrv:
+    name: MSRV 1.99.0 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: Check all targets on the minimum supported Rust
+        run: cargo +1.99.0 check --all-targets --locked
+
   test:
     name: test (${{ matrix.os }})
     strategy:

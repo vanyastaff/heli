@@ -67,3 +67,11 @@ guidance and Cargo's original diagnostic if that probe fails; they never
 silently skip. Argument-only tests using a stand-in Cargo need no nextest.
 CI runs the complete suite and `cargo doc --no-deps --locked` with
 `RUSTDOCFLAGS="-D warnings"` on Windows, Linux and macOS.
+It also checks all targets with the minimum supported Rust, pinned to 1.99.0,
+on each OS; `Cargo.toml` declares `rust-version = "1.99"`.
+
+Windows native path acceptance requires installed Visual Studio C++ tools.
+The test locates `vswhere.exe` through environment roots, Windows Known
+Folders and PATH, then tries `cl.exe` on PATH. Omitting `ProgramFiles` in a
+shell does not hide a normal Visual Studio installation. Missing tools
+remain a test failure with discovery details, never a silent skip.

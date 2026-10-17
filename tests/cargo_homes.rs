@@ -758,6 +758,77 @@ fn main() {
 }
 
 #[cfg(windows)]
+#[test]
+fn native_msvc_acceptance_works_without_program_files_environment() {
+    // Strip both environment-root discovery and PATH discovery in a child,
+    // without changing this test process or other concurrently running tests.
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(std::env::split_paths(&path).filter(|directory| {
+        !directory.join("vswhere.exe").is_file() && !directory.join("cl.exe").is_file()
+    }))
+    .expect("PATH without MSVC discovery tools");
+    let output = bounded_output(
+        Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "isolated_native_home_can_compile_real_msvc_source_at_aws_lc_depth",
+                "--nocapture",
+            ])
+            .env_remove("ProgramFiles")
+            .env_remove("ProgramFiles(x86)")
+            .env_remove("ProgramW6432")
+            .env("PATH", path)
+            .stdin(Stdio::null()),
+    );
+    assert_success(
+        &output,
+        "real MSVC compilation without ProgramFiles or tool PATH entries",
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed; 0 ignored"),
+        "the real native acceptance must run, not skip: {output:?}"
+    );
+}
+
+#[cfg(windows)]
+fn program_files_roots() -> Vec<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath,
+    };
+
+    let mut roots = Vec::new();
+    for folder in [FOLDERID_ProgramFilesX86, FOLDERID_ProgramFiles] {
+        let mut path = std::ptr::null_mut();
+        // SAFETY: valid known-folder GUID and output pointer; a null token
+        // queries the current user. The allocation is freed below on both
+        // success and failure, as required by SHGetKnownFolderPath.
+        let result = unsafe { SHGetKnownFolderPath(&folder, 0, std::ptr::null_mut(), &mut path) };
+        if result >= 0 && !path.is_null() {
+            let mut len = 0;
+            // SAFETY: a successful query returns a NUL-terminated UTF-16
+            // string. Read it only until that terminator, before freeing it.
+            unsafe {
+                while *path.add(len) != 0 {
+                    len += 1;
+                }
+                roots.push(PathBuf::from(OsString::from_wide(
+                    std::slice::from_raw_parts(path, len),
+                )));
+            }
+        } else {
+            eprintln!("MSVC discovery: Windows known-folder query failed: {result:#x}");
+        }
+        // SAFETY: this is the allocation returned by the query, or null
+        // (which CoTaskMemFree permits). It is no longer read afterwards.
+        unsafe { CoTaskMemFree(path.cast()) };
+    }
+    roots
+}
+
+#[cfg(windows)]
 fn installed_msvc() -> PathBuf {
     let mut candidates = Vec::new();
     for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
@@ -766,8 +837,13 @@ fn installed_msvc() -> PathBuf {
                 .push(PathBuf::from(root).join("Microsoft Visual Studio/Installer/vswhere.exe"));
         }
     }
+    candidates.extend(
+        program_files_roots()
+            .into_iter()
+            .map(|root| root.join("Microsoft Visual Studio/Installer/vswhere.exe")),
+    );
     candidates.push("vswhere.exe".into());
-    for candidate in candidates {
+    for candidate in &candidates {
         let output = match Command::new(candidate)
             .args([
                 "-latest",
@@ -807,7 +883,10 @@ fn installed_msvc() -> PathBuf {
         return path;
     }
     panic!(
-        "Windows native Cargo-home acceptance requires installed MSVC C++ tools (vswhere or cl.exe on PATH); this required platform check cannot be silently skipped"
+        "Windows native Cargo-home acceptance requires installed MSVC C++ tools. \
+         Searched vswhere at {candidates:?} (environment roots, Windows known folders, PATH), \
+         then cl.exe on PATH. Install the Visual Studio C++ tools or expose an existing \
+         vswhere.exe/cl.exe on PATH; this required platform check cannot be silently skipped"
     );
 }
 
