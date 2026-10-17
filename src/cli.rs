@@ -41,6 +41,9 @@ pub enum Action {
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
+    /// Explain how the installed cargo tools and the cargo configuration
+    /// interact with heli; as JSON with `json`.
+    Doctor { json: bool },
     /// Import or collect managed immutable dependency snapshots.
     Dependencies(DependencyCommand),
     /// Give the worktree here a removed worktree's build directory, as
@@ -224,6 +227,14 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Explain how the installed cargo tools and the cargo configuration
+    /// (`jobs`, `target-dir`, `build-dir`, wrappers, linkers) interact with
+    /// heli, and what to do about it.
+    Doctor {
+        /// Print the versioned JSON document instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Give the worktree here the build directory of a removed worktree of
     /// its repository, if it has none (run by the `post-checkout` hook
     /// `cargo heli setup` installs).
@@ -332,6 +343,7 @@ pub fn parse(
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
         Command::Gc { dry_run, json } => Action::Gc { dry_run, json },
+        Command::Doctor { json } => Action::Doctor { json },
         Command::Setup {
             print,
             autostart,

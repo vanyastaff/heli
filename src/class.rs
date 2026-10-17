@@ -91,11 +91,27 @@ fn third_party(tool: &str, rest: &[OsString]) -> Class {
         // Delete build output or manifests' dependencies by themselves.
         "sweep" | "clean-all" => Class::Mutate,
         // cargo-hack runs check or clippy over feature combinations.
-        "hack" if before_separator().any(|arg| arg == "check" || arg == "clippy") => {
-            Class::Verify
-        }
+        "hack" if before_separator().any(|arg| arg == "check" || arg == "clippy") => Class::Verify,
         _ => Class::Exec,
     }
+}
+
+/// What heli's built-in profile does with the cargo tool `cargo-<name>`, for
+/// `cargo heli doctor`; `None` for a tool heli has no profile for (it runs
+/// as exec).
+pub fn tool_profile(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "add" | "remove" | "rm" | "update" => "mutate: exclusive worktree lock",
+        "hakari" => "generate/manage-deps mutate (exclusive lock), verify cached",
+        "insta" => "accept/reject mutate (exclusive lock); review and test run as exec",
+        "machete" | "shear" => "verify cached; --fix mutate (exclusive lock)",
+        "udeps" | "public-api" => "verify cached (toolchain is part of the key)",
+        "hack" => "check/clippy verify cached; other commands exec",
+        "sqlx" => "prepare mutate (exclusive lock); others exec",
+        "sweep" | "clean-all" => "mutate (exclusive lock); bypasses heli's build store",
+        "audit" | "deny" => "exec: never cached, the advisory database is not in the key",
+        _ => return None,
+    })
 }
 
 /// The subcommand of `cargo <args>`, first or after a `+toolchain` (as

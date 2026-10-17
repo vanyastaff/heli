@@ -38,6 +38,7 @@ mod daemon;
 mod dependencies;
 mod dependency_home;
 mod direct;
+mod doctor;
 mod environment;
 mod gc;
 mod ipc;
@@ -97,6 +98,7 @@ fn main() {
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),
         cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
+        cli::Action::Doctor { json } => doctor::main(json),
         cli::Action::Dependencies(command) => {
             let result = match command {
                 cli::DependencyCommand::Import {
