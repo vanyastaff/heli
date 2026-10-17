@@ -130,6 +130,11 @@ fn concurrent_builds_share_the_pool() {
     let logs: Vec<ConcurrencyLog> = (0..3)
         .map(|build| fixture.concurrency_log_named(&format!("build-{build}")))
         .collect();
+    // Compiled beforehand: what is measured is the scheduling of the build
+    // scripts, not how fast this machine compiles them.
+    for (build, log) in logs.iter().enumerate() {
+        log.warm_slow_crates(&fixture, &format!("target-{build}"));
+    }
     let builds: Vec<Child> = logs
         .iter()
         .enumerate()

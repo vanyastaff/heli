@@ -1017,6 +1017,27 @@ pub struct Interval {
 impl ConcurrencyLog {
     /// Makes the fixture build scripts run by `command` log here, each
     /// sleeping `sleep_ms` between its two lines.
+    /// Builds the three `slow-*` crates once in `target` (a directory of the
+    /// fixture), with plain cargo, no pool and no sleep, so that a timed
+    /// build there compiles nothing and only reruns their build scripts,
+    /// which a new log makes rerun: what it then measures is how the pool
+    /// schedules the scripts, not how fast this machine compiles them.
+    pub fn warm_slow_crates(&self, fixture: &Fixture, target: &str) {
+        let output = fixture
+            .cargo(["build", "-p", "slow-a", "-p", "slow-b", "-p", "slow-c"])
+            .env("CARGO_TARGET_DIR", fixture.path(target))
+            .env(
+                "HELI_FIXTURE_LOG",
+                fixture.path(&format!("{target}-warm.log")),
+            )
+            .env("HELI_FIXTURE_SLEEP_MS", "0")
+            .env_remove("CARGO_MAKEFLAGS")
+            .stdin(Stdio::null())
+            .output()
+            .expect("run cargo");
+        assert_success(&output, "warming the slow crates");
+    }
+
     pub fn attach(&self, command: &mut Command, sleep_ms: u64) {
         command
             .env("HELI_FIXTURE_LOG", &self.path)

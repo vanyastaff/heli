@@ -113,6 +113,10 @@ fn a_bare_cargo_draws_from_the_pool_beside_a_heli_run() {
         fixture.concurrency_log_named("heli"),
         fixture.concurrency_log_named("bare"),
     ];
+    // Compiled beforehand: a slow machine compiling the bare cargo's build
+    // scripts on its one token must not pass for the pool making it wait.
+    logs[0].warm_slow_crates(&fixture, "target-heli");
+    logs[1].warm_slow_crates(&fixture, "target-bare");
     let heli = slow_build(
         &fixture,
         fixture.heli(Vec::<String>::new()),
