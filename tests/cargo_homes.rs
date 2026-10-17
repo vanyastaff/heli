@@ -368,8 +368,11 @@ fn native_home_mutating_commands_are_refused_before_execution() {
     let original = fixture.path("original/.cargo");
     std::fs::create_dir_all(&original).unwrap();
     for args in [
-        vec!["install", "--list"],
+        vec!["install", "not-a-crate"],
         vec!["uninstall", "not-installed"],
+        vec!["binstall", "--dry-run", "not-a-crate"],
+        vec!["install-update", "-a"],
+        vec!["quickinstall", "not-a-crate"],
         vec!["login", "not-a-real-token"],
         vec!["logout"],
         vec!["publish", "--dry-run", "--offline"],
@@ -394,6 +397,25 @@ fn native_home_mutating_commands_are_refused_before_execution() {
         assert!(!original.join("credentials.toml").exists());
         assert!(!original.join(".crates.toml").exists());
     }
+}
+
+/// `install --list` only reads the record of installed tools, so it is not
+/// refused; it lists the private home's, which is empty.
+#[test]
+fn install_list_is_not_refused_under_an_isolated_home() {
+    let fixture = Fixture::new("basic");
+    let original = fixture.path("original/.cargo");
+    std::fs::create_dir_all(&original).unwrap();
+    let output = fixture
+        .heli(["--cargo-home", "isolated"])
+        .args(["install", "--list"])
+        .env("CARGO_HOME", &original)
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!error.contains("not supported"), "{error}");
+    assert_success(&output, "install --list under an isolated home");
+    assert!(!original.join(".crates.toml").exists());
 }
 
 #[test]
@@ -446,14 +468,13 @@ fn cargo_global_options_do_not_bypass_isolated_home_command_refusal() {
     let fixture = Fixture::new("basic");
     let original = fixture.path("original/.cargo");
     std::fs::create_dir_all(&original).unwrap();
-    // --list is read only: even the pre-fix implementation cannot install
-    // packages, change credentials, or reach a registry in these cases.
+    // The cases are refused before Cargo runs, so nothing can be installed.
     for options in [vec!["--color", "never"], vec!["--color=never"]] {
         let mut command = fixture.heli(["--cargo-home", "isolated", "exec", "--"]);
         command
             .arg(support::cargo_binary())
             .args(options)
-            .args(["install", "--list"])
+            .args(["install", "not-a-crate"])
             .env("CARGO_HOME", &original);
         let output = bounded_output(&mut command);
         assert_eq!(
