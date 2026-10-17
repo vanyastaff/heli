@@ -707,7 +707,7 @@ writing, for the user, the repository, or heli itself.
 | `hack` | verify when `check` or `clippy` is among its arguments; else exec |
 | `insta` | `accept`, `reject` mutate; `review` runs directly in the pool |
 | `sqlx` | `prepare` mutate; else exec |
-| `sweep`, `clean-all` | mutate (they delete build output themselves, bypassing the store) |
+| `sweep`, `clean-all` | mutate, holding heli's eviction lock for the run (below) |
 | `dx`, `trunk` | `serve` runs directly in the pool; else exec |
 | `leptos` | `watch`, `serve` run directly in the pool; else exec |
 | `tauri` | `dev` runs directly in the pool; else exec |
@@ -740,6 +740,8 @@ unkeyed, so not cached. Runs that cannot fetch (`--no-fetch`,
 only) key the database as it is. A configuration that moves the database or
 forces fetching (an `audit.toml` `[database]` table, `db-path`, `db-urls`)
 makes the run unkeyed.
+
+**Cleaners.** cargo-sweep and cargo-clean-all delete build output themselves. Run through heli, each is a mutate run that also holds heli's eviction lock (`evict.lock` in the state directory) from before it starts until its client ends. heli's own eviction and the tool never delete at the same time: the daemon's passes skip while it is held, `cargo heli gc` waits, and the tool waits for a pass in progress. heli says first what the tool cannot see. cargo-sweep sees only `target/`, since the intermediates are in the build store, which `cargo heli gc` evicts. cargo-clean-all deletes whole `target/` directories, other worktrees' included, whose locks heli cannot hold. A client killed during the run releases the lock early.
 
 **Profiles from configuration.** A user writes profiles in heli's
 configuration file, and any repository that uses heli commits its own in

@@ -158,6 +158,12 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
+    // Held until this process ends, with the run: heli's own eviction and a
+    // tool that deletes build output never delete at the same time.
+    let _cleaning = (!invocation.exec)
+        .then(|| class::cleaner_note(&invocation.args))
+        .flatten()
+        .and_then(|note| clean_alongside(note, locations.as_ref().ok()));
     // A tool a profile names is no unknown tool.
     let in_pool = !invocation.exec
         && source == crate::profiles::Source::BuiltIn
@@ -225,6 +231,40 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         );
     }
     direct::run(command)
+}
+
+/// Says `note` before a tool that deletes build output runs, and takes
+/// heli's eviction lock (`crate::store::evict::lock_file`) for the run:
+/// the daemon's eviction passes skip while it is held, `cargo heli gc`
+/// waits, and the tool waits for a pass in progress. Without the lock (no
+/// state directory) the tool still runs, with a warning.
+fn clean_alongside(note: &str, locations: Option<&Locations>) -> Option<std::fs::File> {
+    eprintln!("cargo-heli: note: {note}");
+    let locations = locations?;
+    let opened = locations.create_state_dir().and_then(|()| {
+        std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(crate::store::evict::lock_file(&locations.state_dir))
+    });
+    let locked = opened.and_then(|file| match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("cargo-heli: waiting for heli's eviction pass to end");
+            file.lock().map(|()| file)
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    });
+    match locked {
+        Ok(file) => Some(file),
+        Err(error) => {
+            eprintln!(
+                "cargo-heli: warning: cannot take heli's eviction lock ({error}); running alongside it"
+            );
+            None
+        }
+    }
 }
 
 /// How the client runs a command itself, once the daemon does not run it

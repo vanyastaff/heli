@@ -290,6 +290,9 @@ fn a_build_in_progress_during_withholding_completes() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
     let log = fixture.concurrency_log();
+    // Compiled beforehand: on a slow machine the three 3 s build scripts
+    // could otherwise start too far apart ever to run at once.
+    log.warm_slow_crates(&fixture, "target-slow");
     let build = start_slow_build(&fixture, false, &log, 3000);
     wait_until("three build scripts at once", 60, || log.running() == 3);
     assert_eq!(fixture.status()["pool"], pool(2, 0, 0, 2));

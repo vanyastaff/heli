@@ -66,7 +66,10 @@ configuration:
 - **Tools that rewrite the worktree** take its lock exclusively, so they
   never run under a build: `cargo add`/`remove`/`update`, `upgrade`,
   `set-version`, `release`, `sort`, `hakari generate`, `machete --fix`,
-  `shear --fix`, `insta accept`, `sqlx prepare`, `sweep`, `clean-all`.
+  `shear --fix`, `insta accept`, `sqlx prepare`. `sweep` and `clean-all`
+  also never run alongside heli's own eviction, and heli says what they
+  cannot see: the intermediates are in its build store, which
+  `cargo heli gc` evicts.
 - **Read-only checks** are cached and shared like `check` while nothing
   changed: `hack check`, `machete`, `shear`, `sort --check`,
   `hakari verify`, `udeps`, `public-api`, `miri test`. `audit` and
