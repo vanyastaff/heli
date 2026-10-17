@@ -682,8 +682,7 @@ cargo tools (spec #38). They apply to everyone who installs heli, with no
 configuration; `src/class.rs` is the one place that reads them. A tool that
 is missing gets a profile in heli itself, so every user gets it, not only
 one project. Users and repositories add profiles of their own (below). Not
-yet implemented: cache keys with extra inputs, `caches` and the usage
-memory.
+yet implemented: `caches` and the usage memory.
 
 | Tool | Profile |
 |---|---|
@@ -701,7 +700,21 @@ memory.
 | `tauri` | `dev` runs directly in the pool; else exec |
 | `watch` | runs directly in the pool |
 | `outdated`, `semver-checks`, `vet`, `geiger` | exec, never cached: the result depends on the registry |
-| `audit`, `deny` | exec, never cached: the advisory database is not in the key |
+| `audit` | verify with `--no-fetch` (`-n`), keyed by the advisory database; else exec |
+| `deny` | `check` verify with `--disable-fetch` or `--offline`, or of `bans`, `licenses`, `sources` only; else exec |
+
+**Advisory checks.** `cargo audit` and `cargo deny` fetch the newest
+advisory database before they check. A pass cached by the tree alone would
+hide an advisory published since, so only runs that cannot fetch are verify
+runs. Their key adds the commit of each database they read: cargo-audit's
+`--db`, else `advisory-db` in the Cargo home; every `advisory-dbs/*` there
+for cargo-deny. It also adds the `audit.toml` and `deny.toml` contents and the
+tool's version. A configuration that moves the database (`[database]`,
+`db-path`, `db-urls`) makes the run unkeyed, so it is never cached. A
+`cargo deny check` of bans, licenses or sources needs no database and is
+always reproducible. To share advisory checks between agents, fetch once
+(`cargo audit fetch`, `cargo deny fetch`) and run them with `--no-fetch` or
+`--disable-fetch`.
 
 **Profiles from configuration.** A user writes profiles in heli's
 configuration file, and any repository that uses heli commits its own in

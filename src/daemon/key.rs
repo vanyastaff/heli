@@ -17,6 +17,8 @@
 //!   shared home never certifies another machine;
 //! - the toolchain ([`toolchain`]): `rustc -vV`, and the versions of cargo
 //!   and of the tool the run uses, a missing one keyed as absent;
+//! - for `cargo audit` and `cargo deny`, the advisory databases they read,
+//!   by commit ([`advisory_databases`]);
 //! - the Cargo configuration ([`cargo_config`]): every `config.toml` and
 //!   `config` cargo reads, by content;
 //! - the environment ([`environment()`]): every variable but the neutral ones.
@@ -103,6 +105,7 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
     }
     fields.push(b"machine", &machine());
     toolchain(request, &mut fields);
+    advisory_databases(request, &cwd, &mut fields)?;
     cargo_config(request, &mut fields)?;
     environment(request, &worktree, &mut fields);
     Ok(Some(Key {
@@ -380,6 +383,8 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
         Some("nextest") => {
             probes.push(("cargo nextest --version", cargo, &["nextest", "--version"]));
         }
+        Some("audit") => probes.push(("cargo audit --version", cargo, &["audit", "--version"])),
+        Some("deny") => probes.push(("cargo deny --version", cargo, &["deny", "--version"])),
         _ => {}
     }
     for (name, program, args) in probes {
@@ -396,6 +401,100 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
             _ => fields.push(format!("absent {name}").as_bytes(), b""),
         }
     }
+}
+
+/// Keys the advisory databases a `cargo audit` or `cargo deny` run reads
+/// (`crate::class`: only runs that cannot fetch are verify runs), by the
+/// commit each is at: the `--db` of cargo-audit, else `advisory-db` in the
+/// Cargo home; `advisory-dbs/*` there for cargo-deny. A database that is not
+/// there is keyed as absent. Settings that move a database where heli cannot
+/// see it (an `audit.toml` `[database]` table, a `deny.toml` `db-path` or
+/// `db-urls`) make the run unkeyed, so never cached.
+fn advisory_databases(request: &RunRequest, cwd: &Path, fields: &mut Fields) -> Result<(), String> {
+    let args: Vec<std::ffi::OsString> = request
+        .argv
+        .iter()
+        .skip(1)
+        .map(|arg| arg.0.clone())
+        .collect();
+    let Some((tool, rest)) = crate::class::subcommand(&args) else {
+        return Ok(());
+    };
+    let (configs, home_dir, at): (&[&str], &str, Option<PathBuf>) = match tool.to_str() {
+        Some("audit") => {
+            let mut db = None;
+            let mut rest = rest.iter();
+            while let Some(arg) = rest.next() {
+                if arg == "--" {
+                    break;
+                }
+                if arg == "--db" || arg == "-d" {
+                    db = rest.next().map(|path| cwd.join(path));
+                } else if let Some(path) = arg.to_str().and_then(|arg| arg.strip_prefix("--db=")) {
+                    db = Some(cwd.join(path));
+                }
+            }
+            (&[".cargo/audit.toml", "audit.toml"], "advisory-db", db)
+        }
+        Some("deny") => (
+            &["deny.toml", ".deny.toml", ".cargo/deny.toml"],
+            "advisory-dbs",
+            None,
+        ),
+        _ => return Ok(()),
+    };
+    let home = cargo_home(request, cwd);
+    let worktree = worktree::of(cwd);
+    let mut places: Vec<PathBuf> = cwd
+        .ancestors()
+        .take_while(|dir| dir.starts_with(&worktree))
+        .flat_map(|dir| configs.iter().map(move |file| dir.join(file)))
+        .collect();
+    if let Some(home) = &home {
+        places.push(home.join("audit.toml"));
+    }
+    for place in places {
+        if let Ok(text) = std::fs::read_to_string(&place) {
+            if text.contains("[database]") || text.contains("db-path") || text.contains("db-urls") {
+                return Err(format!(
+                    "{} moves the advisory database where heli cannot key it",
+                    place.display()
+                ));
+            }
+            fields.push(b"advisory-config", text.as_bytes());
+        }
+    }
+    let databases = match (at, &home) {
+        (Some(db), _) => vec![db],
+        (None, Some(home)) if home_dir == "advisory-db" => vec![home.join(home_dir)],
+        (None, Some(home)) => {
+            let mut dirs: Vec<PathBuf> = std::fs::read_dir(home.join(home_dir))
+                .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+                .unwrap_or_default();
+            dirs.retain(|dir| dir.is_dir());
+            dirs.sort();
+            dirs
+        }
+        (None, None) => Vec::new(),
+    };
+    if databases.is_empty() {
+        fields.push(b"advisory-db", b"absent");
+    }
+    for db in databases {
+        let name = db
+            .file_name()
+            .unwrap_or_default()
+            .as_encoded_bytes()
+            .to_vec();
+        if !db.exists() {
+            fields.push(b"advisory-db absent", &name);
+            continue;
+        }
+        let head = git_at(request, &db, &["rev-parse", "HEAD"], None)?;
+        fields.push(b"advisory-db", &name);
+        fields.push(b"advisory-db head", &trim(head));
+    }
+    Ok(())
 }
 
 /// Keys the Cargo configuration cargo reads for the run, by content, in the
@@ -852,5 +951,107 @@ impl Fields {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod advisory_tests {
+    use std::ffi::OsString;
+    use std::process::Command;
+
+    use super::{Fields, advisory_databases};
+    use crate::protocol::{RunRequest, Text};
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args([
+                "-c",
+                "user.name=heli",
+                "-c",
+                "user.email=heli@example.invalid",
+            ])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(status.status.success(), "git {args:?}: {status:?}");
+    }
+
+    fn request(cwd: &std::path::Path, home: &std::path::Path, argv: &[&str]) -> RunRequest {
+        let mut env: Vec<(Text, Text)> = std::env::vars_os()
+            .filter(|(name, _)| name != "CARGO_HOME")
+            .map(|(name, value)| (Text(name), Text(value)))
+            .collect();
+        env.push((Text("CARGO_HOME".into()), Text(home.as_os_str().to_owned())));
+        RunRequest {
+            cwd: Text(cwd.as_os_str().to_owned()),
+            argv: argv.iter().map(|arg| Text(OsString::from(arg))).collect(),
+            env,
+            dependency_epoch: None,
+            class: None,
+            cache: Default::default(),
+            reads_spawned: false,
+        }
+    }
+
+    fn digest(request: &RunRequest) -> Result<String, String> {
+        let mut fields = Fields::default();
+        advisory_databases(request, &request.cwd(), &mut fields)?;
+        Ok(fields.finish())
+    }
+
+    #[test]
+    fn a_new_advisory_commit_changes_the_key() {
+        let root = tempfile::tempdir().expect("dir");
+        let home = root.path().join("home");
+        let db = home.join("advisory-db");
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&db).expect("db");
+        std::fs::create_dir_all(&work).expect("work");
+        git(&db, &["init", "--quiet"]);
+        git(&db, &["commit", "--quiet", "--allow-empty", "-m", "one"]);
+        let audit = request(&work, &home, &["cargo", "audit", "--no-fetch"]);
+        let before = digest(&audit).expect("keyed");
+        assert_eq!(digest(&audit).expect("keyed"), before);
+        git(&db, &["commit", "--quiet", "--allow-empty", "-m", "two"]);
+        assert_ne!(digest(&audit).expect("keyed"), before);
+
+        let other = root.path().join("other-db");
+        std::fs::create_dir_all(&other).expect("other");
+        git(&other, &["init", "--quiet"]);
+        git(&other, &["commit", "--quiet", "--allow-empty", "-m", "x"]);
+        let explicit = request(
+            &work,
+            &home,
+            &["cargo", "audit", "--no-fetch", "--db", "../other-db"],
+        );
+        assert_ne!(
+            digest(&explicit).expect("keyed"),
+            digest(&audit).expect("keyed")
+        );
+    }
+
+    #[test]
+    fn a_relocated_database_is_not_keyed() {
+        let root = tempfile::tempdir().expect("dir");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            root.path().join("deny.toml"),
+            "[advisories]\ndb-path = \"/x\"\n",
+        )
+        .expect("deny.toml");
+        let deny = request(
+            root.path(),
+            &home,
+            &["cargo", "deny", "check", "--disable-fetch"],
+        );
+        assert!(digest(&deny).is_err());
+        // No database at all is keyed as absent, and other tools add nothing.
+        std::fs::remove_file(root.path().join("deny.toml")).expect("remove");
+        assert!(digest(&deny).is_ok());
+        let build = request(root.path(), &home, &["cargo", "build"]);
+        assert_eq!(digest(&build), Ok(Fields::default().finish()));
     }
 }
