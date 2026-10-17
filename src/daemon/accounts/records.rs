@@ -1,8 +1,9 @@
 //! **Source-state records** (DESIGN.md §6.4, "Precise";
 //! `crate::store::record`), which make the next recycling of a build
 //! directory precise. A run's build directory in a store heli manages, in a
-//! repository, gets one as the run ends ([`Learning::ended`], which the run
-//! waits for, at most [`RECORD_WAIT`], before its clients hear its end). And
+//! repository, gets one as the run ends ([`super::Learning::ended`], which
+//! the run waits for, at most [`super::learning::RECORD_WAIT`], before its
+//! clients hear its end). And
 //! each pass of the accountant writes one for each build directory in which
 //! one of cargo's locks was held at the pass before and none is now
 //! (`Accounts::released`): a build without heli, which the accountant saw.

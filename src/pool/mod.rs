@@ -23,7 +23,7 @@
 //! once its daemon is gone and nobody holds it, a bare cargo pointed at it
 //! cannot open it, warns, and builds with a pool of its own. A semaphore
 //! goes with its last handle; a FIFO's path stays, so the daemon's warden
-//! removes it ([`remove_when_released`]).
+//! removes it (`remove_when_released`, Unix only).
 //!
 //! **Accounting.** The pool keeps the slots the memory governor withholds
 //! ([`Pool::withhold`]), and adjusts its free slots to its [`target`]: a

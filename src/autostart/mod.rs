@@ -2,11 +2,12 @@
 //! the daemon when the user logs on, in the user's own session, and through
 //! which clients start it afterwards.
 //!
-//! - **Windows**: a Task Scheduler task ([`task`]) that runs only while the
-//!   user is logged on, in the interactive session.
-//! - **Linux**: a systemd user unit ([`systemd`]), wanted by the user
+//! - **Windows**: a Task Scheduler task (`autostart/task.rs`) that runs only
+//!   while the user is logged on, in the interactive session.
+//! - **Linux**: a systemd user unit (`autostart/systemd.rs`), wanted by the user
 //!   manager's `default.target`.
-//! - **macOS**: a launchd agent ([`launchd`]) in the user's GUI session.
+//! - **macOS**: a launchd agent (`autostart/launchd.rs`) in the user's GUI
+//!   session.
 //!
 //! Never a service, nor a task that runs while the user is logged off: a
 //! daemon there would have no desktop, and neither would its runs.
