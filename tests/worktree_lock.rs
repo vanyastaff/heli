@@ -135,13 +135,31 @@ fn waiting_line(runs: &[(&Value, &str)]) -> String {
     )
 }
 
-/// The first line of `output`'s stderr.
-fn first_stderr_line(output: &Output) -> String {
-    text(&output.stderr)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_owned()
+/// Waits for the first line `child` prints on stderr, at most
+/// [`FINISH_WITHIN`], and returns it; [`finish`] still captures the rest.
+///
+/// A waiting run's line has to be heard before the test lets a run it
+/// waits for end. `status` lists the run as waiting from its admission,
+/// but the daemon names what it waits for only on reaching the lock, a
+/// little later: a run that ends meanwhile is not named, or, if it was the
+/// only one, the run says nothing at all.
+fn first_stderr_line(child: &mut Child) -> String {
+    let mut stderr = child.stderr.take().expect("stderr is captured");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // A byte at a time, so that nothing after the line is taken.
+        let mut line = Vec::new();
+        let mut byte = [0u8];
+        while stderr.read(&mut byte).is_ok_and(|read| read == 1) && byte[0] != b'\n' {
+            line.push(byte[0]);
+        }
+        let _ = sender.send((line, stderr));
+    });
+    let (line, stderr) = receiver
+        .recv_timeout(FINISH_WITHIN)
+        .unwrap_or_else(|_| panic!("heli printed no line within {FINISH_WITHIN:?}"));
+    child.stderr = Some(stderr);
+    text(&line).trim_end_matches('\r').to_owned()
 }
 
 /// Whether heli said that the run waited.
@@ -215,6 +233,10 @@ fn fmt_waits_for_a_build_of_its_worktree() {
         "fmt must not rewrite the worktree during the build"
     );
     assert!(fmt.try_wait().expect("poll fmt").is_none(), "fmt waits");
+    assert_eq!(
+        first_stderr_line(&mut fmt),
+        waiting_line(&[(&build_run, "cargo build -p gated")])
+    );
 
     open(&gate);
     assert_success(&finish(build), "cargo heli build");
@@ -229,10 +251,6 @@ fn fmt_waits_for_a_build_of_its_worktree() {
     assert!(
         modified_ns(&source) >= modified_ns(&built),
         "fmt rewrote the source before the build had finished"
-    );
-    assert_eq!(
-        first_stderr_line(&fmt),
-        waiting_line(&[(&build_run, "cargo build -p gated")])
     );
 }
 
@@ -255,6 +273,10 @@ fn a_build_waits_for_fmt() {
     assert_eq!(build_run["waiting_for"], json!([id(&fmt_run)]));
     assert!(log.intervals().is_empty(), "the build must not start yet");
     assert!(build.try_wait().expect("poll the build").is_none());
+    assert_eq!(
+        first_stderr_line(&mut build),
+        waiting_line(&[(&fmt_run, "cargo fmt")])
+    );
 
     open(&gate);
     assert_success(&finish(fmt), "cargo heli fmt");
@@ -265,10 +287,6 @@ fn a_build_waits_for_fmt() {
     assert!(
         intervals[0].start >= modified_ns(&gate),
         "the build started before fmt could finish"
-    );
-    assert_eq!(
-        first_stderr_line(&build),
-        waiting_line(&[(&fmt_run, "cargo fmt")])
     );
 }
 
@@ -353,11 +371,18 @@ fn fmt_waits_for_every_run_of_its_worktree() {
     let exec_run = wait_until_listed(&fixture, &["exec-arg"], false);
     assert_eq!(exec_run["class"], "exec", "{exec_run}");
 
-    let fmt = stand_in(&fixture, &echo, &["fmt"], None);
+    let mut fmt = stand_in(&fixture, &echo, &["fmt"], None);
     let fmt_run = wait_until_listed(&fixture, &["fmt"], true);
     assert_eq!(
         fmt_run["waiting_for"],
         json!([id(&build_run), id(&exec_run)])
+    );
+    assert_eq!(
+        first_stderr_line(&mut fmt),
+        waiting_line(&[
+            (&build_run, "echo-args build"),
+            (&exec_run, "echo-args exec-arg")
+        ])
     );
 
     open(&build_gate);
@@ -367,15 +392,7 @@ fn fmt_waits_for_every_run_of_its_worktree() {
 
     open(&exec_gate);
     assert_success(&finish(exec), "the exec run");
-    let fmt = finish(fmt);
-    assert_success(&fmt, "fmt");
-    assert_eq!(
-        first_stderr_line(&fmt),
-        waiting_line(&[
-            (&build_run, "echo-args build"),
-            (&exec_run, "echo-args exec-arg")
-        ])
-    );
+    assert_success(&finish(fmt), "fmt");
 }
 
 /// Runs take their turns at a worktree's lock in the order they came: a run
@@ -390,9 +407,13 @@ fn a_waiting_fmt_is_not_overtaken() {
     wait_until_listed(&fixture, &["build"], false);
     let fmt = stand_in(&fixture, &echo, &["fmt"], Some(&fmt_gate));
     let fmt_run = wait_until_listed(&fixture, &["fmt"], true);
-    let check = stand_in(&fixture, &echo, &["check"], None);
+    let mut check = stand_in(&fixture, &echo, &["check"], None);
     let check_run = wait_until_listed(&fixture, &["check"], true);
     assert_eq!(check_run["waiting_for"], json!([id(&fmt_run)]));
+    assert_eq!(
+        first_stderr_line(&mut check),
+        waiting_line(&[(&fmt_run, "echo-args fmt")])
+    );
 
     open(&build_gate);
     assert_success(&finish(build), "the build");
@@ -402,12 +423,7 @@ fn a_waiting_fmt_is_not_overtaken() {
 
     open(&fmt_gate);
     assert_success(&finish(fmt), "fmt");
-    let check = finish(check);
-    assert_success(&check, "the check");
-    assert_eq!(
-        first_stderr_line(&check),
-        waiting_line(&[(&fmt_run, "echo-args fmt")])
-    );
+    assert_success(&finish(check), "the check");
 }
 
 /// A run asked for from inside another heli run does not wait for the
