@@ -12,6 +12,11 @@ use std::process::Output;
 
 use support::Fixture;
 
+#[test]
+fn missing_nextest_explains_the_output_test_prerequisite() {
+    support::assert_nextest_required("a_quiet_green_nextest_run_prints_one_line_with_counts");
+}
+
 fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -46,6 +51,7 @@ fn heli(fixture: &Fixture, args: &[&str]) -> Output {
 /// is smallest.
 #[test]
 fn compact_output_of_a_green_nextest_run_is_at_least_80_percent_smaller() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let size = |mode: &str| {
         let args: Vec<&str> = ["--output", mode]
@@ -86,6 +92,7 @@ fn quiet_line(output: &Output, command: &str, facts: &str) -> String {
 /// nextest's summary (passed, skipped), the duration and the run.
 #[test]
 fn a_quiet_green_nextest_run_prints_one_line_with_counts() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let args: Vec<&str> = ["-q"].into_iter().chain(GREEN_NEXTEST).collect();
     let output = heli(&fixture, &args);
@@ -99,6 +106,7 @@ fn a_quiet_green_nextest_run_prints_one_line_with_counts() {
 /// `--retries`, and the thread count and retries of the environment.
 #[test]
 fn a_failing_nextest_test_shows_its_name_panic_and_output() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let output = fixture
         .heli(["nextest", "run", "-p", "tests-mixed", "--no-fail-fast"])
@@ -326,6 +334,7 @@ fn nextests_build_leaves_out_what_only_the_tests_read() {
 /// here every passing test's line and its output.
 #[test]
 fn nextest_output_levels_the_user_set_are_shown() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let output = heli(
         &fixture,
@@ -571,6 +580,7 @@ fn libtest_drops_only_its_lines_per_test() {
 /// and nothing of cargo's JSON; no tests ran, so heli counts none.
 #[test]
 fn a_test_runs_build_errors_show_as_a_compile_runs() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let plain = fixture
         .cargo(["build", "-p", "broken"])
@@ -672,6 +682,7 @@ fn log_test_shows_one_libtest_tests_output() {
 /// test's line, and a passing test has its line only.
 #[test]
 fn log_test_shows_one_nextest_tests_output() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     for (mode, name, progress) in [
         ("compact", "tests::fails", "counter"),
@@ -744,6 +755,7 @@ fn log_test_shows_one_nextest_tests_output() {
 /// last one. `log --test` shows each test's, the last included.
 #[test]
 fn log_test_shows_an_output_that_ends_the_record() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let output = heli(
         &fixture,
@@ -785,6 +797,7 @@ fn log_test_shows_an_output_that_ends_the_record() {
 /// one selector among the others.
 #[test]
 fn log_test_of_a_test_without_output_says_so() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let (_, run) = failing_run(&fixture, &["nextest", "run", "-p", "tests-mixed"]);
     for name in ["tests::passes", "tests::none"] {

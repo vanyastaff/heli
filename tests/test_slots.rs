@@ -16,6 +16,11 @@ use serde_json::Value;
 
 use support::{ConcurrencyLog, Fixture, assert_success, lines, runs};
 
+#[test]
+fn missing_nextest_fails_before_waiting_for_test_slots() {
+    support::assert_nextest_required("test_threads_one_means_one_slot");
+}
+
 /// `echo-args` copied into the fixture's directory as `cargo`.
 fn fake_cargo(fixture: &Fixture) -> PathBuf {
     let echo = fixture.echo_args();
@@ -266,6 +271,7 @@ fn libtest_holds_its_test_slots_until_the_tests_end() {
 /// time on 1 slot, though the pool has 2.
 #[test]
 fn test_threads_one_means_one_slot() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
     let tests = Gated::start(
@@ -324,6 +330,7 @@ impl Drop for Saturated {
 /// slot: the run waits 5 s, then runs one test at a time with 0 slots.
 #[test]
 fn with_no_slot_free_the_tests_run_on_one_thread() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
     let _saturated = Saturated::pool(&fixture, 2);
@@ -347,6 +354,7 @@ fn with_no_slot_free_the_tests_run_on_one_thread() {
 /// 2 s, a run that waits 5 s for slots still passes.
 #[test]
 fn the_wait_for_test_slots_is_not_test_time() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 1\n");
     let config = fixture.workspace().join(".config");
@@ -379,6 +387,7 @@ fn the_wait_for_test_slots_is_not_test_time() {
 /// run pool, `<host pool>-<run id>`, as its jobserver.
 #[test]
 fn a_nested_build_draws_from_the_run_pool() {
+    support::require_nextest();
     let fixture = Fixture::new("basic");
     let seen = fixture.path("nested-makeflags");
     let output = fixture

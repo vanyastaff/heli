@@ -27,7 +27,7 @@
 //! finer), and 2.05 s for a whole second, which may come from one that
 //! keeps whole seconds or two.
 //!
-//! **Writing** ([`write`]). Never while a build holds one of cargo's locks
+//! **Writing** ([`write()`]). Never while a build holds one of cargo's locks
 //! in the build directory. It waits first until every file there is a
 //! slack old, at most 2.05 s, so that the record of a run that just ended
 //! counts (below). The blob ids come from the snapshot machinery of the

@@ -909,6 +909,76 @@ pub fn cargo_binary() -> OsString {
         .unwrap_or_else(|| OsString::from("cargo"))
 }
 
+/// Real nextest consumers require a runnable plugin. Fail before creating a
+/// fixture or waiting for slots; a missing prerequisite is never a skipped
+/// (and therefore apparently passing) test. Probe through Cargo, just as
+/// the tested command does, including its PATH and CARGO_HOME lookup.
+pub fn require_nextest() {
+    const HELP: &str = "test prerequisite `cargo nextest --version` failed. \
+        These tests require a runnable cargo-nextest; no tests were skipped. \
+        Install it with `cargo install cargo-nextest --locked`, then verify \
+        `cargo nextest --version`. If already installed, check PATH and CARGO_HOME.";
+    let output = Command::new(cargo_binary())
+        .args(["nextest", "--version"])
+        .env("CARGO_TERM_COLOR", "never")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("{HELP}\nCould not start Cargo: {error}"));
+    assert_success(&output, HELP);
+}
+
+/// Replays a real nextest consumer with neither PATH plugins nor Cargo-home
+/// plugins. Its failure must explain the prerequisite, never pass or wait
+/// for tests that cannot start. Only the subprocess's environment changes.
+pub fn assert_nextest_required(test: &str) {
+    let home = tempfile::tempdir().expect("empty Cargo home");
+    let mut child = Command::new(std::env::current_exe().expect("test binary"))
+        .args(["--exact", test, "--nocapture"])
+        .env("CARGO", env!("CARGO"))
+        .env("CARGO_HOME", home.path())
+        .env("PATH", "")
+        .env("CARGO_TERM_COLOR", "never")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run test without nextest");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while child.try_wait().expect("poll test").is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let timed_out = child.try_wait().expect("poll test").is_none();
+    if timed_out {
+        kill_tree(child.id());
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("test output");
+    let diagnostic = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !timed_out,
+        "missing nextest must fail before waiting for test slots: {diagnostic}"
+    );
+    assert!(
+        !output.status.success(),
+        "missing nextest must fail, not skip: {diagnostic}"
+    );
+    for required in [
+        "test prerequisite",
+        "cargo nextest --version",
+        "cargo install cargo-nextest --locked",
+        "no such command",
+    ] {
+        assert!(
+            diagnostic.contains(required),
+            "missing {required:?}: {diagnostic}"
+        );
+    }
+}
+
 /// Panics with the command's output unless it succeeded.
 pub fn assert_success(output: &Output, what: &str) {
     assert!(

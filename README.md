@@ -50,3 +50,28 @@ the artifact budget. See [the operating guide](docs/multi-agent.md) for store
 placement, budgets, credentials, fallback and supported-tool limits.
 
 The contracts and dated acceptance evidence are in [DESIGN.md](DESIGN.md).
+
+## Contributing
+
+The full test suite requires `cargo-nextest` in addition to Rust/Cargo.
+Install it once and verify Cargo can find it in your test environment:
+
+```text
+cargo install cargo-nextest --locked
+cargo nextest --version
+cargo test --locked --no-fail-fast
+```
+
+Tests that exercise real nextest runs fail immediately with installation
+guidance and Cargo's original diagnostic if that probe fails; they never
+silently skip. Argument-only tests using a stand-in Cargo need no nextest.
+CI runs the complete suite and `cargo doc --no-deps --locked` with
+`RUSTDOCFLAGS="-D warnings"` on Windows, Linux and macOS.
+It also checks all targets with the minimum supported Rust, pinned to 1.99.0,
+on each OS; `Cargo.toml` declares `rust-version = "1.99"`.
+
+Windows native path acceptance requires installed Visual Studio C++ tools.
+The test locates `vswhere.exe` through environment roots, Windows Known
+Folders and PATH, then tries `cl.exe` on PATH. Omitting `ProgramFiles` in a
+shell does not hide a normal Visual Studio installation. Missing tools
+remain a test failure with discovery details, never a silent skip.

@@ -253,6 +253,64 @@ fn trash_left(fixture: &Fixture) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Finish the cleanup after a pass that could encounter a temporarily
+/// undeletable Windows file. Eviction and the nonblocking Cargo assertions
+/// are checked separately, before this cleanup.
+fn finish_trash_deletion(fixture: &Fixture) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_error = String::new();
+    loop {
+        let left = trash_left(fixture);
+        if left.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "trash was not deleted: {left:?}; last gc diagnostic: {last_error}"
+        );
+        // A pass reports sharing violations and leaves those files for a
+        // later pass. Retry the real CLI rather than waiting for an unrelated
+        // background survey or assuming its first attempt must succeed.
+        let output = fixture.heli(["gc", "--json"]).output().expect("retry gc");
+        assert_success(&output, "retry deferred trash deletion");
+        last_error = text(&output.stderr);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn trash_cleanup_finishes_after_a_windows_sharing_violation() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let leftover = store(&fixture).join(".trash").join("held");
+    std::fs::create_dir_all(&leftover).unwrap();
+    let path = leftover.join("object.o");
+    std::fs::write(&path, b"busy object").unwrap();
+    // A real sharing violation, not a timer or an antivirus assumption.
+    let held = File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&path)
+        .unwrap();
+    let first = fixture.heli(["gc", "--json"]).output().unwrap();
+    assert_success(&first, "best-effort gc with a held trash file");
+    assert!(leftover.is_dir(), "the held object cannot be deleted yet");
+    assert!(
+        text(&first.stderr).contains("cannot empty"),
+        "gc must report the deferred deletion: {first:?}"
+    );
+    drop(held);
+    finish_trash_deletion(&fixture);
+    assert!(
+        !leftover.exists(),
+        "released trash must actually be deleted"
+    );
+}
+
 /// The profile directory of a build directory: `debug/`.
 fn incremental(build: &Path) -> PathBuf {
     build.join("debug").join("incremental")
@@ -925,7 +983,7 @@ fn deleting_a_large_victim_does_not_hold_up_cargo() {
     assert_success(&output, "cargo heli gc");
     let done: Value = serde_json::from_slice(&output.stdout).expect("a JSON document");
     assert_eq!(victims(&done), [(1, spelled(&large))], "{done}");
-    assert_eq!(trash_left(&fixture), Vec::<PathBuf>::new());
+    finish_trash_deletion(&fixture);
 }
 
 /// The daemon evicts by itself: once a run ends, its figures are over the

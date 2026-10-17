@@ -14,7 +14,8 @@
 //!
 //! [`Tree::kill`]: on Windows, `TerminateJobObject`; on Unix, SIGTERM to
 //! every process of the session, so that cargo and nextest can stop their
-//! children, then, after up to [`TERM_GRACE`], SIGKILL to those left.
+//! children, then, after up to two seconds (`TERM_GRACE` on Unix), SIGKILL
+//! to those left.
 //! Either way it returns once no process of the tree is left, or fails
 //! after [`KILL_WAIT`].
 

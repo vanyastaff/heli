@@ -9,15 +9,15 @@
 //! warden.
 //!
 //! - The daemon starts `cargo-heli daemon --warden` once it has opened the
-//!   pool ([`start`]), with the read end of a pipe as its stdin, and its
-//!   own process id in [`DAEMON_VAR`]. The daemon alone holds the write end,
+//!   pool (`start`, Unix only), with the read end of a pipe as its stdin,
+//!   and its own process id in `DAEMON_VAR`. The daemon alone holds the write end,
 //!   which no run inherits (close-on-exec). However the daemon ends (it
 //!   retires, is killed, crashes), the warden then reads the end of its
 //!   input.
 //! - The end of its input comes as the kernel closes the daemon's files, one
 //!   by one: the pool's lock may still be held then, as by a daemon that
-//!   owns the pool. So the warden waits, at most [`EXIT_WAIT`], until the
-//!   daemon is no longer its parent: its process is gone then, with every
+//!   owns the pool. So the warden waits, at most `EXIT_WAIT` (Unix only),
+//!   until the daemon is no longer its parent: its process is gone then, with every
 //!   file it held.
 //! - The warden leads a process group of its own, so a signal to the
 //!   daemon's group does not take it along, and keeps no stdout or stderr.

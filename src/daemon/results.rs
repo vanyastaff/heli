@@ -1,5 +1,5 @@
 //! The result store (DESIGN.md §7): the verify and test runs that passed,
-//! by key ([`key`](super::key)), so the same run is not repeated.
+//! by key ([`key`]), so the same run is not repeated.
 //!
 //! Each pass is a marker `<state>/verified/<digest>` naming the run, its
 //! worktree and the time, written through a staged file renamed into place,

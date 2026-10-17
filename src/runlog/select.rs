@@ -37,7 +37,7 @@ pub enum Select {
     Grep(String),
     /// The errors, as the compiler rendered them ([`errors`]).
     Errors,
-    /// The output of the test of this name ([`test`]).
+    /// The output of the test of this name ([`test()`]).
     Test(String),
 }
 

@@ -19,7 +19,7 @@
 //!   and of the tool the run uses, a missing one keyed as absent;
 //! - the Cargo configuration ([`cargo_config`]): every `config.toml` and
 //!   `config` cargo reads, by content;
-//! - the environment ([`environment`]): every variable but the neutral ones.
+//! - the environment ([`environment()`]): every variable but the neutral ones.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;

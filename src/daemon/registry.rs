@@ -91,7 +91,8 @@ const TELLING_WAIT: Duration = Duration::from_secs(10);
 /// What makes two runs the same command: the working directory (cargo
 /// picks the package from it), argv, and the environment (the target
 /// directory, flags and tool settings come from it), apart from the
-/// variables a shell keeps for itself ([`SHELL_BOOKKEEPING`]), which differ
+/// variables a shell keeps for itself
+/// ([`environment::SHELL_BOOKKEEPING`]), which differ
 /// between two shells of one agent and which no build reads.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Command {
