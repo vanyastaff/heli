@@ -202,7 +202,7 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     if !reached_without_links(root, &victim.path) {
         return Err("gone, or reached through a link".to_owned());
     }
-    let Some(trash) = trash::of(&surveyed.dir) else {
+    let Some(trash) = surveyed.dir.trash() else {
         return Err("no trash".to_owned());
     };
     let profiles = super::lock_dirs(root);

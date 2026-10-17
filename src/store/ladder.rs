@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::{Dir, Kind, State, subdirs};
+use super::{Dir, State, subdirs};
 use crate::clock;
 use crate::config::{Seam, StoreConfig};
 
@@ -256,8 +256,7 @@ fn measure_root(dir: &Dir) -> Measure {
     let mut total = Measure::default();
     if let Ok(entries) = std::fs::read_dir(&dir.path) {
         for entry in entries.filter_map(Result::ok) {
-            let name = entry.file_name();
-            if dir.kind == Kind::Target && name == super::trash::TARGET_TRASH {
+            if dir.own_trash().is_some_and(|own| entry.file_name() == own) {
                 continue;
             }
             total.add(measure(&entry.path()));
@@ -348,67 +347,10 @@ pub fn candidates(
                 );
             }
         }
-        match (surveyed.dir.kind, surveyed.state) {
-            (Kind::Build, State::Orphan) => {
-                let Some(since) = surveyed.orphaned_since else {
-                    continue;
-                };
-                let unclaimed = now.saturating_sub(since);
-                if unclaimed >= policy.orphan_age {
-                    victim(
-                        Tier::Orphan,
-                        root.clone(),
-                        surveyed.measure.bytes,
-                        unclaimed,
-                        format!("orphan unclaimed for {}", hours(unclaimed)),
-                    );
-                }
-            }
-            (Kind::Build, state)
-                if state == State::Live
-                    || (state == State::Unknown
-                        && super::managed::unknown_is_reclaimable(&surveyed.dir)) =>
-            {
-                if idle >= policy.dir_age {
-                    victim(
-                        Tier::BuildDir,
-                        root.clone(),
-                        surveyed.measure.bytes,
-                        idle,
-                        format!("build directory idle for {}", hours(idle)),
-                    );
-                }
-            }
-            (Kind::Scratch, _) => {
-                let untouched = now.saturating_sub(surveyed.measure.newest.unwrap_or(0));
-                if untouched >= policy.scratch_age {
-                    victim(
-                        Tier::Scratch,
-                        root.clone(),
-                        surveyed.measure.bytes,
-                        untouched,
-                        format!(
-                            "scratch copy left by a cargo tool, untouched for {}",
-                            hours(untouched)
-                        ),
-                    );
-                }
-            }
-            (Kind::Target, _) if idle >= policy.idle_age => {
-                for (cache, pattern) in tool_caches_in(root, tool_caches) {
-                    victim(
-                        Tier::ToolCache,
-                        cache.clone(),
-                        measure(&cache).bytes,
-                        idle,
-                        format!(
-                            "tool cache {pattern} of a target/ directory idle for {}",
-                            hours(idle)
-                        ),
-                    );
-                }
-            }
-            _ => {}
+        for (tier, path, bytes, age, reason) in
+            super::kind::rungs(surveyed, policy, tool_caches, now, idle)
+        {
+            victim(tier, path, bytes, age, reason);
         }
     }
     victims.sort_by(|a, b| {
@@ -422,7 +364,7 @@ pub fn candidates(
 }
 
 /// `seconds` for people, in whole hours.
-fn hours(seconds: u64) -> String {
+pub(super) fn hours(seconds: u64) -> String {
     format!("{} h", seconds / HOUR)
 }
 
@@ -456,7 +398,7 @@ fn incremental_dirs(root: &Path) -> Vec<PathBuf> {
 /// The tool caches in the `target/` directory `root` that `patterns` name,
 /// each with the pattern: directories and files, never links, and never
 /// reached through one.
-fn tool_caches_in(root: &Path, patterns: &[String]) -> Vec<(PathBuf, String)> {
+pub(super) fn tool_caches_in(root: &Path, patterns: &[String]) -> Vec<(PathBuf, String)> {
     let mut caches: Vec<(PathBuf, String)> = Vec::new();
     for pattern in patterns {
         let components: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
