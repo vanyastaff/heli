@@ -162,20 +162,18 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
     let in_pool = !invocation.exec
         && source == crate::profiles::Source::BuiltIn
         && class::runs_directly(&invocation.args, std::io::stdin().is_terminal());
-    let mut pooled = None;
-    let reason = match locations {
-        Err(error) => error,
+    let route = match locations {
+        Err(error) => Route::Fallback { reason: error },
         Ok(locations) => match reach(&locations, Some(depth)) {
             // An interactive or unknown tool runs here, with the host pool.
             Ok(Some(stream)) if in_pool => {
                 drop(stream);
                 record_direct(&locations, &invocation);
                 match crate::pool::makeflags(&locations.pool) {
-                    Ok(makeflags) => {
-                        pooled = Some(makeflags);
-                        String::new()
-                    }
-                    Err(error) => error.to_string(),
+                    Ok(makeflags) => Route::InPool { makeflags },
+                    Err(error) => Route::Fallback {
+                        reason: error.to_string(),
+                    },
                 }
             }
             Ok(Some(stream)) => {
@@ -189,23 +187,27 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
                     &dependency_env,
                 ) {
                     Ok(never) => match never {},
-                    Err(reason) => reason,
+                    Err(reason) => Route::Fallback { reason },
                 }
             }
-            Ok(None) => "no heli daemon answered".to_owned(),
-            Err(reason) => reason,
+            Ok(None) => Route::Fallback {
+                reason: "no heli daemon answered".to_owned(),
+            },
+            Err(reason) => Route::Fallback { reason },
         },
     };
-    if pooled.is_none() {
-        eprintln!("cargo-heli: warning: {reason}; running the command directly");
-    }
     let mut command = Command::new(&invocation.program);
     command
         .args(&invocation.args)
         .env(nesting::VAR, child_depth)
         .envs(dependency_env.iter().map(|(name, value)| (*name, value)));
-    if let Some(makeflags) = &pooled {
-        command.env("CARGO_MAKEFLAGS", makeflags);
+    match &route {
+        Route::InPool { makeflags } => {
+            command.env("CARGO_MAKEFLAGS", makeflags);
+        }
+        Route::Fallback { reason } => {
+            eprintln!("cargo-heli: warning: {reason}; running the command directly");
+        }
     }
     if let Some(prepared) = &prepared {
         let activity = crate::store::lease::directory().unwrap_or_else(|error| {
@@ -223,6 +225,17 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         );
     }
     direct::run(command)
+}
+
+/// How the client runs a command itself, once the daemon does not run it
+/// (a run the daemon takes never returns to the client's own code).
+enum Route {
+    /// Drawing from the host pool, as an interactive or unknown tool does
+    /// (`crate::class::runs_directly`): its `CARGO_MAKEFLAGS`.
+    InPool { makeflags: String },
+    /// Without the daemon or its pool, for `reason`, which the client warns
+    /// of.
+    Fallback { reason: String },
 }
 
 /// Logs a run the client makes itself in the pool (`crate::class::

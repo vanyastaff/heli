@@ -824,18 +824,22 @@ fn inherited_epoch_protects_recycle_metadata_after_its_parent_is_killed() {
     );
     assert!(support::process_runs(metadata));
     write(&release, "go");
+    // The fake cargo creates the file, then writes its line: wait for the
+    // whole line, not for the file, which may still be empty.
     let until = Instant::now() + Duration::from_secs(40);
-    while !read.is_file() {
+    let late_read = loop {
+        if let Ok(text) = std::fs::read_to_string(&read)
+            && text.ends_with('\n')
+        {
+            break text;
+        }
         assert!(
             Instant::now() < until,
             "hook metadata never completed its late read"
         );
         std::thread::sleep(Duration::from_millis(20));
-    }
-    assert_eq!(
-        std::fs::read_to_string(&read).unwrap(),
-        "READ_OK:pub const VALUE: u32 = 7;\n"
-    );
+    };
+    assert_eq!(late_read, "READ_OK:pub const VALUE: u32 = 7;\n");
     while selected.exists() {
         let report = gc(&fixture, &store);
         assert!(
