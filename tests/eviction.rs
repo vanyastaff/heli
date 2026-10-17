@@ -1491,3 +1491,56 @@ fn over_budget_gc_evicts_units_untouched_for_a_day() {
     );
     assert_eq!(evictions[0]["bytes"].as_u64(), Some(MB), "{evictions:?}");
 }
+
+/// A scratch copy cargo-mutants would leave in the temporary directory
+/// (`HELI_SCRATCH_DIR` here): a workspace with `bytes` in its own
+/// `target/debug/`, its files written at `at`.
+fn fake_scratch(fixture: &Fixture, name: &str, bytes: usize, at: u64) -> PathBuf {
+    let copy = fixture.path("scratch").join(name);
+    let debug = copy.join("target").join("debug");
+    std::fs::create_dir_all(&debug).expect("create a scratch copy");
+    std::fs::write(copy.join("Cargo.toml"), "[workspace]\n").expect("its manifest");
+    std::fs::write(debug.join("big"), vec![7u8; bytes]).expect("fill it");
+    std::fs::write(debug.join(".cargo-lock"), "").expect("and cargo's lock");
+    set_times(&copy, at);
+    copy
+}
+
+/// Scratch copies cargo-mutants left behind are the ladder's first rung,
+/// tier 0: one untouched for an hour goes first, a fresh one stays, and one
+/// a cargo still builds in (its lock held) is never touched.
+#[test]
+fn scratch_copies_left_by_cargo_mutants_go_first() {
+    let fixture = Fixture::new("basic");
+    let clock = now();
+    let left = fake_scratch(&fixture, "mutants-left1", 2 * MB as usize, clock - 3 * HOUR);
+    let fresh = fake_scratch(&fixture, "cargo-mutants-app-new1", 2 * MB as usize, clock);
+    let held = fake_scratch(&fixture, "mutants-held1", 2 * MB as usize, clock - 3 * HOUR);
+    let lock = File::options()
+        .write(true)
+        .open(held.join("target").join("debug").join(".cargo-lock"))
+        .expect("open the lock");
+    lock.lock().expect("hold the lock");
+    configure(&fixture, "budget_mb = 1\n");
+    set_clock(&fixture, clock);
+
+    let planned = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(victims(&planned), [(0, spelled(&left))], "{planned}");
+    let kinds: Vec<&str> = planned["dirs"]
+        .as_array()
+        .expect("dirs")
+        .iter()
+        .filter_map(|dir| dir["kind"].as_str())
+        .collect();
+    assert_eq!(
+        kinds.iter().filter(|kind| **kind == "scratch").count(),
+        3,
+        "{planned}"
+    );
+
+    gc(&fixture, &["gc"]);
+    finish_trash_deletion(&fixture);
+    assert!(!left.exists(), "the left copy is evicted");
+    assert!(fresh.exists() && held.exists(), "the others stay");
+    drop(lock);
+}
