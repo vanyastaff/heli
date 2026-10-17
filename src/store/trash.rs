@@ -31,11 +31,12 @@ pub fn of(dir: &Dir) -> Option<PathBuf> {
     match dir.kind {
         Kind::Build => dir.store.as_ref().map(|store| store.join(STORE_TRASH)),
         Kind::Target => Some(dir.path.join(TARGET_TRASH)),
+        Kind::Scratch => Some(super::scratch::trash()),
     }
 }
 
-/// Every trash there may be: each store's, and each registered `target/`
-/// directory's.
+/// Every trash there may be: each store's, each registered `target/`
+/// directory's, and the scratch copies' (`super::scratch::trash`).
 pub fn all(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
     let stores = super::stores(config, registry)
         .into_iter()
@@ -44,7 +45,10 @@ pub fn all(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
         .targets
         .iter()
         .map(|target| target.path.join(TARGET_TRASH));
-    stores.chain(targets).collect()
+    stores
+        .chain(targets)
+        .chain(std::iter::once(super::scratch::trash()))
+        .collect()
 }
 
 /// Renames `victim` into `trash`, created if need be, under a name of its

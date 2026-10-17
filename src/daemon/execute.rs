@@ -14,9 +14,12 @@
 //!
 //! **When a run is over** is when its process has exited, as for a command
 //! the client waited for itself: processes it left behind may keep its
-//! stdout open, so the daemon takes what is left in the pipes for a short
-//! grace period, then reports the exit and keeps draining the pipes into the
-//! void until they close.
+//! stdout open, so the daemon takes what is left in the pipes until they
+//! have been quiet for a short grace period (output still arriving restarts
+//! it, up to a limit), then reports the exit and keeps draining the pipes
+//! into the void until they close. A grace period counted from the exit
+//! alone would cut off the end of a large output that takes longer than it
+//! to read.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
@@ -31,8 +34,13 @@ use crate::protocol::{Channel, RunRequest};
 use crate::run_id::RunId;
 use crate::runlog::Recorder;
 
-/// How long output may still arrive after the run's process has exited.
+/// How long the pipes may stay quiet, after the run's process has exited,
+/// before the run is over: output still arriving restarts it.
 const GRACE: Duration = Duration::from_millis(500);
+
+/// How long after the run's process has exited its output is taken at most,
+/// however steadily processes it left behind keep writing.
+const DRAIN_LIMIT: Duration = Duration::from_secs(10);
 
 /// How much output one frame carries at most.
 const CHUNK: usize = 64 * 1024;
@@ -275,6 +283,7 @@ pub fn pump(mut child: Child, record: &mut Recorder<'_>, live: &Live) -> io::Res
 
     let mut exit = None;
     let mut deadline: Option<Instant> = None;
+    let mut limit: Option<Instant> = None;
     while exit.is_none() || open > 0 {
         let event = match deadline {
             None => received.recv().ok(),
@@ -286,14 +295,19 @@ pub fn pump(mut child: Child, record: &mut Recorder<'_>, live: &Live) -> io::Res
             Some(Event::Output(channel, bytes)) => {
                 let recorded = record.output(channel, &bytes);
                 live.append(channel, bytes, recorded);
+                if let Some(limit) = limit {
+                    deadline = Some((Instant::now() + GRACE).min(limit));
+                }
             }
             Some(Event::Closed) => open -= 1,
             Some(Event::Exited(status)) => {
                 exit = Some(status);
-                deadline = Some(Instant::now() + GRACE);
+                let now = Instant::now();
+                limit = Some(now + DRAIN_LIMIT);
+                deadline = Some(now + GRACE);
             }
-            // The grace period is over: processes the run left behind hold
-            // its pipes.
+            // The pipes were quiet for the grace period, or the limit is
+            // reached: processes the run left behind hold them.
             None => break,
         }
     }

@@ -206,6 +206,7 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
         let kind = match entry.kind {
             Kind::Build => "build",
             Kind::Target => "target",
+            Kind::Scratch => "scratch",
         };
         text.push_str(&format!(
             "{kind:<6}  {:<7}  {:>10}  {}",

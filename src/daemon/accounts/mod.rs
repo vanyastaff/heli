@@ -182,17 +182,23 @@ impl Accounts {
                 }
             })
             .collect();
-        let targets = ledger
-            .figures
-            .iter()
-            .filter(|(_, figures)| figures.kind == Kind::Target)
-            .map(|(path, figures)| TargetUse {
-                path: text(path),
-                used: figures.sizes.total(),
-                by_category: figures.sizes,
-            })
-            .collect();
-        Disk { stores, targets }
+        let of_kind = |kind: Kind| -> Vec<TargetUse> {
+            ledger
+                .figures
+                .iter()
+                .filter(|(_, figures)| figures.kind == kind)
+                .map(|(path, figures)| TargetUse {
+                    path: text(path),
+                    used: figures.sizes.total(),
+                    by_category: figures.sizes,
+                })
+                .collect()
+        };
+        Disk {
+            stores,
+            targets: of_kind(Kind::Target),
+            scratch: of_kind(Kind::Scratch),
+        }
     }
 
     /// The accountant: looks for worktrees to recycle for, surveys the store

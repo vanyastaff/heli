@@ -30,7 +30,8 @@
 //!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
 //!          "targets":[{"path":"D:\\work\\agent-a64b\\target","used":120,
 //!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
-//!                                     "fingerprints":0,"tool_caches":20,"other":100}}]},
+//!                                     "fingerprints":0,"tool_caches":20,"other":100}}],
+//!          "scratch":[]},
 //!  "last_gc":{"at":1791911000,
 //!             "evicted":[{"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
 //!                         "tier":1,"bytes":300}]}}
@@ -109,6 +110,10 @@ pub struct Disk {
     /// One entry per registered `target/` directory.
     #[serde(default)]
     pub targets: Vec<TargetUse>,
+    /// One entry per scratch copy a cargo tool left behind
+    /// (`crate::store::scratch`).
+    #[serde(default)]
+    pub scratch: Vec<TargetUse>,
 }
 
 /// A store's build directories, added up.
@@ -400,6 +405,14 @@ impl Status {
                     "{label:<6}  target {}  {}\n",
                     target.path,
                     used(target.used, &target.by_category)
+                ));
+                label = "";
+            }
+            for scratch in &disk.scratch {
+                text.push_str(&format!(
+                    "{label:<6}  scratch {}  {}\n",
+                    scratch.path,
+                    sizes::human(scratch.used)
                 ));
                 label = "";
             }
