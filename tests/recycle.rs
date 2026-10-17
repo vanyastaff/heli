@@ -1759,8 +1759,9 @@ fn redate_newer(dir: &Path, after: u128, to: std::time::SystemTime) {
             }
             continue;
         }
-        let modified = entry
-            .metadata()
+        // From the file, not its directory entry, which on Windows may
+        // lag (as heli reads it: `crate::store::record`).
+        let modified = std::fs::symlink_metadata(&path)
             .and_then(|metadata| metadata.modified())
             .expect("a modification time");
         let nanos = modified
@@ -1901,7 +1902,8 @@ fn a_file_changed_right_after_staging_keeps_its_time() {
         .expect("write the attributes");
     let a = repo.add_worktree("a");
     repo.build(&a);
-    repo.build_dir_of(&a);
+    let a_dir = repo.build_dir_of(&a);
+    assert!(record_file(&a_dir).is_file(), "a's run left a record");
     let b = repo.replace_worktree("a", "b");
     // Dated otherwise than b's index says, so that git reads it again, and
     // runs the filter, as heli stages b.
@@ -2261,7 +2263,9 @@ fn times_in(dir: &Path) -> String {
                 if !(top && name == ".heli") && !(profile && name == "incremental") {
                     walk(&entry.path(), false, newest);
                 }
-            } else if let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) {
+            } else if let Ok(modified) =
+                std::fs::symlink_metadata(entry.path()).and_then(|metadata| metadata.modified())
+            {
                 let ns = modified
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |since| since.as_nanos());

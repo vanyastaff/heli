@@ -1886,7 +1886,11 @@ worktree git cannot stage gets no recycled directory.
     two. A file changed right after heli's staging read it (below), to
     content of the same size, may be dated before the staging all the same;
     without the slack it would get the recorded mtime, and cargo would link
-    the donor's build of the old content.
+    the donor's build of the old content. heli reads each mtime from the
+    file itself, never from a directory listing: on Windows a listing gives
+    what the file's directory entry holds, which keeps the time of the
+    file's creation until its writer closes it, and may lag on a loaded
+    host, so a record taken by it could be taken before the build.
   - The record counts only if it was taken after the donor's last build: its
     time is no earlier than the mtime of each file in the build directory
     plus its slack, leaving out heli's own `.heli/` and rustc's
