@@ -868,7 +868,7 @@ fn valid_count(name: &str, value: &OsStr) -> Option<bool> {
 
 /// The Cargo home as cargo finds it for the run: `CARGO_HOME` (relative to
 /// the working directory), else `.cargo` in the user's home.
-fn cargo_home(request: &RunRequest, cwd: &Path) -> Option<PathBuf> {
+pub(super) fn cargo_home(request: &RunRequest, cwd: &Path) -> Option<PathBuf> {
     if let Some(home) = request.var("CARGO_HOME").filter(|home| !home.is_empty()) {
         return Some(cwd.join(home));
     }

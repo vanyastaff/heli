@@ -771,10 +771,13 @@ Without a terminal an unknown tool is exec in the daemon, as before.
 
 **Survivors.** A `sccache` server started inside a run would end with the
 run's process tree, and `cargo heli cancel` would cold-start everyone's
-cache. When a run's `RUSTC_WRAPPER` is `sccache`, the daemon runs
-`sccache --start-server` before the run, outside any run's tree. It waits at
-most 5 s and ignores failure, including "already running". A wrapper set only
-in a Cargo configuration file is not yet recognized.
+cache. When a run's compiler wrapper is `sccache`, the daemon runs
+`sccache --start-server` before the run, outside any run's tree. The wrapper
+is read as cargo reads it: `RUSTC_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER` (and
+their `CARGO_BUILD_*` forms), else `build.rustc-wrapper` or
+`build.rustc-workspace-wrapper` from the nearest Cargo configuration. A
+variable set empty turns the wrapper off. The daemon waits at
+most 5 s and ignores failure, including "already running".
 
 `cargo heli doctor [--json]` lists the installed `cargo-*` tools with their
 profile, and explains `jobs`, a global `target-dir`, a user's own `build-dir`
