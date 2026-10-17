@@ -679,7 +679,7 @@ How a command line is read:
 
 Beyond cargo's own subcommands, heli ships built-in profiles for popular
 cargo tools (spec #38). They apply to everyone who installs heli, with no
-configuration; `src/class.rs` is the one place that reads them. A tool that
+configuration. Each is one declarative record in `TOOLS` (`src/class.rs`): its names, a summary for `doctor`, its options that take a value, and rules from a condition on the arguments (the first word, any word, or an argument) to a class or to a direct run. Adding a tool is adding a record. A tool that
 is missing gets a profile in heli itself, so every user gets it, not only
 one project. Users and repositories add profiles of their own (below).
 Tools' caches are the build store's: cargo-mutants' scratch copies are the
