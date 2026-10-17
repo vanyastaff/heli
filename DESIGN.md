@@ -779,6 +779,19 @@ their `CARGO_BUILD_*` forms), else `build.rustc-wrapper` or
 variable set empty turns the wrapper off. The daemon waits at
 most 5 s and ignores failure, including "already running".
 
+**Compatibility matrix.** `.github/workflows/compatibility.yml` installs
+cargo-hack, machete, shear, deny, audit, llvm-cov, mutants and insta on
+Linux, macOS and Windows. It runs them through heli against the `tools`
+fixture (`tests/tool_compatibility.rs`, ignored by the main suite). Each
+must exit as it does without heli. The cached verifications (`hack check`,
+`machete`, `shear`, `deny check`, `audit` with heli's fetch) must hit the
+second time. `mutants --list` must print the same mutants, `llvm-cov` must
+build in `target/llvm-cov-target`, and `insta review` must run directly. It
+runs weekly, so a tool release that breaks under heli shows up, and on
+changes to classes, profiles, the client, the daemon and the store. Not yet
+covered: nightly-only tools (`udeps`, `miri`, `public-api`) and `hakari`,
+which needs a workspace-hack crate.
+
 `cargo heli doctor [--json]` lists the installed `cargo-*` tools with their
 profile, and explains `jobs`, a global `target-dir`, a user's own `build-dir`
 (never overwritten by `setup`), `RUSTC_WRAPPER`, mold or lld, `CARGO_HOME` and
