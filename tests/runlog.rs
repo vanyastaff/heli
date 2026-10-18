@@ -594,3 +594,56 @@ fn an_unknown_run_is_a_clear_error() {
         assert!(output.stdout == direct.stdout, "{id} is {run}");
     }
 }
+
+/// A compact run records cargo's JSON messages, which heli asks for: `log`
+/// prints them as a person would have seen them, the warnings rendered on
+/// stderr and no JSON, and `--tail` and `--grep` work on those lines;
+/// `--raw` prints the record byte for byte, JSON included (#69).
+#[test]
+fn log_renders_a_compact_runs_json() {
+    let fixture = Fixture::new("basic");
+    let output = fixture
+        .heli(["check", "-p", "warnings"])
+        .env("HELI_OUTPUT", "compact")
+        .output()
+        .expect("run heli check");
+    support::assert_success(&output, "cargo heli check");
+    let run = support::split_footer(&output.stderr).1.run;
+
+    let logged = log(&fixture, &[&run]);
+    support::assert_success(&logged, "cargo heli log");
+    let (stdout, stderr) = (text(&logged.stdout), text(&logged.stderr));
+    assert!(
+        !stdout.contains("\"reason\""),
+        "no JSON on stdout: {stdout}"
+    );
+    assert!(
+        !stderr.contains("\"reason\""),
+        "no JSON on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("warning: "),
+        "the warnings, rendered: {stderr}"
+    );
+
+    let grepped = log(&fixture, &[&run, "--grep", "^warning"]);
+    let grepped = text(&grepped.stderr);
+    assert!(
+        !grepped.is_empty() && grepped.lines().all(|line| line.starts_with("warning")),
+        "{grepped}"
+    );
+    let tail = log(&fixture, &[&run, "--tail", "3"]);
+    assert!(
+        !text(&tail.stderr).contains("\"reason\""),
+        "{}",
+        text(&tail.stderr)
+    );
+
+    let raw = log(&fixture, &[&run, "--raw"]);
+    support::assert_success(&raw, "cargo heli log --raw");
+    assert!(
+        text(&raw.stdout).contains("\"reason\":\"compiler-message\""),
+        "{}",
+        text(&raw.stdout)
+    );
+}

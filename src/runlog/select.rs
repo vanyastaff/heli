@@ -1,7 +1,12 @@
 //! Selectors: which part of a record `cargo heli log` prints.
 //!
-//! Without one, `log` prints every output event as it was recorded, each on
-//! its own stream, so stdout and stderr come out byte for byte.
+//! Without one, `log` prints the record as a person would have seen it, each
+//! line on its own stream ([`rendered`]): cargo's JSON messages, which heli
+//! asks for in compact and quiet mode, become the diagnostics they carry as
+//! rustc renders them, on stderr, once each, and its artifact and
+//! build-script records are left out; every other line is as it was
+//! recorded. `--tail` and `--grep` work on these lines. `--raw` prints every
+//! output event as it was recorded instead, byte for byte.
 //!
 //! **Adding a selector**:
 //!
@@ -29,8 +34,10 @@ use crate::run_id::RunId;
 /// Which part of a record to print.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Select {
-    /// All of it, byte for byte.
+    /// All of it, as a person would have seen it ([`rendered`]).
     All,
+    /// All of it, byte for byte, cargo's JSON messages included.
+    Raw,
     /// The last this many lines.
     Tail(usize),
     /// The lines that match this regular expression (`regex` syntax).
@@ -53,19 +60,21 @@ pub fn apply(
     out: &mut Out<'_>,
 ) -> io::Result<()> {
     match select {
-        Select::All => {
+        Select::Raw => {
             for event in events {
                 let event = event?;
                 out(event.channel, &event.bytes)?;
             }
             Ok(())
         }
-        Select::Tail(count) => tail(*count, Lines::new(events), out),
+        Select::All => rendered(Lines::new(events))
+            .try_for_each(|line| line.and_then(|line| out(line.channel, &line.bytes))),
+        Select::Tail(count) => tail(*count, rendered(Lines::new(events)), out),
         Select::Grep(pattern) => {
             let pattern = Regex::new(pattern).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("bad pattern: {error}"))
             })?;
-            grep(&pattern, Lines::new(events), out)
+            grep(&pattern, rendered(Lines::new(events)), out)
         }
         Select::Errors => errors(Lines::new(events), out),
         Select::Test(name) => {
@@ -185,6 +194,48 @@ fn errors(lines: impl Iterator<Item = io::Result<Line>>, out: &mut Out<'_>) -> i
         }
     }
     Ok(())
+}
+
+/// `lines` as a person would have seen the run: a line of stdout that is
+/// one of cargo's JSON messages becomes the diagnostic it carries, as rustc
+/// renders it, on stderr, where cargo prints it (each diagnostic once, as
+/// cargo prints a repeated one once); its artifact, build-script and
+/// build-finished records are left out. Every other line is as recorded.
+fn rendered(
+    lines: impl Iterator<Item = io::Result<Line>>,
+) -> impl Iterator<Item = io::Result<Line>> {
+    let mut seen = HashSet::new();
+    lines.flat_map(move |line| {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => return vec![Err(error)],
+        };
+        if line.channel != Channel::Stdout {
+            return vec![Ok(line)];
+        }
+        match Message::parse(&line.bytes) {
+            None => vec![Ok(line)],
+            Some(Message::Other) => Vec::new(),
+            Some(Message::Diagnostic(diagnostic)) => {
+                if !seen.insert(diagnostic.identity().to_owned()) {
+                    return Vec::new();
+                }
+                // One line each, so that `--tail` counts and `--grep`
+                // matches the lines a person reads.
+                diagnostic
+                    .rendered()
+                    .split_inclusive('\n')
+                    .map(|text| {
+                        Ok(Line {
+                            channel: Channel::Stderr,
+                            event: line.event,
+                            bytes: text.as_bytes().to_vec(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    })
 }
 
 /// The lines that match `pattern`, without their line ends.
