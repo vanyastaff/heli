@@ -12,6 +12,13 @@
   and `cargo heli gc --superseded` reclaims them now, whatever the budget.
   Final artifacts stay, and a directory cargo still writes to is not
   superseded (#92).
+- **`--changed[=REF]` and `--affected[=REF]`** run a cargo subcommand on
+  the workspace members changed since the merge base with `REF` (default:
+  the upstream, else `origin/HEAD`), as a sorted `-p` list; `--affected`
+  adds the members depending on them. A root manifest, `Cargo.lock`,
+  `.cargo/` or `rust-toolchain*` change selects `--workspace`; an unchanged
+  tree runs nothing. `cargo heli changed [--affected] [--base REF] [--json]`
+  prints the selection and why (#90).
 
 ### Fixed
 

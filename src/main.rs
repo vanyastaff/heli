@@ -16,6 +16,8 @@
 //!   the per-user [`config`];
 //! - [`status`]: the `status --json` schema, and where the daemon runs:
 //!   its [`session`];
+//! - [`changed`]: `--changed` and `--affected`, which choose a run's
+//!   packages from what git says changed, and `cargo heli changed`;
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
 //! - [`store`]: the build store and its eviction ladder, [`gc`], which lists
@@ -29,6 +31,7 @@
 //!   what both sides share.
 
 mod autostart;
+mod changed;
 mod class;
 mod cli;
 mod client;
@@ -98,6 +101,11 @@ fn main() {
         cli::Action::Ensure => client::ensure(depth),
         cli::Action::Stop { now, yes, restart } => client::stop(now, yes, restart.then_some(depth)),
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
+        cli::Action::Changed {
+            affected,
+            base,
+            json,
+        } => changed::main(affected, base, json),
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),
         cli::Action::Gc {
