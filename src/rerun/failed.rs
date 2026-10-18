@@ -8,15 +8,22 @@
 //!   of a retry's status (`TRY 2 FAIL`); a later `PASS` or `FLAKY` line
 //!   for it (a retry that passed) takes it back. nextest prints a failure
 //!   again after its summary: each test counts once.
-//! - **libtest** ([`libtest`]): on stdout, each test binary's list of
-//!   failures, `failures:` then a line per test indented by 4 spaces, as
-//!   libtest prints it before the binary's summary (`test result:`); on
-//!   stderr, the line cargo prints once that binary has failed, `error:
-//!   test failed, to rerun pass `-p foo --lib``, which names the target.
-//!   The names a binary lists belong to the next such line, by the order of
-//!   the record's events. A target whose binary lists no names (a
-//!   `harness = false` test) fails whole; names no such line follows (the
-//!   run was cut short) belong to no known target.
+//! - **libtest** ([`libtest`]): on stdout, each test binary's output, from
+//!   `running N tests`, with its list of failures, `failures:` then a line
+//!   per test indented by 4 spaces, before the binary's summary (`test
+//!   result:`). On stderr, the line cargo prints as it starts each binary
+//!   (`Running …`, `Doc-tests …`), and the one once the binary has failed,
+//!   `error: test failed, to rerun pass `-p foo --lib``, which names the
+//!   target. Each stream is in order, but the two only as the daemon read
+//!   them, and cargo's line after a binary comes right as it exits, so an
+//!   output belongs to the binary at the same place in the other stream
+//!   when both count the same binaries, else to the last one cargo started
+//!   before the output began. Without cargo's starting lines (`--quiet`),
+//!   the outputs that list failures pair with cargo's failure lines in
+//!   order when they count the same, else each with the next such line. A
+//!   failed target whose binary lists no names (a `harness = false` test)
+//!   fails whole; names of no failed target (the run was cut short) belong
+//!   to no known target.
 //!
 //! Colours are no part of a line: escape sequences are dropped first.
 
@@ -128,25 +135,66 @@ fn nextest_status(line: &str) -> Option<(&str, NextestTest)> {
     ))
 }
 
+/// A test binary as cargo's stderr shows it.
+struct Binary {
+    /// The event of the line that started it, or of its hint.
+    event: u64,
+    /// The target cargo named once it failed.
+    selects: Option<Vec<String>>,
+}
+
+/// What a test binary printed on stdout, from its `running N tests`.
+#[derive(Default)]
+struct Output {
+    /// The events of its first and last lines.
+    event: u64,
+    end: u64,
+    /// The tests its list of failures names.
+    names: Vec<String>,
+}
+
 /// The failed test binaries of a `cargo test` run, in the order they
 /// failed (see the module docs).
 pub fn libtest(lines: impl Iterator<Item = io::Result<Line>>) -> io::Result<Vec<Target>> {
-    let mut targets = Vec::new();
+    let mut binaries: Vec<Binary> = Vec::new();
+    // Whether cargo said as it started each binary (it does unless
+    // `--quiet`).
+    let mut started = false;
+    let mut outputs: Vec<Output> = Vec::new();
     // The names of the list being read, from its `failures:` on.
     let mut list: Option<Vec<String>> = None;
     let mut listing = false;
-    // The names of the binaries since the last target cargo named.
-    let mut pending = Vec::new();
     for line in lines {
         let line = line?;
         let text = plain(&line);
         if line.channel == Channel::Stderr {
-            if let Some(selects) = rerun_hint(&text) {
-                targets.push(Target {
-                    selects: Some(selects),
-                    names: std::mem::take(&mut pending),
+            if starts_binary(&text) {
+                started = true;
+                binaries.push(Binary {
+                    event: line.event,
+                    selects: None,
                 });
+            } else if let Some(selects) = rerun_hint(&text) {
+                match binaries.last_mut() {
+                    Some(binary) if started && binary.selects.is_none() => {
+                        binary.selects = Some(selects);
+                    }
+                    _ => binaries.push(Binary {
+                        event: line.event,
+                        selects: Some(selects),
+                    }),
+                }
             }
+            continue;
+        }
+        if runs_tests(&text) {
+            outputs.push(Output {
+                event: line.event,
+                end: line.event,
+                names: Vec::new(),
+            });
+            list = None;
+            listing = false;
             continue;
         }
         if text == "failures:" {
@@ -166,16 +214,84 @@ pub fn libtest(lines: impl Iterator<Item = io::Result<Line>>) -> io::Result<Vec<
             }
         }
         if text.starts_with("test result: ") {
-            pending.extend(list.take().unwrap_or_default());
+            if outputs.is_empty() {
+                outputs.push(Output {
+                    event: line.event,
+                    ..Output::default()
+                });
+            }
+            let output = outputs.last_mut().expect("BUG: an output was pushed");
+            output.names.extend(list.take().unwrap_or_default());
+            output.end = line.event;
         }
     }
-    if !pending.is_empty() {
+    // Each output's binary, by its place in each stream when both streams
+    // count the same binaries, else by the order of events.
+    let outputs: Vec<Output> = if started {
+        outputs
+    } else {
+        outputs
+            .into_iter()
+            .filter(|output| !output.names.is_empty())
+            .collect()
+    };
+    let in_step = outputs.len() == binaries.len();
+    let mut names: Vec<Vec<String>> = binaries.iter().map(|_| Vec::new()).collect();
+    let mut unplaced = Vec::new();
+    for (place, output) in outputs.into_iter().enumerate() {
+        let binary = if in_step {
+            Some(place)
+        } else if started {
+            binaries
+                .iter()
+                .rposition(|binary| binary.event <= output.event)
+        } else {
+            binaries
+                .iter()
+                .position(|binary| binary.event >= output.end)
+        };
+        match binary {
+            Some(binary) => names[binary].extend(output.names),
+            None => unplaced.extend(output.names),
+        }
+    }
+    let mut targets = Vec::new();
+    for (binary, names) in binaries.into_iter().zip(names) {
+        match binary.selects {
+            Some(selects) => targets.push(Target {
+                selects: Some(selects),
+                names,
+            }),
+            None => unplaced.extend(names),
+        }
+    }
+    if !unplaced.is_empty() {
         targets.push(Target {
             selects: None,
-            names: pending,
+            names: unplaced,
         });
     }
     Ok(targets)
+}
+
+/// Whether `line` is cargo's as it starts a test binary, right-aligned to
+/// 12 columns: `     Running unittests src/lib.rs (…)`, `   Doc-tests foo`.
+fn starts_binary(line: &str) -> bool {
+    let word = line.trim_start();
+    let indent = line.len() - word.len();
+    ["Running ", "Doc-tests "]
+        .iter()
+        .any(|status| word.starts_with(status) && indent + status.len() == 13)
+}
+
+/// Whether `line` is libtest's first of a test binary: `running 3 tests`.
+fn runs_tests(line: &str) -> bool {
+    line.strip_prefix("running ")
+        .and_then(|rest| {
+            rest.strip_suffix(" tests")
+                .or_else(|| rest.strip_suffix(" test"))
+        })
+        .is_some_and(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// The arguments of cargo's line after a failed test binary, `error: test
@@ -202,19 +318,28 @@ fn plain(line: &Line) -> String {
 mod tests {
     use super::*;
 
-    /// The lines of `stdout` and `stderr` pieces, in this order.
+    /// The lines of `stdout` and `stderr` pieces, in this order, each piece
+    /// an event.
     fn lines(pieces: &[(Channel, &str)]) -> impl Iterator<Item = io::Result<Line>> {
         let lines: Vec<Line> = pieces
             .iter()
-            .flat_map(|(channel, text)| {
-                text.split_inclusive('\n').map(|line| Line {
+            .zip(0..)
+            .flat_map(|((channel, text), event)| {
+                text.split_inclusive('\n').map(move |line| Line {
                     channel: *channel,
-                    event: 0,
+                    event,
                     bytes: line.as_bytes().to_vec(),
                 })
             })
             .collect();
         lines.into_iter().map(Ok)
+    }
+
+    fn target(selects: &str, names: &[&str]) -> Target {
+        Target {
+            selects: Some(selects.split(' ').map(str::to_owned).collect()),
+            names: names.iter().map(|name| (*name).to_owned()).collect(),
+        }
     }
 
     fn test(binary: &str, name: &str) -> NextestTest {
@@ -264,7 +389,9 @@ error: test run failed
     }
 
     /// Each binary's list belongs to the target cargo names after it; its
-    /// sections, before the list, are not names.
+    /// sections, before the list, are not names. With a binary that prints
+    /// no `running` line, the streams count different binaries, and each
+    /// output goes to the binary cargo started last before it.
     #[test]
     fn libtest_failures_come_with_cargos_targets() {
         let failed = libtest(lines(&[
@@ -287,15 +414,11 @@ error: test run failed
             ),
             (
                 Channel::Stdout,
-                "failures:\n    src/lib.rs - f (line 3)\n\ntest result: FAILED. 0 passed; 1 failed\n",
+                "\nrunning 1 test\nfailures:\n    src/lib.rs - f (line 3)\n\ntest result: FAILED. 0 passed; 1 failed\n",
             ),
             (Channel::Stderr, "error: test failed, to rerun pass `-p a --doc`\n"),
         ]))
         .unwrap();
-        let target = |selects: &str, names: &[&str]| Target {
-            selects: Some(selects.split(' ').map(str::to_owned).collect()),
-            names: names.iter().map(|name| (*name).to_owned()).collect(),
-        };
         assert_eq!(
             failed,
             [
@@ -304,6 +427,43 @@ error: test run failed
                 target("-p a --doc", &["src/lib.rs - f (line 3)"]),
             ]
         );
+    }
+
+    /// The daemon may read cargo's line after a failed binary, and the
+    /// next binary's start, before the failed binary's last output: the
+    /// streams pair by place.
+    #[test]
+    fn libtest_failures_pair_by_place_when_the_streams_cross() {
+        let failed = libtest(lines(&[
+            (
+                Channel::Stderr,
+                "     Running unittests src/lib.rs (a-1)\nerror: test failed, to rerun pass `-p a --lib`\n     Running tests/it.rs (it-2)\n",
+            ),
+            (
+                Channel::Stdout,
+                "\nrunning 2 tests\n\nfailures:\n    g1::t2\n\ntest result: FAILED. 1 passed; 1 failed\n\n\nrunning 1 test\n\ntest result: ok. 1 passed; 0 failed\n",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(failed, [target("-p a --lib", &["g1::t2"])]);
+    }
+
+    /// Without cargo's starting lines (`--quiet`), the lists of failures
+    /// pair with cargo's lines after failed binaries.
+    #[test]
+    fn quiet_libtest_failures_pair_with_cargos_lines() {
+        let failed = libtest(lines(&[
+            (
+                Channel::Stderr,
+                "error: test failed, to rerun pass `-p a --lib`\n",
+            ),
+            (
+                Channel::Stdout,
+                "\nrunning 2 tests\n.F\nfailures:\n    g1::t2\n\ntest result: FAILED. 1 passed; 1 failed\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed\n",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(failed, [target("-p a --lib", &["g1::t2"])]);
     }
 
     #[test]

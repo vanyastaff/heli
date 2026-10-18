@@ -1399,9 +1399,15 @@ failed tests.
   - **libtest**: each test binary's list of names after `failures:` on
     stdout, which libtest prints before the binary's summary, and the line
     cargo prints on stderr once that binary has failed, `error: test
-    failed, to rerun pass `-p foo --lib``, which names its target. The names
-    belong to the next such line, by the order of the record's events. The
-    rerun replaces the run's package and target selection (`-p`,
+    failed, to rerun pass `-p foo --lib``, which names its target. Each
+    stream is in order, but across the two only as the daemon read them,
+    and cargo's line comes right as the binary exits, so it may be recorded
+    before the binary's last output. So a binary's output (from libtest's
+    `running N tests`) belongs to the binary at the same place among
+    cargo's `Running …` and `Doc-tests …` lines when both streams count the
+    same binaries, else to the last one cargo started before the output
+    began; without those lines (`--quiet`), the outputs that list failures
+    pair with cargo's failure lines in order. The rerun replaces the run's package and target selection (`-p`,
     `--workspace`, `--exclude`, `--lib`, `--bin`, `--test`, `--doc`, …) with
     the failed targets, and adds `--exact` and the names after `--`;
     binaries without failures do not run.
