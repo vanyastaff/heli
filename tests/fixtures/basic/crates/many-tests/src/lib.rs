@@ -7,13 +7,20 @@
 //! two like nextest's status lines (`PASS [ 0.012s] many-tests g0::t0`), two
 //! like libtest's own lines (`... not progress`, `running two tests`).
 
-/// A passing test per name, printing its own path and the look-alikes.
+/// A passing test per name, printing its own path and the look-alikes;
+/// failing instead when `HELI_FIXTURE_FAIL`, a comma-separated list of
+/// paths (`g1::t2,g3::t4`), names it.
 #[cfg(test)]
 macro_rules! tests {
     ($($name:ident)*) => {
         $(
             #[test]
             fn $name() {
+                let path = concat!(module_path!(), "::", stringify!($name));
+                let failing = std::env::var("HELI_FIXTURE_FAIL").unwrap_or_default();
+                if failing.split(',').any(|name| path.ends_with(&format!("::{name}"))) {
+                    panic!("fixture failure: HELI_FIXTURE_FAIL names {path}");
+                }
                 println!(concat!("output of ", module_path!(), "::", stringify!($name)));
                 println!("NOT [a] status line");
                 println!("not a: status [   1.000s] line");

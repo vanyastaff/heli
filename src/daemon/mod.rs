@@ -524,6 +524,7 @@ impl Daemon {
             registry::Kind {
                 class: request.class.unwrap_or(Class::Exec),
                 profile: request.profile.clone(),
+                rerun_of: request.rerun_of.clone(),
             },
             nested(&request),
             retiring,
@@ -698,6 +699,14 @@ impl Daemon {
             live.note(&recycled.describe());
         }
         let mut record = self.runlog.record(id);
+        if let Some(args) = &request.invocation {
+            record.start(&runlog::Start {
+                args: args.clone(),
+                cwd: request.cwd.clone(),
+                class: request.class.unwrap_or(Class::Exec),
+                rerun_of: request.rerun_of.clone(),
+            });
+        }
         let (makeflags, error) = self.broker.open(id);
         if let Some(error) = error {
             self.log.write(&format!(

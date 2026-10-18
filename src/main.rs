@@ -17,6 +17,7 @@
 //! - [`status`]: the `status --json` schema, and where the daemon runs:
 //!   its [`session`];
 //! - [`runlog`]: the record of each run's output, and `cargo heli log`;
+//!   [`rerun`]: `cargo heli rerun`, which runs a recorded run again;
 //! - [`output`]: what the client prints of a run, in the chosen output mode;
 //! - [`store`]: the build store and its eviction ladder, [`gc`], which lists
 //!   its directories and evicts, and [`recycle`], which git's
@@ -52,6 +53,7 @@ mod processes;
 mod profiles;
 mod protocol;
 mod recycle;
+mod rerun;
 mod run_id;
 mod runlog;
 mod session;
@@ -100,6 +102,11 @@ fn main() {
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),
+        cli::Action::Rerun {
+            run,
+            failed,
+            then_all,
+        } => rerun::main(run, failed, then_all),
         cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
         cli::Action::Doctor { json } => doctor::main(json),
         cli::Action::Dependencies(command) => {

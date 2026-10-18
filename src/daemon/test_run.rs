@@ -174,6 +174,8 @@ impl TestRun {
             cache: request.cache,
             reads_spawned: request.reads_spawned,
             profile: request.profile.clone(),
+            invocation: request.invocation.clone(),
+            rerun_of: request.rerun_of.clone(),
         })
     }
 
@@ -220,6 +222,8 @@ impl TestRun {
             cache: request.cache,
             reads_spawned: request.reads_spawned,
             profile: request.profile.clone(),
+            invocation: request.invocation.clone(),
+            rerun_of: request.rerun_of.clone(),
         }
     }
 }

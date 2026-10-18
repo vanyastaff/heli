@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **`cargo heli rerun [<run>] [--failed [--then-all]]`** runs a recorded run
+  again, from its directory with the current environment; without a run,
+  the latest test run with failed tests in this worktree. `--failed` reruns
+  only the tests that failed, for nextest with an exact filterset and for
+  libtest with the failed targets and `-- --exact` their names, and says
+  when it has to run more; `--then-all` then runs the whole run once they
+  pass. Each record now starts with the run's command line as typed (never
+  its environment), and `status` and `log` show `rerun of r17` (#91).
+
 ### Fixed
 
 - **`cargo heli test` through a target's `runner`** (`wasm-bindgen-test-runner`

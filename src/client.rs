@@ -938,6 +938,8 @@ fn submit(
         dependency_epoch: prepared
             .and_then(|prepared| prepared.epoch.as_ref())
             .map(|epoch| Text(epoch.path().as_os_str().to_owned())),
+        invocation: Some(invocation.typed.iter().cloned().map(Text).collect()),
+        rerun_of: invocation.rerun_of.map(|run| run.to_string()),
     };
     stream
         .set_deadline(Some(Instant::now() + HANDSHAKE_TIMEOUT))
