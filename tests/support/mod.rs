@@ -89,8 +89,9 @@ const ISOLATED_VARS: [&str; 12] = [
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
 /// configuration, or change what it prints.
-const HELI_VARS: [&str; 9] = [
+const HELI_VARS: [&str; 10] = [
     "HELI_SCRATCH_DIR",
+    "HELI_TEST_USER_ENV",
     "HELI_STATE_DIR",
     "HELI_ENDPOINT",
     "HELI_DEPTH",
@@ -213,6 +214,11 @@ impl Fixture {
                 "HELI_SCRATCH_DIR".into(),
                 Some(fixture.path("scratch").into()),
             ),
+            // Never the user's real environment (`user_env`).
+            (
+                "HELI_TEST_USER_ENV".into(),
+                Some(fixture.path("user-env").into()),
+            ),
         ];
         fixture.change_config(|config| config.seam.memory = Some(Memory::PLENTY));
         fixture
@@ -243,6 +249,11 @@ impl Fixture {
         isolation.push((
             "HELI_SCRATCH_DIR".into(),
             Some(fixture.path("scratch").into()),
+        ));
+        // Never the user's real environment (`user_env`).
+        isolation.push((
+            "HELI_TEST_USER_ENV".into(),
+            Some(fixture.path("user-env").into()),
         ));
         fixture.isolation = isolation;
         fixture

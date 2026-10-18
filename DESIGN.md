@@ -557,7 +557,12 @@ every run gets for the host pool (`-j --jobserver-auth=<semaphore>`, or
   the assignment, and replaces lines an earlier setup wrote with another
   value. On Windows, Git Bash, MSYS2 and Cygwin set `SHELL`; without it
   (PowerShell, cmd) setup prints the PowerShell line that sets the variable
-  in the user environment, and writes nothing there itself.
+  in the user environment. And on Windows the user environment itself
+  (`HKCU\Environment`), which every process the user starts reads
+  (terminals, editors, rust-analyzer, Task Scheduler's tasks): setup shows
+  the assignment, asks `Set it there? [y/N]` with the same consent, writes
+  the value as `setx` does and broadcasts the change, so that programs
+  started afterwards get it (#82).
 - **Consent.** For each file, setup first shows exactly what it would write:
   the file's whole new content ("would become:") or the lines it would end
   with ("would end with:"), followed by an empty line. It then asks
@@ -623,13 +628,17 @@ daemon through the registration too (§3, "Starting on demand").
 
 Rules:
 
-- **Default locations only.** A task cannot hand its program variables, so
-  the registration starts the daemon a plain `cargo heli` finds, and setup
-  refuses to register or unregister (exit 1, one line saying why) while
-  `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or `HELI_CONFIG` is set. The
-  unit and the agent name the locations setup resolved, so that the service
-  manager's environment, which lacks what a shell's profile sets, cannot
-  move them.
+- **The locations every process has.** A task cannot hand its program
+  variables, so the registration starts the daemon a plain `cargo heli` of
+  the user finds, and setup refuses to register or unregister (exit 1, one
+  line saying why) while `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or
+  `HELI_CONFIG` is set for setup's process only. On Windows a variable set
+  in the user environment (`HKCU\Environment`) with the value setup's
+  process has is every process's, the logon task's included, and does not
+  refuse: these are the locations §3 tells a packaged app's user to set
+  (#70, #82). The refusal names the difference. The unit and the agent name
+  the locations setup resolved, so that the service manager's environment,
+  which lacks what a shell's profile sets, cannot move them.
 - **The record**, `autostart` in the state directory, names the program and
   the locations setup registered. A client starts the daemon through the
   registration only when the record names its own (§3). setup removes the

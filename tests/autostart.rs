@@ -886,12 +886,21 @@ fn setup_refuses_autostart_for_other_locations() {
         } else {
             "remove"
         };
+        let reason = if cfg!(windows) {
+            format!(
+                "{var} is set for this process only, not in your user environment, and the \
+                 registration starts the daemon every process of yours finds; set it there \
+                 (setx {var} \"...\") with the same value, or unset it"
+            )
+        } else {
+            format!(
+                "{var} is set, and the registration starts the daemon heli finds by default; \
+                 unset it first"
+            )
+        };
         assert_eq!(
             stderr,
-            format!(
-                "cargo-heli: cannot {verb} autostart: {var} is set, and the registration \
-                 starts the daemon heli finds by default; unset it first\n"
-            )
+            format!("cargo-heli: cannot {verb} autostart: {reason}\n")
         );
     }
     assert_eq!(user.manager.calls(), Vec::<Vec<String>>::new());
@@ -1129,4 +1138,86 @@ fn the_definition_passes_the_service_managers_own_check() {
     let output = user.setup(&["--autostart"]);
     assert_success(&output, "cargo heli setup --autostart");
     platform::check(&platform::definition(&user.home()), &user.home());
+}
+
+/// On Windows, location variables set persistently in the user environment
+/// (as `cargo heli doctor` tells an MSIX-packaged host to set them, #70) are
+/// every process's, the logon task's included: setup registers the task for
+/// those locations, and a client with the same values starts the daemon
+/// through it (#82). The user environment is the fixture's stand-in file.
+#[cfg(windows)]
+#[test]
+fn setup_registers_for_locations_in_the_user_environment() {
+    let user = User::new();
+    let state = user.fixture.path("persistent-state");
+    let config = user.fixture.path("persistent-config.toml");
+    std::fs::write(
+        user.fixture.path("user-env"),
+        format!(
+            "HELI_STATE_DIR={}
+HELI_CONFIG={}
+",
+            state.display(),
+            config.display()
+        ),
+    )
+    .expect("write the user environment");
+    // The daemon is at these locations, not the fixture's own, so the
+    // fixture would not stop it.
+    let _stop = StopDaemon {
+        user: &user,
+        state: state.clone(),
+        config: config.clone(),
+    };
+    let output = user
+        .setup_command(&["--autostart"])
+        .env("HELI_STATE_DIR", &state)
+        .env("HELI_CONFIG", &config)
+        .output()
+        .expect("run heli setup");
+    assert_success(&output, "cargo heli setup --autostart");
+    let names = platform::Names::from(&user.manager.calls());
+    assert!(
+        state.join("autostart-task.xml").is_file(),
+        "the task is defined in the persistent state directory"
+    );
+    user.manager.clear_calls();
+
+    let mut ensure = user.heli(&["ensure"]);
+    ensure
+        .env("HELI_STATE_DIR", &state)
+        .env("HELI_CONFIG", &config);
+    user.manager
+        .apply_starting(&mut ensure, heli_binary(), platform::START_ARGS);
+    let output = ensure.output().expect("run heli ensure");
+    assert_success(&output, "cargo heli ensure");
+    assert_eq!(user.manager.calls(), vec![names.start()]);
+}
+
+/// Stops the daemon at `state` and `config` when dropped, however the test
+/// ends.
+#[cfg(windows)]
+struct StopDaemon<'a> {
+    user: &'a User,
+    state: PathBuf,
+    config: PathBuf,
+}
+
+#[cfg(windows)]
+impl Drop for StopDaemon<'_> {
+    fn drop(&mut self) {
+        let status = self
+            .user
+            .heli(&["status", "--json"])
+            .env("HELI_STATE_DIR", &self.state)
+            .env("HELI_CONFIG", &self.config)
+            .output();
+        let pid = status
+            .ok()
+            .and_then(|output| serde_json::from_slice(&output.stdout).ok())
+            .and_then(|status: serde_json::Value| support::daemon_pid(&status));
+        if let Some(pid) = pid {
+            support::kill_tree(pid);
+        }
+    }
 }

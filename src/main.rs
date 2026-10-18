@@ -59,6 +59,7 @@ mod setup;
 mod source;
 mod status;
 mod store;
+mod user_env;
 mod worktree;
 
 use std::ffi::OsString;

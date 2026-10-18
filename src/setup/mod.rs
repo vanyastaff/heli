@@ -141,6 +141,10 @@ pub fn main(print: bool, autostart: Option<bool>) -> ! {
         );
         present(Ok(hook));
     }
+    if cfg!(windows) {
+        println!();
+        failed |= !offer_user_environment(&mut consent, &makeflags);
+    }
     if let Some((register, registration)) = &registration {
         println!();
         failed |= !if *register {
@@ -157,6 +161,40 @@ pub fn main(print: bool, autostart: Option<bool>) -> ! {
         println!("To start it when you log on, run `cargo heli setup --autostart`.");
     }
     std::process::exit(i32::from(failed))
+}
+
+/// On Windows, offers to set `CARGO_MAKEFLAGS` in the user environment
+/// (`crate::user_env`), which every process the user starts reads:
+/// terminals, editors, rust-analyzer, Task Scheduler. False when it could
+/// not be set.
+fn offer_user_environment(consent: &mut Consent, makeflags: &str) -> bool {
+    let place = r"Your user environment (HKCU\Environment)";
+    if crate::user_env::get(VAR).is_some_and(|value| value == makeflags) {
+        println!("{place} already sets {VAR} to this.");
+        return true;
+    }
+    println!(
+        "{place}, which every process you start reads (terminals, editors, rust-analyzer, \
+         Task Scheduler), would set:\n{VAR}={makeflags}"
+    );
+    if matches!(consent, Consent::Never) {
+        return true;
+    }
+    print!("\nSet it there? [y/N] ");
+    if !consent.agrees() {
+        println!("Left as it was.");
+        return true;
+    }
+    match crate::user_env::set(VAR, std::ffi::OsStr::new(makeflags)) {
+        Ok(()) => {
+            println!("Set. Programs started from now on get it.");
+            true
+        }
+        Err(error) => {
+            eprintln!("cargo-heli: cannot set {VAR} in the user environment: {error}");
+            false
+        }
+    }
 }
 
 /// The Cargo configurations that would set `build.build-dir`: this

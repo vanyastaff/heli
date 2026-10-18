@@ -273,7 +273,9 @@ fn every_project_set_up_builds_into_the_store() {
     )
     .expect("write the user's configuration");
 
-    let output = answered(fixture.setup(None, Vec::<String>::new()), "y\n");
+    // On Windows, the user environment is offered too.
+    let answers = if cfg!(windows) { "y\ny\n" } else { "y\n" };
+    let output = answered(fixture.setup(None, Vec::<String>::new()), answers);
     assert_success(&output, "cargo heli setup");
     let stdout = text(&output.stdout);
     let none = stdout
@@ -1307,7 +1309,8 @@ fn setup_replaces_only_its_own_build_dir() {
             stdout.lines().any(|line| line == left),
             "{content}: {stdout}"
         );
-        assert!(!stdout.contains("[y/N]"), "{stdout}");
+        // No file to write (on Windows the user environment may be offered).
+        assert!(asked(&stdout).is_empty(), "{stdout}");
         assert_eq!(
             std::fs::read_to_string(&user_config).expect("the user's configuration"),
             content
