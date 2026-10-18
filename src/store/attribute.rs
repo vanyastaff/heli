@@ -293,8 +293,8 @@ mod tests {
     fn infers_a_gone_workspace_from_its_objects() {
         let dir = tempfile::tempdir().expect("dir");
         let ws = dir.path().join("gone");
-        // As cargo spells it: the canonical path of what exists, then the rest.
-        let manifest = spellings(&ws.join("Cargo.toml"))[1].clone();
+        // One of the spellings cargo may have hashed.
+        let manifest = spellings(&ws.join("Cargo.toml")).pop().expect("a spelling");
         let (outer, inner) = workspace_path_hash(&manifest);
         let build = dir.path().join("store").join(outer).join(inner);
         let session = build
