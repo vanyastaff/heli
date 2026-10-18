@@ -714,6 +714,26 @@ fn stop_daemon(now: bool, yes: bool, restart: Option<u32>) -> Result<(), String>
             return Err("nothing stopped".to_owned());
         }
     }
+    // Cancelled first: a retired daemon exits as its last run ends, before
+    // it could answer the cancel.
+    if now {
+        for run in &in_flight {
+            if let Some(mut stream) = reach(&locations, None)? {
+                let request = Request::Cancel(CancelRequest {
+                    run: (*run).to_owned(),
+                });
+                match protocol::write_message(&mut stream, &request)
+                    .and_then(|()| protocol::read_message::<Reply>(&mut stream))
+                {
+                    Ok(Reply::Cancelled) => eprintln!("cargo-heli: cancelled {run}"),
+                    Ok(Reply::CancelFailed { message }) => {
+                        eprintln!("cargo-heli: warning: {message}");
+                    }
+                    _ => eprintln!("cargo-heli: warning: cannot cancel {run}"),
+                }
+            }
+        }
+    }
     let Some(mut stream) = reach(&locations, None)? else {
         eprintln!("cargo-heli: the heli daemon (pid {pid}) has exited");
         return match restart {
@@ -734,24 +754,6 @@ fn stop_daemon(now: bool, yes: bool, restart: Option<u32>) -> Result<(), String>
         Err(error) => return Err(format!("the heli daemon did not answer: {error}")),
     };
     drop(stream);
-    if now {
-        for run in &in_flight {
-            if let Some(mut stream) = reach(&locations, None)? {
-                let request = Request::Cancel(CancelRequest {
-                    run: (*run).to_owned(),
-                });
-                match protocol::write_message(&mut stream, &request)
-                    .and_then(|()| protocol::read_message::<Reply>(&mut stream))
-                {
-                    Ok(Reply::Cancelled) => eprintln!("cargo-heli: cancelled {run}"),
-                    Ok(Reply::CancelFailed { message }) => {
-                        eprintln!("cargo-heli: warning: {message}");
-                    }
-                    _ => eprintln!("cargo-heli: warning: cannot cancel {run}"),
-                }
-            }
-        }
-    }
     match runs {
         Some(0) => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
         _ if now => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
