@@ -138,7 +138,10 @@ pub fn main(print: bool, autostart: Option<bool>) -> ! {
         "\nWith {} set, cargo keeps a workspace's intermediates (deps, incremental, \
          fingerprints, build scripts) in heli's build store on its volume, and its target/ \
          keeps the final artifacts. Tools that look for intermediates in \
-         target/<profile>/deps no longer find them there.",
+         target/<profile>/deps no longer find them there. Set for every project, it also \
+         gives each temporary workspace that cargo run inside tests makes (trybuild and the \
+         like) a build directory in the store; heli evicts those first once the workspace is \
+         gone, when it can tell whose they are. Set for a repository, it leaves them out.",
         cargo::SETTING
     );
     present(repository);

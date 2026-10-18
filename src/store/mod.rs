@@ -21,6 +21,7 @@
 //! [`trash`] under cargo's locks, and the trash is deleted afterwards. An
 //! [`orphan`] counts as unclaimed from the first pass that finds it.
 
+pub mod attribute;
 pub mod evict;
 pub mod kind;
 pub mod ladder;
@@ -144,7 +145,8 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
     let mut dirs = Vec::new();
     for store in stores(config, registry) {
         for path in build_dirs(&store) {
-            let owner = owner::read(&path);
+            let owner =
+                owner::read(&path).or_else(|| attribute::attribute(&path, crate::clock::now()));
             dirs.push(Dir {
                 kind: Kind::Build,
                 workspace: owner.as_ref().map(|owner| owner.workspace.clone()),

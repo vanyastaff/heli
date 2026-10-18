@@ -703,10 +703,10 @@ fn a_busy_directory_is_never_touched() {
     assert!(planned.contains(&(5, spelled(&build))), "{after}");
 }
 
-/// A build directory only bare cargo built in has no owner manifest: heli
-/// cannot tell whether its workspace lives. Its incremental units and its
-/// `incremental/` can go, but it is never deleted whole, however long it
-/// has been idle.
+/// A build directory only bare cargo checked in has no owner manifest, and
+/// no object file to attribute it by (#88): heli cannot tell whether its
+/// workspace lives. Its incremental units and its `incremental/` can go,
+/// but it is never deleted whole, however long it has been idle.
 #[test]
 fn an_unknown_build_directory_is_never_deleted_whole() {
     let fixture = Fixture::new("basic");
@@ -714,11 +714,11 @@ fn an_unknown_build_directory_is_never_deleted_whole() {
     let workspace = fixture.workspace();
     use_store(&fixture, &workspace);
     let output = fixture
-        .cargo(["build", "--quiet", "-p", "echo-args"])
+        .cargo(["check", "--quiet", "-p", "echo-args"])
         .env_remove("CARGO_TARGET_DIR")
         .output()
-        .expect("run cargo build");
-    assert_success(&output, "cargo build");
+        .expect("run cargo check");
+    assert_success(&output, "cargo check");
     let builds = build_dirs(&store(&fixture));
     assert_eq!(builds.len(), 1, "{builds:?}");
     let build = &builds[0];
@@ -1624,4 +1624,56 @@ fn a_shared_target_directory_is_left_alone() {
         all - shared_size,
         "the budget leaves it out"
     );
+}
+
+/// A build directory only bare cargo built in, for a temporary workspace
+/// (as nested cargo in tests makes), is attributed to that workspace from
+/// what cargo compiled; once the workspace is gone it is an orphan nothing
+/// can claim (no repository), and the next pass over the budget evicts it
+/// without waiting (#88).
+#[test]
+fn a_bare_build_of_a_gone_temporary_workspace_is_attributed_and_evicted() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let throwaway = fixture.path("throwaway");
+    std::fs::create_dir_all(throwaway.join("src")).expect("create the workspace");
+    std::fs::write(
+        throwaway.join("Cargo.toml"),
+        "[package]\nname = \"throwaway\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .expect("write its manifest");
+    std::fs::write(throwaway.join("src").join("main.rs"), "fn main() {}\n").expect("write main");
+    use_store(&fixture, &throwaway);
+    let output = fixture
+        .cargo(["build", "--quiet"])
+        .current_dir(&throwaway)
+        .output()
+        .expect("run cargo");
+    assert_success(&output, "a bare cargo build");
+
+    let builds = |document: &Value| -> Vec<Value> {
+        document["dirs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no dirs: {document}"))
+            .iter()
+            .filter(|dir| dir["kind"] == "build")
+            .cloned()
+            .collect()
+    };
+    let listed = gc(&fixture, &["gc", "--dry-run"]);
+    let dirs = builds(&listed);
+    assert_eq!(dirs.len(), 1, "{listed}");
+    assert_eq!(dirs[0]["state"], "live", "{listed}");
+    let workspace = dirs[0]["workspace"].as_str().expect("attributed");
+    assert_eq!(spelled(Path::new(workspace)), spelled(&throwaway));
+    let build = PathBuf::from(dirs[0]["path"].as_str().expect("a path"));
+
+    std::fs::remove_dir_all(&throwaway).expect("remove the workspace");
+    configure(&fixture, "budget_mb = 0\n");
+    let done = gc(&fixture, &["gc"]);
+    assert!(
+        victims(&done).contains(&(2, spelled(&build))),
+        "evicted at once: {done}"
+    );
+    assert!(!build.exists(), "{} is still there", build.display());
 }

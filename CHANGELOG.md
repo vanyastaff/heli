@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Build directories only bare or nested cargo built in** are attributed to
+  their workspace from what cargo compiled, checked against cargo's
+  `{workspace-path-hash}`. `status` and `gc` show the workspace, and one
+  whose workspace is gone and has no repository (a test's temporary
+  workspace) is evicted on the next pass over the budget, without waiting.
+  `setup` explains what a user-wide `build-dir` does to nested cargo (#88).
+
 ### Added
 
 - **The Windows user environment.** `setup --autostart` registers the

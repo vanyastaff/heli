@@ -134,7 +134,14 @@ pub fn rungs(
                 return Vec::new();
             };
             let unclaimed = now.saturating_sub(since);
-            if unclaimed < policy.orphan_age {
+            // Only a worktree of its repository can claim it (recycling):
+            // without one, nothing will, and it need not wait (#88).
+            let claimable = surveyed
+                .dir
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner.repository.is_some());
+            if claimable && unclaimed < policy.orphan_age {
                 return Vec::new();
             }
             whole(

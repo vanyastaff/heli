@@ -28,10 +28,13 @@
 //! A victim inside one taken before only counts the bytes left in it; one
 //! inside a victim taken before is not one.
 //!
-//! **Which directories.** A busy directory has no victims. A build
-//! directory without an owner manifest (`unknown`, which only bare cargo
-//! built in) has tiers 1 and 3, plus tier 5 inside a verified exclusively
-//! regenerable cache root (`super::managed`). It never counts as an orphan. A
+//! **Which directories.** A busy directory has no victims. An orphan
+//! without a repository, which no worktree can claim, does not wait out
+//! `orphan_hours` (#88). A build directory without an owner manifest that
+//! `super::attribute` cannot attribute (`unknown`: only bare cargo built
+//! in, and compiled no object file) has tiers 1 and 3, plus tier 5 inside a
+//! verified exclusively regenerable cache root (`super::managed`). It never
+//! counts as an orphan. A
 //! registered `target/` directory has tiers 1, 3 and 4, and is never
 //! deleted whole: it is in the user's worktree.
 //!

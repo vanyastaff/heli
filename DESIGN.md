@@ -1589,8 +1589,25 @@ A build directory is in one of three states:
   worktree can leave files behind.
 - **Orphan.** Its workspace is gone, because the worktree was removed.
 
-A build directory without a manifest, which only bare cargo has built in, is
-**unknown**: heli cannot tell whose it is. Registered `target/` directories
+A build directory without a manifest, which only bare or nested cargo has
+built in, is attributed when it can be (#88). Cargo names it after the hash of
+its workspace's canonical manifest path (`{workspace-path-hash}`: cargo's
+`short_hash`, `StableSipHasher128` over the path, little-endian hex, split
+2/14). The hash cannot be inverted, but a candidate can be checked: the
+compiler records its working directory, the workspace root, in the object
+files of the crates it compiles incrementally. heli reads the absolute paths
+in the four smallest `.o` files of the directory's incremental sessions, and
+takes the ancestor whose `Cargo.toml` (canonical when it exists; else as
+spelled, under its nearest existing ancestor's canonical path, and on Windows
+verbatim) hashes to the directory's name: never a guess. It then writes the
+owner manifest, with no repository and no last run, and the directory is live
+or an orphan like any other. One it cannot attribute (only `check` or
+`clippy` built there: no object file) is marked `.heli/unattributed`, tried
+again only after cargo has written in it, and is **unknown**: heli cannot
+tell whose it is. A user-wide `build-dir` gives every temporary workspace of
+cargo run inside tests (trybuild, generated projects) a directory of its
+own; `setup` says so, and a repository's `build-dir` leaves them out.
+Registered `target/` directories
 have the same states, from the same locks and their registered workspace.
 
 `cargo heli gc --dry-run` lists every directory, build and target, with its
@@ -1659,7 +1676,10 @@ Which directories have which tiers:
 
 - A busy directory has none.
 - A live build directory has tiers 1, 3 and 5; an orphan 1, 2 and 3. An
-  orphan is deleted whole by tier 2 only, so it always has its 24 h.
+  orphan is deleted whole by tier 2 only, so it has its 24 h to be claimed
+  by a worktree of its repository (§6.4). One without a repository (a
+  temporary workspace's, attributed as in §6.2) can be claimed by none and
+  does not wait (#88).
 - An **unknown** build directory, which only bare or nested cargo built in,
   normally has tiers 1 and 3 only. Its first heli run gives it a manifest.
   In an exclusively regenerable cache root created by heli, it also has
