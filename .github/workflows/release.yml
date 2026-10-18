@@ -33,9 +33,20 @@ jobs:
             exit 1
           }
       - name: Create a draft release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file CHANGELOG.md
+        run: |
+          # The notes: this version's section of CHANGELOG.md, without its
+          # heading.
+          version=${GITHUB_REF_NAME#v}
+          awk -v head="## $version" '
+            $0 == head { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section ## $version"; exit 1; }
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
 
   build:
     name: build (${{ matrix.target }})

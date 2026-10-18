@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.0.2
+
+### Changed
+
+- **`cargo heli log`** prints a run as a person would have seen it. Cargo's
+  JSON messages, which heli asks for in compact and quiet mode, become the
+  diagnostics they carry, and `--tail` and `--grep` work on those lines.
+  The new `--raw` prints the record byte for byte (#69).
+- **Isolated Cargo homes** refuse `binstall`, `install-update` and
+  `quickinstall`, which would install into the private home, as they refuse
+  `cargo install`. `install --list` is allowed (#67).
+
+### Fixed
+
+- **Runs with an isolated Cargo home are keyed again** on workspaces with
+  optional or other-platform dependencies, so the result cache and live
+  sharing work with the configuration the README recommends. When a full
+  offline resolution needs packages the home lacks, the manifests are the
+  inventory (#66).
+- **A `target/` directory several workspaces share** (a global
+  `CARGO_TARGET_DIR`) is left alone by the build store: no eviction, and
+  not counted toward the budget (#65).
+- **`cargo heli doctor`** reports what heli does with nextest, llvm-cov and
+  mutants, leaves out cargo-ndk's helper binaries, follows the configured
+  Cargo home, and reports an unused build store and a fixed
+  `RUST_TEST_THREADS` (#68).
+
+### Added
+
+- **Windows packaged apps.** `doctor` and `ensure` report when package
+  virtualization (the Claude desktop app, packaged terminals) redirects
+  heli's state and configuration, and how to fix it (#70).
+- **Profiles for cross builds:** `cargo ndk` and `cargo zigbuild`, keyed by
+  the NDK and zig versions (#63).
+- **The compatibility matrix** checks that the pool bounds a real tool, and
+  `insta review` on a real terminal (#64).
+
 ## 0.0.1
 
 The first release. heli schedules cargo on a machine shared by many agents,
