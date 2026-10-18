@@ -103,6 +103,16 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         // ordinary shared-mode commands retain direct fallback.
         Err(_) => ClientConfig::default(),
     };
+    let configured = || config.output.mode;
+    let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
+        eprintln!("cargo-heli: {error}");
+        std::process::exit(USAGE)
+    });
+    // Before the profiles, which match the arguments it adds.
+    if let Some(selection) = invocation.select.take() {
+        let quiet = mode == output::Mode::Quiet;
+        crate::changed::apply(&selection, &invocation.program, &mut invocation.args, quiet);
+    }
     let source = if invocation.exec {
         invocation.profile = Some("exec");
         crate::profiles::Source::BuiltIn
@@ -111,11 +121,6 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         invocation.profile = Some(source.name(&invocation.args));
         source
     };
-    let configured = || config.output.mode;
-    let mode = output::choose(invocation.output, configured).unwrap_or_else(|error| {
-        eprintln!("cargo-heli: {error}");
-        std::process::exit(USAGE)
-    });
     let epoch_path = invocation.dependency_epoch.clone().or_else(|| {
         std::env::var_os("HELI_DEPENDENCY_EPOCH")
             .filter(|value| !value.is_empty())
