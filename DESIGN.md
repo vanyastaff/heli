@@ -2182,11 +2182,17 @@ downloads are recovered by Cargo in that home. Selected isolation survives
 daemon loss and direct fallback rather than silently becoming shared.
 
 Home-mutating Cargo commands need an explicit destination policy. This
-profile refuses `install` (but not the read-only `install --list`),
-`uninstall`, `login`, `logout` and `publish`, and the tools whose profile
-writes the Cargo home (`writes_home` in §5: `binstall`, `install-update`,
-`quickinstall`), instead of silently changing their original destination or
-installing into a private `bin/` that nothing has on `PATH`. An explicit shared request
+profile refuses `install`, `uninstall`, `login`, `logout` and `publish`, and
+the tools whose profile writes the Cargo home (`writes_home` in §5:
+`binstall`, `install-update`, `quickinstall`), instead of silently changing
+their original destination or installing into a private `bin/` that nothing
+has on `PATH`. A command that only prints is not refused and runs as bare
+Cargo would, with the caller's own home: `install --list`, which reads the
+home's record of installed tools (so it lists what is really installed, not
+the empty private home), and `-h` or `--help` of any of those commands, and
+`-V` or `--version` when it is the only argument (`install` and `binstall`
+take `--version <semver>`). `install foo --help` counts as help. Inside an
+already isolated parent the home stays the private one. An explicit shared request
 inside an inherited isolated command is refused rather than escaping its
 parent's context. Use an outer shared command for home maintenance. Arbitrary
 extensions and executables may interpret Cargo home themselves; their full

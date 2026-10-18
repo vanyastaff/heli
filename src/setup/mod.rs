@@ -52,6 +52,16 @@ pub fn cargo_home(cwd: &Path) -> Option<PathBuf> {
     cargo::home(cwd)
 }
 
+/// The `build-dir` line setup writes (and `--print` shows) for `store`.
+pub fn build_dir_line(store: &Path) -> String {
+    let value = crate::store::build_dir(store);
+    format!(
+        "{} = {}",
+        cargo::KEY,
+        cargo::basic_string(&value.to_string_lossy())
+    )
+}
+
 /// The configuration file cargo reads in `dir`, for `cargo heli doctor`.
 pub fn cargo_config_file(dir: &Path) -> PathBuf {
     cargo::file(dir)
