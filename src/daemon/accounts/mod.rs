@@ -20,7 +20,7 @@
 //! cargo without heli built. It looks again when a run ends, and every
 //! [`LOOK`] otherwise; it never takes cargo's locks. `status` reads the
 //! figures: one entry per store, its build directories added up, and one
-//! per registered `target/` directory.
+//! per registered `target/` directory, with its superseded intermediates.
 
 mod eviction;
 mod learning;
@@ -95,6 +95,8 @@ struct Figures {
     kind: Kind,
     store: Option<PathBuf>,
     sizes: Sizes,
+    /// Bytes in its superseded intermediates (`crate::store::superseded`).
+    superseded: u64,
     scanned: Instant,
 }
 
@@ -191,6 +193,7 @@ impl Accounts {
                     path: text(path),
                     used: figures.sizes.total(),
                     by_category: figures.sizes,
+                    superseded: figures.superseded,
                     shared: figures.kind == Kind::SharedTarget,
                 })
                 .collect()
@@ -233,6 +236,7 @@ impl Accounts {
                         kind: dir.kind,
                         store: dir.store.clone(),
                         sizes: dir.scan(&self.config),
+                        superseded: dir.superseded(&self.config),
                         scanned: Instant::now(),
                     };
                     self.ledger().figures.insert(dir.path.clone(), figures);

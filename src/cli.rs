@@ -42,8 +42,13 @@ pub enum Action {
     /// Kill run `run` (`r<number>`) with every process it started.
     Cancel { run: RunId },
     /// List the build store's directories and evict what the ladder says,
-    /// or with `dry_run` only name it; as JSON with `json`.
-    Gc { dry_run: bool, json: bool },
+    /// or with `dry_run` only name it; as JSON with `json`. With
+    /// `superseded`, reclaim every superseded directory instead.
+    Gc {
+        dry_run: bool,
+        json: bool,
+        superseded: bool,
+    },
     /// Explain how the installed cargo tools and the cargo configuration
     /// interact with heli; as JSON with `json`.
     Doctor { json: bool },
@@ -286,6 +291,11 @@ enum Command {
         /// Print the versioned JSON document instead of text.
         #[arg(long)]
         json: bool,
+        /// Reclaim, whatever the budget, every directory of intermediates in
+        /// a registered target/ directory that the build store superseded,
+        /// and nothing else.
+        #[arg(long)]
+        superseded: bool,
     },
     /// Explain how the installed cargo tools and the cargo configuration
     /// (`jobs`, `target-dir`, `build-dir`, wrappers, linkers) interact with
@@ -414,7 +424,15 @@ pub fn parse(
             yes,
             restart: true,
         },
-        Command::Gc { dry_run, json } => Action::Gc { dry_run, json },
+        Command::Gc {
+            dry_run,
+            json,
+            superseded,
+        } => Action::Gc {
+            dry_run,
+            json,
+            superseded,
+        },
         Command::Doctor { json } => Action::Doctor { json },
         Command::Setup {
             print,

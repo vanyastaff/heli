@@ -1677,3 +1677,156 @@ fn a_bare_build_of_a_gone_temporary_workspace_is_attributed_and_evicted() {
     );
     assert!(!build.exists(), "{} is still there", build.display());
 }
+
+/// Builds `echo-args` with heli in the fixture's workspace in its own
+/// `target/`, ages what that left in `target/debug/`, then builds again
+/// with a build directory in the store; returns the `target/` directory
+/// once the registry has it apart from its build directory (#92), with no
+/// daemon left to evict on its own.
+fn separated_target(fixture: &Fixture) -> PathBuf {
+    let workspace = fixture.workspace();
+    let target = workspace.join("target");
+    // In place, whatever the user's own cargo configuration says.
+    let output = heli_in(
+        fixture,
+        &workspace,
+        &["build", "--quiet", "-p", "echo-args"],
+    )
+    .env("CARGO_BUILD_BUILD_DIR", &target)
+    .output()
+    .expect("run heli build");
+    assert_success(&output, "cargo heli build in place");
+    set_times(&target.join("debug"), now() - HOUR);
+    use_store(fixture, &workspace);
+    build_in(fixture, &workspace, "echo-args");
+    wait_for("the target directory to be seen apart", || {
+        let registry = std::fs::read_to_string(fixture.state_dir().join("store.json")).ok()?;
+        let registry: Value = serde_json::from_str(&registry).ok()?;
+        registry["targets"].as_array()?.iter().find(|known| {
+            known["separated_since"].is_u64()
+                && spelled(Path::new(known["path"].as_str().unwrap_or_default()))
+                    == spelled(&target)
+        })?;
+        Some(())
+    });
+    fixture.kill_daemon();
+    target
+}
+
+/// The intermediates `separated_target` left in `target`, as tier 6 victims
+/// in order.
+fn superseded_victims(target: &Path, names: &[&str]) -> Vec<(u64, PathBuf)> {
+    let mut expected: Vec<(u64, PathBuf)> = names
+        .iter()
+        .map(|name| target.join("debug").join(name))
+        .filter(|dir| dir.is_dir())
+        .map(|dir| (6, spelled(&dir)))
+        .collect();
+    expected.sort();
+    expected
+}
+
+/// The bytes in the files under `path`.
+fn bytes_in(path: &Path) -> u64 {
+    let metadata = std::fs::symlink_metadata(path).expect("a path to measure");
+    if metadata.is_dir() {
+        std::fs::read_dir(path)
+            .expect("read a directory")
+            .map(|entry| bytes_in(&entry.expect("an entry").path()))
+            .sum()
+    } else {
+        metadata.len()
+    }
+}
+
+/// A `target/` directory built once in place and once with a build
+/// directory in the store keeps the intermediates of the first build: they
+/// are superseded (#92). `gc` reports them, with a hint; the ladder's first
+/// rung takes them over the budget; and `gc --superseded` reclaims them
+/// without a budget, never the final binary, nor a directory cargo wrote to
+/// after the move.
+#[test]
+fn superseded_intermediates_are_reported_and_reclaimed() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let target = separated_target(&fixture);
+    let debug = target.join("debug");
+    assert!(debug.join("deps").is_dir() && debug.join("incremental").is_dir());
+    std::fs::write(debug.join(".fingerprint").join("late.bin"), [0u8; 10])
+        .expect("write after the move");
+    let expected = superseded_victims(&target, &["deps", "incremental", "build"]);
+
+    let listing = gc(&fixture, &["gc", "--dry-run"]);
+    let reported: u64 = expected.iter().map(|(_, dir)| bytes_in(dir)).sum();
+    assert_eq!(
+        listed(&listing, &target)["superseded"],
+        reported,
+        "{listing}"
+    );
+    let output = fixture
+        .heli(["gc", "--dry-run"])
+        .output()
+        .expect("run heli gc");
+    assert_success(&output, "cargo heli gc --dry-run");
+    assert!(
+        text(&output.stdout).contains("superseded by the build store: cargo heli gc --superseded"),
+        "{}",
+        text(&output.stdout)
+    );
+
+    let planned = gc(&fixture, &["gc", "--superseded", "--dry-run"]);
+    assert_eq!(victims(&planned), expected, "{planned}");
+    assert!(expected.iter().all(|(_, dir)| dir.is_dir()), "a dry run");
+
+    configure(&fixture, "budget_mb = 0\n");
+    let ladder = gc(&fixture, &["gc", "--dry-run"]);
+    // The ladder takes nothing that frees nothing, as an empty `build/`.
+    let holding: Vec<(u64, PathBuf)> = expected
+        .iter()
+        .filter(|(_, dir)| bytes_in(dir) > 0)
+        .cloned()
+        .collect();
+    let first = victims(&ladder);
+    assert!(first.len() >= holding.len(), "{ladder}");
+    assert_eq!(first[..holding.len()], holding, "first: {ladder}");
+    configure(&fixture, "");
+
+    let done = gc(&fixture, &["gc", "--superseded"]);
+    assert_eq!(victims(&done), expected, "{done}");
+    assert_eq!(done["skipped"], serde_json::json!([]), "{done}");
+    assert!(expected.iter().all(|(_, dir)| !dir.exists()));
+    assert!(
+        debug.join(".fingerprint").is_dir(),
+        "written after the move"
+    );
+    let binary = debug.join(format!("echo-args{}", std::env::consts::EXE_SUFFIX));
+    assert!(binary.is_file(), "the final binary stays");
+    let after = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(listed(&after, &target)["superseded"], 0, "{after}");
+}
+
+/// Superseded intermediates are left alone while a cargo holds the lock of
+/// their profile, and reclaimed once it lets go.
+#[test]
+fn superseded_intermediates_wait_for_a_held_lock() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let target = separated_target(&fixture);
+    let expected = superseded_victims(&target, &["deps", "incremental", "build", ".fingerprint"]);
+    assert!(!expected.is_empty());
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(target.join("debug").join(".cargo-lock"))
+        .expect("open the profile's lock");
+    lock.lock().expect("take the profile's lock");
+
+    let held = gc(&fixture, &["gc", "--superseded"]);
+    assert_eq!(victims(&held), [], "{held}");
+    assert!(expected.iter().all(|(_, dir)| dir.is_dir()));
+
+    drop(lock);
+    let done = gc(&fixture, &["gc", "--superseded"]);
+    assert_eq!(victims(&done), expected, "{done}");
+}

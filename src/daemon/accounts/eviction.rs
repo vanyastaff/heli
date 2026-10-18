@@ -73,7 +73,7 @@ impl Accounts {
                 return;
             }
         };
-        let mut pass = evict::plan(&self.config, registry, now, false);
+        let mut pass = evict::plan(&self.config, registry, now, false, evict::Scope::Ladder);
         evict::execute(&mut pass, now);
         if pass.runtime_busy {
             self.log

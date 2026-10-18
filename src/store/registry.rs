@@ -9,6 +9,12 @@
 //! a global `CARGO_TARGET_DIR` or `build.target-dir`. The build store then
 //! leaves it alone (`super::kind`, #65).
 //!
+//! A `target/` directory whose workspace builds its intermediates elsewhere
+//! (`build.build-dir`) has that `build_dir`, and `separated_since`: when
+//! heli first saw them apart. What its profiles still hold of cargo's
+//! intermediates, untouched since then, is superseded (`super::superseded`,
+//! #92). Seen building in the target directory again, it loses both.
+//!
 //! A `target/` directory is registered, with the workspace it was last seen
 //! for, when a heli run builds in that workspace (`crate::daemon::accounts`).
 //! The daemon adds to it; `gc --dry-run` and the daemon's accounts read it.
@@ -37,6 +43,28 @@ pub struct Target {
     /// It was seen for more than one workspace.
     #[serde(default)]
     pub shared: bool,
+    /// Where its workspace builds its intermediates, when not here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_dir: Option<PathBuf>,
+    /// When heli first saw its workspace build them elsewhere, in seconds
+    /// since 1970.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separated_since: Option<u64>,
+}
+
+impl Target {
+    /// `path`, seen at `at` for `workspace`, which builds its intermediates
+    /// in `build_dir`.
+    pub fn seen(path: PathBuf, workspace: PathBuf, build_dir: &Path, at: u64) -> Self {
+        let apart = !same_path(build_dir, &path);
+        Self {
+            path,
+            workspace,
+            shared: false,
+            build_dir: apart.then(|| build_dir.to_path_buf()),
+            separated_since: apart.then_some(at),
+        }
+    }
 }
 
 /// The registry's file in `state_dir`.
@@ -55,22 +83,37 @@ impl Registry {
     }
 
     /// Registers `target` in the registry in `state_dir`, or updates its
-    /// workspace. Only one writer may call this at a time.
+    /// workspace and build directory. A target directory already apart from
+    /// its build directory keeps the time it was first seen apart. Only one
+    /// writer may call this at a time.
     pub fn add(state_dir: &Path, target: Target) -> io::Result<()> {
         let mut registry = Self::load(state_dir);
-        let known = registry
+        if !registry.merge(target) {
+            return Ok(());
+        }
+        registry.save(state_dir)
+    }
+
+    /// Merges `target` into the registry; whether that changed it.
+    fn merge(&mut self, target: Target) -> bool {
+        let known = self
             .targets
             .iter_mut()
             .find(|known| same_path(&known.path, &target.path));
-        match known {
-            Some(known) if same_path(&known.workspace, &target.workspace) => return Ok(()),
-            Some(known) => {
-                known.workspace = target.workspace;
-                known.shared = true;
-            }
-            None => registry.targets.push(target),
+        let Some(known) = known else {
+            self.targets.push(target);
+            return true;
+        };
+        let before = known.clone();
+        if !same_path(&known.workspace, &target.workspace) {
+            known.workspace = target.workspace;
+            known.shared = true;
         }
-        registry.save(state_dir)
+        known.separated_since = target
+            .separated_since
+            .map(|at| known.separated_since.unwrap_or(at));
+        known.build_dir = target.build_dir;
+        *known != before
     }
 
     fn save(&self, state_dir: &Path) -> io::Result<()> {
@@ -85,5 +128,50 @@ impl Registry {
         std::fs::rename(&temporary, path(state_dir)).inspect_err(|_| {
             let _ = std::fs::remove_file(&temporary);
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seen(build_dir: &str, at: u64) -> Target {
+        Target::seen(
+            PathBuf::from("/w/target"),
+            PathBuf::from("/w"),
+            Path::new(build_dir),
+            at,
+        )
+    }
+
+    #[test]
+    fn a_target_keeps_when_it_was_first_seen_apart_from_its_build_directory() {
+        let mut registry = Registry::default();
+        assert!(registry.merge(seen("/w/target", 10)));
+        assert_eq!(registry.targets[0].separated_since, None);
+        assert!(!registry.merge(seen("/w/target", 20)), "nothing changed");
+
+        assert!(registry.merge(seen("/store/ab/1", 30)));
+        assert_eq!(registry.targets[0].separated_since, Some(30));
+        assert!(!registry.merge(seen("/store/ab/1", 40)), "still since 30");
+        assert!(registry.merge(seen("/store/cd/2", 50)));
+        assert_eq!(registry.targets[0].separated_since, Some(30));
+        assert_eq!(
+            registry.targets[0].build_dir,
+            Some(PathBuf::from("/store/cd/2"))
+        );
+
+        assert!(registry.merge(seen("/w/target", 60)), "back together");
+        assert_eq!(registry.targets[0].separated_since, None);
+        assert_eq!(registry.targets[0].build_dir, None);
+    }
+
+    #[test]
+    fn an_old_registry_still_loads() {
+        let registry: Registry = serde_json::from_str(
+            r#"{"targets":[{"path":"/w/target","workspace":"/w","shared":false}]}"#,
+        )
+        .expect("an old registry");
+        assert_eq!(registry.targets[0].separated_since, None);
     }
 }

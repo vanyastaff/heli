@@ -18,7 +18,9 @@
 //! - the victim, and every directory between it and its root, must be a
 //!   directory of its own, not a link;
 //! - a directory of an unknown lock layout must not have changed within the
-//!   hour, and an orphan must still be one, with the same owner.
+//!   hour, an orphan must still be one, with the same owner, and superseded
+//!   intermediates must still be untouched since their `target/` directory
+//!   was seen apart from its build directory.
 //!
 //! What is in the trash is deleted afterwards, by whoever made the pass
 //! (`super::trash::empty`).
@@ -50,6 +52,16 @@ pub struct Volume {
     pub pending: u64,
 }
 
+/// What a pass reclaims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// What the ladder chooses over the budget or under the floor.
+    Ladder,
+    /// Every superseded directory, whatever the budget and the floor
+    /// (`gc --superseded`).
+    Superseded,
+}
+
 /// What a pass found and did.
 #[derive(Debug)]
 pub struct Pass {
@@ -68,11 +80,17 @@ pub struct Pass {
     pub skipped: Vec<(Victim, String)>,
 }
 
-/// Looks at the store at `now`, and plans what the ladder would evict
+/// Looks at the store at `now`, and plans what `scope` would evict
 /// ([`Pass::victims`]); [`execute`] evicts it. A `dry_run` changes nothing
 /// at all; otherwise the orphans' notes are brought up to date first
 /// (`super::orphan`).
-pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) -> Pass {
+pub fn plan(
+    config: &StoreConfig,
+    registry: &Registry,
+    now: u64,
+    dry_run: bool,
+    scope: Scope,
+) -> Pass {
     let runtime_busy = super::lease::busy();
     let policy = Policy::of(config);
     let mut dirs: Vec<Surveyed> = Vec::new();
@@ -119,11 +137,17 @@ pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) 
         victims: Vec::new(),
         skipped: Vec::new(),
     };
-    if !goals.any() {
+    if scope == Scope::Ladder && !goals.any() {
         return pass;
     }
     let candidates = ladder::candidates(&pass.dirs, &policy, &config.tool_cache_patterns(), now);
-    pass.victims = ladder::plan(candidates, &pass.dirs, goals);
+    pass.victims = match scope {
+        Scope::Ladder => ladder::plan(candidates, &pass.dirs, goals),
+        Scope::Superseded => candidates
+            .into_iter()
+            .filter(|victim| victim.tier == Tier::Superseded)
+            .collect(),
+    };
     pass
 }
 
@@ -247,6 +271,15 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     }
     if victim.tier == Tier::Orphan && !still_orphan(&surveyed.dir) {
         return Err("no longer an orphan".to_owned());
+    }
+    if victim.tier == Tier::Superseded
+        && !surveyed
+            .dir
+            .separation
+            .as_ref()
+            .is_some_and(|separation| super::superseded::still(&victim.path, separation.since))
+    {
+        return Err("written since the build directory moved".to_owned());
     }
     // Inspecting a large victim above may be slow. Only the final rename
     // needs the activity interlock: a new managed command takes its shared

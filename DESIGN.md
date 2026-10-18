@@ -1584,7 +1584,12 @@ repository, which waits for it in case its worktree gets a recycled build
 directory (§6.4).
 
 - The `target/` directory is **registered**, with its workspace, in
-  `store.json` in the state directory, which outlives the daemon.
+  `store.json` in the state directory, which outlives the daemon. When the
+  build directory is elsewhere, the entry also has `build_dir` and
+  `separated_since`: when heli first saw the two apart, in seconds since
+  1970, kept while they stay apart (a move from one store to another
+  included) and dropped once the workspace builds in its `target/` again.
+  Both are optional, so an older `store.json` still loads (#92).
 - A build directory at `<store>/<2 hex digits>/<hex digits>` in a store
   heli manages (configured, or its volume's default) gets its manifest,
   JSON: `{"workspace":…,"repository":…,"created_at":…,"last_run":…}`, times
@@ -1606,6 +1611,20 @@ run built in once the run has ended (cargo has let go of its locks), and any
 whose figures are an hour old, which catches what bare cargo built. It
 never takes cargo's locks; `status` shows its figures, and
 `gc --dry-run` scans afresh.
+
+**Superseded intermediates** (#92). A worktree built before `setup` set
+`build-dir` keeps its old intermediates in `target/` after the switch:
+cargo no longer reads them, and on flui they were most of the disk. In a
+registered, non-shared `target/` directory with `separated_since`, a
+profile directory's `deps/`, `incremental/`, `build/` and `.fingerprint/`
+are **superseded** when nothing in them was written after that time
+(`src/store/superseded.rs`). One cargo still writes to (another
+configuration, an environment variable) is not. Final artifacts at a
+profile's top level, `examples/`, tool caches and a build directory inside
+`target/` never are. `status` and `gc` report each target's superseded
+bytes as `superseded`, which `by_category` counts too, and the text form
+ends with a hint: `58.3 GiB superseded by the build store: cargo heli gc
+--superseded`.
 
 A build directory is in one of three states:
 
@@ -1648,12 +1667,15 @@ them. It reads the store itself and needs no daemon. `--json` prints a
 versioned document (`schema`, now 1): `dry_run`; `dirs`, one entry per
 directory, with `kind` (`build` or `target`), `path`, `store`, `state`,
 `workspace`, `repository`, `created_at`, `last_run`, `size` and
-`by_category`; `used` (what every directory takes), `budget` and `floor`
+`by_category`, and `superseded` (bytes, above); `used` (what every directory takes), `budget` and `floor`
 (bytes, `null` without one); `volumes`, each with `root`, `free` (`null`
 when unknown) and `pending` (bytes still in its trash); `victims`, planned
 in a dry run, else evicted, in order, each with `tier`, `path`, `bytes`,
 `age` (seconds, as its tier counts it) and `reason`; and `skipped`, the
-victims that could not be evicted, each also with `why`.
+victims that could not be evicted, each also with `why`. The document's
+`superseded` says whether the pass was `gc --superseded`, which reclaims
+every superseded directory now (tier 6, §6.3), whatever the budget and the
+floor, and nothing else; `--dry-run` combines with it.
 
 ### 6.3 Budget and eviction
 
@@ -1665,8 +1687,15 @@ without them, nothing is evicted. Over budget, heli evicts down to 85 % of
 B. Under the floor, it evicts on that volume until F is free there,
 counting what its trash still holds as free. It evicts what is cheapest to
 regenerate first, oldest first within each tier (the ages are `[store]
-scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
+scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`).
+A tier's number names it and does not rank it: tier 6, the newest, comes
+first, so that the numbers `gc`, `status` and the event log already showed
+keep their meaning.
 
+6. Superseded intermediates in registered `target/` directories (§6.2),
+   whatever their age: cargo will not read them again. Reason:
+   `intermediates superseded by build-dir <dir>`; age: since the
+   directory was seen apart from its build directory.
 0. Scratch copies cargo tools left in the temporary directory, untouched for
    1 h. cargo-mutants copies the workspace there for its builds
    (`mutants-*` on Windows, `cargo-mutants-<dir>-*` elsewhere) and deletes
@@ -1690,7 +1719,7 @@ scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
 
 A registered `target/` directory seen for two workspaces (a global `CARGO_TARGET_DIR` or `build.target-dir`) is `shared` from then on. It is not heli's to manage: it has no rungs, not even 1 and 3, and does not count toward B. `gc` and `status` list it as shared (#65).
 
-What depends on a directory's kind (build, target, scratch or shared) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches and its own rungs (0, 2, 4 and 5); rungs 1 and 3 apply to every kind.
+What depends on a directory's kind (build, target, scratch or shared) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches and its own rungs (6, 0, 2, 4 and 5); rungs 1 and 3 apply to every kind.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
 days, cargo-sweep's approach (out of scope for now).
@@ -1727,8 +1756,12 @@ Which directories have which tiers:
   Configure a fresh root for nested-Cargo reclamation; there is no implicit
   migration of an existing store.
 - A registered `target/` directory has tiers 1 and 3 where cargo keeps its
-  intermediates there (no `build-dir`), and tier 4. It is in the user's
-  worktree, so it is never deleted whole.
+  intermediates there (no `build-dir`), tier 6 where it kept them before
+  `build-dir` moved them, and tier 4. It is in the user's worktree, so it
+  is never deleted whole. A tier 6 victim is renamed into its trash under
+  the profile locks like the others, so a held `.cargo-lock` or
+  `.cargo-artifact-lock` skips it, and only if it is still untouched since
+  the separation.
 
 Safety rules:
 

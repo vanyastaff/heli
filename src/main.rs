@@ -100,7 +100,11 @@ fn main() {
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),
-        cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
+        cli::Action::Gc {
+            dry_run,
+            json,
+            superseded,
+        } => gc::main(dry_run, json, superseded),
         cli::Action::Doctor { json } => doctor::main(json),
         cli::Action::Dependencies(command) => {
             let result = match command {
