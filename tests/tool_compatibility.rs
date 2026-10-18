@@ -333,3 +333,93 @@ fn add_and_remove_edit_the_manifest() {
     let added = std::fs::read_to_string(&manifest).expect("read the manifest");
     assert!(added.contains("util"), "{added}\n--- before\n{original}");
 }
+
+/// `insta review` on a real terminal: interactive, it runs in the client
+/// and ends as it does without heli (#64).
+#[test]
+#[ignore = "needs cargo-insta; run by the compatibility workflow"]
+fn insta_review_runs_on_a_terminal() {
+    require("insta");
+    let repo = Repo::new();
+    let mut command = repo.fixture.heli(["insta", "review"]);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("CARGO_PKG_") {
+            command.env_remove(name);
+        }
+    }
+    let shown = support::terminal::run(&mut command);
+    assert_eq!(shown.code, Some(0), "{}", shown.text);
+    assert!(
+        !shown.text.contains("running the command directly"),
+        "no fallback warning: {}",
+        shown.text
+    );
+}
+
+/// The host pool bounds a real tool's cargos (#64): two `cargo heli hack
+/// check` runs at once, with a pool of two slots, never run more than the
+/// pool's two jobs plus one of each cargo's own at once. Their argv differ,
+/// so heli runs both rather than sharing one; the slow crates are compiled
+/// beforehand, so what is measured is how the pool schedules their build
+/// scripts.
+#[test]
+#[ignore = "needs cargo-hack; run by the compatibility workflow"]
+fn the_pool_bounds_cargo_hack() {
+    require("hack");
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 2\n");
+    let runs = [
+        ("a", ["-p", "slow-a", "-p", "slow-b"]),
+        ("b", ["-p", "slow-b", "-p", "slow-c"]),
+    ];
+    let logs: Vec<support::ConcurrencyLog> = runs
+        .iter()
+        .map(|(name, _)| fixture.concurrency_log_named(name))
+        .collect();
+    for ((name, _), log) in runs.iter().zip(&logs) {
+        log.warm_slow_crates(&fixture, &format!("target-{name}"));
+    }
+    let children: Vec<std::process::Child> = runs
+        .iter()
+        .zip(&logs)
+        .map(|((name, packages), log)| {
+            let mut command = fixture.heli(["hack", "check"]);
+            command
+                .args(packages)
+                .env("CARGO_TARGET_DIR", fixture.path(&format!("target-{name}")))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("CARGO_PKG_") {
+                    command.env_remove(name);
+                }
+            }
+            log.attach(&mut command, 3000);
+            command.spawn().expect("start heli")
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().expect("wait for heli");
+        assert_success(&output, "cargo heli hack check");
+    }
+    let per_run: Vec<Vec<support::Interval>> = logs.iter().map(|log| log.intervals()).collect();
+    assert!(
+        per_run.iter().all(|run| !run.is_empty()),
+        "both runs' build scripts ran"
+    );
+    // They ran at once, or the bound would say nothing.
+    for (run, other) in [(0, 1), (1, 0)] {
+        let first_start = per_run[run].iter().map(|script| script.start).min();
+        let last_end = per_run[other].iter().map(|script| script.end).max();
+        assert!(
+            first_start < last_end,
+            "run {run} waited for run {other}: {per_run:?}"
+        );
+    }
+    let most = support::max_overlap(&per_run.concat());
+    assert!(
+        most <= 2 + 2,
+        "{most} build scripts ran at once: {per_run:?}"
+    );
+}
