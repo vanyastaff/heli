@@ -845,7 +845,10 @@ fn status_prints_text_for_people() {
     let pid = support::daemon_pid(&status).expect("a daemon");
     let daemon_line = busy.lines().next().unwrap_or_default();
     let uptime: u64 = daemon_line
-        .strip_prefix(&format!("daemon  pid {pid}, protocol "))
+        .strip_prefix(&format!(
+            "daemon  pid {pid}, version {}, protocol ",
+            env!("CARGO_PKG_VERSION")
+        ))
         .and_then(|rest| rest.split_once(", up "))
         .and_then(|(_, uptime)| uptime.strip_suffix('s'))
         .and_then(|uptime| uptime.parse().ok())

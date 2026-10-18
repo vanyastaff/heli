@@ -6,7 +6,9 @@
 //!
 //! ```json
 //! {"schema":1,
-//!  "daemon":{"pid":4242,"protocol":1,"started_at":1791910980,"session":1,
+//!  "daemon":{"pid":4242,"version":"0.0.3",
+//!            "executable":"C:\\Users\\me\\.cargo\\bin\\cargo-heli.exe",
+//!            "protocol":1,"started_at":1791910980,"session":1,
 //!            "window_station":"WinSta0","desktop":"Default","interactive":true},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
 //!  "memory":{"total":68719476736,"available":44291850240,
@@ -37,6 +39,9 @@
 //!                         "tier":1,"bytes":300}]}}
 //! ```
 //!
+//! `daemon.version` is the daemon's cargo-heli version and `executable` its
+//! program, both `null` from a daemon older than them (0.0.2 and before);
+//! the text form flags a daemon older than the client.
 //! `daemon`, `pool` and `memory` are `null` when no daemon answers; `memory`
 //! is also `null` while the daemon cannot read the machine's memory. A run
 //! waiting for its worktree's lock has `waiting_since` and, in
@@ -62,6 +67,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
 use crate::store::sizes::{self, Sizes};
+
+/// Whether version `a` (`major.minor.patch`, perhaps with a suffix) is
+/// older than `b`; a version that does not read as numbers is not.
+pub fn older(a: &str, b: &str) -> bool {
+    let numbers = |version: &str| -> Option<Vec<u64>> {
+        version
+            .split(['-', '+'])
+            .next()?
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    };
+    matches!((numbers(a), numbers(b)), (Some(a), Some(b)) if a < b)
+}
 
 /// The version of the `--json` schema.
 pub const SCHEMA: u32 = 1;
@@ -169,6 +188,12 @@ pub struct Memory {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Daemon {
     pub pid: u32,
+    /// Its cargo-heli version; absent from a daemon older than this field.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Its program; absent from a daemon older than this field.
+    #[serde(default)]
+    pub executable: Option<String>,
     /// The protocol version it speaks.
     pub protocol: u32,
     pub started_at: u64,
@@ -336,12 +361,24 @@ impl Status {
                     Some(false) => place.push_str(" (not interactive)"),
                     None => {}
                 }
-                format!(
-                    "daemon  pid {}, protocol {}{place}, up {}s\n",
+                let client = env!("CARGO_PKG_VERSION");
+                let version = daemon.version.as_deref();
+                let mut line = format!(
+                    "daemon  pid {}, version {}, protocol {}{place}, up {}s\n",
                     daemon.pid,
+                    version.unwrap_or("before 0.0.3"),
                     daemon.protocol,
                     age(daemon.started_at)
-                )
+                );
+                if let Some(program) = &daemon.executable {
+                    line.push_str(&format!("        {program}\n"));
+                }
+                if version.is_none_or(|version| older(version, client)) {
+                    line.push_str(&format!(
+                        "        older than this cargo-heli ({client}): `cargo heli restart` replaces it\n"
+                    ));
+                }
+                line
             }
         };
         if let Some(pool) = &self.pool {
@@ -481,5 +518,21 @@ fn class_of(run: &Run) -> String {
     match run.profile.as_deref() {
         None | Some("cargo" | "exec") => class.to_owned(),
         Some(profile) => format!("{class} ({profile})"),
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::older;
+
+    #[test]
+    fn compares_versions_by_number() {
+        assert!(older("0.0.2", "0.0.3"));
+        assert!(older("0.0.9", "0.0.10"));
+        assert!(older("0.9.0", "1.0.0"));
+        assert!(!older("0.0.3", "0.0.3"));
+        assert!(!older("0.1.0", "0.0.9"));
+        assert!(!older("0.0.3-dev", "0.0.3"));
+        assert!(!older("garbled", "0.0.3"));
     }
 }

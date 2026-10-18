@@ -13,11 +13,19 @@
 
 ### Added
 
+- **`cargo heli stop` and `cargo heli restart`.** `stop` has the daemon take
+  no new runs and exit once its runs end (`--now` cancels them, after a
+  confirmation); `restart` then starts the current binary's daemon.
+  `status` shows the daemon's version and program, and says when it is older
+  than the client (#87).
 - **The Windows user environment.** `setup --autostart` registers the
   daemon for `HELI_STATE_DIR` and `HELI_CONFIG` set there (with `setx`, as
   `doctor` advises for packaged apps); one set for a process only is still
   refused, and the message says so. `setup` offers to set `CARGO_MAKEFLAGS`
   there (#82).
+- **`cargo heli doctor`** warns about a `CARGO_MAKEFLAGS` that names another
+  jobserver than heli's pool, such as one written before the state
+  directory moved, and gives the value to set (#86).
 
 ## 0.0.2
 
