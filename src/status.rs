@@ -133,6 +133,9 @@ pub struct TargetUse {
     pub path: String,
     pub used: u64,
     pub by_category: Sizes,
+    /// Seen for more than one workspace: the build store leaves it alone.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// The host pool's slots (`crate::pool`), counted as the status was taken.
@@ -402,8 +405,13 @@ impl Status {
             }
             for target in &disk.targets {
                 text.push_str(&format!(
-                    "{label:<6}  target {}  {}\n",
+                    "{label:<6}  target {}{}  {}\n",
                     target.path,
+                    if target.shared {
+                        " (shared, left alone)"
+                    } else {
+                        ""
+                    },
                     used(target.used, &target.by_category)
                 ));
                 label = "";

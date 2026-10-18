@@ -1544,3 +1544,84 @@ fn scratch_copies_left_by_cargo_mutants_go_first() {
     assert!(fresh.exists() && held.exists(), "the others stay");
     drop(lock);
 }
+
+/// A `target/` directory two workspaces build in (a global
+/// `CARGO_TARGET_DIR`) is shared from then on (#65): `gc` lists it as
+/// `shared`, takes no victim in it however old its units, and does not count
+/// it toward the budget, while another workspace's own `target/` is evicted
+/// as usual.
+#[test]
+fn a_shared_target_directory_is_left_alone() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "budget_mb = 1\n");
+    let main = fixture.workspace();
+    init_repo(&main);
+    let shared = fixture.path("shared-target");
+    let clock = now() + 300 * HOUR;
+    for name in ["a", "b"] {
+        let worktree = add_worktree(&main, name);
+        let output = heli_in(
+            &fixture,
+            &worktree,
+            &["build", "--quiet", "-p", "echo-args"],
+        )
+        .env("CARGO_TARGET_DIR", &shared)
+        .output()
+        .expect("run heli build");
+        assert_success(&output, "cargo heli build into the shared target");
+    }
+    let own = add_worktree(&main, "own");
+    let output = heli_in(&fixture, &own, &["build", "--quiet", "-p", "echo-args"])
+        .output()
+        .expect("run heli build");
+    assert_success(&output, "cargo heli build into its own target");
+    wait_for("the shared target to be registered as shared", || {
+        let registry = std::fs::read_to_string(fixture.state_dir().join("store.json")).ok()?;
+        let registry: Value = serde_json::from_str(&registry).ok()?;
+        registry["targets"].as_array()?.iter().find(|target| {
+            target["shared"] == true
+                && spelled(Path::new(target["path"].as_str().unwrap_or_default()))
+                    == spelled(&shared)
+        })?;
+        Some(())
+    });
+    // No daemon, whose own passes would evict before the dry run looks.
+    fixture.kill_daemon();
+    for dir in [&shared, &own.join("target")] {
+        fake_unit(
+            &incremental(dir),
+            "old-unit",
+            4 * MB as usize,
+            clock - 100 * HOUR,
+        );
+        set_times(dir, clock - 100 * HOUR);
+    }
+    set_clock(&fixture, clock);
+    let planned = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(listed(&planned, &shared)["kind"], "shared", "{planned}");
+    let victims = victims(&planned);
+    assert!(
+        victims
+            .iter()
+            .all(|(_, path)| !path.starts_with(spelled(&shared))),
+        "nothing in the shared target is a victim: {victims:?}"
+    );
+    assert!(
+        victims
+            .iter()
+            .any(|(_, path)| path.starts_with(spelled(&own.join("target")))),
+        "the workspace's own target is evicted as usual: {victims:?}"
+    );
+    let shared_size = listed(&planned, &shared)["size"].as_u64().expect("a size");
+    let all: u64 = planned["dirs"]
+        .as_array()
+        .expect("dirs")
+        .iter()
+        .filter_map(|dir| dir["size"].as_u64())
+        .sum();
+    assert_eq!(
+        used(&planned),
+        all - shared_size,
+        "the budget leaves it out"
+    );
+}

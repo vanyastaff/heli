@@ -2,8 +2,12 @@
 //! `store.json` in the state directory:
 //!
 //! ```json
-//! {"targets":[{"path":"D:\\flui\\target","workspace":"D:\\flui"}]}
+//! {"targets":[{"path":"D:\\flui\\target","workspace":"D:\\flui","shared":false}]}
 //! ```
+//!
+//! A `target/` directory seen for two workspaces is `shared` from then on:
+//! a global `CARGO_TARGET_DIR` or `build.target-dir`. The build store then
+//! leaves it alone (`super::kind`, #65).
 //!
 //! A `target/` directory is registered, with the workspace it was last seen
 //! for, when a heli run builds in that workspace (`crate::daemon::accounts`).
@@ -30,6 +34,9 @@ pub struct Target {
     pub path: PathBuf,
     /// The workspace it was last seen for.
     pub workspace: PathBuf,
+    /// It was seen for more than one workspace.
+    #[serde(default)]
+    pub shared: bool,
 }
 
 /// The registry's file in `state_dir`.
@@ -56,8 +63,11 @@ impl Registry {
             .iter_mut()
             .find(|known| same_path(&known.path, &target.path));
         match known {
-            Some(known) if known.workspace == target.workspace => return Ok(()),
-            Some(known) => known.workspace = target.workspace,
+            Some(known) if same_path(&known.workspace, &target.workspace) => return Ok(()),
+            Some(known) => {
+                known.workspace = target.workspace;
+                known.shared = true;
+            }
             None => registry.targets.push(target),
         }
         registry.save(state_dir)

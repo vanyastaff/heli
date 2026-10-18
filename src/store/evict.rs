@@ -101,7 +101,12 @@ pub fn plan(config: &StoreConfig, registry: &Registry, now: u64, dry_run: bool) 
             }
         }
     }
-    let used = dirs.iter().map(|surveyed| surveyed.measure.bytes).sum();
+    // A shared `target/` directory is not heli's to manage (`super::kind`).
+    let used = dirs
+        .iter()
+        .filter(|surveyed| surveyed.dir.kind.managed())
+        .map(|surveyed| surveyed.measure.bytes)
+        .sum();
     let volumes = volumes(config, registry, &dirs);
     let goals = goals(&policy, used, &volumes);
     let mut pass = Pass {

@@ -182,22 +182,23 @@ impl Accounts {
                 }
             })
             .collect();
-        let of_kind = |kind: Kind| -> Vec<TargetUse> {
+        let of_kinds = |kinds: &[Kind]| -> Vec<TargetUse> {
             ledger
                 .figures
                 .iter()
-                .filter(|(_, figures)| figures.kind == kind)
+                .filter(|(_, figures)| kinds.contains(&figures.kind))
                 .map(|(path, figures)| TargetUse {
                     path: text(path),
                     used: figures.sizes.total(),
                     by_category: figures.sizes,
+                    shared: figures.kind == Kind::SharedTarget,
                 })
                 .collect()
         };
         Disk {
             stores,
-            targets: of_kind(Kind::Target),
-            scratch: of_kind(Kind::Scratch),
+            targets: of_kinds(&[Kind::Target, Kind::SharedTarget]),
+            scratch: of_kinds(&[Kind::Scratch]),
         }
     }
 

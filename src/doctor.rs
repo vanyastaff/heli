@@ -345,7 +345,7 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "target-dir",
             "warn",
             format!(
-                "A global target directory is set ({dir}). Workspaces sharing it share one build directory, so cargo's artifact lock serializes them and the build store's recycling and eviction cannot own it."
+                "A global target directory is set ({dir}). Workspaces sharing it share one build directory, so cargo's artifact lock serializes them. Once heli has seen it for two workspaces, the build store leaves it alone: it evicts nothing there and leaves it out of the budget."
             ),
             "Unset it, or set it per worktree.",
         );
