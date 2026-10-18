@@ -118,9 +118,9 @@ pub fn compute(request: &RunRequest, scratch: &Path) -> Result<Option<Key>, Stri
 /// well as staged Git identities. Missing inventories disable caching.
 pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String> {
     let probe = Probe::request(request);
-    let selected = probe
-        .sources_at(None)
-        .ok_or("cannot discover the command's local Cargo sources offline")?;
+    let selected = probe.sources_at(None).map_err(|why| {
+        format!("cannot discover the command's local Cargo sources offline: {why}")
+    })?;
     let caller = worktree::of(&request.cwd());
     let mut roots = BTreeSet::new();
     roots.insert(caller.clone());
@@ -151,20 +151,20 @@ pub fn snapshot(request: &RunRequest, scratch: &Path) -> Result<Snapshot, String
             roots.insert(root);
             manifests.insert(package.manifest_path.clone());
         }
-        for package in workspace
+        let paths = workspace
             .packages
             .iter()
             .filter(|package| package.source.is_none())
-        {
-            for dependency in &package.dependencies {
-                if let Some(path) = &dependency.path {
-                    let manifest = path.join("Cargo.toml");
-                    if manifests.insert(manifest.clone()) {
-                        pending.push(probe.sources_at(Some(&manifest)).ok_or_else(|| {
-                            format!("cannot discover local dependency {}", path.display())
-                        })?);
-                    }
-                }
+            .flat_map(|package| package.dependencies.iter())
+            .filter_map(|dependency| dependency.path.clone())
+            .chain(workspace.patches.iter().cloned())
+            .collect::<Vec<_>>();
+        for path in paths {
+            let manifest = path.join("Cargo.toml");
+            if manifests.insert(manifest.clone()) {
+                pending.push(probe.sources_at(Some(&manifest)).map_err(|why| {
+                    format!("cannot discover local dependency {}: {why}", path.display())
+                })?);
             }
         }
     }

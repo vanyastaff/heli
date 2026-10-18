@@ -25,6 +25,9 @@ Cargo downloads and resolves dependencies itself. For a command-scoped
 choice, use `cargo heli --cargo-home isolated --cache off check --locked`.
 The default is `shared`; an outer `--cargo-home shared` keeps the caller's
 original home. An explicit epoch selection still uses its isolated profile.
+Keep one mode per target directory: the registry sources' paths differ
+between a private home and the shared one, so switching a `target/` between
+`isolated` and `shared` rebuilds every dependency once.
 
 This trades duplicate downloads and storage for independence. A cold
 isolated home cannot build offline just because another home has the

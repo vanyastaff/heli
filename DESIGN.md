@@ -2241,6 +2241,14 @@ was found by a failing test.
   toolchain and configuration included). Offline resolution with all
   features inventories local packages, including external path dependencies
   and registry/git patches; their Git roots contribute raw content too.
+  That resolution needs every package of the lockfile in the Cargo home. A
+  private home (§6.6) lacks optional and other-platform dependencies it
+  never built, and then the manifests alone (`--no-deps`) are the
+  inventory. They declare every path dependency, optional and
+  platform-specific ones included. The local crates that `[patch]` and
+  `[replace]` put in place are read from the root manifest and from the
+  Cargo configuration. Registry and git sources are already keyed through
+  the lockfile, which is in the tree (#66).
   If the inventory cannot be established, or a local source has no Git
   inventory, the command runs without result caching. Existing key markers
   use a different composition and cannot match these keys.
