@@ -16,13 +16,17 @@
 //! `systemctl` and `launchctl`, or the programs `HELI_SCHTASKS`,
 //! `HELI_SYSTEMCTL` and `HELI_LAUNCHCTL` name (tests point them at a fake).
 //!
-//! **Default locations only.** A Task Scheduler task cannot hand its program
-//! variables, so the registration starts the daemon that a plain
-//! `cargo heli` finds, and setup refuses to register or unregister while
-//! one of `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or `HELI_CONFIG` is
-//! set. The unit and the agent still name the locations setup resolved, so
-//! that the service manager's environment (which may lack the XDG variables
-//! a shell sets) cannot move them.
+//! **The locations every process has.** A Task Scheduler task cannot hand
+//! its program variables, so the registration starts the daemon that a
+//! plain `cargo heli` of the user finds. setup refuses to register or
+//! unregister while one of `HELI_STATE_DIR`, `HELI_ENDPOINT`, `HELI_POOL` or
+//! `HELI_CONFIG` is set for this process only. On Windows one set
+//! persistently, in the user environment (`crate::user_env`) with the value
+//! this process has, is every process's, the logon task's included, so the
+//! registration is for those locations (#82): what `cargo heli doctor` tells
+//! an MSIX-packaged host to set. The unit and the agent still name the
+//! locations setup resolved, so that the service manager's environment
+//! (which may lack the XDG variables a shell sets) cannot move them.
 //!
 //! **The record**, `autostart` in the state directory, says that setup
 //! registered the daemon, with which program and for which locations. A
@@ -143,14 +147,26 @@ impl Registration {
     /// The registration for this program and the default locations, or why
     /// there can be none.
     pub fn new() -> Result<Self, String> {
-        if let Some(var) = locations::VARS
-            .into_iter()
-            .find(|var| std::env::var_os(var).is_some_and(|value| !value.is_empty()))
-        {
-            return Err(format!(
-                "{var} is set, and the registration starts the daemon heli finds by default; \
-                 unset it first"
-            ));
+        for var in locations::VARS {
+            let Some(value) = std::env::var_os(var).filter(|value| !value.is_empty()) else {
+                continue;
+            };
+            if cfg!(windows) && crate::user_env::get(var).as_ref() == Some(&value) {
+                // Every process has it, the logon task too.
+                continue;
+            }
+            return Err(if cfg!(windows) {
+                format!(
+                    "{var} is set for this process only, not in your user environment, and the \
+                     registration starts the daemon every process of yours finds; set it there \
+                     (setx {var} \"...\") with the same value, or unset it"
+                )
+            } else {
+                format!(
+                    "{var} is set, and the registration starts the daemon heli finds by default; \
+                     unset it first"
+                )
+            });
         }
         let locations = Locations::resolve()?;
         let program = std::env::current_exe()

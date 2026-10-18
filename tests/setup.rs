@@ -234,10 +234,15 @@ fn setup_writes_what_it_showed_once_the_user_agrees() {
     let settings = shown(&printed, &home.settings_header());
     let profile_end = shown(&printed, &home.profile_header());
 
-    // The third answer is for the Cargo configuration (`tests/store.rs`).
+    // The third answer is for the Cargo configuration (`tests/store.rs`), the
+    // fourth, on Windows, for the user environment (the fixture's stand-in).
     let output = answered(
         fixture.setup(Some("/bin/bash"), Vec::<String>::new()),
-        "\u{feff}y\nyes\ny\n",
+        if cfg!(windows) {
+            "\u{feff}y\nyes\ny\ny\n"
+        } else {
+            "\u{feff}y\nyes\ny\n"
+        },
     );
     assert_success(&output, "cargo heli setup");
     let stdout = text(&output.stdout);
@@ -265,7 +270,7 @@ fn setup_writes_what_it_showed_once_the_user_agrees() {
     assert!(!stdout.contains("[y/N]"), "nothing left to ask: {stdout}");
     assert_eq!(
         stdout.matches("already sets CARGO_MAKEFLAGS").count(),
-        2,
+        if cfg!(windows) { 3 } else { 2 },
         "{stdout}"
     );
     assert_eq!(home.contents(), written, "nothing written twice");
@@ -286,8 +291,12 @@ fn setup_writes_nothing_without_consent() {
         "n\n",
     );
     assert_success(&output, "cargo heli setup, answered no");
-    // The settings, the profile and the Cargo configuration.
-    assert_eq!(text(&output.stdout).matches("[y/N]").count(), 3);
+    // The settings, the profile and the Cargo configuration, and on Windows
+    // the user environment.
+    assert_eq!(
+        text(&output.stdout).matches("[y/N]").count(),
+        if cfg!(windows) { 4 } else { 3 }
+    );
     let output = fixture
         .setup(Some("/bin/bash"), Vec::<String>::new())
         .output()
@@ -490,8 +499,13 @@ fn setup_leaves_settings_it_cannot_edit_alone() {
             home.settings.display()
         );
         assert!(stdout.contains(&left), "{settings}: {stdout}");
-        // The profile and the Cargo configuration.
-        assert_eq!(stdout.matches("[y/N]").count(), 2, "{stdout}");
+        // The profile and the Cargo configuration, and on Windows the user
+        // environment.
+        assert_eq!(
+            stdout.matches("[y/N]").count(),
+            if cfg!(windows) { 3 } else { 2 },
+            "{stdout}"
+        );
         assert_eq!(read(&home.settings), settings);
     }
 }

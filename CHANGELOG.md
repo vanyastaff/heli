@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The Windows user environment.** `setup --autostart` registers the
+  daemon for `HELI_STATE_DIR` and `HELI_CONFIG` set there (with `setx`, as
+  `doctor` advises for packaged apps); one set for a process only is still
+  refused, and the message says so. `setup` offers to set `CARGO_MAKEFLAGS`
+  there (#82).
+
 ## 0.0.2
 
 ### Changed

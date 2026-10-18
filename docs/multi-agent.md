@@ -21,6 +21,9 @@ setx HELI_CONFIG "%USERPROFILE%\.heli\config.toml"
 ```
 
 Restart the apps and terminals afterwards, so that they see the variables.
+`cargo heli setup --autostart` then registers the daemon for these
+locations, and `cargo heli setup` offers to put `CARGO_MAKEFLAGS` in the
+user environment too.
 
 The current priority is independent progress across projects and worktrees.
 Disk and RAM caps are secondary; preserve runtime safety without treating
