@@ -338,6 +338,28 @@ const TOOLS: &[Tool] = &[
         writes_home: false,
         cleaner: None,
     },
+    Tool {
+        // Its `target/llvm-cov-target` is a built-in tool cache
+        // (`crate::config::BUILTIN_TOOL_CACHES`).
+        names: &["llvm-cov"],
+        summary: "exec; its target/llvm-cov-target is a tool cache heli accounts for and evicts",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Exec),
+        cleaner: None,
+        writes_home: false,
+    },
+    Tool {
+        // Its scratch copies of the workspace are eviction tier 0
+        // (`crate::store::scratch`).
+        names: &["mutants"],
+        summary: "exec; its scratch copies of the workspace are evicted first (tier 0)",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Exec),
+        cleaner: None,
+        writes_home: false,
+    },
 ];
 
 impl Tool {
