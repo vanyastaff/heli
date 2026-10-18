@@ -1624,7 +1624,9 @@ scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`):
    `facade-consumer-check`.
 5. Whole build directories of live workspaces idle for 7 days.
 
-What depends on a directory's kind (build, target or scratch) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches and its own rungs (0, 2, 4 and 5); rungs 1 and 3 apply to every kind.
+A registered `target/` directory seen for two workspaces (a global `CARGO_TARGET_DIR` or `build.target-dir`) is `shared` from then on. It is not heli's to manage: it has no rungs, not even 1 and 3, and does not count toward B. `gc` and `status` list it as shared (#65).
+
+What depends on a directory's kind (build, target, scratch or shared) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches and its own rungs (0, 2, 4 and 5); rungs 1 and 3 apply to every kind.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
 days, cargo-sweep's approach (out of scope for now).

@@ -8,8 +8,12 @@
 //! | build   | anywhere inside                 | `<store>/.trash`        | none        | 2 orphan, 5 whole directory                    |
 //! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 4 tool caches                                  |
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
+//! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
 //!
-//! Every kind also has the ladder's incremental rungs, 1 and 3.
+//! Every kind but shared also has the ladder's incremental rungs, 1 and 3.
+//! A shared `target/` directory, seen for more than one workspace (a global
+//! `CARGO_TARGET_DIR` or `build.target-dir`), is not heli's to manage: it
+//! has no rungs at all, and does not count toward the budget (#65).
 
 use std::path::PathBuf;
 
@@ -36,6 +40,10 @@ pub enum Kind {
     /// A scratch copy a cargo tool left in the temporary directory
     /// (`super::scratch`).
     Scratch,
+    /// A registered `target/` directory seen for more than one workspace
+    /// (`super::registry::Target::shared`).
+    #[serde(rename = "shared")]
+    SharedTarget,
 }
 
 /// Where a cargo's lock makes a directory busy.
@@ -55,14 +63,21 @@ impl Kind {
             Self::Build => "build",
             Self::Target => "target",
             Self::Scratch => "scratch",
+            Self::SharedTarget => "shared",
         }
+    }
+
+    /// Whether heli manages directories of this kind: evicts from them and
+    /// counts them toward the budget. Not a shared `target/` directory.
+    pub fn managed(self) -> bool {
+        !matches!(self, Self::SharedTarget)
     }
 
     /// Where a cargo's lock makes a directory of this kind busy.
     pub fn lock_scope(self) -> LockScope {
         match self {
             Self::Build | Self::Scratch => LockScope::Anywhere,
-            Self::Target => LockScope::Profiles,
+            Self::Target | Self::SharedTarget => LockScope::Profiles,
         }
     }
 }
@@ -72,7 +87,7 @@ impl Dir {
     pub fn trash(&self) -> Option<PathBuf> {
         match self.kind {
             Kind::Build => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
-            Kind::Target => Some(self.path.join(TARGET_TRASH)),
+            Kind::Target | Kind::SharedTarget => Some(self.path.join(TARGET_TRASH)),
             Kind::Scratch => Some(super::scratch::trash()),
         }
     }
@@ -81,7 +96,7 @@ impl Dir {
     /// trash), which measuring it skips.
     pub fn own_trash(&self) -> Option<&'static str> {
         match self.kind {
-            Kind::Target => Some(TARGET_TRASH),
+            Kind::Target | Kind::SharedTarget => Some(TARGET_TRASH),
             Kind::Build | Kind::Scratch => None,
         }
     }
@@ -90,7 +105,7 @@ impl Dir {
     pub fn tool_caches(&self, config: &StoreConfig) -> Vec<String> {
         match self.kind {
             Kind::Target => config.tool_cache_patterns(),
-            Kind::Build | Kind::Scratch => Vec::new(),
+            Kind::Build | Kind::Scratch | Kind::SharedTarget => Vec::new(),
         }
     }
 }
@@ -173,6 +188,6 @@ pub fn rungs(
                 )
             })
             .collect(),
-        (Kind::Target, _) => Vec::new(),
+        (Kind::Target, _) | (Kind::SharedTarget, _) => Vec::new(),
     }
 }

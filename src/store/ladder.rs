@@ -302,6 +302,9 @@ pub fn candidates(
         }
         let root = &surveyed.dir.path;
         let idle = now.saturating_sub(surveyed.last_use);
+        if !surveyed.dir.kind.managed() {
+            continue;
+        }
         let mut victim = |tier: Tier, path: PathBuf, bytes: u64, age: u64, reason: String| {
             victims.push(Victim {
                 tier,

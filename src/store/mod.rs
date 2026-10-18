@@ -157,7 +157,11 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
     for target in &registry.targets {
         if is_real_dir(&target.path) {
             dirs.push(Dir {
-                kind: Kind::Target,
+                kind: if target.shared {
+                    Kind::SharedTarget
+                } else {
+                    Kind::Target
+                },
                 path: target.path.clone(),
                 store: None,
                 workspace: Some(target.workspace.clone()),

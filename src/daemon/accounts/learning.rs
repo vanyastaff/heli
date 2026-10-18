@@ -212,6 +212,7 @@ impl Accounts {
         self.register(Target {
             path: workspace.target.clone(),
             workspace: workspace.root.clone(),
+            shared: false,
         });
         Some(Learnt {
             dirs: vec![workspace.target, build],

@@ -926,7 +926,8 @@ fn setup_offers_the_store_on_the_worktrees_volume() {
 }
 
 /// A `target/` directory several workspaces build into belongs to the last
-/// one heli ran in: it lives as long as that one does.
+/// one heli ran in: it lives as long as that one does. It is shared from
+/// the second, which the build store leaves alone (#65).
 #[test]
 fn a_shared_target_directory_belongs_to_its_last_workspace() {
     let fixture = Fixture::new("basic");
@@ -951,6 +952,7 @@ fn a_shared_target_directory_belongs_to_its_last_workspace() {
     std::fs::remove_dir_all(&first).expect("remove the first workspace");
     let listed = listed_target(&fixture, &shared).expect("the shared target directory");
     assert_eq!(listed["state"], "live", "{listed}");
+    assert_eq!(listed["kind"], "shared", "{listed}");
 }
 
 /// Only a run of cargo is asked where it builds: an `exec` of a program
@@ -995,7 +997,7 @@ fn only_a_run_of_cargo_is_asked_about_its_workspace() {
 fn listed_target(fixture: &Fixture, target: &Path) -> Option<Value> {
     let target = canonical(target);
     gc(fixture).into_iter().find(|dir| {
-        dir["kind"] == "target"
+        (dir["kind"] == "target" || dir["kind"] == "shared")
             && std::fs::canonicalize(dir["path"].as_str().expect("a path")).ok()
                 == Some(target.clone())
     })
