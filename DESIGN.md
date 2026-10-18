@@ -165,6 +165,16 @@ directory, and passes them to the daemon it starts. `HELI_SCHTASKS`,
 `schtasks`, `systemctl` and `launchctl` (§4, "Autostart"); tests point them
 at a fake, so that none registers anything with the real ones.
 
+On Windows, a process an MSIX-packaged app starts sees `%LOCALAPPDATA%`
+and `%APPDATA%` through package virtualization: the default state
+directory and configuration are then the app's own, under
+`...\Packages\<family>\LocalCache\`. Such a child need not have the
+package's identity (`GetCurrentPackageFullName` can say it has none). The
+path the file system gives for the file is the test, which `doctor` and
+`ensure` run: a canonical path in a package's `LocalCache` that the spelled
+one is not. Both then say to set `HELI_STATE_DIR` and `HELI_CONFIG` outside
+`AppData` for every process (#70).
+
 **The endpoint.** On Windows, a pipe whose DACL allows the user's SID alone
 (without one, Everyone may read), which rejects remote clients and is
 created as the first instance, so the daemon never joins a pipe someone else

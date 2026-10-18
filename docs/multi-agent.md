@@ -6,6 +6,22 @@ default checkout-local `target/`;
 do not export a single `CARGO_TARGET_DIR` shared by several worktrees. A shared
 host jobserver cannot remove Cargo's exclusive artifact-directory lock.
 
+On Windows, agents run by an MSIX-packaged app (the Claude desktop app, a
+packaged terminal or editor) see `%LOCALAPPDATA%` and `%APPDATA%` through
+package virtualization. heli's default state directory and configuration
+then live in `...\Packages\<family>\LocalCache\` for that app only. A
+terminal, an editor or a scheduled task outside it reaches the same daemon,
+but reads another configuration and state. `cargo heli doctor` and
+`cargo heli ensure` say so when it happens. Give every process the same
+locations outside `AppData`, as user environment variables:
+
+```text
+setx HELI_STATE_DIR "%USERPROFILE%\.heli\state"
+setx HELI_CONFIG "%USERPROFILE%\.heli\config.toml"
+```
+
+Restart the apps and terminals afterwards, so that they see the variables.
+
 The current priority is independent progress across projects and worktrees.
 Disk and RAM caps are secondary; preserve runtime safety without treating
 disk optimization as a demonstrated prerequisite for concurrency.
