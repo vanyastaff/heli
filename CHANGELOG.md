@@ -1,15 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Fixed
-
-- **Build directories only bare or nested cargo built in** are attributed to
-  their workspace from what cargo compiled, checked against cargo's
-  `{workspace-path-hash}`. `status` and `gc` show the workspace, and one
-  whose workspace is gone and has no repository (a test's temporary
-  workspace) is evicted on the next pass over the budget, without waiting.
-  `setup` explains what a user-wide `build-dir` does to nested cargo (#88).
+## 0.0.3
 
 ### Added
 
@@ -26,6 +17,21 @@
 - **`cargo heli doctor`** warns about a `CARGO_MAKEFLAGS` that names another
   jobserver than heli's pool, such as one written before the state
   directory moved, and gives the value to set (#86).
+
+### Fixed
+
+- **Build directories only bare or nested cargo built in** are attributed to
+  their workspace from what cargo compiled, checked against cargo's
+  `{workspace-path-hash}`. `status` and `gc` show the workspace, and one
+  whose workspace is gone and has no repository (a test's temporary
+  workspace) is evicted on the next pass over the budget, without waiting.
+  `setup` explains what a user-wide `build-dir` does to nested cargo (#88).
+- **Isolated Cargo homes:** `cargo install --list` lists the caller's
+  installed tools, not the empty private home's, and `--help` or a lone
+  `--version` of a refused command is no longer refused (#80).
+- **`cargo heli doctor`** no longer lists as unknown a tool that has a
+  profile now, and its `build-dir` hint is the line `setup --print` shows
+  (#81).
 
 ## 0.0.2
 
