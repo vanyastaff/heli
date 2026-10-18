@@ -189,6 +189,14 @@ pub struct RunRequest {
         skip_serializing_if = "Priority::is_normal"
     )]
     pub priority: Priority,
+    /// heli's command line as the user typed it, after `cargo heli`, which
+    /// the daemon records as the run's start event (`crate::runlog::Start`);
+    /// absent from a client older than `cargo heli rerun`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invocation: Option<Vec<Text>>,
+    /// The run this one reruns (`cargo heli rerun`), `r<number>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_of: Option<String>,
 }
 
 impl RunRequest {

@@ -364,6 +364,8 @@ mod tests {
             reads_spawned: false,
             profile: None,
             priority: Default::default(),
+            invocation: None,
+            rerun_of: None,
         }
     }
 

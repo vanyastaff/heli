@@ -1049,6 +1049,8 @@ mod advisory_tests {
             reads_spawned: false,
             profile: None,
             priority: Default::default(),
+            invocation: None,
+            rerun_of: None,
         }
     }
 
@@ -1143,6 +1145,8 @@ mod advisory_fetch_tests {
             reads_spawned: false,
             profile: None,
             priority: Default::default(),
+            invocation: None,
+            rerun_of: None,
         };
         for _ in 0..2 {
             let mut fields = Fields::default();
@@ -1178,6 +1182,8 @@ mod cross_tests {
             reads_spawned: false,
             profile: None,
             priority: Default::default(),
+            invocation: None,
+            rerun_of: None,
         }
     }
 

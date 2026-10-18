@@ -51,13 +51,16 @@
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
 //! empty. `class` is `null` only from a daemon older than run classes.
 //! `profile` says where the class came from (`crate::profiles::Source::
-//! name`), `null` from a client or daemon older than profiles. A
+//! name`), `null` from a client or daemon older than profiles.
+//! `rerun_of` names the run a rerun reruns (`cargo heli rerun`); it is
+//! `null` for any other run, and absent from a daemon older than reruns. A
 //! run's `priority` (`crate::priority`) is `interactive`, `normal` or
 //! `background`; `normal` from a daemon older than priorities. A
 //! run's `slots` are the host pool's slots it uses, and `share` its share of
-//! them (`crate::pool::broker`), weighted by its priority. `runs` lists the runs in flight, and the
-//! last runs that ended while no client followed them (`daemon::registry`),
-//! so whoever started them can still learn how they ended.
+//! them (`crate::pool::broker`), weighted by its priority. `runs` lists the
+//! runs in flight, and the last runs that ended while no client followed
+//! them (`daemon::registry`), so whoever started them can still learn how
+//! they ended.
 //!
 //! `disk` is the build store as the daemon last counted it
 //! (`crate::daemon::accounts`): each store's bytes in use, by category
@@ -242,6 +245,10 @@ pub struct Run {
     /// priorities, and for a priority this build does not know.
     #[serde(default, deserialize_with = "crate::priority::known")]
     pub priority: Priority,
+    /// The run it reruns (`cargo heli rerun`); `None` for a run that is no
+    /// rerun, and from a daemon older than reruns.
+    #[serde(default)]
+    pub rerun_of: Option<String>,
     pub phase: Phase,
     pub started_at: u64,
     /// Since when the run waits for its worktree's lock, if it does.
@@ -417,7 +424,7 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
-            let state = match &run.exit {
+            let mut state = match &run.exit {
                 Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
                 None if run.waiting_for.is_empty() => {
                     format!("{}, {} attached", run.phase.name(), run.attached_clients)
@@ -433,6 +440,9 @@ impl Status {
             } else {
                 format!("{}  ", run.priority)
             };
+            if let Some(of) = &run.rerun_of {
+                state.push_str(&format!(", rerun of {of}"));
+            }
             text.push_str(&format!(
                 "{label:<6}  {}  {}  {}  {}  {state}  {priority}{} slot{}, share {}  {}s\n",
                 run.id,

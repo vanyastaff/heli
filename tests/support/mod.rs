@@ -547,6 +547,9 @@ impl Fixture {
         {
             command.env_remove(var);
         }
+        if let Some(home) = original_cargo_home() {
+            command.env("CARGO_HOME", home);
+        }
         for (var, value) in &self.isolation {
             match value {
                 Some(value) => command.env(var, value),
@@ -927,6 +930,19 @@ pub fn copy_program(from: &Path, to: &Path) {
     } else {
         std::fs::copy(from, to).unwrap_or_else(|error| panic!("copy {}: {error}", from.display()));
     }
+}
+
+/// The Cargo home the tests' caller started from, when the tests run
+/// inside a `cargo heli` with an isolated Cargo home: that run hands its
+/// private home down as `CARGO_HOME`, and heli under test would take it for
+/// one inherited from a managed parent and stay isolated, asking the
+/// fixture's stand-in cargo for its version. `None` otherwise: the inherited
+/// `CARGO_HOME`, if any, is the caller's own.
+fn original_cargo_home() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("CARGO_HOME")?);
+    let marker = std::fs::read(home.join(".heli-private-home.json")).ok()?;
+    let marker: Value = serde_json::from_slice(&marker).ok()?;
+    marker["original_home"].as_str().map(PathBuf::from)
 }
 
 /// The `cargo-heli` binary under test.
