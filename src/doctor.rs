@@ -19,9 +19,9 @@
 //! ```json
 //! {"schema":1,
 //!  "tools":[{"name":"insta","profile":"accept/reject mutate …"},
-//!           {"name":"zigbuild","profile":null}],
+//!           {"name":"bloat","profile":null}],
 //!  "findings":[{"id":"jobs","level":"note","message":"…","action":"…"}],
-//!  "unknown_tools":[{"name":"zigbuild","runs":12}]}
+//!  "unknown_tools":[{"name":"bloat","runs":12}]}
 //! ```
 //!
 //! The helper programs of a multi-binary tool (`cargo-ndk-env` beside
@@ -614,10 +614,10 @@ mod tests {
             format!(r#"{{"at":1,"event":"{event}","argv":{argv},"profile":"{profile}"}}"#)
         };
         let events = vec![
-            line("admit", r#"["cargo","zigbuild"]"#, "unknown"),
+            line("admit", r#"["cargo","bloat"]"#, "unknown"),
             line(
                 "direct",
-                r#"["cargo","+nightly","zigbuild","--release"]"#,
+                r#"["cargo","+nightly","bloat","--release"]"#,
                 "unknown",
             ),
             line("admit", r#"["cargo","expand"]"#, "unknown"),
@@ -634,7 +634,7 @@ mod tests {
             report.unknown_tools,
             [
                 Usage {
-                    name: "zigbuild".into(),
+                    name: "bloat".into(),
                     runs: 2
                 },
                 Usage {
@@ -675,7 +675,7 @@ mod tests {
         let exe = std::env::consts::EXE_SUFFIX;
         for name in [
             format!("cargo-insta{exe}"),
-            format!("cargo-zigbuild{exe}"),
+            format!("cargo-bloat{exe}"),
             format!("cargo-heli{exe}"),
             "cargo-fmt.pdb".to_owned(),
             "other".to_owned(),
@@ -691,7 +691,7 @@ mod tests {
             .iter()
             .map(|tool| (tool.name.as_str(), tool.profile.is_some()))
             .collect();
-        assert_eq!(names, [("insta", true), ("zigbuild", false)]);
+        assert_eq!(names, [("bloat", false), ("insta", true)]);
     }
 
     fn installed(names: &[&str]) -> (tempfile::TempDir, Inputs) {

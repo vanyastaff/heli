@@ -385,8 +385,17 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
         }
         Some("audit") => probes.push(("cargo audit --version", cargo, &["audit", "--version"])),
         Some("deny") => probes.push(("cargo deny --version", cargo, &["deny", "--version"])),
+        Some("ndk") => probes.push(("cargo ndk --version", cargo, &["ndk", "--version"])),
+        Some("zigbuild") => {
+            probes.push((
+                "cargo zigbuild --version",
+                cargo,
+                &["zigbuild", "--version"],
+            ));
+        }
         _ => {}
     }
+    cross_toolchain(request, subcommand.and_then(OsStr::to_str), fields);
     for (name, program, args) in probes {
         let output = tool(
             request,
@@ -400,6 +409,42 @@ fn toolchain(request: &RunRequest, fields: &mut Fields) {
             }
             _ => fields.push(format!("absent {name}").as_bytes(), b""),
         }
+    }
+}
+
+/// Keys what a cross build links with beyond the Rust toolchain: for
+/// `cargo ndk`, the NDK's `source.properties` (its version) under
+/// `ANDROID_NDK_HOME`, else `ANDROID_NDK_ROOT`, else `ANDROID_NDK`; for
+/// `cargo zigbuild`, `zig version` (`CARGO_ZIGBUILD_ZIG_PATH` if set, else
+/// `zig`). Either, missing, is keyed as absent. The variables themselves,
+/// and the targets in the argv, are keyed with the rest (#63).
+fn cross_toolchain(request: &RunRequest, subcommand: Option<&str>, fields: &mut Fields) {
+    match subcommand {
+        Some("ndk") => {
+            let ndk = ["ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "ANDROID_NDK"]
+                .into_iter()
+                .find_map(|name| request.var(name).filter(|value| !value.is_empty()));
+            let properties = ndk
+                .map(|ndk| request.cwd().join(ndk).join("source.properties"))
+                .and_then(|path| std::fs::read(path).ok());
+            match properties {
+                Some(properties) => fields.push(b"version android ndk", &properties),
+                None => fields.push(b"absent android ndk", b""),
+            }
+        }
+        Some("zigbuild") => {
+            let zig = request
+                .var("CARGO_ZIGBUILD_ZIG_PATH")
+                .filter(|zig| !zig.is_empty())
+                .unwrap_or(OsStr::new("zig"));
+            match tool(request, zig, ["version"]).output() {
+                Ok(output) if output.status.success() => {
+                    fields.push(b"version zig", &output.stdout);
+                }
+                _ => fields.push(b"absent zig", b""),
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1102,5 +1147,58 @@ mod advisory_fetch_tests {
             let keyed = advisory_databases(&request, root.path(), root.path(), &mut fields);
             assert!(keyed.is_err_and(|error| error.contains("advisory database")));
         }
+    }
+}
+
+#[cfg(test)]
+mod cross_tests {
+    use std::ffi::OsString;
+
+    use super::{Fields, cross_toolchain};
+    use crate::protocol::{RunRequest, Text};
+
+    fn request(cwd: &std::path::Path, env: &[(&str, &std::path::Path)]) -> RunRequest {
+        RunRequest {
+            cwd: Text(cwd.as_os_str().to_owned()),
+            argv: vec![Text("cargo".into()), Text("ndk".into())],
+            env: env
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        Text(OsString::from(name)),
+                        Text(value.as_os_str().to_owned()),
+                    )
+                })
+                .collect(),
+            dependency_epoch: None,
+            class: None,
+            cache: Default::default(),
+            reads_spawned: false,
+            profile: None,
+        }
+    }
+
+    fn digest(request: &RunRequest, subcommand: &str) -> String {
+        let mut fields = Fields::default();
+        cross_toolchain(request, Some(subcommand), &mut fields);
+        fields.finish()
+    }
+
+    /// Another NDK version is another key; no NDK is keyed as absent.
+    #[test]
+    fn the_ndk_version_is_keyed() {
+        let dir = tempfile::tempdir().expect("dir");
+        let ndk = dir.path().join("ndk");
+        std::fs::create_dir_all(&ndk).expect("ndk");
+        std::fs::write(ndk.join("source.properties"), "Pkg.Revision = 27.0.1\n").expect("write");
+        let with = request(dir.path(), &[("ANDROID_NDK_HOME", &ndk)]);
+        let first = digest(&with, "ndk");
+        assert_eq!(digest(&with, "ndk"), first);
+        std::fs::write(ndk.join("source.properties"), "Pkg.Revision = 28.0.0\n").expect("write");
+        assert_ne!(digest(&with, "ndk"), first);
+        let without = request(dir.path(), &[]);
+        assert_ne!(digest(&without, "ndk"), first);
+        // Other tools add nothing.
+        assert_eq!(digest(&with, "build"), Fields::default().finish());
     }
 }

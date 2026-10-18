@@ -714,6 +714,8 @@ writing, for the user, the repository, or heli itself.
 | `machete`, `shear` | verify; mutate with `--fix` |
 | `udeps`, `public-api` | verify (the `+toolchain` is in the argv, so in the key) |
 | `miri` | `test`, `nextest` verify, keyed by the toolchain; else exec |
+| `ndk` | `build` compile, `check`/`clippy` verify; keyed by the ABIs and API level (argv), the NDK's location (environment) and version (`source.properties`); else exec |
+| `zigbuild` | compile, keyed by the target (argv) and `zig version` |
 | `hack` | verify when `check` or `clippy` is among its arguments; else exec |
 | `insta` | `accept`, `reject` mutate; `review` runs directly in the pool |
 | `sqlx` | `prepare` mutate; else exec |

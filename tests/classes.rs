@@ -95,6 +95,13 @@ fn status_shows_each_runs_class() {
         (&["public-api"], "verify"),
         (&["+nightly", "miri", "test", "-p", "a"], "verify"),
         (&["+nightly", "miri", "setup"], "exec"),
+        (&["ndk", "-t", "arm64-v8a", "build", "--release"], "compile"),
+        (&["ndk", "--platform", "21", "check"], "verify"),
+        (&["ndk", "-t", "x86_64", "test"], "exec"),
+        (
+            &["zigbuild", "--target", "aarch64-unknown-linux-gnu"],
+            "compile",
+        ),
         (&["audit"], "verify"),
         (&["deny", "check"], "verify"),
         (&["audit", "--no-fetch"], "verify"),

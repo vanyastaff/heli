@@ -330,6 +330,41 @@ const TOOLS: &[Tool] = &[
         writes_home: true,
     },
     Tool {
+        // Android cross builds: `cargo ndk -t <abi> build`. The NDK's
+        // version is in the key (`crate::daemon::key`), the ABIs and the
+        // API level are in the argv, and the NDK's location in the
+        // environment; cross builds never share across them.
+        names: &["ndk"],
+        summary: "build compile, check/clippy verify cached, keyed by target, API level and NDK version; else exec",
+        valued: &[
+            "-t",
+            "--target",
+            "-p",
+            "--platform",
+            "-o",
+            "--output-dir",
+            "--manifest-path",
+        ],
+        rules: &[
+            (When::Word(&["build", "b", "rustc"]), Run(Class::Compile)),
+            (When::Word(&["check", "c", "clippy"]), Run(Class::Verify)),
+        ],
+        otherwise: Run(Class::Exec),
+        cleaner: None,
+        writes_home: false,
+    },
+    Tool {
+        // `cargo zigbuild` is `cargo build` linking with zig: the zig
+        // version is in the key, the target in the argv.
+        names: &["zigbuild"],
+        summary: "compile, keyed by target and zig version",
+        valued: &[],
+        rules: &[],
+        otherwise: Run(Class::Compile),
+        cleaner: None,
+        writes_home: false,
+    },
+    Tool {
         names: &["outdated", "semver-checks", "vet", "geiger"],
         summary: "exec: never cached, the result depends on the registry",
         valued: &[],
@@ -586,7 +621,7 @@ mod tests {
 
     #[test]
     fn unknown_tools_run_directly_only_at_a_terminal() {
-        let zig = args(&["zigbuild", "--release"]);
+        let zig = args(&["bloat", "--release"]);
         assert!(runs_directly(&zig, true));
         assert!(!runs_directly(&zig, false));
     }
