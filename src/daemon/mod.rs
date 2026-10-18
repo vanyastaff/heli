@@ -533,6 +533,7 @@ impl Daemon {
             registry::Kind {
                 class: request.class.unwrap_or(Class::Exec),
                 profile: request.profile.clone(),
+                priority: request.priority,
                 rerun_of: request.rerun_of.clone(),
             },
             nested(&request),
@@ -716,7 +717,7 @@ impl Daemon {
                 rerun_of: request.rerun_of.clone(),
             });
         }
-        let (makeflags, error) = self.broker.open(id);
+        let (makeflags, error) = self.broker.open(id, request.priority);
         if let Some(error) = error {
             self.log.write(&format!(
                 "{id}: no run pool ({error}); it draws from the host pool"

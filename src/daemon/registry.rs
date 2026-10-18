@@ -75,6 +75,7 @@ use super::key::{Key, Snapshot};
 use super::live::Live;
 use super::tree::Tree;
 use crate::class::{Access, Class};
+use crate::priority::Priority;
 use crate::protocol::{Cache, RunRequest};
 use crate::run_id::RunId;
 use crate::status::{self, Exit, Phase};
@@ -182,6 +183,7 @@ impl Same {
 pub struct Kind {
     pub class: Class,
     pub profile: Option<String>,
+    pub priority: Priority,
     /// The run it reruns (`cargo heli rerun`), as the client said.
     pub rerun_of: Option<String>,
 }
@@ -204,6 +206,8 @@ struct Entry {
     class: Class,
     /// Where its class came from, as the client said.
     profile: Option<String>,
+    /// Its priority, as the client said.
+    priority: Priority,
     /// The run it reruns, as the client said.
     rerun_of: Option<String>,
     /// Its phase while in flight; once it has ended, it is done.
@@ -387,6 +391,7 @@ impl Registry {
         let Kind {
             class,
             profile,
+            priority,
             rerun_of,
         } = kind;
         let lock = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
@@ -449,6 +454,7 @@ impl Registry {
                 settled: false,
                 class,
                 profile,
+                priority,
                 rerun_of,
                 phase: Phase::Running,
                 started_at: SystemTime::now(),
@@ -691,6 +697,7 @@ impl Inner {
                 .collect(),
             class: Some(entry.class),
             profile: entry.profile.clone(),
+            priority: entry.priority,
             rerun_of: entry.rerun_of.clone(),
             phase,
             started_at: clock::unix_seconds(entry.started_at),

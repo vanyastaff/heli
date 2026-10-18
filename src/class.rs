@@ -31,6 +31,8 @@ use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
 
+use crate::priority::Priority;
+
 /// What kind of work a run does (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,6 +87,9 @@ struct Tool {
     /// Cargo home it would write the private one, which nothing has on `PATH`,
     /// so heli refuses it as it refuses `cargo install`.
     writes_home: bool,
+    /// Whether its runs default to the background priority
+    /// (`crate::priority`): long work nobody waits for.
+    background: bool,
 }
 
 /// A condition on a tool's arguments, all before any `--`.
@@ -131,6 +136,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Mutate),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -140,6 +146,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Arg(&["--check", "-c"]), Run(Class::Verify))],
         otherwise: Run(Class::Mutate),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -149,6 +156,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Arg(&["--fix"]), Run(Class::Mutate))],
         otherwise: Run(Class::Verify),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -161,6 +169,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Word(&["test", "nextest"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -170,6 +179,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Verify),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -182,6 +192,7 @@ const TOOLS: &[Tool] = &[
         ],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -194,6 +205,7 @@ const TOOLS: &[Tool] = &[
         ],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -203,6 +215,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Word(&["prepare"]), Run(Class::Mutate))],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -212,6 +225,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Mutate),
         writes_home: false,
+        background: false,
         cleaner: Some(
             "cargo-sweep sees only target/: heli keeps the intermediates in its build store, \
              which `cargo heli gc` evicts by age and budget. heli's own eviction waits until \
@@ -225,6 +239,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Mutate),
         writes_home: false,
+        background: false,
         cleaner: Some(
             "cargo-clean-all deletes whole target/ directories, those of other worktrees heli \
              may be building in right now included: heli holds only this worktree's lock. \
@@ -262,6 +277,7 @@ const TOOLS: &[Tool] = &[
         ],
         otherwise: Run(Class::Verify),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -271,6 +287,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Arg(&["check"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -281,6 +298,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Arg(&["check", "clippy"]), Run(Class::Verify))],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -290,6 +308,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Word(&["serve"]), Direct)],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -299,6 +318,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Word(&["watch", "serve"]), Direct)],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -308,6 +328,7 @@ const TOOLS: &[Tool] = &[
         rules: &[(When::Word(&["dev"]), Direct)],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -317,6 +338,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Direct,
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -328,6 +350,7 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Exec),
         cleaner: None,
         writes_home: true,
+        background: false,
     },
     Tool {
         // Android cross builds: `cargo ndk -t <abi> build`. The NDK's
@@ -352,6 +375,7 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Exec),
         cleaner: None,
         writes_home: false,
+        background: false,
     },
     Tool {
         // `cargo zigbuild` is `cargo build` linking with zig: the zig
@@ -363,6 +387,7 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Compile),
         cleaner: None,
         writes_home: false,
+        background: false,
     },
     Tool {
         names: &["outdated", "semver-checks", "vet", "geiger"],
@@ -371,6 +396,7 @@ const TOOLS: &[Tool] = &[
         rules: &[],
         otherwise: Run(Class::Exec),
         writes_home: false,
+        background: false,
         cleaner: None,
     },
     Tool {
@@ -383,6 +409,7 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Exec),
         cleaner: None,
         writes_home: false,
+        background: false,
     },
     Tool {
         // Its scratch copies of the workspace are eviction tier 0
@@ -394,6 +421,7 @@ const TOOLS: &[Tool] = &[
         otherwise: Run(Class::Exec),
         cleaner: None,
         writes_home: false,
+        background: true,
     },
 ];
 
@@ -521,6 +549,15 @@ pub fn writes_home(name: &str) -> bool {
     Tool::named(name).is_some_and(|profile| profile.writes_home)
 }
 
+/// The priority `cargo <args>` defaults to by heli's built-in profile of
+/// its tool, if it names one: background for cargo-mutants.
+pub fn default_priority(args: &[OsString]) -> Option<Priority> {
+    let (tool, _) = subcommand(args)?;
+    Tool::named(tool.to_str()?)?
+        .background
+        .then_some(Priority::Background)
+}
+
 /// What heli's built-in profile does with the cargo tool `cargo-<name>`, for
 /// `cargo heli doctor`; `None` for a tool heli has no profile for (it runs
 /// as exec).
@@ -602,6 +639,20 @@ mod tests {
 
     fn args(words: &[&str]) -> Vec<OsString> {
         words.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn mutants_runs_in_the_background() {
+        assert_eq!(
+            default_priority(&args(&["mutants", "--in-place"])),
+            Some(Priority::Background)
+        );
+        assert_eq!(
+            default_priority(&args(&["+nightly", "mutants"])),
+            Some(Priority::Background)
+        );
+        assert_eq!(default_priority(&args(&["build"])), None);
+        assert_eq!(default_priority(&args(&["nextest", "run"])), None);
     }
 
     #[test]

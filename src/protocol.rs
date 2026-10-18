@@ -73,6 +73,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
 use crate::environment;
+use crate::priority::Priority;
 use crate::run_id::RunId;
 use crate::runlog::select::Select;
 use crate::status::{self, Status};
@@ -180,6 +181,14 @@ pub struct RunRequest {
     /// client older than profiles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Its weight in the broker's shares (`crate::priority`); absent
+    /// (normal) from a client older than priorities, and when normal.
+    #[serde(
+        default,
+        deserialize_with = "crate::priority::known",
+        skip_serializing_if = "Priority::is_normal"
+    )]
+    pub priority: Priority,
     /// heli's command line as the user typed it, after `cargo heli`, which
     /// the daemon records as the run's start event (`crate::runlog::Start`);
     /// absent from a client older than `cargo heli rerun`.
