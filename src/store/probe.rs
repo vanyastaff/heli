@@ -46,6 +46,8 @@ pub struct Workspace {
 
 #[derive(Debug, Deserialize)]
 pub struct Package {
+    #[serde(default)]
+    pub name: String,
     pub manifest_path: PathBuf,
     pub source: Option<String>,
     #[serde(default)]
@@ -191,9 +193,29 @@ impl Probe {
         Ok(output.stdout)
     }
 
+    /// The probe for `cwd`, as this process's environment would run
+    /// `cargo <args>` with `cargo`: its toolchain, manifest and
+    /// configuration.
+    pub fn cargo_in(cwd: PathBuf, cargo: OsString, args: &[OsString]) -> Self {
+        let args_for_metadata = metadata_args(args, &cwd);
+        let target = target_override(args, &cwd);
+        Self {
+            args: args_for_metadata,
+            target,
+            cargo,
+            ..Self::here(cwd)
+        }
+    }
+
     /// The workspace as `cargo metadata` describes it.
     pub fn workspace(&self) -> Option<Workspace> {
         self.workspace_at(None)
+    }
+
+    /// The workspace's members as `cargo metadata --no-deps` describes
+    /// them, or why cargo could not say.
+    pub fn members(&self) -> Result<Workspace, String> {
+        self.metadata(None, false)
     }
 
     /// The local dependency declarations of a selected manifest, without
