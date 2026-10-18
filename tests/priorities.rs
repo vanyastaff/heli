@@ -9,6 +9,7 @@
 
 mod support;
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
@@ -90,16 +91,16 @@ fn new_runs(status: &Value, known: &[String]) -> Vec<String> {
 }
 
 /// Starts the `first` runs and waits until they use every one of `pool`
-/// slots, then starts `last` and waits for ten `status` samples in a row
-/// (half a second) in which every run uses its weighted share, within one
-/// slot, and they use every slot. Returns the runs, their ids in the order
-/// given, and the first of those samples.
+/// slots, then starts `last` and waits until, in eight of ten `status`
+/// samples in a row (half a second), every run uses the slots `expected`
+/// of it, within one, and they use every slot. Returns the runs, their ids
+/// in the order given, and the last of those samples.
 fn settle(
     fixture: &Fixture,
     pool: u64,
     first: &[(u32, Given)],
     last: (u32, Given),
-    shares: &[f64],
+    expected: &[u64],
 ) -> (Vec<Jobs>, Vec<String>, Value) {
     let jobs = fixture.binary("jobs");
     let mut started = Vec::new();
@@ -138,29 +139,35 @@ fn settle(
         "the last run waited {first_slot:?} for a slot"
     );
 
+    // A run with work pending dips for a moment now and then (a worker
+    // between two slots, or a slot not yet taken from its pool, which on
+    // macOS a FIFO can hold for a while): most of the last ten samples
+    // count, not every one.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut settled = Vec::new();
+    let mut window = VecDeque::new();
     let mut samples = Vec::new();
-    while settled.len() < 10 {
+    loop {
         let status = fixture.status();
         let used: Vec<u64> = ids.iter().map(|id| slots(&status, id)).collect();
         let at_share = used
             .iter()
-            .zip(shares)
-            .all(|(&used, &share)| (used as f64 - share).abs() <= 1.0);
-        if at_share && used.iter().sum::<u64>() == pool {
-            settled.push(status);
-        } else {
-            settled.clear();
+            .zip(expected)
+            .all(|(&used, &expected)| used.abs_diff(expected) <= 1);
+        let good = at_share && used.iter().sum::<u64>() == pool;
+        window.push_back(good);
+        if window.len() > 10 {
+            window.pop_front();
         }
         samples.push(used);
+        if good && window.len() == 10 && window.iter().filter(|good| **good).count() >= 8 {
+            return (started, ids, status);
+        }
         assert!(
             Instant::now() < deadline,
-            "the runs never settled at {shares:?}: {samples:?}"
+            "the runs never settled at {expected:?}: {samples:?}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    (started, ids, settled.swap_remove(0))
 }
 
 fn assert_shares(status: &Value, ids: &[String], shares: &[f64]) {
@@ -173,24 +180,25 @@ fn assert_shares(status: &Value, ids: &[String], shares: &[f64]) {
     }
 }
 
-/// With the pool saturated by two background runs (N = 18), an interactive
+/// With the pool saturated by two background runs (N = 9), an interactive
 /// run gets a slot at once and settles at its weighted share, 4 of 4.5:
-/// 16 slots, the background runs keeping 1 each. `status` shows each run's
-/// priority.
+/// a share of 8, of which it uses 7, the background runs keeping the one
+/// slot each that a run with work pending never gives up. `status` shows
+/// each run's priority.
 #[test]
 fn an_interactive_run_takes_its_share_from_background_runs() {
     let fixture = Fixture::new("basic");
-    fixture.configure("[pool]\nslots = 18\n");
-    let shares = [1.0, 1.0, 16.0];
+    fixture.configure("[pool]\nslots = 9\n");
+    let shares = [0.5, 0.5, 8.0];
     let (started, ids, settled) = settle(
         &fixture,
-        18,
+        9,
         &[
-            (10, Given::Flag("background")),
-            (10, Given::Var("background")),
+            (6, Given::Flag("background")),
+            (6, Given::Var("background")),
         ],
-        (18, Given::Flag("interactive")),
-        &shares,
+        (12, Given::Flag("interactive")),
+        &[1, 1, 7],
     );
     assert_shares(&settled, &ids, &shares);
     for (id, priority) in ids.iter().zip(["background", "background", "interactive"]) {
@@ -209,7 +217,7 @@ fn an_interactive_run_takes_its_share_from_background_runs() {
     for jobs in started {
         jobs.stop();
     }
-    assert_eq!(fixture.status()["pool"]["free"], 18);
+    assert_eq!(fixture.status()["pool"]["free"], 9);
 }
 
 /// Interactive against normal, 4 : 1 of N = 10: 8 slots and 2.
@@ -223,7 +231,7 @@ fn interactive_and_normal_share_four_to_one() {
         10,
         &[(12, Given::Default)],
         (12, Given::Var("interactive")),
-        &shares,
+        &[2, 8],
     );
     assert_shares(&settled, &ids, &shares);
     assert_eq!(run(&settled, &ids[0])["priority"], "normal", "{settled}");
@@ -244,7 +252,7 @@ fn normal_and_background_share_four_to_one() {
         10,
         &[(12, Given::Flag("background"))],
         (12, Given::Flag("normal")),
-        &shares,
+        &[2, 8],
     );
     assert_shares(&settled, &ids, &shares);
     for jobs in started {
