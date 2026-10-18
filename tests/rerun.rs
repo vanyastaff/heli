@@ -147,9 +147,12 @@ fn a_whole_rerun_takes_the_current_environment_and_says_what_it_reruns() {
         .into_iter()
         .find(|run| run["rerun_of"].as_str() == Some(&of))
         .expect("the rerun");
+    // Canonical: on macOS the temporary directory is reached through a
+    // symbolic link (`/var` is `/private/var`).
+    let canonical = |path: std::path::PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
     assert_eq!(
-        std::path::PathBuf::from(listed["worktree"].as_str().expect("a worktree")),
-        fixture.workspace()
+        canonical(listed["worktree"].as_str().expect("a worktree").into()),
+        canonical(fixture.workspace())
     );
     std::fs::write(&gate, "").expect("open the gate");
     let rerun = rerun.wait_with_output().expect("wait for heli rerun");
