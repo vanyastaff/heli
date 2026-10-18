@@ -44,7 +44,10 @@ use crate::profiles::{Profiles, Rule};
 const SCHEMA: u32 = 1;
 
 /// Variables that override the Cargo configuration doctor explains.
-const VARS: [&str; 7] = [
+const VARS: [&str; 10] = [
+    "CARGO_MAKEFLAGS",
+    "MAKEFLAGS",
+    "MFLAGS",
     "CARGO_BUILD_JOBS",
     "CARGO_TARGET_DIR",
     "CARGO_BUILD_TARGET_DIR",
@@ -81,6 +84,9 @@ pub struct Inputs {
     pub redirections: Vec<(&'static str, PathBuf, PathBuf)>,
     /// The Cargo home, where cargo-audit keeps its advisory database.
     pub cargo_home: Option<PathBuf>,
+    /// The `CARGO_MAKEFLAGS` that points a cargo at heli's host pool, as
+    /// `cargo heli setup --print` shows it.
+    pub makeflags: Option<String>,
     /// `[cargo] home` of heli's configuration.
     pub home_mode: CargoHome,
     /// The build store that serves the working directory, when it exists:
@@ -208,6 +214,7 @@ pub fn gather(cwd: &Path) -> Inputs {
     inputs.repository_profiles =
         crate::profiles::repository(&crate::worktree::of(cwd)).unwrap_or_default();
     if let Ok(locations) = crate::locations::Locations::resolve() {
+        inputs.makeflags = crate::pool::makeflags(&locations.pool).ok();
         for (what, path) in [
             ("state directory", &locations.state_dir),
             ("configuration", &locations.config),
@@ -308,6 +315,15 @@ fn names_linker(value: &toml::Value, linker: &str, in_setting: bool) -> bool {
         }),
         _ => false,
     }
+}
+
+/// The jobserver that make flags `flags` name: what `--jobserver-auth=`
+/// (or the older `--jobserver-fds=`) gives.
+fn jobserver_auth(flags: &str) -> Option<&str> {
+    flags.split_whitespace().find_map(|word| {
+        word.strip_prefix("--jobserver-auth=")
+            .or_else(|| word.strip_prefix("--jobserver-fds="))
+    })
 }
 
 /// Explains `inputs`.
@@ -471,6 +487,30 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Nothing to do; to bound the threads of a run, pass --test-threads (or -j for nextest) or size the pool.",
         );
     }
+    // Cargo takes the first of these that is set (#86).
+    if let Some((var, flags)) = ["CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"]
+        .into_iter()
+        .find_map(|var| Some((var, env(var)?)))
+        && let Some(auth) = jobserver_auth(&flags)
+        && let Some(ours) = &inputs.makeflags
+        && let Some(pool) = jobserver_auth(ours)
+        // The host pool, or a run's own pool inside it (`<pool>-<run>`).
+        && auth != pool
+        && !auth
+            .strip_prefix(pool)
+            .is_some_and(|run| run.starts_with('-'))
+    {
+        add(
+            "makeflags",
+            "warn",
+            format!(
+                "{var} names the jobserver {auth}, not heli's host pool {pool}. A cargo started with it cannot connect (it prints one warning) and runs as many jobs as it likes, beside the pool. The pool's name follows the state directory: moving it, or setting HELI_STATE_DIR or HELI_POOL, changes the name."
+            ),
+            &format!(
+                "Run `cargo heli setup` to rewrite what it wrote before, and set {var} to `{ours}` wherever else you set it (an editor's rust-analyzer.cargo.extraEnv); then start the programs that read it again."
+            ),
+        );
+    }
     let analyzer = |dir: &PathBuf| {
         dir.join("rust-analyzer").is_file() || dir.join("rust-analyzer.exe").is_file()
     };
@@ -594,6 +634,54 @@ mod tests {
         assert_eq!(
             ids(&diagnose(&inputs)),
             ["jobs", "target-dir", "rustc-wrapper", "linker"]
+        );
+    }
+
+    #[test]
+    fn makeflags_naming_another_jobserver_are_reported() {
+        let ours = "-j --jobserver-auth=heli-09df93cc14834806";
+        let with = |vars: &[(&str, &str)]| Inputs {
+            env: vars
+                .iter()
+                .map(|(var, value)| ((*var).to_owned(), (*value).to_owned()))
+                .collect(),
+            makeflags: Some(ours.to_owned()),
+            ..Inputs::default()
+        };
+        let stale = "-j --jobserver-auth=heli-3d99e7e1415767df";
+        let report = diagnose(&with(&[("CARGO_MAKEFLAGS", stale)]));
+        assert_eq!(ids(&report), ["makeflags"]);
+        let finding = &report.findings[0];
+        assert_eq!(finding.level, "warn");
+        assert!(
+            finding.message.contains("heli-3d99e7e1415767df"),
+            "{finding:?}"
+        );
+        assert!(finding.action.contains(ours), "{finding:?}");
+        // MAKEFLAGS counts when CARGO_MAKEFLAGS is not set, as for cargo.
+        let report = diagnose(&with(&[("MAKEFLAGS", "-j4 --jobserver-fds=3,4")]));
+        assert_eq!(ids(&report), ["makeflags"]);
+        assert!(
+            ids(&diagnose(&with(&[
+                ("CARGO_MAKEFLAGS", ours),
+                ("MAKEFLAGS", stale)
+            ])))
+            .is_empty()
+        );
+        // The pool itself, a run's pool in it, and flags without a jobserver.
+        for flags in [ours, "-j --jobserver-auth=heli-09df93cc14834806-42", "-j4"] {
+            assert!(
+                ids(&diagnose(&with(&[("CARGO_MAKEFLAGS", flags)]))).is_empty(),
+                "{flags}"
+            );
+        }
+        assert!(
+            !ids(&diagnose(&with(&[(
+                "CARGO_MAKEFLAGS",
+                "-j --jobserver-auth=heli-09df93cc148348060"
+            )])))
+            .is_empty(),
+            "another pool whose name starts with this one's"
         );
     }
 
