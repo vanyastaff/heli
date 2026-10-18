@@ -834,8 +834,14 @@ then runs rustup's proxy, `cargo` on the search path, instead. Any other
 `cargo heli doctor [--json]` lists the installed `cargo-*` tools with their
 profile, and explains `jobs`, a global `target-dir`, a user's own `build-dir`
 (never overwritten by `setup`), `RUSTC_WRAPPER`, mold or lld, `CARGO_HOME` and
-rust-analyzer. It reads configuration and changes nothing. The `--json`
-document has `schema` 1, `tools` and `findings`.
+rust-analyzer. It warns about a `CARGO_MAKEFLAGS` (else `MAKEFLAGS`,
+`MFLAGS`, the one cargo reads) whose jobserver is neither the host pool nor a
+run pool in it: the pool's name follows the state directory, so a value
+written before the directory moved names a pool that no longer exists, and a
+cargo with it builds unbounded after one warning. The action names the value
+`setup` writes now; `setup` replaces its own earlier values (#86). It reads
+configuration and changes nothing. The `--json` document has `schema` 1,
+`tools` and `findings`.
 
 ### Lifecycle
 

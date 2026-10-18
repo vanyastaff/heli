@@ -74,3 +74,32 @@ fn doctor_lists_the_unknown_tools_used_most() {
         "{report}"
     );
 }
+
+/// A `CARGO_MAKEFLAGS` naming another jobserver than this host pool, as one
+/// written before the state directory moved does, is a warning with the
+/// value setup would write now (#86); this pool's own is not.
+#[test]
+fn doctor_reports_makeflags_for_another_pool() {
+    let fixture = Fixture::new("basic");
+    let doctor = |makeflags: &str| {
+        let output = fixture
+            .heli(["doctor", "--json"])
+            .env("CARGO_MAKEFLAGS", makeflags)
+            .output()
+            .expect("run heli doctor");
+        assert_success(&output, "cargo heli doctor --json");
+        let report: Value = serde_json::from_slice(&output.stdout).expect("a JSON report");
+        report["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| finding["id"] == "makeflags")
+            .cloned()
+    };
+    let stale = fixture.makeflags().replace("heli", "heli-moved");
+    let finding = doctor(&stale).expect("a makeflags finding");
+    assert_eq!(finding["level"], "warn", "{finding}");
+    let action = finding["action"].as_str().expect("an action");
+    assert!(action.contains(&fixture.makeflags()), "{finding}");
+    assert_eq!(doctor(&fixture.makeflags()), None);
+}
