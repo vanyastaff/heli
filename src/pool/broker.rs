@@ -4,23 +4,28 @@
 //!
 //! - **Lend.** A run whose pool has no free slot may be waiting for one: it
 //!   gets one from the host pool, the waiting run with the fewest slots in
-//!   use first.
+//!   use for its weight first.
 //! - **Return.** Free slots in a run pool beyond one go back to the host
 //!   pool once they have stayed free for a [`TICK`]: until then, they may
 //!   be slots that a run with work pending gave back and that its processes
 //!   waiting on the pool have not yet woken to take (a process blocked on a
 //!   FIFO takes a byte only once the scheduler runs it). The one left goes
-//!   back too when the host pool has none free and a run that waits uses
-//!   fewer slots than this one; an idle run (using none) keeps it, for the
-//!   next process that asks.
+//!   back too when the host pool has none free and a run that waits would
+//!   still use fewer slots for its weight with it than this one does; an
+//!   idle run (using none) keeps it, for the next process that asks.
+//! - **Weight.** A run weighs what its priority says
+//!   ([`Priority::weight`]): interactive 4, normal 1, background ¼. Runs
+//!   are compared by the slots they use *for their weight*, `in_use / w`.
 //! - **Share.** A run's share is the capacity (the host pool's free slots
-//!   plus those the active runs hold) divided by the active runs. While
-//!   another run waits, a run using its share or more gets no new slot. A
-//!   run alone can borrow every slot.
+//!   plus those the active runs hold) times its weight over the sum of the
+//!   active runs' weights: with equal weights, the capacity divided by the
+//!   active runs. While another run waits, a run using its share or more
+//!   gets no new slot. A run alone can borrow every slot.
 //! - **Reclaim.** While the host pool has no free slot and a run waits, a
-//!   run using more than its share, and at least two slots more than the
-//!   waiting run with the fewest, gives slots back as its processes finish
-//!   with them. A process waiting for a slot from a run pool takes the next
+//!   run using more than its share, which with one slot fewer would still
+//!   use as many for its weight as the neediest waiting run would with one
+//!   more (with equal weights: at least two slots more than it), gives
+//!   slots back as its processes finish with them. A process waiting for a slot from a run pool takes the next
 //!   one its run gives back, so the slots of a run with work pending are
 //!   never free there: the broker waits for one in line with them (a
 //!   [`Waiter`] in a thread of its own) and returns it to the host pool,
@@ -34,7 +39,7 @@
 //! - **Test slots.** Before its test phase, a test run asks for K slots
 //!   ([`Broker::take_test_slots`]) and waits for them at most a few
 //!   seconds. Free slots in its own pool count first; it then waits like
-//!   any run that waits, the fewest in use first. The daemon holds the
+//!   any run that waits, the fewest in use for its weight first. The daemon holds the
 //!   slots it got for the test threads until the phase ends.
 //!
 //! A run is *waiting* when its pool has no free slot, or it waits for test
@@ -56,6 +61,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{Pool, RunPool, Waiter};
+use crate::priority::Priority;
 use crate::run_id::RunId;
 
 /// How often the broker looks at the pools.
@@ -80,6 +86,8 @@ struct State {
 
 /// What the broker knows of a run.
 struct Run {
+    /// Its priority's weight in the shares.
+    weight: f64,
     /// `None` when it could not be created: the run then draws from the
     /// host pool directly.
     pool: Option<RunPool>,
@@ -154,10 +162,10 @@ impl Broker {
         broker
     }
 
-    /// Gives run `id` a run pool, and returns the `CARGO_MAKEFLAGS` its
-    /// processes get. When the run pool cannot be created, the run draws
-    /// from the host pool, and the error says why.
-    pub fn open(self: &Arc<Self>, id: RunId) -> (OsString, Option<io::Error>) {
+    /// Gives run `id`, of `priority`, a run pool, and returns the
+    /// `CARGO_MAKEFLAGS` its processes get. When the run pool cannot be
+    /// created, the run draws from the host pool, and the error says why.
+    pub fn open(self: &Arc<Self>, id: RunId, priority: Priority) -> (OsString, Option<io::Error>) {
         let (pool, makeflags, error) = match self.host.run_pool(&id.to_string()) {
             Ok(pool) => {
                 let makeflags = pool.makeflags();
@@ -166,21 +174,7 @@ impl Broker {
             Err(error) => (None, self.host.makeflags(), Some(error)),
         };
         let mut state = self.lock();
-        state.runs.insert(
-            id,
-            Run {
-                pool,
-                lent: 0,
-                free: 0,
-                surplus_since: None,
-                last_free: Instant::now(),
-                test_wanted: 0,
-                test_held: 0,
-                reclaim: None,
-                unreclaimable: false,
-                loans: Loans::default(),
-            },
-        );
+        state.runs.insert(id, Run::new(pool, priority));
         self.balance(&mut state);
         drop(state);
         self.changed.notify_all();
@@ -319,10 +313,10 @@ impl Broker {
             }
         }
         if self.host.free().unwrap_or(0) == 0
-            && let Some(fewest) = state.fewest_waiting()
+            && let Some(neediest) = state.neediest_waiting()
         {
             for run in state.runs.values_mut() {
-                if !run.waiting() && run.in_use() > fewest && run.take_free() {
+                if !run.waiting() && yields(run.in_use(), run.weight, neediest) && run.take_free() {
                     self.give_host();
                 }
             }
@@ -378,19 +372,20 @@ impl Broker {
         }
     }
 
-    /// Whether `run` gives slots back now (Take back, in the module docs):
-    /// the host pool has no free slot, and another run waits using at least
-    /// two slots fewer, while `run` uses more than its share.
+    /// Whether `run` gives slots back now (Reclaim, in the module docs):
+    /// the host pool has no free slot, and another run waits that would use
+    /// no more slots for its weight with one more than `run` would with one
+    /// fewer, while `run` uses more than its share.
     fn wants_back(&self, state: &State, run: &Run) -> bool {
         if self.host.free().unwrap_or(0) != 0 {
             return false;
         }
-        let Some(fewest) = state.fewest_waiting() else {
+        let Some(neediest) = state.neediest_waiting() else {
             return false;
         };
         let in_use = run.in_use();
         run.lent > run.free
-            && in_use >= fewest + 2
+            && yields(in_use.saturating_sub(1), run.weight, neediest)
             && f64::from(in_use) > self.shares(state).of(run)
     }
 
@@ -471,12 +466,7 @@ impl Broker {
 
     /// The capacity and the active runs, as counted last.
     fn shares(&self, state: &State) -> Shares {
-        let free = self.host.free().unwrap_or(0);
-        let active = state.runs.values().filter(|run| run.active());
-        Shares {
-            capacity: free + active.clone().map(Run::holdings).sum::<u32>(),
-            active: u32::try_from(active.count()).unwrap_or(u32::MAX),
-        }
+        state.shares(self.host.free().unwrap_or(0))
     }
 
     /// Gives a slot taken out of the host pool back to it. A pool already
@@ -498,35 +488,79 @@ impl State {
         }
     }
 
-    /// The fewest slots a waiting run uses.
-    fn fewest_waiting(&self) -> Option<u32> {
-        self.runs
-            .values()
-            .filter(|run| run.waiting())
-            .map(Run::in_use)
-            .min()
+    /// The capacity, with `free` slots in the host pool, and the active
+    /// runs' weights.
+    fn shares(&self, free: u32) -> Shares {
+        let active = self.runs.values().filter(|run| run.active());
+        Shares {
+            capacity: free + active.clone().map(Run::holdings).sum::<u32>(),
+            weights: active.map(|run| run.weight).sum(),
+        }
     }
 
-    /// The run the next free slot of the host pool goes to: the waiting run
-    /// with the fewest slots in use, the oldest first, unless it uses its
-    /// share already while another run waits.
-    fn next_loan(&self, shares: &Shares) -> Option<RunId> {
-        let waiting: Vec<(RunId, &Run)> = self
+    /// The waiting runs, the neediest first: the fewest slots in use for
+    /// their weight, then the heaviest, then the oldest.
+    fn waiting_in_order(&self) -> Vec<(RunId, &Run)> {
+        let mut waiting: Vec<(RunId, &Run)> = self
             .runs
             .iter()
             .filter(|(_, run)| run.waiting())
             .map(|(&id, run)| (id, run))
             .collect();
+        waiting.sort_by(|(a_id, a), (b_id, b)| {
+            a.relative_use()
+                .total_cmp(&b.relative_use())
+                .then(b.weight.total_cmp(&a.weight))
+                .then(a_id.cmp(b_id))
+        });
+        waiting
+    }
+
+    /// The slots the neediest waiting run uses, and its weight.
+    fn neediest_waiting(&self) -> Option<(u32, f64)> {
+        self.waiting_in_order()
+            .first()
+            .map(|(_, run)| (run.in_use(), run.weight))
+    }
+
+    /// The run the next free slot of the host pool goes to: the neediest
+    /// waiting run, unless it uses its share already while another run
+    /// waits.
+    fn next_loan(&self, shares: &Shares) -> Option<RunId> {
+        let waiting = self.waiting_in_order();
         let alone = waiting.len() == 1;
         waiting
             .into_iter()
-            .filter(|(_, run)| alone || f64::from(run.in_use()) < shares.of(run))
-            .min_by_key(|&(id, run)| (run.in_use(), id))
+            .find(|(_, run)| alone || f64::from(run.in_use()) < shares.of(run))
             .map(|(id, _)| id)
     }
 }
 
+/// Whether a run of `weight` using `in_use` slots uses at least as many for
+/// its weight as the `neediest` waiting run (its slots and weight) would
+/// with one more: a slot given up then goes where it is needed more, and is
+/// never lent straight back.
+fn yields(in_use: u32, weight: f64, (neediest, its_weight): (u32, f64)) -> bool {
+    f64::from(in_use) * its_weight >= f64::from(neediest + 1) * weight
+}
+
 impl Run {
+    fn new(pool: Option<RunPool>, priority: Priority) -> Self {
+        Self {
+            weight: priority.weight(),
+            pool,
+            lent: 0,
+            free: 0,
+            surplus_since: None,
+            last_free: Instant::now(),
+            test_wanted: 0,
+            test_held: 0,
+            reclaim: None,
+            unreclaimable: false,
+            loans: Loans::default(),
+        }
+    }
+
     /// Counts the run pool's free slots.
     fn observe(&mut self, now: Instant) {
         let Some(pool) = &self.pool else {
@@ -596,6 +630,11 @@ impl Run {
         self.lent.saturating_sub(self.free) + self.test_held
     }
 
+    /// The slots the run uses for its weight.
+    fn relative_use(&self) -> f64 {
+        f64::from(self.in_use()) / self.weight
+    }
+
     /// The slots taken from the host pool for the run.
     fn holdings(&self) -> u32 {
         self.lent + self.test_held
@@ -612,22 +651,24 @@ impl Run {
     }
 }
 
-/// The capacity of the host pool for heli runs, and how many runs share it.
+/// The capacity of the host pool for heli runs, and the weights of the runs
+/// that share it.
 struct Shares {
     capacity: u32,
-    active: u32,
+    /// The sum of the active runs' weights.
+    weights: f64,
 }
 
 impl Shares {
-    /// The share of `run`: the capacity divided by the active runs, `run`
-    /// and what it holds among them.
+    /// The share of `run`: the capacity times its weight over the active
+    /// runs' weights, `run` and what it holds among them.
     fn of(&self, run: &Run) -> f64 {
-        let (capacity, runs) = if run.active() {
-            (self.capacity, self.active)
+        let (capacity, weights) = if run.active() {
+            (self.capacity, self.weights)
         } else {
-            (self.capacity + run.holdings(), self.active + 1)
+            (self.capacity + run.holdings(), self.weights + run.weight)
         };
-        f64::from(capacity) / f64::from(runs.max(1))
+        f64::from(capacity) * run.weight / weights
     }
 }
 
@@ -646,5 +687,106 @@ impl Loans {
         waits.sort_unstable();
         let median = *waits.get(waits.len() / 2)?;
         Some((median, self.longest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Run, State, yields};
+    use crate::priority::Priority::{self, Background, Interactive, Normal};
+    use crate::run_id::RunId;
+
+    /// A run without a pool, using `in_use` slots (as test slots), and
+    /// waiting for another when `waits`.
+    fn run(priority: Priority, in_use: u32, waits: bool) -> Run {
+        let mut run = Run::new(None, priority);
+        run.test_held = in_use;
+        run.test_wanted = in_use + u32::from(waits);
+        run
+    }
+
+    fn state(runs: Vec<Run>) -> State {
+        State {
+            runs: runs
+                .into_iter()
+                .enumerate()
+                .map(|(number, run)| (RunId::new(number as u64 + 1), run))
+                .collect(),
+        }
+    }
+
+    fn share(state: &State, free: u32, number: u64) -> f64 {
+        state.shares(free).of(&state.runs[&RunId::new(number)])
+    }
+
+    #[test]
+    fn shares_follow_the_weights() {
+        // 4 : 1 of 10 slots.
+        let both = state(vec![run(Interactive, 0, true), run(Normal, 0, true)]);
+        assert_eq!(share(&both, 10, 1), 8.0);
+        assert_eq!(share(&both, 10, 2), 2.0);
+        // 1 : 1/4.
+        let both = state(vec![run(Normal, 3, true), run(Background, 2, true)]);
+        assert_eq!(share(&both, 5, 1), 8.0);
+        assert_eq!(share(&both, 5, 2), 2.0);
+        // 4 of 4.5 against two background runs.
+        let three = state(vec![
+            run(Background, 8, false),
+            run(Background, 9, false),
+            run(Interactive, 1, true),
+        ]);
+        assert_eq!(share(&three, 0, 3), 16.0);
+        assert_eq!(share(&three, 0, 1), 1.0);
+        // Equal weights: the capacity divided by the runs.
+        let equal = state(vec![run(Background, 2, true), run(Background, 1, true)]);
+        assert_eq!(share(&equal, 3, 1), 3.0);
+    }
+
+    #[test]
+    fn a_new_run_counts_itself_in_with_its_weight() {
+        let state = state(vec![run(Normal, 6, true), run(Interactive, 0, false)]);
+        // Idle, the interactive run would share 6 slots with the other.
+        assert!((share(&state, 0, 2) - 4.8).abs() < 1e-9);
+        assert_eq!(share(&state, 0, 1), 6.0);
+    }
+
+    #[test]
+    fn loans_go_to_the_fewest_in_use_for_their_weight() {
+        // 1 for 1 against 3 for 4.
+        let both = state(vec![run(Normal, 1, true), run(Interactive, 3, true)]);
+        assert_eq!(both.next_loan(&both.shares(4)), Some(RunId::new(2)));
+        // As many for their weights (none): the heavier first.
+        let both = state(vec![run(Background, 0, true), run(Interactive, 0, true)]);
+        assert_eq!(both.next_loan(&both.shares(4)), Some(RunId::new(2)));
+        // And among equals, the oldest.
+        let both = state(vec![run(Normal, 2, true), run(Normal, 2, true)]);
+        assert_eq!(both.next_loan(&both.shares(4)), Some(RunId::new(1)));
+    }
+
+    #[test]
+    fn a_run_at_its_share_waits_unless_alone() {
+        // 17 slots: shares 1 and 16, each used.
+        let both = state(vec![run(Background, 1, true), run(Interactive, 16, true)]);
+        assert_eq!(both.next_loan(&both.shares(0)), None);
+        // One under its share.
+        let both = state(vec![run(Background, 1, true), run(Interactive, 15, true)]);
+        assert_eq!(both.next_loan(&both.shares(1)), Some(RunId::new(2)));
+        // A background run alone gets every slot, whatever the others hold.
+        let alone = state(vec![run(Background, 7, true), run(Interactive, 9, false)]);
+        assert_eq!(alone.next_loan(&alone.shares(1)), Some(RunId::new(1)));
+    }
+
+    #[test]
+    fn slots_go_back_to_a_run_that_needs_them_more_for_its_weight() {
+        // Equal weights: two slots more.
+        assert!(yields(3 - 1, 1.0, (1, 1.0)));
+        assert!(!yields(2 - 1, 1.0, (1, 1.0)));
+        // A background run with 2 gives one to an interactive run with 6.
+        assert!(yields(2 - 1, 0.25, (6, 4.0)));
+        // An interactive run with 3 gives none to a background run with 0.
+        assert!(!yields(3 - 1, 4.0, (0, 0.25)));
+        // A normal run with 5 gives one to an interactive run with 15, not 16.
+        assert!(yields(5 - 1, 1.0, (15, 4.0)));
+        assert!(!yields(5 - 1, 1.0, (16, 4.0)));
     }
 }

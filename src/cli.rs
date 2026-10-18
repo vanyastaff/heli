@@ -16,6 +16,7 @@ use crate::changed::Selection;
 use crate::class::Class;
 use crate::config::CargoHome;
 use crate::output::Mode;
+use crate::priority::Priority;
 use crate::protocol::Cache;
 use crate::run_id::RunId;
 use crate::runlog::select::Select;
@@ -109,6 +110,9 @@ pub struct Invocation {
     /// Where its class came from, once the client has read the profiles
     /// (`crate::profiles::Source::name`).
     pub profile: Option<&'static str>,
+    /// The priority heli's `--priority` flag chose, if it chose one; once
+    /// the client has chosen it (`crate::priority::choose`), the run's.
+    pub priority: Option<Priority>,
     /// heli's command line as the user typed it, after `cargo heli`, for
     /// the run's record (`crate::runlog::Start`).
     pub typed: Vec<OsString>,
@@ -172,6 +176,12 @@ struct Cli {
     /// Writable Cargo home: isolated per worktree, or the caller's shared home.
     #[arg(long, value_name = "MODE", value_parser = parse_cargo_home)]
     cargo_home: Option<CargoHome>,
+    /// The run's weight in the shared pool: interactive (a person waits),
+    /// normal (agents) or background (long, not urgent). Default:
+    /// `HELI_PRIORITY`, else interactive on a terminal without an agent
+    /// marker (`CLAUDECODE`, `CI`), else normal.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_priority)]
+    priority: Option<Priority>,
     /// The run this one reruns, as `cargo heli rerun` says (first of all).
     #[arg(long, hide = true, value_parser = parse_run)]
     rerun_of: Option<RunId>,
@@ -512,6 +522,7 @@ pub fn parse(
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
+                priority: cli.priority,
                 typed,
                 rerun_of: cli.rerun_of,
                 select: None,
@@ -604,6 +615,7 @@ pub fn parse(
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
+                priority: cli.priority,
                 typed,
                 rerun_of: cli.rerun_of,
                 select,
@@ -639,6 +651,10 @@ fn parse_cache(text: &str) -> Result<Cache, String> {
         "off" => Ok(Cache::Live),
         _ => Err("cache mode must be on, refresh or off".to_owned()),
     }
+}
+
+fn parse_priority(text: &str) -> Result<Priority, String> {
+    text.parse()
 }
 
 fn parse_cargo_home(text: &str) -> Result<CargoHome, String> {

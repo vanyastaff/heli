@@ -121,6 +121,24 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         invocation.profile = Some(source.name(&invocation.args));
         source
     };
+    // The run's weight in the pool (`crate::priority`).
+    let var = std::env::var_os(crate::priority::VAR);
+    let priority = crate::priority::choose(
+        invocation.priority,
+        var.as_ref().map(|value| value.to_string_lossy()).as_deref(),
+        (!invocation.exec)
+            .then(|| class::default_priority(&invocation.args))
+            .flatten(),
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        crate::priority::AGENT_MARKERS
+            .iter()
+            .any(|marker| std::env::var_os(marker).is_some_and(|value| !value.is_empty())),
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("cargo-heli: {error}");
+        std::process::exit(USAGE)
+    });
+    invocation.priority = Some(priority);
     let epoch_path = invocation.dependency_epoch.clone().or_else(|| {
         std::env::var_os("HELI_DEPENDENCY_EPOCH")
             .filter(|value| !value.is_empty())
@@ -940,6 +958,7 @@ fn submit(
         cache: invocation.cache,
         reads_spawned: true,
         profile: invocation.profile.map(str::to_owned),
+        priority: invocation.priority.unwrap_or_default(),
         dependency_epoch: prepared
             .and_then(|prepared| prepared.epoch.as_ref())
             .map(|epoch| Text(epoch.path().as_os_str().to_owned())),

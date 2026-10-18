@@ -1048,6 +1048,7 @@ mod advisory_tests {
             cache: Default::default(),
             reads_spawned: false,
             profile: None,
+            priority: Default::default(),
             invocation: None,
             rerun_of: None,
         }
@@ -1143,6 +1144,7 @@ mod advisory_fetch_tests {
             cache: Default::default(),
             reads_spawned: false,
             profile: None,
+            priority: Default::default(),
             invocation: None,
             rerun_of: None,
         };
@@ -1179,6 +1181,7 @@ mod cross_tests {
             cache: Default::default(),
             reads_spawned: false,
             profile: None,
+            priority: Default::default(),
             invocation: None,
             rerun_of: None,
         }

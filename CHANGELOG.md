@@ -12,6 +12,12 @@
   and `cargo heli gc --superseded` reclaims them now, whatever the budget.
   Final artifacts stay, and a directory cargo still writes to is not
   superseded (#92).
+- **Priorities.** `--priority interactive|normal|background` (or
+  `HELI_PRIORITY`) weighs a run's share of the pool 4 / 1 / ¼: an interactive
+  run beside two background ones gets 4/4.5 of the slots. Runs default to
+  interactive on a terminal without `CLAUDECODE` or `CI`, else normal;
+  cargo-mutants runs in the background. A run alone still gets the whole
+  pool. `status` shows each run's priority (#93).
 - **`cargo heli rerun [<run>] [--failed [--then-all]]`** runs a recorded run
   again, from its directory with the current environment; without a run,
   the latest test run with failed tests in this worktree. `--failed` reruns

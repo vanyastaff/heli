@@ -92,7 +92,7 @@ const ISOLATED_VARS: [&str; 12] = [
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
 /// configuration, or change what it prints.
-const HELI_VARS: [&str; 11] = [
+const HELI_VARS: [&str; 12] = [
     "HELI_SCRATCH_DIR",
     "HELI_TEST_OWNER",
     "HELI_TEST_USER_ENV",
@@ -104,6 +104,7 @@ const HELI_VARS: [&str; 11] = [
     "HELI_OUTPUT",
     "HELI_ACTIVITY_DIR",
     "HELI_DEPENDENCY_EPOCH",
+    "HELI_PRIORITY",
 ];
 
 /// Variables that locate the user's own configuration files, which
