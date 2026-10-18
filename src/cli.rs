@@ -237,6 +237,10 @@ enum Command {
         /// and name, `my-crate tests::it_works`.
         #[arg(long, value_name = "NAME", group = "select")]
         test: Option<String>,
+        /// All of it byte for byte, cargo's JSON messages included, instead
+        /// of as a person would have seen it.
+        #[arg(long, group = "select")]
+        raw: bool,
     },
     /// Kill a run in flight with every process it started; its clients
     /// report it as cancelled.
@@ -395,6 +399,7 @@ pub fn parse(
             grep,
             errors,
             test,
+            raw,
         } => Action::Log {
             run,
             select: match (tail, grep, test) {
@@ -402,6 +407,7 @@ pub fn parse(
                 (None, Some(pattern), _) => Select::Grep(pattern),
                 (None, None, Some(name)) => Select::Test(name),
                 (None, None, None) if errors => Select::Errors,
+                (None, None, None) if raw => Select::Raw,
                 (None, None, None) => Select::All,
             },
         },

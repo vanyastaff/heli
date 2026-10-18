@@ -1038,7 +1038,7 @@ cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cac
 cargo heli exec [heli flags] -- <command…>
 cargo heli [--cache on|refresh|off | --no-cache] exec --verify [output flags] -- <verification command…>
 cargo heli status [--json]
-cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re>]
+cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re> | --raw]
 cargo heli cancel <run>
 cargo heli gc [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
@@ -1263,9 +1263,15 @@ for the result store (§7). Rendered compact output has no colours.
 `cargo heli log` and so that clients can attach to it (lifecycle step 4).
 The output modes only change what the client prints, and the footer names
 the run. `cargo heli log <run>` prints the record by run id, without
-re-running: stdout on stdout and stderr on stderr, byte for byte. At most one
-selector picks a part of it:
+re-running: stdout on stdout and stderr on stderr, as a person would have
+seen the run. Every line is as recorded, except cargo's JSON messages, which
+heli asks for in compact and quiet mode. Each diagnostic becomes its
+rendering, on stderr where cargo prints it, once however many targets
+reported it. Artifact, build-script and build-finished records are left
+out (#69). At most one selector picks a part of it:
 
+- `--raw`: the record byte for byte, cargo's JSON included, for tools and
+  for runs that asked for `--message-format json` themselves;
 - `--errors`: every error, as rustc rendered it, on stderr. From cargo's
   JSON in the record of a compact or quiet run, once however many targets
   reported it; from text otherwise, each from a line that starts with
@@ -1285,8 +1291,9 @@ selector picks a part of it:
   so:
   ``cargo-heli: no output of test `<name>` in r17`` (a compact run holds no
   passing test's output);
-- `--tail N`: the last N lines;
-- `--grep <re>`: matching lines, each matched without its line end.
+- `--tail N`: the last N lines, as `log` prints them;
+- `--grep <re>`: matching lines, as `log` prints them, each matched without
+  its line end.
 
 - **The record** is `runs/<run>.log` in the state directory. The daemon
   writes it as the output arrives, whether or not a client still listens,

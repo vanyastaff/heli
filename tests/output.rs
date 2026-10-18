@@ -488,8 +488,9 @@ fn a_quiet_run_that_succeeds_prints_one_line() {
         .output()
         .expect("run heli");
     let run = quiet_line(&output, "check -p warnings", "4 warnings, ");
+    // Rendered from the record's JSON, on stderr, where cargo prints them.
     let logged = log(&fixture, &[&run, "--grep", "unused_imports"]);
-    assert!(!logged.stdout.is_empty(), "the record holds the warnings");
+    assert!(!logged.stderr.is_empty(), "the record holds the warnings");
 
     let output = fixture
         .heli(["build", "-p", "warnings"])
