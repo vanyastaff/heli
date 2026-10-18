@@ -272,3 +272,70 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
 }
+
+/// Where Windows actually keeps `path`, when package virtualization
+/// redirects it (#70): a process that an MSIX-packaged app starts (the
+/// Claude desktop app, a packaged terminal or editor) writes `%LOCALAPPDATA%`
+/// and `%APPDATA%` into `...\Packages\<family>\LocalCache\...`, which
+/// only processes of that app see. Such a child need not have the package's
+/// identity, so asking for one is no test; the path the file system returns
+/// for the file (`std::fs::canonicalize`) is. `path` need not exist: its
+/// nearest existing ancestor is asked. `None` where nothing is redirected,
+/// and always on other systems.
+pub fn package_redirection(path: &Path) -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let existing = path.ancestors().find(|dir| dir.exists())?;
+    let canonical = std::fs::canonicalize(existing).ok()?;
+    // `\\?\C:\...` as people spell it, `C:\...`.
+    let text = canonical.to_string_lossy();
+    let mut actual = match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => canonical.clone(),
+    };
+    let rest = path.strip_prefix(existing).ok()?;
+    if !rest.as_os_str().is_empty() {
+        actual.push(rest);
+    }
+    redirected(path, &actual).then_some(actual)
+}
+
+/// Whether `actual` is in a package's redirected `LocalCache`
+/// (`Packages\<family>\LocalCache`) while `spelled` is not.
+fn redirected(spelled: &Path, actual: &Path) -> bool {
+    let in_cache = |path: &Path| {
+        let names: Vec<String> = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        names
+            .windows(3)
+            .any(|three| three[0] == "packages" && three[2] == "localcache")
+    };
+    in_cache(actual) && !in_cache(spelled)
+}
+
+#[cfg(test)]
+mod redirection_tests {
+    use std::path::Path;
+
+    use super::redirected;
+
+    #[test]
+    fn a_path_in_a_packages_local_cache_is_redirected() {
+        assert!(redirected(
+            Path::new(r"C:\Users\u\AppData\Local\heli"),
+            Path::new(
+                r"\\?\C:\Users\u\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\heli"
+            ),
+        ));
+        assert!(!redirected(
+            Path::new(r"C:\Users\u\AppData\Local\heli"),
+            Path::new(r"\\?\C:\Users\u\AppData\Local\heli"),
+        ));
+        // Asked for there on purpose: nothing redirected it.
+        let cache = Path::new(r"C:\Users\u\AppData\Local\Packages\X\LocalCache\Local\heli");
+        assert!(!redirected(cache, cache));
+    }
+}

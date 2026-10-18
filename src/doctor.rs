@@ -74,6 +74,10 @@ pub struct Inputs {
     pub configs: Vec<(PathBuf, toml::Table)>,
     /// The variables of [`VARS`] that are set and not empty.
     pub env: BTreeMap<String, String>,
+    /// heli's locations that Windows package virtualization redirects
+    /// (`crate::locations::package_redirection`): what each is, where it is
+    /// spelled, and where it actually is.
+    pub redirections: Vec<(&'static str, PathBuf, PathBuf)>,
     /// The Cargo home, where cargo-audit keeps its advisory database.
     pub cargo_home: Option<PathBuf>,
     /// `[cargo] home` of heli's configuration.
@@ -186,6 +190,14 @@ pub fn gather(cwd: &Path) -> Inputs {
             .filter(|store| store.is_dir());
     }
     if let Ok(locations) = crate::locations::Locations::resolve() {
+        for (what, path) in [
+            ("state directory", &locations.state_dir),
+            ("configuration", &locations.config),
+        ] {
+            if let Some(actual) = crate::locations::package_redirection(path) {
+                inputs.redirections.push((what, path.clone(), actual));
+            }
+        }
         let log = locations.event_log();
         let mut rotated = log.clone().into_os_string();
         rotated.push(".1");
@@ -468,6 +480,18 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Move it aside and let `cargo audit` clone the database again.",
         );
     }
+    for (what, spelled, actual) in &inputs.redirections {
+        add(
+            "package-redirection",
+            "warn",
+            format!(
+                "heli's {what} {} is redirected by Windows package virtualization to {}: only processes of this app see it. A terminal, an editor or a scheduled task outside it reaches the same daemon but reads another configuration and state.",
+                spelled.display(),
+                actual.display()
+            ),
+            "Set HELI_STATE_DIR and HELI_CONFIG, as user environment variables so that every process gets them, to paths outside AppData, for example %USERPROFILE%\\.heli\\state and %USERPROFILE%\\.heli\\config.toml.",
+        );
+    }
     Report {
         schema: SCHEMA,
         tools,
@@ -619,6 +643,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_redirected_location_is_reported() {
+        let inputs = Inputs {
+            redirections: vec![(
+                "configuration",
+                PathBuf::from(r"C:\Users\u\AppData\Roaming\heli\config.toml"),
+                PathBuf::from(
+                    r"C:\Users\u\AppData\Local\Packages\X\LocalCache\Roaming\heli\config.toml",
+                ),
+            )],
+            ..Inputs::default()
+        };
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["package-redirection"]);
+        assert!(report.findings[0].action.contains("HELI_CONFIG"));
     }
 
     #[test]

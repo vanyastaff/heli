@@ -501,12 +501,34 @@ pub fn status(json: bool) -> ! {
 /// agent; and quick when one already did. Exits 1, with one line saying
 /// why, when none could be reached.
 pub fn ensure(depth: u32) -> ! {
-    let reached = Locations::resolve().and_then(|locations| reach(&locations, Some(depth)));
+    let reached = Locations::resolve().and_then(|locations| {
+        warn_of_package_redirection(&locations);
+        reach(&locations, Some(depth))
+    });
     match reached {
         Ok(_daemon) => std::process::exit(0),
         Err(reason) => {
             eprintln!("cargo-heli: {reason}");
             std::process::exit(NO_DAEMON)
+        }
+    }
+}
+
+/// Warns when Windows package virtualization redirects heli's state or
+/// configuration (`crate::locations::package_redirection`): this process
+/// then sees files no process outside its app sees. `cargo heli doctor`
+/// says what to do.
+fn warn_of_package_redirection(locations: &Locations) {
+    for (what, path) in [
+        ("state directory", &locations.state_dir),
+        ("configuration", &locations.config),
+    ] {
+        if let Some(actual) = crate::locations::package_redirection(path) {
+            eprintln!(
+                "cargo-heli: warning: Windows redirects heli's {what} {} to {} for this app only; processes outside it use another (see `cargo heli doctor`)",
+                path.display(),
+                actual.display()
+            );
         }
     }
 }
