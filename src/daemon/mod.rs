@@ -823,7 +823,16 @@ impl Daemon {
         let recorded = run.record.output(Channel::Stderr, header.as_bytes());
         run.live
             .append(Channel::Stderr, header.into_bytes(), recorded);
-        let tested = self.phase(run, &plan.test(slots.max(1)));
+        let test = plan.test(run.request, slots.max(1));
+        let mut phase = Execution {
+            request: &test,
+            epoch: run.epoch,
+            id: run.id,
+            makeflags: run.makeflags,
+            live: run.live,
+            record: &mut *run.record,
+        };
+        let tested = self.phase(&mut phase, &test.argv());
         self.broker.release_test_slots(run.id);
         tested
     }

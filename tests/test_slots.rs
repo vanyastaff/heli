@@ -100,13 +100,21 @@ fn heli_adds_no_job_count() {
 }
 
 /// `cargo heli test` first builds with `--no-run`, then runs the tests with
-/// `--test-threads=K` for libtest, after the user's own arguments; K is the
-/// pool's 2 slots for a run alone. The user's `-j` stays as it was.
+/// `RUST_TEST_THREADS=K` for libtest, and the user's arguments as they are:
+/// no libtest flag a target's runner or a `harness = false` test could
+/// refuse (#98). K is the pool's 2 slots for a run alone. The user's `-j`
+/// stays as it was.
 #[test]
 fn a_test_run_builds_then_tests() {
     let fixture = Fixture::new("basic");
     fixture.configure("[pool]\nslots = 2\n");
-    let output = with_fake_cargo(&fixture, &["test", "-j", "3", "--", "--nocapture"], |_| {});
+    let output = with_fake_cargo(
+        &fixture,
+        &["test", "-j", "3", "--", "--nocapture"],
+        |heli| {
+            heli.env("ECHO_ENV", "RUST_TEST_THREADS");
+        },
+    );
     assert_eq!(
         printed_args(&output),
         [
@@ -116,13 +124,20 @@ fn a_test_run_builds_then_tests() {
             "arg: \"3\"",
             "arg: \"--\"",
             "arg: \"--nocapture\"",
+            "env RUST_TEST_THREADS=None",
             "arg: \"test\"",
             "arg: \"-j\"",
             "arg: \"3\"",
             "arg: \"--\"",
             "arg: \"--nocapture\"",
-            "arg: \"--test-threads=2\"",
+            "env RUST_TEST_THREADS=Some(\"2\")",
         ]
+    );
+    let output = with_fake_cargo(&fixture, &["test"], |_| {});
+    assert_eq!(
+        printed_args(&output),
+        ["arg: \"test\"", "arg: \"--no-run\"", "arg: \"test\""],
+        "no `--` of heli's"
     );
 }
 
@@ -464,14 +479,15 @@ fn what_is_a_test_run() {
         printed_args(&output),
         ["arg: \"test\"", "arg: \"--no-run\""]
     );
-    let output = with_fake_cargo(&fixture, &["test", "--doc"], |_| {});
+    let output = with_fake_cargo(&fixture, &["test", "--doc"], |heli| {
+        heli.env("ECHO_ENV", "RUST_TEST_THREADS");
+    });
     assert_eq!(
         printed_args(&output),
         [
             "arg: \"test\"",
             "arg: \"--doc\"",
-            "arg: \"--\"",
-            "arg: \"--test-threads=2\""
+            "env RUST_TEST_THREADS=Some(\"2\")"
         ]
     );
     let output = with_fake_cargo(&fixture, &["+stable", "nextest", "r"], |_| {});
@@ -540,11 +556,12 @@ fn the_threads_asked_for_come_from_flags_and_the_environment() {
         ["arg: \"test\"", "arg: \"--\"", "arg: \"--test-threads=1\""]
     );
     let output = with_fake_cargo(&fixture, &["test"], |heli| {
-        heli.env("RUST_TEST_THREADS", "1");
+        heli.env("RUST_TEST_THREADS", "1")
+            .env("ECHO_ENV", "RUST_TEST_THREADS");
     });
     assert_eq!(
         test_threads(&output),
-        ["arg: \"test\"", "arg: \"--\"", "arg: \"--test-threads=1\""]
+        ["arg: \"test\"", "env RUST_TEST_THREADS=Some(\"1\")"]
     );
 }
 
@@ -570,14 +587,58 @@ fn a_test_run_asks_for_its_share() {
     fixture.wait_for_status("the busy run to hold every slot", |status| {
         runs(status).len() == 1 && runs(status)[0]["slots"] == 4
     });
-    let output = with_fake_cargo(&fixture, &["test"], |_| {});
+    let output = with_fake_cargo(&fixture, &["test"], |heli| {
+        heli.env("ECHO_ENV", "RUST_TEST_THREADS");
+    });
     std::fs::write(&stop, "").expect("stop the busy run");
     assert_success(&busy.wait_with_output().expect("wait"), "the busy run");
     assert_eq!(
-        printed_args(&output)[2..],
-        ["arg: \"test\"", "arg: \"--\"", "arg: \"--test-threads=2\""]
+        printed_args(&output)[3..],
+        ["arg: \"test\"", "env RUST_TEST_THREADS=Some(\"2\")"]
     );
     let header = header(&output);
     assert!(header.contains(" 2 slots (share 2)"), "{header}");
     assert!(waited(&header) < 4.0, "{header}");
+}
+
+/// A target's `runner` (as `wasm-bindgen-test-runner` for wasm) gets the
+/// test binary and the user's arguments only: no `--test-threads` and no
+/// `--quiet` of heli's, which such a runner refuses, also in compact output,
+/// which runs cargo quietly; the threads go in `RUST_TEST_THREADS` (#98).
+#[test]
+fn a_target_runner_gets_no_libtest_flags_of_helis() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[pool]\nslots = 2\n");
+    let rustc = std::process::Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("run rustc -vV");
+    let host = String::from_utf8_lossy(&rustc.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
+        .expect("the host triple");
+    let runner = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host.to_uppercase().replace(['-', '.'], "_")
+    );
+    let output = fixture
+        .heli(["test", "-p", "tests-mixed", "--lib"])
+        .env("HELI_OUTPUT", "compact")
+        .env(&runner, fixture.echo_args())
+        .env("ECHO_ENV", "RUST_TEST_THREADS")
+        .env_remove("RUST_TEST_THREADS")
+        .output()
+        .expect("run heli");
+    assert_success(&output, "cargo heli test through a runner");
+    let printed = lines(&output.stdout);
+    let args: Vec<&String> = printed
+        .iter()
+        .filter(|line| line.starts_with("arg: "))
+        .collect();
+    assert_eq!(args.len(), 1, "the test binary alone: {printed:?}");
+    assert!(args[0].contains("tests_mixed"), "{printed:?}");
+    assert!(
+        printed.contains(&"env RUST_TEST_THREADS=Some(\"2\")".to_owned()),
+        "{printed:?}"
+    );
 }

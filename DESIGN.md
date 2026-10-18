@@ -977,8 +977,14 @@ configuration and changes nothing. The `--json` document has `schema` 1,
      unchanged so the native runner reports its own failure and exit code;
      heli never replaces an invalid option with a valid count.
    - It runs the tests with `--test-threads K` (nextest, in place of the
-     user's own) or `-- --test-threads=K` (libtest, after the user's test
-     arguments, in place of theirs) and holds the K slots until they finish.
+     user's own) or, for libtest, `RUST_TEST_THREADS=K` (and `--test-threads=K`
+     after `--` only in place of the user's own), and holds the K slots until
+     they finish. What follows `--` reaches every test binary, and through a
+     target's `runner` (`wasm-bindgen-test-runner`) or to a `harness = false`
+     test a libtest flag may be refused, so heli adds none; for the same
+     reason the test phase drops the `--quiet` compact output adds, which
+     cargo passes on to each test binary, and the compact view leaves out
+     cargo's `Finished`/`Running`/`Doc-tests` lines instead (#98).
      A header line on stderr says so before the tests start:
      `cargo-heli: r17: testing on 4 threads, 4 slots (share 8), waited 0.2 s`,
      or `… testing on 1 thread, no pool slot free (share 2), waited 5.0 s`.

@@ -482,7 +482,7 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "test-threads",
             "note",
             format!(
-                "RUST_TEST_THREADS = {threads}: in a test run, heli's test slots decide the threads. `cargo heli test` passes `--test-threads=K` after `--`, which overrides the variable, and K is at most the variable's value when the client's environment has it (a Cargo [env] entry is not seen by heli, so it only gets overridden). `cargo heli nextest run` passes `--test-threads K` and ignores the variable. Other commands keep it."
+                "RUST_TEST_THREADS = {threads}: in a test run, heli's test slots decide the threads. `cargo heli test` sets it to K (and replaces a `--test-threads` after `--`), and K is at most the variable's value when the client's environment has it (a Cargo [env] entry is not seen by heli, so it only gets overridden). `cargo heli nextest run` passes `--test-threads K` and ignores the variable. Other commands keep it."
             ),
             "Nothing to do; to bound the threads of a run, pass --test-threads (or -j for nextest) or size the pool.",
         );
