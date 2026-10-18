@@ -391,12 +391,18 @@ the host pool, and the daemon's log says why.
 A broker in the daemon moves slots between the host pool and the run pools,
 every 20 ms. It cannot see the processes blocked on a pool, so a run whose
 pool has no free slot counts as **waiting** for one; a run is **active**
-while it uses a slot or waits. A run's **share** is the capacity (the host
-pool's free slots, plus the slots the active runs hold) divided by the active
-runs; withheld slots and slots bare cargo holds are not in it.
+while it uses a slot or waits. Each run has a **weight**, its priority's
+(below): interactive 4, normal 1, background ¼. A run's **share** is the
+capacity (the host pool's free slots, plus the slots the active runs hold)
+times its weight over the sum of the active runs' weights; with equal
+weights, the capacity divided by the active runs. A run that is not yet
+active counts itself in, with what it holds. Withheld slots and slots bare
+cargo holds are not in the capacity. Runs are compared by the slots they use
+for their weight, `in_use / w`.
 
 - **Lend.** A free slot of the host pool goes to the waiting run with the
-  fewest slots in use, the oldest first. While another run waits, a run
+  fewest slots in use for its weight; between equals, the heavier, then the
+  oldest. While another run waits, a run
   already using its share or more gets none. A run alone can borrow every
   slot. A process waiting on a semaphore takes a slot as it is put in, so in
   the same pass the broker lends again to a run that still waits.
@@ -409,12 +415,15 @@ runs; withheld slots and slots bare cargo holds are not in it.
   taken back (seen on a macOS CI runner: a third slot taken back where two
   balance the runs). An idle run keeps one, for the next process that asks.
   That one goes back too when the host pool has none free and a run that
-  waits uses fewer slots than this one.
+  waits would, with it, still use no more slots for its weight than this
+  one.
 - **Take back.** A run with work pending never shows a free slot: each slot
   one of its processes gives back is taken at once by another waiting on the
   same pool. So while the host pool has no free slot and a run waits, a run
-  using more than its share, and at least two slots more than the waiting run
-  with the fewest, gives slots back as its processes finish with them. The
+  using more than its share, which with one slot fewer would still use as
+  many for its weight as the neediest waiting run would with one more (with
+  equal weights, at least two slots more than it), gives slots back as its
+  processes finish with them. The
   broker waits on that run's pool in line with its processes (a thread
   blocked on the semaphore and a cancel event, or in a blocking read of the
   FIFO), and the slot it gets goes to the host pool and on to the poorer run.
@@ -426,8 +435,8 @@ runs; withheld slots and slots bare cargo holds are not in it.
   run waiting, and count as taken back (what still took a third slot back
   on macOS once Return waited a tick). Where it goes then follows
   from that same count, so a slot taken back always goes to another run.
-  Nothing running is interrupted. The margin of two keeps an odd split (3
-  and 2) from moving back and forth. Cargo keeps its tokens from one job to
+  Nothing running is interrupted. The margin (of two, with equal weights)
+  keeps an odd split (3 and 2) from moving back and forth. Cargo keeps its tokens from one job to
   the next while it has jobs ready (`job_queue`, `spawn_work_if_possible`),
   so a cargo's slots come back when it has no job ready and as rustc's
   codegen and build scripts' own jobs end; clients that take a token per job,
@@ -449,6 +458,32 @@ runs; withheld slots and slots bare cargo holds are not in it.
   per tick: 32 slots take some 0.65 s, short next to a rustc job.
 
 Bare cargo, started without heli, still draws from the host pool directly.
+
+### Priorities
+
+A run's priority sets its weight in the shares (#93):
+
+| Priority | Weight | For |
+|---|---|---|
+| `interactive` | 4 | a person waits at a terminal |
+| `normal` | 1 | agents |
+| `background` | ¼ | long and not urgent: mutation testing, full sweeps |
+
+The client chooses it: `--priority <level>`, else `HELI_PRIORITY`, else
+`background` for a tool whose built-in profile says so (cargo-mutants),
+else `interactive` when stdin and stdout are terminals and neither
+`CLAUDECODE` nor `CI` is set, else `normal`. A `HELI_PRIORITY` that is no
+priority is a usage error (2). The run request carries it (absent:
+`normal`, so an older client's runs are normal), and a test run's build and
+test phases keep it. A client that attaches to a run in flight leaves the
+run's priority as it was.
+
+With the pool saturated by two background runs, an interactive run gets the
+next slot one of them gives back (Take back) and settles at 4/4.5 of the
+capacity; the background runs keep one slot each. Weights change only how
+the broker shares: a run alone still borrows every slot, a background run
+gets slots whenever nobody else waits, and test slots come from the weighted
+share (§5). The memory governor treats every priority alike.
 
 ### Properties
 
@@ -1089,7 +1124,7 @@ These are the only waits; nothing else makes a heli run wait for another run.
 ### Command line and contracts
 
 ```
-cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cache] <subcommand> [tool args…]
+cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cache] [--priority interactive|normal|background] <subcommand> [tool args…]
 cargo heli exec [heli flags] -- <command…>
 cargo heli [--cache on|refresh|off | --no-cache] exec --verify [output flags] -- <verification command…>
 cargo heli status [--json]
@@ -1110,7 +1145,8 @@ cargo heli recycle                                 (internal: the post-checkout 
   - 2 for heli's usage errors and refusals: `heli` given as its own
     subcommand, or nesting deeper than 16 (`HELI_DEPTH`). The daemon and its
     detaching starter count as levels too. An output mode that is not one
-    (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. For `log`, also a
+    (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. A priority that
+    is not one (`--priority`, `HELI_PRIORITY`, §4). For `log`, also a
     run id that is not `r<number>` (or a bare number), a bad regular
     expression, or two selectors at once.
   - 1 when the daemon is lost once a run's command has started (§3), and
@@ -2475,7 +2511,9 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   plus `commit_available` on Windows, and the `low_watermark` and
   `high_watermark`; `null` when no daemon answers or memory cannot be read;
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
-  holding `.git`, else the working directory), `argv`, `class`, `phase`
+  holding `.git`, else the working directory), `argv`, `class`, `priority`
+  (`interactive`, `normal` or `background`, §4; the text form shows it when
+  not `normal`), `phase`
   (running for a run of one phase; building, testing, done; `unknown` for
   a newer daemon's phase the client does not know), `slots` (the
   host pool's slots it uses: lent to its run pool and not free there, plus
@@ -2903,8 +2941,8 @@ this ordinary-layout experiment does not change its build-dir acceptance.
   alongside disk growth. The single-worktree compatibility gate in #27
   establishes placement compatibility, not this multi-agent acceptance.
 - **Phase 3.** Result store and single-flight.
-- **Phase 4.** Donation by block cloning, priorities beyond equal shares,
-  per-job memory calibration.
+- **Phase 4.** Donation by block cloning, per-job memory calibration.
+  Weighted shares by priority are done (§4, "Priorities").
 
 Measure throughout:
 

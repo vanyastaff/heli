@@ -15,15 +15,18 @@
 //!            "commit_available":42521726976,
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
 //!  "runs":[{"id":"r17","worktree":"D:\\work\\agent-a64b","argv":["cargo","build"],
-//!           "class":"compile","phase":"running","started_at":1791911112,
+//!           "class":"compile","priority":"interactive","phase":"running",
+//!           "started_at":1791911112,
 //!           "waiting_since":null,"waiting_for":[],"slots":6,"share":8.0,
 //!           "attached_clients":1,"ended_at":null,"exit":null},
 //!          {"id":"r18","worktree":"D:\\work\\agent-a64b","argv":["cargo","fmt"],
-//!           "class":"mutate","phase":"running","started_at":1791911120,
+//!           "class":"mutate","priority":"normal","phase":"running",
+//!           "started_at":1791911120,
 //!           "waiting_since":1791911120,"waiting_for":["r17"],"slots":0,"share":4.0,
 //!           "attached_clients":2,"ended_at":null,"exit":null},
 //!          {"id":"r16","worktree":"D:\\work\\agent-f1c0","argv":["cargo","test"],
-//!           "class":"test","phase":"done","started_at":1791910990,
+//!           "class":"test","priority":"background","phase":"done",
+//!           "started_at":1791910990,
 //!           "waiting_since":null,"waiting_for":[],"slots":0,"share":0.0,
 //!           "attached_clients":0,"ended_at":1791911050,
 //!           "exit":{"code":101,"signal":null,"cancelled":false}}],
@@ -49,8 +52,10 @@
 //! empty. `class` is `null` only from a daemon older than run classes.
 //! `profile` says where the class came from (`crate::profiles::Source::
 //! name`), `null` from a client or daemon older than profiles. A
+//! run's `priority` (`crate::priority`) is `interactive`, `normal` or
+//! `background`; `normal` from a daemon older than priorities. A
 //! run's `slots` are the host pool's slots it uses, and `share` its share of
-//! them (`crate::pool::broker`). `runs` lists the runs in flight, and the
+//! them (`crate::pool::broker`), weighted by its priority. `runs` lists the runs in flight, and the
 //! last runs that ended while no client followed them (`daemon::registry`),
 //! so whoever started them can still learn how they ended.
 //!
@@ -66,6 +71,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::class::Class;
+use crate::priority::Priority;
 use crate::store::sizes::{self, Sizes};
 
 /// Whether version `a` (`major.minor.patch`, perhaps with a suffix) is
@@ -232,6 +238,10 @@ pub struct Run {
     /// from a client or daemon older than profiles.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Its weight in the shares; normal from a daemon older than
+    /// priorities, and for a priority this build does not know.
+    #[serde(default, deserialize_with = "crate::priority::known")]
+    pub priority: Priority,
     pub phase: Phase,
     pub started_at: u64,
     /// Since when the run waits for its worktree's lock, if it does.
@@ -418,8 +428,13 @@ impl Status {
                     run.attached_clients
                 ),
             };
+            let priority = if run.priority.is_normal() {
+                String::new()
+            } else {
+                format!("{}  ", run.priority)
+            };
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {state}  {} slot{}, share {}  {}s\n",
+                "{label:<6}  {}  {}  {}  {}  {state}  {priority}{} slot{}, share {}  {}s\n",
                 run.id,
                 run.worktree,
                 run.argv.join(" "),

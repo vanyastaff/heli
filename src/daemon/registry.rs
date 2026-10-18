@@ -75,6 +75,7 @@ use super::key::{Key, Snapshot};
 use super::live::Live;
 use super::tree::Tree;
 use crate::class::{Access, Class};
+use crate::priority::Priority;
 use crate::protocol::{Cache, RunRequest};
 use crate::run_id::RunId;
 use crate::status::{self, Exit, Phase};
@@ -182,6 +183,7 @@ impl Same {
 pub struct Kind {
     pub class: Class,
     pub profile: Option<String>,
+    pub priority: Priority,
 }
 
 struct Entry {
@@ -202,6 +204,8 @@ struct Entry {
     class: Class,
     /// Where its class came from, as the client said.
     profile: Option<String>,
+    /// Its priority, as the client said.
+    priority: Priority,
     /// Its phase while in flight; once it has ended, it is done.
     phase: Phase,
     started_at: SystemTime,
@@ -380,7 +384,11 @@ impl Registry {
         nested: bool,
         retiring: bool,
     ) -> Admission {
-        let Kind { class, profile } = kind;
+        let Kind {
+            class,
+            profile,
+            priority,
+        } = kind;
         let lock = std::fs::canonicalize(&worktree).unwrap_or_else(|_| worktree.clone());
         let deadline = Instant::now() + TELLING_WAIT;
         let mut inner = self.lock();
@@ -441,6 +449,7 @@ impl Registry {
                 settled: false,
                 class,
                 profile,
+                priority,
                 phase: Phase::Running,
                 started_at: SystemTime::now(),
                 // The client that asked for it.
@@ -682,6 +691,7 @@ impl Inner {
                 .collect(),
             class: Some(entry.class),
             profile: entry.profile.clone(),
+            priority: entry.priority,
             phase,
             started_at: clock::unix_seconds(entry.started_at),
             waiting_since: (!waiting_for.is_empty()).then(|| clock::unix_seconds(entry.started_at)),

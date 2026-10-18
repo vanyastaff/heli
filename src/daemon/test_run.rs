@@ -174,6 +174,7 @@ impl TestRun {
             cache: request.cache,
             reads_spawned: request.reads_spawned,
             profile: request.profile.clone(),
+            priority: request.priority,
         })
     }
 
@@ -220,6 +221,7 @@ impl TestRun {
             cache: request.cache,
             reads_spawned: request.reads_spawned,
             profile: request.profile.clone(),
+            priority: request.priority,
         }
     }
 }

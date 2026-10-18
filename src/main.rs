@@ -25,7 +25,7 @@
 //!   draw from the pool, cargo's `build-dir` in the build [`store`], and the
 //!   [`autostart`] registration that starts the daemon at logon;
 //! - [`locations`], [`worktree`], [`environment`], [`clock`], [`nesting`],
-//!   [`run_id`]:
+//!   [`run_id`], [`priority`]:
 //!   what both sides share.
 
 mod autostart;
@@ -48,6 +48,7 @@ mod memory;
 mod nesting;
 mod output;
 mod pool;
+mod priority;
 mod processes;
 mod profiles;
 mod protocol;

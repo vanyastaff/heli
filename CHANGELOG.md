@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **Priorities.** `--priority interactive|normal|background` (or
+  `HELI_PRIORITY`) weighs a run's share of the pool 4 / 1 / ¼: an interactive
+  run beside two background ones gets 4/4.5 of the slots. Runs default to
+  interactive on a terminal without `CLAUDECODE` or `CI`, else normal;
+  cargo-mutants runs in the background. A run alone still gets the whole
+  pool. `status` shows each run's priority (#93).
+
 ### Fixed
 
 - **`cargo heli test` through a target's `runner`** (`wasm-bindgen-test-runner`
