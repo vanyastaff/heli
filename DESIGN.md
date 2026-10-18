@@ -807,7 +807,12 @@ build in `target/llvm-cov-target`, and `insta review` must run directly. It
 runs weekly, so a tool release that breaks under heli shows up, and on
 changes to classes, profiles, the client, the daemon and the store. `hakari`
 runs in the same job against a workspace-hack crate it creates (`generate`
-must mutate as directly, `verify` must hit). A nightly job runs `udeps`,
+must mutate as directly, `verify` must hit). The pool must bound a real tool: two `cargo heli hack check` runs at once,
+with two slots, run no more than N + 1 build scripts per cargo at once, and
+they must overlap. `insta review` must end as it does directly on a real
+terminal (ConPTY, `posix_openpt`). The main suite checks that an unknown tool
+at a terminal runs directly in the pool: it gets the pool's `CARGO_MAKEFLAGS`
+and no `HELI_RUN` (#64). A nightly job runs `udeps`,
 `public-api` and `miri test` through `cargo heli +nightly`, each a cached
 verification keyed by the toolchain.
 

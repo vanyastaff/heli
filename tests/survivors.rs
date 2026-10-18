@@ -85,3 +85,30 @@ fn a_configured_sccache_wrapper_is_started_too() {
     let started = std::fs::read_to_string(&starts).expect("starts");
     assert_eq!(started.lines().count(), 2, "{started}");
 }
+
+/// At a terminal, a tool no profile names runs in the client, with the host
+/// pool: it gets the pool's `CARGO_MAKEFLAGS`, and not `HELI_RUN`, which only
+/// a run the daemon executes has (#64).
+#[test]
+fn an_unknown_tool_at_a_terminal_runs_directly_in_the_pool() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let shown = |variable: &str| {
+        let mut command = fixture.heli(["bloat", "--release"]);
+        command
+            .env("CARGO", &echo)
+            .env("ECHO_ENV", variable)
+            .env("HELI_OUTPUT", "full");
+        let shown = support::terminal::run(&mut command);
+        assert_eq!(shown.code, Some(0), "{}", shown.text);
+        shown.text
+    };
+    let makeflags = shown("CARGO_MAKEFLAGS");
+    assert!(makeflags.contains("--jobserver-auth="), "{makeflags}");
+    let run = shown("HELI_RUN");
+    assert!(run.contains("HELI_RUN=None"), "{run}");
+    assert!(
+        !run.contains("running the command directly"),
+        "no fallback warning: {run}"
+    );
+}
