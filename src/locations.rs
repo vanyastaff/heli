@@ -316,7 +316,8 @@ fn redirected(spelled: &Path, actual: &Path) -> bool {
     in_cache(actual) && !in_cache(spelled)
 }
 
-#[cfg(test)]
+// Windows paths: elsewhere `\` separates nothing, and nothing is redirected.
+#[cfg(all(test, windows))]
 mod redirection_tests {
     use std::path::Path;
 
