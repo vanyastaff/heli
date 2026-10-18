@@ -256,9 +256,23 @@ fn plan(run: Option<RunId>, failed: bool) -> Result<Rerun, String> {
         }
     };
     if let Some(cargo) = cargo {
-        rerun.args = recorded.flags.iter().cloned().chain(cargo).collect();
+        rerun.args = without_package_choice(&recorded.flags)
+            .into_iter()
+            .chain(cargo)
+            .collect();
     }
     Ok(rerun)
+}
+
+/// heli's flags `flags` without `--changed` and `--affected`, which would
+/// choose packages again from what changed since (and run nothing on an
+/// unchanged tree): a rerun of failed tests selects its own.
+fn without_package_choice(flags: &[OsString]) -> Vec<OsString> {
+    flags
+        .iter()
+        .filter(|flag| !is_flag(flag, "--changed") && !is_flag(flag, "--affected"))
+        .cloned()
+        .collect()
 }
 
 /// `rerunning 2 failed tests of r17: a::t1, b::t2`.
@@ -652,6 +666,16 @@ mod tests {
             "(binary_id(=many-tests) & test(=g1::t2)) | (binary_id(=many-tests::it) & test(=g3::t4))"
         );
         assert_eq!(narrowed.len(), original.len() + 2);
+    }
+
+    #[test]
+    fn a_rerun_of_failed_tests_chooses_no_packages_from_changes() {
+        assert_eq!(
+            words(&without_package_choice(&args(
+                "--output compact --changed=origin/main --affected --no-cache"
+            ))),
+            "--output compact --no-cache"
+        );
     }
 
     #[test]

@@ -36,7 +36,8 @@
 //! and the run log,
 //! `crate::runlog`, all as configured, and on Unix the pool's [`warden`])
 //! is set up in [`main`]. The daemon
-//! runs until it is killed or retired. Its own log (start, end, errors)
+//! runs until it is killed or retired, or in a debug build until its
+//! [`owner`] is gone. Its own log (start, end, errors)
 //! is `daemon.log` in the state directory (`daemon-<session>.log` on
 //! Windows), since it has no terminal.
 
@@ -47,6 +48,7 @@ pub mod execute;
 pub mod governor;
 pub mod key;
 pub mod live;
+pub mod owner;
 pub mod registry;
 pub mod results;
 pub mod test_run;
@@ -180,6 +182,13 @@ pub fn main() -> ! {
                 &daemon.log,
                 lent,
             )
+        });
+    }
+    if let Some(owner) = owner::pid() {
+        let daemon = Arc::clone(&daemon);
+        std::thread::spawn(move || {
+            owner::wait_for_exit(owner);
+            daemon.orphaned(owner)
         });
     }
     // Listening last: a client that finds the endpoint finds the daemon
@@ -940,6 +949,21 @@ impl Daemon {
     /// loaded host).
     fn exit(&self, listener: ipc::Listener) -> ! {
         drop(listener);
+        let _ = self.lock.unlock();
+        std::process::exit(0)
+    }
+
+    /// Its owner, process `owner` ([`owner`]), is gone: kills the runs in
+    /// flight, releases the lock and exits.
+    fn orphaned(&self, owner: u32) -> ! {
+        self.log.write(&format!(
+            "its owner, pid {owner}, is gone; cancelling the runs in flight and exiting"
+        ));
+        for (id, _) in self.registry.snapshot() {
+            if let Ok(Some(tree)) = self.registry.cancel(id) {
+                let _ = tree.kill();
+            }
+        }
         let _ = self.lock.unlock();
         std::process::exit(0)
     }

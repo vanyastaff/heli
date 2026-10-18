@@ -1090,6 +1090,8 @@ These are the only waits; nothing else makes a heli run wait for another run.
 
 ```
 cargo heli [--output full|compact|quiet] [-q] [--cache on|refresh|off | --no-cache] <subcommand> [tool args…]
+cargo heli [--changed[=REF] | --affected[=REF]] <subcommand that takes -p> [tool args…]
+cargo heli changed [--affected] [--base REF] [--json]
 cargo heli exec [heli flags] -- <command…>
 cargo heli [--cache on|refresh|off | --no-cache] exec --verify [output flags] -- <verification command…>
 cargo heli status [--json]
@@ -1105,6 +1107,31 @@ cargo heli daemon [--detach | --warden]            (internal)
 cargo heli recycle                                 (internal: the post-checkout hook, §6.4)
 ```
 
+- **Changed packages (#90).** `--changed` runs the subcommand on the
+  workspace members whose files changed; `--affected` adds every member that
+  depends on them, transitively, through normal, dev and build dependencies
+  (`cargo metadata --no-deps`).
+  - The base is the merge base of `HEAD` with `REF`: by default
+    `@{upstream}`, else `origin/HEAD`; without either heli refuses and says
+    to give `=REF`. The changes are what `git diff <base>` names (commits
+    since the base, staged and unstaged) and the untracked files git does
+    not ignore.
+  - A file belongs to the deepest member whose manifest directory holds it.
+    `Cargo.lock`, the root `Cargo.toml`, and `.cargo/` or `rust-toolchain*`
+    in the workspace root or above it in the repository select the whole
+    workspace (`--workspace`). Other files (docs, `.github/`) select nothing.
+  - The selection goes to cargo as `-p a -p b`, sorted so the run key
+    (§7) is stable, before any `--`. One line on stderr says what it chose:
+    `cargo-heli: --affected since origin/main (3f2a1c9): -p a -p b (+2
+    dependents)`. When nothing is selected, heli prints `nothing changed
+    since <base>` and exits 0 without running anything.
+  - It works with build, check, clippy, test, bench, doc, `nextest run`,
+    `nextest list` and llvm-cov; heli refuses (exit 2) any other subcommand,
+    and `-p`, `--package`, `--workspace`, `--all`, `--exclude` or nextest's
+    `-E` beside it.
+  - `cargo heli changed` prints the selection, each package with why (its
+    changed files, or the member it depends on), and the files in no
+    package; `--json`, a versioned document (`schema` 1).
 - **Exit codes.**
   - The tool's own code.
   - 127 when the command does not exist, 126 when it cannot be started.
@@ -1113,7 +1140,8 @@ cargo heli recycle                                 (internal: the post-checkout 
     detaching starter count as levels too. An output mode that is not one
     (`--output`, `HELI_OUTPUT`), or `-q` with `--output`. For `log`, also a
     run id that is not `r<number>` (or a bare number), a bad regular
-    expression, or two selectors at once.
+    expression, or two selectors at once. A `--changed` or `--affected`
+    heli refuses or cannot resolve (no git repository, no base).
   - 1 when the daemon is lost once a run's command has started (§3), and
     when `log` has no record of the run or cannot read it. For `rerun`, the
     rerun's own code; 1 when there is nothing to rerun ("Reruns" below).
@@ -1419,6 +1447,9 @@ failed tests.
     with the names; a nextest run that already filters (`-E`, a test
     filter, arguments after `--`), which a filterset of heli's would only
     add to, or failures heli cannot place in a target, rerun the run whole.
+  - A narrowed rerun drops the run's `--changed` and `--affected`: it
+    selects its own packages, and those would choose again from what
+    changed since (and run nothing on an unchanged tree).
   - The first line says what reruns: `cargo-heli: rerunning 2 failed tests
     of r17: a::t1, b::t2`.
 - `--then-all`, with `--failed`: once the failed tests pass, the whole run

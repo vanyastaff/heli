@@ -12,6 +12,13 @@
   when it has to run more; `--then-all` then runs the whole run once they
   pass. Each record now starts with the run's command line as typed (never
   its environment), and `status` and `log` show `rerun of r17` (#91).
+- **`--changed[=REF]` and `--affected[=REF]`** run a cargo subcommand on
+  the workspace members changed since the merge base with `REF` (default:
+  the upstream, else `origin/HEAD`), as a sorted `-p` list; `--affected`
+  adds the members depending on them. A root manifest, `Cargo.lock`,
+  `.cargo/` or `rust-toolchain*` change selects `--workspace`; an unchanged
+  tree runs nothing. `cargo heli changed [--affected] [--base REF] [--json]`
+  prints the selection and why (#90).
 
 ### Fixed
 
