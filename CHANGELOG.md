@@ -41,6 +41,14 @@
   `RUST_TEST_THREADS` instead of adding `--test-threads` after `--`, and the
   test phase no longer passes on compact output's `--quiet`; such runners
   refused both (#98).
+- **heli's tests no longer build into the user's build store.** Their
+  workspaces were in the system's temporary directory, under the user's
+  home on Windows, so the user's `~/.cargo/config.toml` (and the Cargo home
+  `CARGO_HOME` names) applied to every cargo they ran: a user-wide
+  `build-dir` gave each one a directory in the real store. They now get an
+  empty Cargo home and a directory with no Cargo configuration or git
+  repository above it (`HELI_TEST_TMP` overrides it), and fail naming the
+  file when there is none (#109).
 
 ## 0.0.3
 

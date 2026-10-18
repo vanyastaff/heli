@@ -498,7 +498,7 @@ mod tests {
     /// `.cargo/`); patches without one are not local.
     #[test]
     fn local_patches_come_from_the_manifest_and_the_configuration() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = crate::test_tmp::tempdir();
         let root = dir.path().join("ws");
         std::fs::create_dir_all(root.join(".cargo")).expect("dirs");
         std::fs::write(

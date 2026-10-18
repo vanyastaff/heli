@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn wrappers_come_from_variables_then_the_nearest_configuration() {
-        let root = tempfile::tempdir().expect("dir");
+        let root = crate::test_tmp::tempdir();
         let home = root.path().join("home");
         let work = root.path().join("ws").join("crate");
         std::fs::create_dir_all(&home).expect("home");

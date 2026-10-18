@@ -2,9 +2,11 @@
 //!
 //! Every test drives the `cargo-heli` binary from outside, as an agent
 //! would, against a fixture workspace from `tests/fixtures/` copied into a
-//! temporary directory of its own. Commands made here are isolated from the
-//! caller's environment: their own target directory, and none of the
-//! variables that would change how cargo builds or how many jobs it runs.
+//! temporary directory of its own ([`test_tmp`]: never below a Cargo
+//! configuration or a git repository). Commands made here are isolated
+//! from the caller's environment: their own target directory, an empty Cargo
+//! home, and none of the variables that would change how cargo builds or how
+//! many jobs it runs. So no Cargo configuration of the user's applies.
 //!
 //! Each fixture also has a daemon of its own: every command it makes carries
 //! `HELI_STATE_DIR` and `HELI_ENDPOINT` inside the fixture's temporary
@@ -59,6 +61,8 @@ pub mod fake_daemon;
 pub mod fake_manager;
 pub mod jobserver;
 pub mod terminal;
+#[path = "../../src/test_tmp.rs"]
+pub mod test_tmp;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -267,7 +271,7 @@ impl Fixture {
     }
 
     fn bare(name: &str) -> Self {
-        let root = tempfile::tempdir().expect("temporary directory");
+        let root = test_tmp::tempdir();
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("fixtures")
@@ -547,9 +551,10 @@ impl Fixture {
         {
             command.env_remove(var);
         }
-        if let Some(home) = original_cargo_home() {
-            command.env("CARGO_HOME", home);
-        }
+        // Cargo reads `$CARGO_HOME/config.toml` wherever it runs, and the
+        // caller's (rustup sets `CARGO_HOME` for the tests) may send builds
+        // into the user's own build store. The fixtures need no registry.
+        command.env("CARGO_HOME", self.path("empty-cargo-home"));
         for (var, value) in &self.isolation {
             match value {
                 Some(value) => command.env(var, value),
@@ -932,19 +937,6 @@ pub fn copy_program(from: &Path, to: &Path) {
     }
 }
 
-/// The Cargo home the tests' caller started from, when the tests run
-/// inside a `cargo heli` with an isolated Cargo home: that run hands its
-/// private home down as `CARGO_HOME`, and heli under test would take it for
-/// one inherited from a managed parent and stay isolated, asking the
-/// fixture's stand-in cargo for its version. `None` otherwise: the inherited
-/// `CARGO_HOME`, if any, is the caller's own.
-fn original_cargo_home() -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("CARGO_HOME")?);
-    let marker = std::fs::read(home.join(".heli-private-home.json")).ok()?;
-    let marker: Value = serde_json::from_slice(&marker).ok()?;
-    marker["original_home"].as_str().map(PathBuf::from)
-}
-
 /// The `cargo-heli` binary under test.
 pub fn heli_binary() -> PathBuf {
     // Cargo can retain a mixed-separator spelling from --target-dir in
@@ -984,7 +976,7 @@ pub fn require_nextest() {
 /// plugins. Its failure must explain the prerequisite, never pass or wait
 /// for tests that cannot start. Only the subprocess's environment changes.
 pub fn assert_nextest_required(test: &str) {
-    let home = tempfile::tempdir().expect("empty Cargo home");
+    let home = test_tmp::tempdir();
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args(["--exact", test, "--nocapture"])
         .env("CARGO", env!("CARGO"))
