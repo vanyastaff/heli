@@ -1752,8 +1752,11 @@ fn superseded_intermediates_are_reported_and_reclaimed() {
     let target = separated_target(&fixture);
     let debug = target.join("debug");
     assert!(debug.join("deps").is_dir() && debug.join("incremental").is_dir());
-    std::fs::write(debug.join(".fingerprint").join("late.bin"), [0u8; 10])
-        .expect("write after the move");
+    // Written after the move: later than its second, which a fast build
+    // and this write can share.
+    let late = debug.join(".fingerprint").join("late.bin");
+    std::fs::write(&late, [0u8; 10]).expect("write after the move");
+    set_times(&late, now() + 60);
     let expected = superseded_victims(&target, &["deps", "incremental", "build"]);
 
     let listing = gc(&fixture, &["gc", "--dry-run"]);
