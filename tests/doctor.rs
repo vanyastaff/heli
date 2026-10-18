@@ -96,7 +96,12 @@ fn doctor_reports_makeflags_for_another_pool() {
             .find(|finding| finding["id"] == "makeflags")
             .cloned()
     };
-    let stale = fixture.makeflags().replace("heli", "heli-moved");
+    // A pool of another state directory.
+    let stale = if cfg!(windows) {
+        "-j --jobserver-auth=heli-3d99e7e1415767df".to_owned()
+    } else {
+        "-j --jobserver-auth=fifo:/elsewhere/heli/jobserver".to_owned()
+    };
     let finding = doctor(&stale).expect("a makeflags finding");
     assert_eq!(finding["level"], "warn", "{finding}");
     let action = finding["action"].as_str().expect("an action");
