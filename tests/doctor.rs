@@ -48,8 +48,8 @@ fn doctor_lists_the_unknown_tools_used_most() {
     let fixture = Fixture::new("basic");
     let echo = fixture.echo_args();
     for args in [
-        &["zigbuild"][..],
-        &["zigbuild", "--release"],
+        &["bloat"][..],
+        &["bloat", "--release"],
         &["expand"],
         &["build"],
     ] {
@@ -70,7 +70,7 @@ fn doctor_lists_the_unknown_tools_used_most() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("a JSON report");
     assert_eq!(
         report["unknown_tools"],
-        serde_json::json!([{"name": "zigbuild", "runs": 2}, {"name": "expand", "runs": 1}]),
+        serde_json::json!([{"name": "bloat", "runs": 2}, {"name": "expand", "runs": 1}]),
         "{report}"
     );
 }
