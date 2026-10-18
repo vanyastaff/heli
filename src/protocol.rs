@@ -39,6 +39,8 @@
 //!   end is the run's.
 //! - [`Request::Cancel`]: [`Reply::Cancelled`] once every process of the run
 //!   is gone, or [`Reply::CancelFailed`].
+//! - [`Request::Stop`]: [`Reply::Stopping`], with the runs in flight; the
+//!   daemon then retires, as after [`RETIRE`] (`cargo heli stop`, #87).
 //! - [`Request::Log`]: output frames holding the part of the run's record
 //!   asked for (`crate::runlog`), each on the channel the run wrote it to,
 //!   then [`Reply::LogEnd`]; or [`Reply::LogFailed`].
@@ -128,6 +130,8 @@ pub enum Request {
     Log(LogRequest),
     /// Kill a run in flight, with every process it started.
     Cancel(CancelRequest),
+    /// Take no more runs, and exit once the runs in flight have ended.
+    Stop,
 }
 
 /// The run to cancel.
@@ -313,6 +317,11 @@ pub enum Reply {
     },
     /// The run was cancelled: none of its processes is left.
     Cancelled,
+    /// The daemon takes no more runs, and exits once the `runs` in flight
+    /// have ended (at once without any).
+    Stopping {
+        runs: u32,
+    },
     /// The run was not cancelled; `message` says why.
     CancelFailed {
         message: String,

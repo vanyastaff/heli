@@ -96,6 +96,7 @@ fn main() {
         cli::Action::Run(invocation) => client::run(invocation, depth),
         cli::Action::Status { json } => client::status(json),
         cli::Action::Ensure => client::ensure(depth),
+        cli::Action::Stop { now, yes, restart } => client::stop(now, yes, restart.then_some(depth)),
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Log { run, select } => client::log(run, &select),
         cli::Action::Cancel { run } => client::cancel(run),

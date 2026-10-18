@@ -668,9 +668,143 @@ pub fn cancel(run: RunId) -> ! {
     std::process::exit(FAILED)
 }
 
-fn query_status() -> Result<Status, String> {
+/// `cargo heli stop`, and with `restart` (this process's nesting depth)
+/// `cargo heli restart`: asks the daemon to retire, cancelling the runs in
+/// flight first with `now` (after a confirmation unless `yes`). A restart
+/// then waits until that daemon has exited and starts a new one, through
+/// the autostart registration when it names this program (`crate::launch`).
+/// Exits 1, with one line saying why, when that fails.
+pub fn stop(now: bool, yes: bool, restart: Option<u32>) -> ! {
+    match stop_daemon(now, yes, restart) {
+        Ok(()) => std::process::exit(0),
+        Err(reason) => {
+            eprintln!("cargo-heli: {reason}");
+            std::process::exit(FAILED)
+        }
+    }
+}
+
+fn stop_daemon(now: bool, yes: bool, restart: Option<u32>) -> Result<(), String> {
     let locations = Locations::resolve()?;
+    let status = query_status_at(&locations)?;
+    let Some(daemon) = &status.daemon else {
+        eprintln!("cargo-heli: no heli daemon is running");
+        if let Some(depth) = restart {
+            return start_reporting(&locations, depth);
+        }
+        return Ok(());
+    };
+    let pid = daemon.pid;
+    let in_flight: Vec<&str> = status
+        .runs
+        .iter()
+        .filter(|run| run.exit.is_none())
+        .map(|run| run.id.as_str())
+        .collect();
+    if now && !in_flight.is_empty() && !yes {
+        eprint!(
+            "Cancel {} run(s) in flight ({})? [y/N] ",
+            in_flight.len(),
+            in_flight.join(", ")
+        );
+        let _ = io::stderr().flush();
+        let mut answer = String::new();
+        let _ = io::stdin().read_line(&mut answer);
+        if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+            return Err("nothing stopped".to_owned());
+        }
+    }
     let Some(mut stream) = reach(&locations, None)? else {
+        eprintln!("cargo-heli: the heli daemon (pid {pid}) has exited");
+        return match restart {
+            Some(depth) => start_reporting(&locations, depth),
+            None => Ok(()),
+        };
+    };
+    let asked = protocol::write_message(&mut stream, &Request::Stop)
+        .and_then(|()| protocol::read_message::<Reply>(&mut stream));
+    let runs = match asked {
+        Ok(Reply::Stopping { runs }) => Some(runs),
+        // Older than `stop`: it retires as after a version mismatch.
+        Ok(Reply::Unsupported) => {
+            let _ = unsupported(&mut stream);
+            None
+        }
+        Ok(other) => return Err(format!("the heli daemon answered {other:?} to stop")),
+        Err(error) => return Err(format!("the heli daemon did not answer: {error}")),
+    };
+    drop(stream);
+    if now {
+        for run in &in_flight {
+            if let Some(mut stream) = reach(&locations, None)? {
+                let request = Request::Cancel(CancelRequest {
+                    run: (*run).to_owned(),
+                });
+                match protocol::write_message(&mut stream, &request)
+                    .and_then(|()| protocol::read_message::<Reply>(&mut stream))
+                {
+                    Ok(Reply::Cancelled) => eprintln!("cargo-heli: cancelled {run}"),
+                    Ok(Reply::CancelFailed { message }) => {
+                        eprintln!("cargo-heli: warning: {message}");
+                    }
+                    _ => eprintln!("cargo-heli: warning: cannot cancel {run}"),
+                }
+            }
+        }
+    }
+    match runs {
+        Some(0) => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
+        _ if now => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
+        Some(runs) => eprintln!(
+            "cargo-heli: the heli daemon (pid {pid}) takes no new runs and exits once its {runs} run(s) in flight end"
+        ),
+        None => eprintln!(
+            "cargo-heli: the heli daemon (pid {pid}) is older than this cargo-heli; it takes no new runs and exits once idle"
+        ),
+    }
+    let Some(depth) = restart else {
+        return Ok(());
+    };
+    let mut told = false;
+    loop {
+        match query_status_at(&locations).map(|status| status.daemon) {
+            // Still there, or busy exiting.
+            Ok(Some(daemon)) if daemon.pid == pid => {}
+            Err(_) => {}
+            // Gone; or a client has started a new daemon already.
+            Ok(_) => break,
+        }
+        if !told {
+            eprintln!("cargo-heli: waiting for it to exit");
+            told = true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    start_reporting(&locations, depth)
+}
+
+/// Makes sure a daemon runs, as `ensure` does, and says which.
+fn start_reporting(locations: &Locations, depth: u32) -> Result<(), String> {
+    reach(locations, Some(depth))?;
+    match query_status_at(locations)?.daemon {
+        Some(daemon) => {
+            eprintln!(
+                "cargo-heli: the heli daemon runs: pid {}, version {}",
+                daemon.pid,
+                daemon.version.as_deref().unwrap_or("before 0.0.3")
+            );
+            Ok(())
+        }
+        None => Err("the new heli daemon did not answer".to_owned()),
+    }
+}
+
+fn query_status() -> Result<Status, String> {
+    query_status_at(&Locations::resolve()?)
+}
+
+fn query_status_at(locations: &Locations) -> Result<Status, String> {
+    let Some(mut stream) = reach(locations, None)? else {
         return Ok(Status::without_daemon());
     };
     let asked = protocol::write_message(&mut stream, &Request::Status)

@@ -25,6 +25,9 @@ cargo heli ensure
 cargo heli doctor
 ```
 
+After installing a new version, `cargo heli restart` replaces the running
+daemon once its runs have ended; `cargo heli status` shows its version.
+
 In each agent's worktree, keep Cargo's checkout-local `target/` and run:
 
 ```text
