@@ -135,6 +135,13 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {error}");
         std::process::exit(USAGE);
     });
+    // A command that only prints runs as bare Cargo would, so `install --list`
+    // lists the caller's home. Inside an isolated parent the home is already
+    // the private one and stays so.
+    let isolated = isolated
+        && (epoch_path.is_some()
+            || inherited
+            || !cargo_arguments(&invocation).is_some_and(reads_home_only));
     let prepared = isolated
         .then(|| {
             let locations = locations.as_ref().map_err(Clone::clone)?;
@@ -348,15 +355,7 @@ fn isolated_command(invocation: &Invocation) -> Result<(), String> {
     let Some(command) = isolated_subcommand(args)? else {
         return Ok(());
     };
-    // `install --list` only reads the home's record of installed tools.
-    let lists_only = command == "install"
-        && args
-            .iter()
-            .skip_while(|arg| arg.as_os_str() != command)
-            .skip(1)
-            .take_while(|arg| *arg != "--")
-            .any(|arg| arg == "--list");
-    if !lists_only
+    if !reads_home_only(args)
         && (["install", "uninstall", "login", "logout", "publish"]
             .iter()
             .any(|name| command == *name)
@@ -368,6 +367,28 @@ fn isolated_command(invocation: &Invocation) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Whether Cargo's arguments only print: `install --list`, which reads the
+/// home's record of installed tools, or the help or version of a command. Such
+/// a command never writes the Cargo home, and `install --list` is only right
+/// when it reads the caller's own home. `install foo --help` counts as help; a
+/// `--version` or `-V` counts only as the sole argument, since `install` and
+/// `binstall` take `--version <semver>` to pick a crate version.
+fn reads_home_only(args: &[OsString]) -> bool {
+    let Ok(Some(command)) = isolated_subcommand(args) else {
+        return false;
+    };
+    let rest: Vec<&OsString> = args
+        .iter()
+        .skip_while(|arg| arg.as_os_str() != command)
+        .skip(1)
+        .take_while(|arg| *arg != "--")
+        .collect();
+    let has = |flags: &[&str]| rest.iter().any(|arg| flags.iter().any(|flag| *arg == flag));
+    (command == "install" && has(&["--list"]))
+        || has(&["-h", "--help"])
+        || (rest.len() == 1 && has(&["-V", "--version"]))
 }
 
 /// Read only Cargo's leading global options for the isolation guard. Keep the
