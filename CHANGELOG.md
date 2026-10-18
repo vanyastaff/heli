@@ -12,6 +12,14 @@
   and `cargo heli gc --superseded` reclaims them now, whatever the budget.
   Final artifacts stay, and a directory cargo still writes to is not
   superseded (#92).
+- **`cargo heli rerun [<run>] [--failed [--then-all]]`** runs a recorded run
+  again, from its directory with the current environment; without a run,
+  the latest test run with failed tests in this worktree. `--failed` reruns
+  only the tests that failed, for nextest with an exact filterset and for
+  libtest with the failed targets and `-- --exact` their names, and says
+  when it has to run more; `--then-all` then runs the whole run once they
+  pass. Each record now starts with the run's command line as typed (never
+  its environment), and `status` and `log` show `rerun of r17` (#91).
 - **`--changed[=REF]` and `--affected[=REF]`** run a cargo subcommand on
   the workspace members changed since the merge base with `REF` (default:
   the upstream, else `origin/HEAD`), as a sorted `-p` list; `--affected`
