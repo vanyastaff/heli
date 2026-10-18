@@ -40,7 +40,7 @@ const MARKER: &str =
     "# Added by `cargo heli setup`: cargo keeps its intermediates in heli's build store.";
 
 /// The key under `[build]`.
-const KEY: &str = "build-dir";
+pub const KEY: &str = "build-dir";
 
 /// The main worktree of the repository holding `dir`, or why there is none.
 pub fn repository(dir: &Path) -> Result<PathBuf, String> {
@@ -227,7 +227,7 @@ fn is_build_header(line: &str) -> bool {
 }
 
 /// `value` as a TOML basic string.
-fn basic_string(value: &str) -> String {
+pub fn basic_string(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('"');
     for character in value.chars() {

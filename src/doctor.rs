@@ -38,6 +38,7 @@ use serde::Serialize;
 
 use crate::class;
 use crate::config::CargoHome;
+use crate::profiles::{Profiles, Rule};
 
 /// The version of the `--json` document.
 const SCHEMA: u32 = 1;
@@ -88,6 +89,10 @@ pub struct Inputs {
     /// The event log's lines, oldest first (the rotated file, then the
     /// current one).
     pub events: Vec<String>,
+    /// `[profiles]` of heli's configuration.
+    pub profiles: Profiles,
+    /// The profiles of the repository's `.config/heli.toml`.
+    pub repository_profiles: Vec<Rule>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -123,9 +128,11 @@ pub struct Report {
 /// How many unknown tools doctor lists.
 const UNKNOWN_SHOWN: usize = 10;
 
-/// The tools of the runs in `events` that no profile named, by runs, most
-/// first (then by name), [`UNKNOWN_SHOWN`] at most.
-fn unknown_usage(events: &[String]) -> Vec<Usage> {
+/// The tools of the runs in `events` that were recorded without a profile
+/// and that heli has none for now (no built-in profile, not a cargo
+/// subcommand, not named by the `user` or `repository` profiles), by runs,
+/// most first (then by name), [`UNKNOWN_SHOWN`] at most.
+fn unknown_usage(events: &[String], user: &Profiles, repository: &[Rule]) -> Vec<Usage> {
     let mut counts: BTreeMap<String, u64> = BTreeMap::new();
     for line in events {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -141,7 +148,15 @@ fn unknown_usage(events: &[String]) -> Vec<Usage> {
             .map(|argv| argv.iter().skip(1).filter_map(|arg| arg.as_str()).collect())
             .unwrap_or_default();
         let tool = words.iter().find(|word| !word.starts_with('+'));
-        if let Some(tool) = tool {
+        if let Some(tool) = tool
+            && class::tool_profile(tool).is_none()
+            && !class::is_cargo_builtin(tool)
+            && !user
+                .tool
+                .iter()
+                .chain(repository)
+                .any(|rule| rule.tool == *tool)
+        {
             *counts.entry((*tool).to_owned()).or_default() += 1;
         }
     }
@@ -178,6 +193,7 @@ pub fn gather(cwd: &Path) -> Inputs {
     if let Ok(path) = crate::locations::Locations::config_path() {
         if let Ok(client) = crate::config::Config::load_client(&path) {
             inputs.home_mode = client.cargo.home;
+            inputs.profiles = client.profiles;
         }
         let store = std::fs::read_to_string(&path)
             .ok()
@@ -189,6 +205,8 @@ pub fn gather(cwd: &Path) -> Inputs {
             .ok()
             .filter(|store| store.is_dir());
     }
+    inputs.repository_profiles =
+        crate::profiles::repository(&crate::worktree::of(cwd)).unwrap_or_default();
     if let Ok(locations) = crate::locations::Locations::resolve() {
         for (what, path) in [
             ("state directory", &locations.state_dir),
@@ -428,6 +446,7 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             .or_else(|| setting("build-dir"))
             .is_none()
     {
+        let line = crate::setup::build_dir_line(store);
         let store = store.display();
         add(
             "store-unused",
@@ -436,7 +455,7 @@ pub fn diagnose(inputs: &Inputs) -> Report {
                 "The build store {store} exists, but no Cargo configuration reaching this workspace sets build.build-dir, so its intermediates stay in target/ and the store is unused."
             ),
             &format!(
-                "Run `cargo heli setup`, or add `build-dir = '{store}/{{workspace-path-hash}}'` under [build] in a Cargo configuration (or set CARGO_BUILD_BUILD_DIR)."
+                "Run `cargo heli setup`, or add `{line}` under [build] in a Cargo configuration (or set CARGO_BUILD_BUILD_DIR)."
             ),
         );
     }
@@ -496,7 +515,11 @@ pub fn diagnose(inputs: &Inputs) -> Report {
         schema: SCHEMA,
         tools,
         findings,
-        unknown_tools: unknown_usage(&inputs.events),
+        unknown_tools: unknown_usage(
+            &inputs.events,
+            &inputs.profiles,
+            &inputs.repository_profiles,
+        ),
     }
 }
 
@@ -646,6 +669,41 @@ mod tests {
     }
 
     #[test]
+    fn leaves_out_tools_that_have_a_profile_now() {
+        let line =
+            |argv: &str| format!(r#"{{"at":1,"event":"admit","argv":{argv},"profile":"unknown"}}"#);
+        let events = vec![
+            line(r#"["cargo","binstall","x"]"#),
+            line(r#"["cargo","bloat"]"#),
+            line(r#"["cargo","fetch"]"#),
+            line(r#"["cargo","xtask"]"#),
+            line(r#"["cargo","just"]"#),
+        ];
+        let rule = |tool: &str| Rule {
+            tool: tool.to_owned(),
+            args: Vec::new(),
+            class: crate::profiles::RuleClass::Exec,
+        };
+        assert!(class::tool_profile("binstall").is_some());
+        let report = diagnose(&Inputs {
+            events,
+            profiles: Profiles {
+                tool: vec![rule("xtask")],
+                ..Profiles::default()
+            },
+            repository_profiles: vec![rule("just")],
+            ..Inputs::default()
+        });
+        assert_eq!(
+            report.unknown_tools,
+            [Usage {
+                name: "bloat".into(),
+                runs: 1
+            }]
+        );
+    }
+
+    #[test]
     fn a_redirected_location_is_reported() {
         let inputs = Inputs {
             redirections: vec![(
@@ -747,13 +805,19 @@ mod tests {
 
     #[test]
     fn a_store_the_workspace_does_not_use_is_reported() {
+        let store = PathBuf::from(if cfg!(windows) { r"D:\cache" } else { "/cache" });
         let mut inputs = Inputs {
-            store: Some(PathBuf::from("D:/cache")),
+            store: Some(store.clone()),
             ..Inputs::default()
         };
         let report = diagnose(&inputs);
         assert_eq!(ids(&report), ["store-unused"]);
         assert!(report.findings[0].action.contains("{workspace-path-hash}"));
+        let line = crate::setup::build_dir_line(&store);
+        assert!(report.findings[0].action.contains(&format!("`{line}`")));
+        if cfg!(windows) {
+            assert!(!line.contains('/'), "{line}");
+        }
         assert!(report.findings[0].action.contains("cargo heli setup"));
         inputs.configs = vec![config(
             "[build]
