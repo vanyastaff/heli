@@ -10,7 +10,13 @@
 //!    (`crate::output::nextest`).
 //! 2. **Test**: the daemon takes K test slots from the pool, then runs the
 //!    command again with K threads: `--test-threads K` for nextest (in place
-//!    of the user's own), `--test-threads=K` after `--` for libtest.
+//!    of the user's own). For libtest, `RUST_TEST_THREADS=K`, and in place of
+//!    the user's own `--test-threads` after `--` when there is one: cargo
+//!    hands what follows `--` to every test binary, and through a target's
+//!    `runner` (`wasm-bindgen-test-runner`) or to a `harness = false` test it
+//!    may be refused (#98). For the same reason the test phase drops the
+//!    `--quiet` that compact output adds (`crate::output::cargo::
+//!    with_json_messages`), which cargo passes on to every test binary.
 //!
 //! K is at most the threads the user asked for: nextest's `-j`,
 //! `--test-threads` or `--jobs`, or `NEXTEST_TEST_THREADS`; libtest's
@@ -171,10 +177,13 @@ impl TestRun {
         })
     }
 
-    /// The test phase's command line, with `threads` test threads.
-    pub fn test(&self, threads: u32) -> Vec<OsString> {
+    /// The test phase of the run `request` asks for, with `threads` test
+    /// threads: a request of its own, with the test phase's command line and
+    /// environment (see the module docs).
+    pub fn test(&self, request: &RunRequest, threads: u32) -> RunRequest {
         let mut argv = self.argv[..self.at].to_vec();
         let (tool, test_args) = split_at_separator(&self.argv[self.at..]);
+        let mut env = request.env.clone();
         match self.runner {
             Runner::Nextest => {
                 argv.extend(["--test-threads".into(), threads.to_string().into()]);
@@ -185,16 +194,33 @@ impl TestRun {
                 }
             }
             Runner::Libtest => {
-                argv.extend(tool.iter().cloned());
-                argv.push("--".into());
-                argv.extend(without_flags(
-                    test_args.unwrap_or_default(),
-                    &["--test-threads"],
+                argv.extend(without_added_quiet(tool));
+                if let Some(test_args) = test_args {
+                    argv.push("--".into());
+                    if thread_flags(test_args, &["--test-threads"]).is_empty() {
+                        argv.extend(test_args.iter().cloned());
+                    } else {
+                        argv.extend(without_flags(test_args, &["--test-threads"]));
+                        argv.push(format!("--test-threads={threads}").into());
+                    }
+                }
+                env.retain(|(name, _)| !environment::same_name(&name.0, "RUST_TEST_THREADS"));
+                env.push((
+                    Text("RUST_TEST_THREADS".into()),
+                    Text(threads.to_string().into()),
                 ));
-                argv.push(format!("--test-threads={threads}").into());
             }
         }
-        argv
+        RunRequest {
+            cwd: request.cwd.clone(),
+            argv: argv.into_iter().map(Text).collect(),
+            env,
+            dependency_epoch: request.dependency_epoch.clone(),
+            class: request.class,
+            cache: request.cache,
+            reads_spawned: request.reads_spawned,
+            profile: request.profile.clone(),
+        }
     }
 }
 
@@ -267,6 +293,20 @@ fn without_flags(args: &[OsString], names: &[&str]) -> Vec<OsString> {
             }
             Flag::Not => kept.push(arg.clone()),
         }
+    }
+    kept
+}
+
+/// cargo's arguments `args` without the `--quiet` that compact output adds
+/// before `--message-format json` (`crate::output::cargo::
+/// with_json_messages`).
+fn without_added_quiet(args: &[OsString]) -> Vec<OsString> {
+    let added = args.windows(3).position(|three| {
+        three[0] == "--quiet" && three[1] == "--message-format" && three[2] == "json"
+    });
+    let mut kept = args.to_vec();
+    if let Some(at) = added {
+        kept.remove(at);
     }
     kept
 }

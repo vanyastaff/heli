@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`cargo heli test` through a target's `runner`** (`wasm-bindgen-test-runner`
+  for wasm) and for `harness = false` tests: heli passes the test threads in
+  `RUST_TEST_THREADS` instead of adding `--test-threads` after `--`, and the
+  test phase no longer passes on compact output's `--quiet`; such runners
+  refused both (#98).
+
 ## 0.0.3
 
 ### Added
