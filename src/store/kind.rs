@@ -6,7 +6,7 @@
 //! | Kind    | Busy while a cargo lock is held | Trash                   | Tool caches | Its own rungs (`super::ladder`)                |
 //! |---------|---------------------------------|-------------------------|-------------|------------------------------------------------|
 //! | build   | anywhere inside                 | `<store>/.trash`        | none        | 2 orphan, 5 whole directory                    |
-//! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 4 tool caches                                  |
+//! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 6 superseded intermediates, 4 tool caches      |
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
 //! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
 //!
@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use super::ladder::{Measure, Policy, Surveyed, Tier, hours, measure, tool_caches_in};
-use super::{Dir, State};
+use super::{Dir, State, superseded};
 use crate::config::StoreConfig;
 
 /// A store's trash, in the store.
@@ -179,22 +179,47 @@ pub fn rungs(
                 ),
             )
         }
-        (Kind::Target, _) if idle >= policy.idle_age => tool_caches_in(root, tool_caches)
-            .into_iter()
-            .map(|(cache, pattern)| {
-                let Measure { bytes, .. } = measure(&cache);
-                (
-                    Tier::ToolCache,
-                    cache,
-                    bytes,
-                    idle,
-                    format!(
-                        "tool cache {pattern} of a target/ directory idle for {}",
-                        hours(idle)
-                    ),
-                )
-            })
-            .collect(),
-        (Kind::Target, _) | (Kind::SharedTarget, _) => Vec::new(),
+        (Kind::Target, _) => {
+            let mut rungs: Vec<Rung> = surveyed
+                .dir
+                .separation
+                .iter()
+                .flat_map(|separation| {
+                    superseded::find(root, separation, tool_caches)
+                        .into_iter()
+                        .map(|(dir, held)| {
+                            (
+                                Tier::Superseded,
+                                dir,
+                                held.bytes,
+                                now.saturating_sub(separation.since),
+                                format!(
+                                    "intermediates superseded by build-dir {}",
+                                    separation.build_dir.display()
+                                ),
+                            )
+                        })
+                })
+                .collect();
+            if idle >= policy.idle_age {
+                rungs.extend(tool_caches_in(root, tool_caches).into_iter().map(
+                    |(cache, pattern)| {
+                        let Measure { bytes, .. } = measure(&cache);
+                        (
+                            Tier::ToolCache,
+                            cache,
+                            bytes,
+                            idle,
+                            format!(
+                                "tool cache {pattern} of a target/ directory idle for {}",
+                                hours(idle)
+                            ),
+                        )
+                    },
+                ));
+            }
+            rungs
+        }
+        (Kind::SharedTarget, _) => Vec::new(),
     }
 }

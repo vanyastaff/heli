@@ -37,6 +37,7 @@ pub mod runner;
 pub mod scan;
 pub mod scratch;
 pub mod sizes;
+pub mod superseded;
 pub mod trash;
 pub mod volume;
 
@@ -97,6 +98,9 @@ pub struct Dir {
     pub workspace: Option<PathBuf>,
     /// A build directory's owner manifest.
     pub owner: Option<Owner>,
+    /// Where a registered, non-shared `target/` directory's workspace
+    /// builds instead, if elsewhere ([`superseded`]).
+    pub separation: Option<superseded::Separation>,
 }
 
 impl Dir {
@@ -104,6 +108,13 @@ impl Dir {
     /// of its kind ([`kind`]).
     pub fn scan(&self, config: &StoreConfig) -> Sizes {
         sizes::scan(&self.path, &self.tool_caches(config))
+    }
+
+    /// The bytes of its superseded intermediates ([`superseded`]).
+    pub fn superseded(&self, config: &StoreConfig) -> u64 {
+        self.separation.as_ref().map_or(0, |separation| {
+            superseded::bytes(&self.path, separation, &self.tool_caches(config))
+        })
     }
 
     /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
@@ -153,6 +164,7 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
                 owner,
                 store: Some(store.clone()),
                 path,
+                separation: None,
             });
         }
     }
@@ -168,6 +180,13 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
                 store: None,
                 workspace: Some(target.workspace.clone()),
                 owner: None,
+                separation: match (target.shared, &target.build_dir, target.separated_since) {
+                    (false, Some(build_dir), Some(since)) => Some(superseded::Separation {
+                        build_dir: build_dir.clone(),
+                        since,
+                    }),
+                    _ => None,
+                },
             });
         }
     }
@@ -178,6 +197,7 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
             store: None,
             workspace: None,
             owner: None,
+            separation: None,
         });
     }
     dirs

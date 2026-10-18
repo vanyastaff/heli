@@ -1,10 +1,16 @@
-//! `cargo heli gc [--dry-run] [--json]`: every directory the build store
+//! `cargo heli gc [--superseded] [--dry-run] [--json]`: every directory the build store
 //! accounts for (`crate::store::survey`), with its state and size, and an
 //! eviction pass over them (DESIGN.md §6.3, `crate::store::evict`): over
 //! the budget or under the floor, the victims the ladder chooses, each with
 //! its tier and reason. `gc` evicts them, logs each eviction in the event
 //! log (`crate::daemon::events`) and deletes the trash before it exits, at
 //! low I/O priority; `--dry-run` only names them, and changes nothing.
+//!
+//! **`--superseded`** reclaims every superseded directory in the registered
+//! `target/` directories (`crate::store::superseded`, tier 6) now, whatever
+//! the budget and the floor, and nothing else; with `--dry-run` it names
+//! them. Without it, the text form ends with a hint while any are left:
+//! `58.3 GiB superseded by the build store: cargo heli gc --superseded`.
 //!
 //! It reads the store itself, as of now, and needs no daemon: the
 //! configuration names the stores, the budget, the floor and the ages, the
@@ -17,11 +23,11 @@
 //! added:
 //!
 //! ```json
-//! {"schema":1,"dry_run":true,"dirs":[
+//! {"schema":1,"dry_run":true,"superseded":false,"dirs":[
 //!   {"kind":"build","path":"D:\\.heli\\build\\28\\4ec2fa37745150",
 //!    "store":"D:\\.heli\\build","state":"live","workspace":"D:\\flui",
 //!    "repository":"D:\\flui\\.git","created_at":1791910980,
-//!    "last_run":1791911112,"size":1000,"by_category":{…}}],
+//!    "last_run":1791911112,"size":1000,"by_category":{…},"superseded":0}],
 //!  "used":1000,"budget":900,"floor":null,
 //!  "volumes":[{"root":"D:\\","free":218103808000,"pending":0}],
 //!  "victims":[{"tier":1,"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
@@ -32,7 +38,11 @@
 //! `kind` is `build` or `target`; `state` is `busy`, `live`, `orphan` or
 //! `unknown` (`crate::store::State`). `store` is `null` for a `target/`
 //! directory; `workspace`, `repository`, `created_at` and `last_run` are
-//! `null` where no owner manifest says them. `used` is what every directory
+//! `null` where no owner manifest says them. A directory's `superseded` is
+//! the bytes of its superseded intermediates, which `by_category` counts
+//! too (0 but in a `target/` directory apart from its build directory);
+//! the document's `superseded` says the pass was `--superseded`. `used` is
+//! what every directory
 //! takes, and `budget` and `floor` are B and F in bytes (`null`: none);
 //! each volume has its free bytes (`null`: unknown) and the bytes its trash
 //! still holds. `victims` are the ones planned in a dry run, else the ones
@@ -46,7 +56,7 @@ use serde::Serialize;
 use crate::config::{Config, StoreConfig};
 use crate::daemon::events::Events;
 use crate::locations::Locations;
-use crate::store::evict::{self, Pass, Volume};
+use crate::store::evict::{self, Pass, Scope, Volume};
 use crate::store::ladder::{self, Victim};
 use crate::store::registry::Registry;
 use crate::store::sizes::{self, Sizes};
@@ -59,6 +69,8 @@ const SCHEMA: u32 = 1;
 struct Listing<'a> {
     schema: u32,
     dry_run: bool,
+    /// The pass was `--superseded`.
+    superseded: bool,
     runtime_busy: bool,
     dirs: Vec<Entry>,
     used: u64,
@@ -84,6 +96,8 @@ struct Entry {
     /// Bytes in its files.
     size: u64,
     by_category: Sizes,
+    /// Bytes in its superseded intermediates, also in `by_category`.
+    superseded: u64,
 }
 
 #[derive(Serialize)]
@@ -116,12 +130,13 @@ impl Entry {
             last_run: dir.owner.as_ref().map(|owner| owner.last_run),
             size: sizes.total(),
             by_category: sizes,
+            superseded: dir.superseded(config),
         }
     }
 }
 
-/// `cargo heli gc`.
-pub fn main(dry_run: bool, json: bool) -> ! {
+/// `cargo heli gc`; `superseded` for `--superseded`.
+pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
     let (locations, config, registry) = match Locations::resolve().and_then(|locations| {
         let config = Config::load(&locations.config)?;
         let registry = Registry::load(&locations.state_dir);
@@ -133,7 +148,12 @@ pub fn main(dry_run: bool, json: bool) -> ! {
     let now = ladder::now(Some(&config.seam()));
     // Held until gc exits: one pass evicts at a time.
     let _evicting = (!dry_run).then(|| evict_lock(&locations));
-    let mut pass = evict::plan(&config.store, &registry, now, dry_run);
+    let scope = if superseded {
+        Scope::Superseded
+    } else {
+        Scope::Ladder
+    };
+    let mut pass = evict::plan(&config.store, &registry, now, dry_run, scope);
     let dirs: Vec<Entry> = pass
         .dirs
         .iter()
@@ -149,6 +169,7 @@ pub fn main(dry_run: bool, json: bool) -> ! {
     let listing = Listing {
         schema: SCHEMA,
         dry_run,
+        superseded,
         runtime_busy: pass.runtime_busy,
         dirs,
         used: pass.used,
@@ -219,7 +240,11 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
         }
         text.push('\n');
     }
-    text.push_str(&limits(pass));
+    if listing.superseded {
+        text.push_str("reclaiming superseded intermediates, whatever the budget (--superseded)\n");
+    } else {
+        text.push_str(&limits(pass));
+    }
     let verb = if listing.dry_run { "evict" } else { "evicted" };
     for victim in listing.victims {
         text.push_str(&format!(
@@ -267,7 +292,19 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
         summary.push('\n');
     }
     text.push_str(&summary);
+    let superseded: u64 = listing.dirs.iter().map(|entry| entry.superseded).sum();
+    if !listing.superseded && superseded > 0 {
+        text.push_str(&hint(superseded));
+    }
     text
+}
+
+/// The line that points at `gc --superseded` while `bytes` are superseded.
+pub fn hint(bytes: u64) -> String {
+    format!(
+        "{} superseded by the build store: cargo heli gc --superseded\n",
+        sizes::human(bytes)
+    )
 }
 
 /// The budget and the floor, and how the store stands against them.

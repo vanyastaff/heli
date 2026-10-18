@@ -418,6 +418,7 @@ pub fn orphans(store: &Path, repository: &Path) -> Vec<Dir> {
                 workspace: Some(owner.workspace.clone()),
                 owner: Some(owner),
                 path,
+                separation: None,
             };
             (dir.state() == State::Orphan).then_some(dir)
         })

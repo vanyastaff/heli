@@ -35,7 +35,8 @@
 //!                                    "fingerprints":10,"tool_caches":0,"other":40}}],
 //!          "targets":[{"path":"D:\\work\\agent-a64b\\target","used":120,
 //!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
-//!                                     "fingerprints":0,"tool_caches":20,"other":100}}],
+//!                                     "fingerprints":0,"tool_caches":20,"other":100},
+//!                      "superseded":0}],
 //!          "scratch":[]},
 //!  "last_gc":{"at":1791911000,
 //!             "evicted":[{"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
@@ -66,7 +67,9 @@
 //! (`crate::daemon::accounts`): each store's bytes in use, by category
 //! (`crate::store::sizes`), and the `budget` all of them and the registered
 //! `target/` directories share (`null`: no budget); and each registered
-//! `target/` directory's. It is `null` when no daemon answers, or one older
+//! `target/` directory's, with `superseded`: the bytes of its superseded
+//! intermediates (`crate::store::superseded`), which `by_category` counts
+//! too. It is `null` when no daemon answers, or one older
 //! than the build store. `last_gc` is the daemon's last eviction pass that
 //! evicted anything (DESIGN.md §6.3): when, and each victim's `path`, `tier`
 //! and `bytes`; `null` before the first.
@@ -161,6 +164,10 @@ pub struct TargetUse {
     pub path: String,
     pub used: u64,
     pub by_category: Sizes,
+    /// Bytes in its superseded intermediates, also in `by_category`; 0 from
+    /// a daemon older than this field.
+    #[serde(default)]
+    pub superseded: u64,
     /// Seen for more than one workspace: the build store leaves it alone.
     #[serde(default)]
     pub shared: bool,
@@ -466,8 +473,13 @@ impl Status {
                 label = "";
             }
             for target in &disk.targets {
+                let superseded = if target.superseded > 0 {
+                    format!(", {} superseded", sizes::human(target.superseded))
+                } else {
+                    String::new()
+                };
                 text.push_str(&format!(
-                    "{label:<6}  target {}{}  {}\n",
+                    "{label:<6}  target {}{}  {}{superseded}\n",
                     target.path,
                     if target.shared {
                         " (shared, left alone)"
@@ -476,6 +488,11 @@ impl Status {
                     },
                     used(target.used, &target.by_category)
                 ));
+                label = "";
+            }
+            let superseded: u64 = disk.targets.iter().map(|target| target.superseded).sum();
+            if superseded > 0 {
+                text.push_str(&format!("{label:<6}  {}", crate::gc::hint(superseded)));
                 label = "";
             }
             for scratch in &disk.scratch {
@@ -559,5 +576,57 @@ mod version_tests {
         assert!(!older("0.1.0", "0.0.9"));
         assert!(!older("0.0.3-dev", "0.0.3"));
         assert!(!older("garbled", "0.0.3"));
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::{Disk, Status, TargetUse};
+    use crate::store::sizes::Sizes;
+
+    #[test]
+    fn superseded_intermediates_are_shown_with_a_hint() {
+        let target = |path: &str, superseded: u64| TargetUse {
+            path: path.to_owned(),
+            used: 4096,
+            by_category: Sizes {
+                deps: 4096,
+                ..Sizes::default()
+            },
+            superseded,
+            shared: false,
+        };
+        let status = Status {
+            disk: Some(Disk {
+                stores: Vec::new(),
+                targets: vec![target("/a/target", 3072), target("/b/target", 0)],
+                scratch: Vec::new(),
+            }),
+            ..Status::without_daemon()
+        };
+        let text = status.to_text(0);
+        assert!(
+            text.contains("target /a/target  4.0 KiB (deps 4.0 KiB), 3.0 KiB superseded\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("target /b/target  4.0 KiB (deps 4.0 KiB)\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("3.0 KiB superseded by the build store: cargo heli gc --superseded\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_status_from_an_older_daemon_has_nothing_superseded() {
+        let older = serde_json::json!({
+            "path": "/a/target",
+            "used": 1,
+            "by_category": crate::store::sizes::Sizes::default(),
+        });
+        let target: TargetUse = serde_json::from_value(older).expect("an older target");
+        assert_eq!(target.superseded, 0);
     }
 }

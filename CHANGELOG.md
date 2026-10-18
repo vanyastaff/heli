@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Superseded intermediates.** A `target/` directory built before
+  `build-dir` moved its workspace's intermediates into the build store keeps
+  the old `deps/`, `incremental/`, `build/` and `.fingerprint/`, which cargo
+  no longer reads. `status` and `gc` report them per target as
+  `superseded`, with a hint; they are the ladder's new first rung (tier 6),
+  and `cargo heli gc --superseded` reclaims them now, whatever the budget.
+  Final artifacts stay, and a directory cargo still writes to is not
+  superseded (#92).
 - **Priorities.** `--priority interactive|normal|background` (or
   `HELI_PRIORITY`) weighs a run's share of the pool 4 / 1 / ¼: an interactive
   run beside two background ones gets 4/4.5 of the slots. Runs default to

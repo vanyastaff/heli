@@ -11,6 +11,9 @@
 //!
 //! **What, in this order** (a tier's ages are configurable, `[store]`):
 //!
+//! 6. superseded intermediates in registered `target/` directories whose
+//!    workspace builds elsewhere (`super::superseded`), whatever their age:
+//!    tier 6 is the newest rung, and the cheapest, so it comes first;
 //! 0. scratch copies cargo tools left in the temporary directory
 //!    (`super::scratch`) untouched for 1 h (`scratch_hours`), oldest first;
 //! 1. `incremental/<unit>` directories untouched for 24 h (`unit_hours`),
@@ -35,7 +38,7 @@
 //! in, and compiled no object file) has tiers 1 and 3, plus tier 5 inside a
 //! verified exclusively regenerable cache root (`super::managed`). It never
 //! counts as an orphan. A
-//! registered `target/` directory has tiers 1, 3 and 4, and is never
+//! registered `target/` directory has tiers 6, 1, 3 and 4, and is never
 //! deleted whole: it is in the user's worktree.
 //!
 //! **Ages.** A unit is untouched since its newest file was written (a
@@ -127,20 +130,31 @@ pub fn now(seam: Option<&Seam>) -> u64 {
         .map_or_else(clock::now, |ms| ms / 1000)
 }
 
-/// A rung of the ladder.
+/// A rung of the ladder, in the ladder's order. Its number names it, as
+/// `gc`, `status` and the event log show it, and does not order it: the
+/// newest rung, superseded intermediates, is 6, and comes first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    Scratch = 0,
-    Unit = 1,
-    Orphan = 2,
-    Incremental = 3,
-    ToolCache = 4,
-    BuildDir = 5,
+    Superseded,
+    Scratch,
+    Unit,
+    Orphan,
+    Incremental,
+    ToolCache,
+    BuildDir,
 }
 
 impl Tier {
     pub fn number(self) -> u8 {
-        self as u8
+        match self {
+            Self::Scratch => 0,
+            Self::Unit => 1,
+            Self::Orphan => 2,
+            Self::Incremental => 3,
+            Self::ToolCache => 4,
+            Self::BuildDir => 5,
+            Self::Superseded => 6,
+        }
     }
 }
 

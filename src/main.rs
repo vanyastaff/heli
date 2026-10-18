@@ -116,7 +116,11 @@ fn main() {
             failed,
             then_all,
         } => rerun::main(run, failed, then_all),
-        cli::Action::Gc { dry_run, json } => gc::main(dry_run, json),
+        cli::Action::Gc {
+            dry_run,
+            json,
+            superseded,
+        } => gc::main(dry_run, json, superseded),
         cli::Action::Doctor { json } => doctor::main(json),
         cli::Action::Dependencies(command) => {
             let result = match command {

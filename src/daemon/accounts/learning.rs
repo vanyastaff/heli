@@ -7,7 +7,9 @@
 //! under another name. That names
 //! the workspace root, its `target/` directory and its build directory, as
 //! the run's configuration places them. The `target/` directory is
-//! registered (`crate::store::registry`). When the build directory is in a
+//! registered (`crate::store::registry`), with the build directory when it
+//! is elsewhere and since when, which supersedes the intermediates it
+//! held (`crate::store::superseded`). When the build directory is in a
 //! store heli manages (`crate::store::store_of`), heli writes its owner
 //! manifest (`crate::store::owner`), with the run's start as the last run
 //! and the repository git names for the workspace. Nothing of this can
@@ -209,11 +211,12 @@ impl Accounts {
         }
         // Last, so that a registered target directory says that all of this
         // is done.
-        self.register(Target {
-            path: workspace.target.clone(),
-            workspace: workspace.root.clone(),
-            shared: false,
-        });
+        self.register(Target::seen(
+            workspace.target.clone(),
+            workspace.root.clone(),
+            &build,
+            at,
+        ));
         Some(Learnt {
             dirs: vec![workspace.target, build],
             recorded,
