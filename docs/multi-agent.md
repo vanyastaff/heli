@@ -68,9 +68,11 @@ Windows: native tools can still reject sufficiently long paths. Existing
 inherited homes keep their paths until their commands finish.
 
 Perform Cargo-home maintenance such as install/login/logout from an outer
-shared command. The isolated profile refuses `install` (except
-`install --list`), `uninstall`, `login`, `logout`, `publish` and the
-installers `binstall`, `install-update` and `quickinstall`, and refuses an explicit switch to shared inside an already
+shared command. The isolated profile refuses `install`, `uninstall`, `login`,
+`logout`, `publish` and the installers `binstall`, `install-update` and
+`quickinstall`, except for commands that only print: `install --list` lists
+the tools installed in your own Cargo home, and `--help`, `-h` and `--version`
+are answered. It also refuses an explicit switch to shared inside an already
 isolated invocation. Arbitrary external tools can have their own Cargo-home
 assumptions. `cargo heli doctor` lists what heli does with each installed
 tool; the tool profiles and the compatibility matrix are in DESIGN.md §5.

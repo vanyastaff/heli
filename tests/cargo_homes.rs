@@ -400,22 +400,84 @@ fn native_home_mutating_commands_are_refused_before_execution() {
 }
 
 /// `install --list` only reads the record of installed tools, so it is not
-/// refused; it lists the private home's, which is empty.
+/// refused, and it answers for the caller's home, as bare Cargo does.
 #[test]
-fn install_list_is_not_refused_under_an_isolated_home() {
+fn install_list_reads_the_callers_home_under_an_isolated_home() {
     let fixture = Fixture::new("basic");
     let original = fixture.path("original/.cargo");
     std::fs::create_dir_all(&original).unwrap();
-    let output = fixture
-        .heli(["--cargo-home", "isolated"])
+    write(
+        &original.join(".crates.toml"),
+        "[v1]
+\"cargo-fake-tool 1.2.3 (registry+https://github.com/rust-lang/crates.io-index)\" = [\"cargo-fake-tool.exe\"]
+",
+    );
+    let bare = Command::new("cargo")
         .args(["install", "--list"])
         .env("CARGO_HOME", &original)
         .output()
         .unwrap();
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(!error.contains("not supported"), "{error}");
-    assert_success(&output, "install --list under an isolated home");
-    assert!(!original.join(".crates.toml").exists());
+    assert_success(&bare, "bare install --list");
+    let bare = String::from_utf8_lossy(&bare.stdout).into_owned();
+    assert!(bare.contains("cargo-fake-tool v1.2.3"), "{bare}");
+    let isolated = |command: &mut Command| {
+        let output = command.env("CARGO_HOME", &original).output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("not supported"), "{error}");
+        assert_success(&output, "install --list under an isolated home");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let output = isolated(
+        fixture
+            .heli(["--cargo-home", "isolated"])
+            .args(["install", "--list"]),
+    );
+    assert_eq!(output, bare);
+    let output = isolated(
+        fixture
+            .heli(["--cargo-home", "isolated", "exec", "--"])
+            .args(["cargo", "install", "--list"]),
+    );
+    assert_eq!(output, bare);
+    assert!(!original.join("credentials.toml").exists());
+}
+
+/// Help only prints, so a home-writing command's help is not refused.
+#[test]
+fn help_of_home_writing_commands_is_not_refused_under_an_isolated_home() {
+    let fixture = Fixture::new("basic");
+    let original = fixture.path("original/.cargo");
+    std::fs::create_dir_all(&original).unwrap();
+    for args in [
+        vec!["install", "--help"],
+        vec!["install", "foo", "-h"],
+        vec!["uninstall", "--help"],
+        vec!["login", "-h"],
+        vec!["publish", "--help"],
+        vec!["install-update", "--help"],
+        vec!["binstall", "--version"],
+        vec!["quickinstall", "-h"],
+    ] {
+        let output = fixture
+            .heli(["--cargo-home", "isolated"])
+            .args(&args)
+            .env("CARGO_HOME", &original)
+            .output()
+            .unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !error.contains("not supported") && !error.contains("cannot prepare"),
+            "{args:?}: {error}"
+        );
+    }
+    // A crate version is not a request for the version.
+    let output = fixture
+        .heli(["--cargo-home", "isolated"])
+        .args(["install", "--version", "1.0.0", "not-a-crate"])
+        .env("CARGO_HOME", &original)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
 }
 
 #[test]
