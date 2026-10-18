@@ -25,6 +25,7 @@
 //! - **status**: describe the daemon and the registry's runs;
 //! - **log**: send part of a run's record;
 //! - **cancel**: kill a run's process tree;
+//! - **stop**: say how many runs are in flight, then retire, as below;
 //! - a request it does not know: answer that it is unsupported;
 //! - **retire**, from a newer client (of another protocol version, or with a
 //!   request this daemon does not know): accept no more runs and exit once
@@ -380,6 +381,7 @@ impl Daemon {
             Ok(Request::Run(request)) => self.run(stream, request),
             Ok(Request::Log(request)) => self.log(stream, &request),
             Ok(Request::Cancel(request)) => self.cancel(stream, &request),
+            Ok(Request::Stop) => self.stop(stream),
             Err(_) => {
                 if protocol::write_message(&mut stream, &Reply::Unsupported).is_ok() {
                     self.retire_if_asked(&mut stream, "a client with a request this daemon lacks");
@@ -397,6 +399,24 @@ impl Daemon {
                 .write(&format!("{client} asked this daemon to retire"));
             self.retire();
         }
+    }
+
+    /// Answers with the runs in flight, then retires: the answer first,
+    /// since a daemon with no run exits at once.
+    fn stop(&self, mut stream: Stream) {
+        let runs = self
+            .registry
+            .snapshot()
+            .iter()
+            .filter(|(_, run)| run.exit.is_none())
+            .count();
+        let runs = u32::try_from(runs).unwrap_or(u32::MAX);
+        let _ = protocol::write_message(&mut stream, &Reply::Stopping { runs });
+        drop(stream);
+        self.log.write(&format!(
+            "a client asked this daemon to stop, with {runs} runs in flight"
+        ));
+        self.retire();
     }
 
     /// Sends the part of a run's record that `request` asks for.
@@ -825,6 +845,10 @@ impl Daemon {
             schema: status::SCHEMA,
             daemon: Some(status::Daemon {
                 pid: std::process::id(),
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+                executable: std::env::current_exe()
+                    .ok()
+                    .map(|path| path.display().to_string()),
                 protocol: protocol::VERSION,
                 started_at: clock::unix_seconds(self.started_at),
                 interactive: place.interactive(),

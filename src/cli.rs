@@ -26,6 +26,9 @@ pub enum Action {
     Status { json: bool },
     /// Start the daemon unless one runs.
     Ensure,
+    /// Ask the daemon to exit once its runs end; with `now`, cancel them
+    /// first (`yes`: without asking). With `restart`, then start a new one.
+    Stop { now: bool, yes: bool, restart: bool },
     /// Offer the environment that lets a bare cargo draw from the pool;
     /// with `print`, only show it. `autostart` registers the daemon to start
     /// at logon (`Some(true)`), removes that registration (`Some(false)`),
@@ -203,6 +206,28 @@ enum Command {
     },
     /// Start heli's daemon unless one is running; for a session-start hook.
     Ensure,
+    /// Ask heli's daemon to exit once its runs in flight have ended; it
+    /// takes no new runs meanwhile.
+    Stop {
+        /// Cancel the runs in flight instead of waiting for them, after a
+        /// confirmation.
+        #[arg(long)]
+        now: bool,
+        /// Cancel without asking.
+        #[arg(long, short, requires = "now")]
+        yes: bool,
+    },
+    /// Replace heli's daemon with one of this cargo-heli: stop it, wait
+    /// until it has exited, and start a new one.
+    Restart {
+        /// Cancel the runs in flight instead of waiting for them, after a
+        /// confirmation.
+        #[arg(long)]
+        now: bool,
+        /// Cancel without asking.
+        #[arg(long, short, requires = "now")]
+        yes: bool,
+    },
     /// Offer to set `CARGO_MAKEFLAGS` for agents and shells, so that a bare
     /// cargo draws from heli's pool; each file is written only on a yes.
     Setup {
@@ -379,6 +404,16 @@ pub fn parse(
         }
         Command::Status { json } => Action::Status { json },
         Command::Ensure => Action::Ensure,
+        Command::Stop { now, yes } => Action::Stop {
+            now,
+            yes,
+            restart: false,
+        },
+        Command::Restart { now, yes } => Action::Stop {
+            now,
+            yes,
+            restart: true,
+        },
         Command::Gc { dry_run, json } => Action::Gc { dry_run, json },
         Command::Doctor { json } => Action::Doctor { json },
         Command::Setup {

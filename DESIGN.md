@@ -581,6 +581,23 @@ versions. When no daemon can be reached, or the one there speaks another
 protocol version (an older one is asked to retire, as for a run), it exits
 1 with one line saying why.
 
+**`cargo heli stop [--now [--yes]]`** asks the daemon to retire, as a newer
+client does (§3): it takes no new runs (they run directly, after one
+warning line) and exits once its runs in flight have ended; the daemon
+answers with how many. A daemon older than `stop` answers "unsupported",
+and the client asks it to retire as after a mismatch. With `--now` the
+client cancels the runs in flight (as `cancel` does) after asking
+`Cancel N run(s) in flight (r1, …)? [y/N]` on stderr, read from stdin;
+`--yes` does not ask, and anything but a yes stops nothing (exit 1). With no
+daemon, `stop` says so and exits 0. **`cargo heli restart`**, with the same
+flags, stops the daemon, waits until it has exited (or another client has
+started a new one), then starts one as `ensure` does, through the autostart
+registration when its record names this program, and names its pid and
+version. `status` shows the daemon's version and program (`version` and
+`executable` in the JSON document, `null` from a daemon older than them),
+and the text form says when the daemon is older than the client, with
+`restart` as the fix (#87).
+
 ### Autostart
 
 **`cargo heli setup --autostart`** registers the daemon to start when the
@@ -1075,6 +1092,8 @@ cargo heli cancel <run>
 cargo heli gc [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
+cargo heli stop [--now [--yes]]
+cargo heli restart [--now [--yes]]
 cargo heli daemon [--detach | --warden]            (internal)
 cargo heli recycle                                 (internal: the post-checkout hook, §6.4)
 ```
