@@ -4,12 +4,15 @@
 //! (`crate::class`). heli's flags choose the output mode (`crate::output`):
 //! `--output <mode>` or `-q`, before a cargo subcommand, or before or after
 //! `exec`; and `--cache` / `--no-cache`, before a cargo subcommand.
+//! `--changed[=REF]` and `--affected[=REF]`, before a cargo subcommand that
+//! takes `-p`, choose its packages from what changed (`crate::changed`).
 
 use std::ffi::OsString;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
+use crate::changed::Selection;
 use crate::class::Class;
 use crate::config::CargoHome;
 use crate::output::Mode;
@@ -37,6 +40,13 @@ pub enum Action {
     Setup {
         print: bool,
         autostart: Option<bool>,
+    },
+    /// Print what `--changed`, or with `affected` `--affected`, would select
+    /// since `base`, and why; as JSON with `json`.
+    Changed {
+        affected: bool,
+        base: Option<String>,
+        json: bool,
     },
     /// Print the recorded output of run `run` (`r<number>`), or a part of it.
     Log { run: RunId, select: Select },
@@ -90,6 +100,9 @@ pub struct Invocation {
     /// The priority heli's `--priority` flag chose, if it chose one; once
     /// the client has chosen it (`crate::priority::choose`), the run's.
     pub priority: Option<Priority>,
+    /// The packages `--changed` or `--affected` choose, which the client
+    /// adds to `args` (`crate::changed::apply`).
+    pub select: Option<Selection>,
 }
 
 impl Invocation {
@@ -150,6 +163,19 @@ struct Cli {
     /// marker (`CLAUDECODE`, `CI`), else normal.
     #[arg(long, value_name = "LEVEL", value_parser = parse_priority)]
     priority: Option<Priority>,
+    /// Run on the workspace members whose files changed since the merge base
+    /// with REF (default: the upstream branch, else origin/HEAD), as `-p`.
+    #[arg(long, value_name = "REF", num_args = 0..=1, require_equals = true)]
+    changed: Option<Option<String>>,
+    /// As --changed, and on every member that depends on those too.
+    #[arg(
+        long,
+        value_name = "REF",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with = "changed"
+    )]
+    affected: Option<Option<String>>,
     #[command(subcommand)]
     command: Command,
 }
@@ -252,6 +278,20 @@ enum Command {
         /// Remove the registration `--autostart` made.
         #[arg(long)]
         no_autostart: bool,
+    },
+    /// Print which workspace members changed since a base, and why: what
+    /// `--changed` (or `--affected`) would run on.
+    Changed {
+        /// Also the members that depend on the changed ones.
+        #[arg(long)]
+        affected: bool,
+        /// Compare with the merge base of HEAD and REF (default: the upstream
+        /// branch, else origin/HEAD).
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+        /// Print the versioned JSON document instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Print a run's recorded output: stdout on stdout, stderr on stderr.
     Log {
@@ -372,6 +412,31 @@ pub fn parse(
         ));
     }
     let output = cli.output.mode();
+    let select = match (&cli.changed, &cli.affected) {
+        (Some(base), None) => Some(Selection {
+            affected: false,
+            base: base.clone().filter(|base| !base.is_empty()),
+        }),
+        (None, Some(base)) => Some(Selection {
+            affected: true,
+            base: base.clone().filter(|base| !base.is_empty()),
+        }),
+        _ => None,
+    };
+    if let Some(selection) = &select {
+        let flag = if selection.affected {
+            "--affected"
+        } else {
+            "--changed"
+        };
+        let refusal = match &cli.command {
+            Command::Cargo(args) => crate::changed::refusal(flag, args),
+            _ => Some(format!("{flag} goes only before a cargo subcommand")),
+        };
+        if let Some(refusal) = refusal {
+            return Err(Cli::command().error(ErrorKind::ArgumentConflict, refusal));
+        }
+    }
     Ok(match cli.command {
         Command::LeaseRun {
             roots,
@@ -411,6 +476,7 @@ pub fn parse(
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
                 priority: cli.priority,
+                select: None,
             })
         }
         Command::Status { json } => Action::Status { json },
@@ -438,6 +504,15 @@ pub fn parse(
                 (false, true) => Some(false),
                 (false, false) => None,
             },
+        },
+        Command::Changed {
+            affected,
+            base,
+            json,
+        } => Action::Changed {
+            affected,
+            base,
+            json,
         },
         Command::Log {
             run,
@@ -475,6 +550,7 @@ pub fn parse(
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
                 priority: cli.priority,
+                select,
             })
         }
     })

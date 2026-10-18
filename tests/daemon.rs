@@ -5,7 +5,7 @@ mod support;
 
 use std::io::{Read, Write};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use support::fake_daemon::{Answer, FakeDaemon};
 use support::{Fixture, assert_success, lines, runs};
@@ -287,6 +287,61 @@ fn the_daemon_outlives_the_call_that_started_it() {
     fixture.wait_for_status("the run to finish", |status| {
         runs(status).iter().all(|run| run["phase"] == "done")
     });
+}
+
+/// A daemon whose owner (`HELI_TEST_OWNER`, a test seam of debug builds) is
+/// gone kills its runs and exits: the daemon of a test killed by its runner,
+/// which never drops its fixture, does not outlive it.
+#[test]
+fn a_daemon_exits_once_its_owner_is_gone() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    let mut owner = Command::new(&echo)
+        .env("ECHO_WAIT_FOR", fixture.path("never"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the owner");
+    let mut call = fixture.heli(["exec", "--"]);
+    call.arg(&echo)
+        .env("HELI_TEST_OWNER", owner.id().to_string())
+        .env("ECHO_WAIT_FOR", fixture.path("gate"))
+        .env("ECHO_PID", "1");
+    let call = start(&mut call);
+    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let daemon = support::daemon_pid(&status).expect("a daemon");
+    let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    fixture.wait_for_run_output(&id);
+    let logged = fixture.heli(["log", &id]).output().expect("run heli log");
+    let run: u32 = text(&logged.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("pid "))
+        .and_then(|pid| pid.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the run's pid in its log: {logged:?}"));
+
+    owner.kill().expect("kill the owner");
+    owner.wait().expect("wait for the owner");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while (support::process_runs(daemon) || support::process_runs(run)) && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !support::process_runs(daemon),
+        "the daemon outlived its owner; its log:
+{}",
+        fixture.daemon_log()
+    );
+    assert!(!support::process_runs(run), "its run outlived it");
+    assert!(
+        fixture
+            .daemon_log()
+            .contains(&format!("its owner, pid {}, is gone", owner.id())),
+        "{}",
+        fixture.daemon_log()
+    );
+    let output = finish(call);
+    assert!(!output.status.success(), "the run's client fails");
 }
 
 /// `echo-args` with `args`, run by `heli` and directly: `heli` printed

@@ -50,6 +50,16 @@ downloads dependencies normally; no vendor/import/fetch prepass is needed.
 Nested commands keep that home. A cold private home needs network access;
 another worktree's warm cache does not make it ready for `--offline`.
 
+To check only what a branch changed, put `--changed` (the changed workspace
+members) or `--affected` (those and their dependents) before the
+subcommand; `=REF` gives the base, else it is the upstream branch:
+
+```text
+cargo heli --affected clippy --all-targets -- -D warnings
+cargo heli --affected=origin/main nextest run
+cargo heli changed --affected
+```
+
 Use `cargo heli status` to see active work and `cargo heli log <run-id>` for
 recorded output. Wrap project task runners with
 `cargo heli exec -- <command> [args...]`; a runner's own host-wide lock still

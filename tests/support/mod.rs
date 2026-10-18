@@ -10,7 +10,10 @@
 //! `HELI_STATE_DIR` and `HELI_ENDPOINT` inside the fixture's temporary
 //! directory, so no test meets another test's daemon or the user's real one.
 //! Dropping the fixture kills the daemon, and with it any run still going,
-//! even when the test panics. Its host pool (`HELI_POOL`: a semaphore name
+//! even when the test panics. A test killed itself (a timeout, a cancelled
+//! run) drops nothing: so every command names the test's process as its
+//! daemon's owner (`HELI_TEST_OWNER`), and a daemon whose owner is gone kills
+//! its runs and exits. Its host pool (`HELI_POOL`: a semaphore name
 //! unique to the fixture on Windows, a FIFO in its temporary directory
 //! elsewhere) and its configuration file (`HELI_CONFIG`, written by
 //! [`Fixture::configure`]) are the fixture's own too.
@@ -89,8 +92,9 @@ const ISOLATED_VARS: [&str; 12] = [
 /// heli's variables a test command must not inherit from whoever runs the
 /// tests: they could point it at the user's real daemon, pool or
 /// configuration, or change what it prints.
-const HELI_VARS: [&str; 11] = [
+const HELI_VARS: [&str; 12] = [
     "HELI_SCRATCH_DIR",
+    "HELI_TEST_OWNER",
     "HELI_TEST_USER_ENV",
     "HELI_STATE_DIR",
     "HELI_ENDPOINT",
@@ -220,6 +224,7 @@ impl Fixture {
                 "HELI_TEST_USER_ENV".into(),
                 Some(fixture.path("user-env").into()),
             ),
+            owner(),
         ];
         fixture.change_config(|config| config.seam.memory = Some(Memory::PLENTY));
         fixture
@@ -256,6 +261,7 @@ impl Fixture {
             "HELI_TEST_USER_ENV".into(),
             Some(fixture.path("user-env").into()),
         ));
+        isolation.push(owner());
         fixture.isolation = isolation;
         fixture
     }
@@ -713,6 +719,15 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.kill_daemon();
     }
+}
+
+/// `HELI_TEST_OWNER`, naming this test's process: a daemon its commands
+/// start exits once the test is gone, however it ends.
+fn owner() -> (OsString, Option<OsString>) {
+    (
+        "HELI_TEST_OWNER".into(),
+        Some(std::process::id().to_string().into()),
+    )
 }
 
 /// The `runs` of a `status --json` document.
