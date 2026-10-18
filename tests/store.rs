@@ -529,7 +529,9 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
         "{listing:?}"
     );
 
-    // A build directory only a bare cargo built in has no manifest.
+    // A build directory only a bare cargo built in has no manifest of a
+    // run's, but is attributed to its workspace from what cargo compiled
+    // (#88), without a repository.
     let output = fixture
         .cargo(["build", "--quiet", "-p", "echo-args"])
         .current_dir(&main)
@@ -542,8 +544,13 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
         .filter(|dir| dir["kind"] == "build" && dir["path"] != live["path"])
         .collect();
     assert_eq!(unknown.len(), 1, "{unknown:?}");
-    assert_eq!(unknown[0]["state"], "unknown", "{unknown:?}");
-    assert_eq!(unknown[0]["workspace"], Value::Null, "{unknown:?}");
+    assert_eq!(unknown[0]["state"], "live", "{unknown:?}");
+    assert_eq!(
+        canonical(unknown[0]["workspace"].as_str().expect("attributed")),
+        canonical(&main),
+        "{unknown:?}"
+    );
+    assert_eq!(unknown[0]["repository"], Value::Null, "{unknown:?}");
 
     let output = fixture
         .heli(["gc", "--dry-run"])

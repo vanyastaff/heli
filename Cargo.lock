@@ -84,6 +84,7 @@ dependencies = [
  "junction",
  "libc",
  "regex",
+ "rustc-stable-hash",
  "rustix",
  "serde",
  "serde_json",
@@ -350,6 +351,12 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rustc-stable-hash"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
 name = "rustix"
