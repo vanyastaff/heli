@@ -14,6 +14,9 @@
   `doctor` advises for packaged apps); one set for a process only is still
   refused, and the message says so. `setup` offers to set `CARGO_MAKEFLAGS`
   there (#82).
+- **`cargo heli doctor`** warns about a `CARGO_MAKEFLAGS` that names another
+  jobserver than heli's pool, such as one written before the state
+  directory moved, and gives the value to set (#86).
 
 ## 0.0.2
 
