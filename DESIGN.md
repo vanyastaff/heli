@@ -1097,6 +1097,7 @@ cargo heli [--cache on|refresh|off | --no-cache] exec --verify [output flags] --
 cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re> | --raw]
 cargo heli cancel <run>
+cargo heli rerun [<run>] [--failed [--then-all]]
 cargo heli gc [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
@@ -1142,7 +1143,8 @@ cargo heli recycle                                 (internal: the post-checkout 
     expression, or two selectors at once. A `--changed` or `--affected`
     heli refuses or cannot resolve (no git repository, no base).
   - 1 when the daemon is lost once a run's command has started (§3), and
-    when `log` has no record of the run or cannot read it.
+    when `log` has no record of the run or cannot read it. For `rerun`, the
+    rerun's own code; 1 when there is nothing to rerun ("Reruns" below).
   - For `cancel`: 0 once the run's processes are gone; 1 when the run is
     not in flight (it ended, or never was), when no daemon runs (`cancel`
     starts none), or when the daemon cannot cancel it (too old: it is asked
@@ -1387,7 +1389,15 @@ out (#69). At most one selector picks a part of it:
   run". It is a sequence of numbered
   events, each the bytes one read of the run's stdout or stderr returned, in
   the order the daemon received them: exact within each stream, and across
-  the two as close as two pipes allow. Selectors work on lines: one stream's
+  the two as close as two pipes allow. Before them comes a start event: the
+  run's command line as the user typed it (heli's flags, the subcommand and
+  its arguments, before the client added anything for its output mode),
+  its working directory, its class, and the run it reruns, if it is a rerun
+  ("Reruns" below). Never its environment, which may hold secrets. Readers
+  skip events they do not know, so a record without one, written by an
+  older heli, reads as before. Unless `--raw` asks for the record byte for
+  byte, `log` of a rerun begins with one line on stderr,
+  `cargo-heli: r18: rerun of r17`. Selectors work on lines: one stream's
   bytes up to a `\n` (or its unended last bytes), ordered by the event that
   holds their last byte, so `--tail` counts both streams together.
 - **Reading.** `log` asks the daemon; when none answers, the client reads
@@ -1399,6 +1409,58 @@ out (#69). At most one selector picks a part of it:
   whichever limit is hit first: when a run starts, the oldest records
   (lowest run number) are deleted first. The record of a run in flight is
   never deleted.
+
+**Reruns** (#91). `cargo heli rerun <run>` runs a recorded run again: the
+command line of its start event, from its working directory, with the
+environment `rerun` is given. It is a run of its own, linked to the one it
+reruns: `status` (`rerun_of`, §8) and `log` say `rerun of r17`. Without
+`<run>`, it takes the latest test run in this worktree whose record shows
+failed tests.
+
+- `--failed` reruns only the tests that failed, read from the record as the
+  runner printed them, in any output mode (colours dropped):
+  - **nextest**: its status lines on stderr, `FAIL [ 0.012s] (1/3)
+    <binary-id> <test>`, also `TIMEOUT`, `ABORT`, a signal (`SIGSEGV`) or
+    a retry's last word (`TRY 2 FAIL`), unless a later `PASS` or `FLAKY`
+    line takes the test back. The rerun adds one filterset that names each
+    test exactly: `-E '(binary_id(=b) & test(=t)) | …'`.
+  - **libtest**: each test binary's list of names after `failures:` on
+    stdout, which libtest prints before the binary's summary, and the line
+    cargo prints on stderr once that binary has failed, `error: test
+    failed, to rerun pass `-p foo --lib``, which names its target. Each
+    stream is in order, but across the two only as the daemon read them,
+    and cargo's line comes right as the binary exits, so it may be recorded
+    before the binary's last output. So a binary's output (from libtest's
+    `running N tests`) belongs to the binary at the same place among
+    cargo's `Running …` and `Doc-tests …` lines when both streams count the
+    same binaries, else to the last one cargo started before the output
+    began; without those lines (`--quiet`), the outputs that list failures
+    pair with cargo's failure lines in order. The rerun replaces the run's package and target selection (`-p`,
+    `--workspace`, `--exclude`, `--lib`, `--bin`, `--test`, `--doc`, …) with
+    the failed targets, and adds `--exact` and the names after `--`;
+    binaries without failures do not run.
+  - When that cannot be exact, heli says why in a `note:` line and runs
+    more: a libtest run that already selects tests by name, or a target
+    whose failures libtest did not list (`harness = false`), reruns the
+    failed targets whole; failed doc tests together with other targets,
+    which cargo cannot run in one command, keep the run's own selection,
+    with the names; a nextest run that already filters (`-E`, a test
+    filter, arguments after `--`), which a filterset of heli's would only
+    add to, or failures heli cannot place in a target, rerun the run whole.
+  - A narrowed rerun drops the run's `--changed` and `--affected`: it
+    selects its own packages, and those would choose again from what
+    changed since (and run nothing on an unchanged tree).
+  - The first line says what reruns: `cargo-heli: rerunning 2 failed tests
+    of r17: a::t1, b::t2`.
+- `--then-all`, with `--failed`: once the failed tests pass, the whole run
+  again, as another rerun.
+- A run with no record (pruned, or never), with no start event (it ran
+  before heli recorded them), or, with `--failed`, one that is not a test
+  run or failed no tests: one line saying so, and exit 1.
+
+The rerun is this program again with a hidden first flag, `--rerun-of
+<run>`, which the client sends in its request and which is not part of the
+recorded command line.
 
 **With rtk installed.** A bare `cargo test` that rtk rewrites to
 `rtk cargo test` still draws from the heli pool: rtk passes the environment
@@ -2511,7 +2573,9 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   need not be whole), `waiting_since` (`null` unless the run waits),
   `waiting_for`
   (the ids of the runs it waits for at the worktree lock),
-  `attached_clients` (the clients following it now), `started_at`, and
+  `attached_clients` (the clients following it now), `rerun_of` (the run a
+  rerun reruns, §5 "Reruns"; `null` for any other run, and the text form
+  adds `rerun of r17` to the run's state), `started_at`, and
   once it has ended `ended_at` and `exit` (`code`, `signal` on Unix,
   `cancelled`), else `null`. The runs in flight are listed, and the last
   32 runs that ended while no client followed them, as done: nobody else

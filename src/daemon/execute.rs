@@ -363,6 +363,8 @@ mod tests {
             cache: Default::default(),
             reads_spawned: false,
             profile: None,
+            invocation: None,
+            rerun_of: None,
         }
     }
 

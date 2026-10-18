@@ -15,18 +15,22 @@
 //! **Format.** The 8 bytes `HELI-LOG` and the format [`VERSION`] (`u32`,
 //! little-endian), then events: a kind byte, a little-endian `u32` length,
 //! then that many bytes. Kinds: [`STDOUT`] and [`STDERR`], output as one
-//! read from the run's pipe returned it. Readers skip kinds they do not
-//! know, so new events (the run's start or end, say) need no new version.
-//! An event's **index** is its position among the record's events, from 0;
-//! [`Event`] and [`select::Line`] carry it, so a selector can relate what
-//! the two streams printed. A record can be read while it is written: a
-//! reader sees every event written so far, and a partial event at the end is
-//! not one yet.
+//! read from the run's pipe returned it; [`START`], the record's first event
+//! when there is one, the run's command line as JSON ([`Start`]). Readers
+//! skip kinds they do not know, so new events need no new version.
+//! An output event's **index** is its position among the record's output
+//! events, from 0, as the daemon published it to the run's followers
+//! (`daemon::live`); [`Event`] and [`select::Line`] carry it, so a selector
+//! can relate what the two streams printed. A record can be read while it
+//! is written: a reader sees every event written so far, and a partial
+//! event at the end is not one yet.
 //!
 //! **Reading.** [`read`] opens a record and writes the part a selector
-//! picks ([`select`], where the module docs say how to add one). The daemon
-//! serves `log` requests with it; a client reads the record itself when no
-//! daemon answers.
+//! picks ([`select`], where the module docs say how to add one), after a
+//! line naming the run it reruns, if it is a rerun ([`Start::rerun_of`]).
+//! The daemon serves `log` requests with it; a client reads the record
+//! itself when no daemon answers. [`start`] reads a record's start event,
+//! for `cargo heli rerun` (`crate::rerun`).
 //!
 //! **Retention** (`[log]` in `crate::config`). When a run starts, its record
 //! is created and the oldest records are deleted first until at most
@@ -43,8 +47,11 @@ use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 
+use serde::{Deserialize, Serialize};
+
+use crate::class::Class;
 use crate::config::LogConfig;
-use crate::protocol::Channel;
+use crate::protocol::{Channel, Text};
 use crate::run_id::RunId;
 
 use select::{Out, Select};
@@ -56,6 +63,25 @@ pub const VERSION: u32 = 1;
 pub const STDOUT: u8 = 1;
 /// Event kind: bytes the run wrote to its stderr.
 pub const STDERR: u8 = 2;
+/// Event kind: the run's command line ([`Start`]).
+pub const START: u8 = 3;
+
+/// A run's start event: what `cargo heli rerun` runs again. Never the
+/// environment, which may hold secrets: a rerun takes the environment it is
+/// given.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Start {
+    /// heli's command line as the user typed it, after `cargo heli`: heli's
+    /// own flags, then the subcommand and its arguments, before the client
+    /// added anything for its output mode (`crate::output::plan`).
+    pub args: Vec<Text>,
+    /// The client's working directory.
+    pub cwd: Text,
+    pub class: Class,
+    /// The run this one reruns, `r<number>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_of: Option<String>,
+}
 
 const MAGIC: [u8; 8] = *b"HELI-LOG";
 
@@ -199,15 +225,25 @@ pub struct Recorder<'a> {
 }
 
 impl Recorder<'_> {
+    /// Records the run's command line, as the record's first event.
+    pub fn start(&mut self, start: &Start) {
+        let json = serde_json::to_vec(start).expect("BUG: a start event serializes");
+        self.event(START, &json);
+    }
+
     /// Appends what the run wrote to `channel`; `false` when it is not in
     /// the record (recording has failed).
     pub fn output(&mut self, channel: Channel, bytes: &[u8]) -> bool {
-        let Some(file) = &mut self.file else {
-            return false;
-        };
         let kind = match channel {
             Channel::Stdout => STDOUT,
             Channel::Stderr => STDERR,
+        };
+        self.event(kind, bytes)
+    }
+
+    fn event(&mut self, kind: u8, bytes: &[u8]) -> bool {
+        let Some(file) = &mut self.file else {
+            return false;
         };
         // Pipe reads are far smaller (`daemon::execute`).
         let length = u32::try_from(bytes.len()).expect("BUG: an event of 4 GiB");
@@ -252,7 +288,7 @@ impl Drop for Pin<'_> {
 /// One output event of a record.
 #[derive(Debug)]
 pub struct Event {
-    /// Its position among the record's events, from 0.
+    /// Its position among the record's output events, from 0.
     pub index: u64,
     pub channel: Channel,
     pub bytes: Vec<u8>,
@@ -262,39 +298,51 @@ pub struct Event {
 pub struct Events {
     /// `None` for a record whose header is not written yet: no events.
     reader: Option<BufReader<File>>,
+    /// The index of the next output event.
     next: u64,
+}
+
+impl Events {
+    /// The next event of any kind: its kind and its bytes.
+    fn next_raw(&mut self) -> Option<io::Result<(u8, Vec<u8>)>> {
+        let reader = self.reader.as_mut()?;
+        let mut header = [0u8; 5];
+        match read_whole(reader, &mut header) {
+            Ok(true) => {}
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        }
+        let mut length = [0u8; 4];
+        length.copy_from_slice(&header[1..]);
+        let length = u32::from_le_bytes(length);
+        // Read through `take`, so a damaged length costs no more memory
+        // than the file holds.
+        let mut bytes = Vec::new();
+        match reader.by_ref().take(length.into()).read_to_end(&mut bytes) {
+            Ok(read) if read == length as usize => {}
+            Ok(_) => return None,
+            Err(error) => return Some(Err(error)),
+        }
+        Some(Ok((header[0], bytes)))
+    }
 }
 
 impl Iterator for Events {
     type Item = io::Result<Event>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let reader = self.reader.as_mut()?;
         loop {
-            let mut header = [0u8; 5];
-            match read_whole(reader, &mut header) {
-                Ok(true) => {}
-                Ok(false) => return None,
+            let (kind, bytes) = match self.next_raw()? {
+                Ok(event) => event,
                 Err(error) => return Some(Err(error)),
-            }
-            let mut length = [0u8; 4];
-            length.copy_from_slice(&header[1..]);
-            let length = u32::from_le_bytes(length);
-            // Read through `take`, so a damaged length costs no more memory
-            // than the file holds.
-            let mut bytes = Vec::new();
-            match reader.by_ref().take(length.into()).read_to_end(&mut bytes) {
-                Ok(read) if read == length as usize => {}
-                Ok(_) => return None,
-                Err(error) => return Some(Err(error)),
-            }
-            let index = self.next;
-            self.next += 1;
-            let channel = match header[0] {
+            };
+            let channel = match kind {
                 STDOUT => Channel::Stdout,
                 STDERR => Channel::Stderr,
                 _ => continue,
             };
+            let index = self.next;
+            self.next += 1;
             return Some(Ok(Event {
                 index,
                 channel,
@@ -373,9 +421,28 @@ pub fn open(dir: &Path, run: RunId) -> Result<Events, ReadError> {
     Ok(Events { reader, next: 0 })
 }
 
+/// The start event of `run`'s record in `dir`; `None` for a record without
+/// one (written before heli recorded them, or not yet).
+pub fn start(dir: &Path, run: RunId) -> Result<Option<Start>, ReadError> {
+    let mut events = open(dir, run)?;
+    match events.next_raw() {
+        Some(Ok((START, json))) => Ok(serde_json::from_slice(&json).ok()),
+        Some(Err(error)) => Err(ReadError::Io(run, error)),
+        _ => Ok(None),
+    }
+}
+
 /// Writes the part of `run`'s record in `dir` that `select` picks to `out`,
-/// each piece on the channel it was written to.
+/// each piece on the channel it was written to. Unless `select` asks for
+/// the record byte for byte, a rerun's begins with a line on stderr naming
+/// the run it reruns.
 pub fn read(dir: &Path, run: RunId, select: &Select, out: &mut Out<'_>) -> Result<(), ReadError> {
+    if *select != Select::Raw
+        && let Some(of) = start(dir, run)?.and_then(|start| start.rerun_of)
+    {
+        let header = format!("cargo-heli: {run}: rerun of {of}\n");
+        out(Channel::Stderr, header.as_bytes()).map_err(|error| ReadError::Io(run, error))?;
+    }
     let events = open(dir, run)?;
     select::apply(select, run, events, out).map_err(|error| ReadError::Io(run, error))
 }

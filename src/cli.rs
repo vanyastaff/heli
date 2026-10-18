@@ -51,6 +51,14 @@ pub enum Action {
     Log { run: RunId, select: Select },
     /// Kill run `run` (`r<number>`) with every process it started.
     Cancel { run: RunId },
+    /// Run run `run` again, or the latest failed test run in this worktree
+    /// (`crate::rerun`): whole, or with `failed` only its failed tests,
+    /// and with `then_all` the whole run once those pass.
+    Rerun {
+        run: Option<RunId>,
+        failed: bool,
+        then_all: bool,
+    },
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`.
     Gc { dry_run: bool, json: bool },
@@ -96,6 +104,12 @@ pub struct Invocation {
     /// Where its class came from, once the client has read the profiles
     /// (`crate::profiles::Source::name`).
     pub profile: Option<&'static str>,
+    /// heli's command line as the user typed it, after `cargo heli`, for
+    /// the run's record (`crate::runlog::Start`).
+    pub typed: Vec<OsString>,
+    /// The run this one reruns: `cargo heli rerun` runs heli again with the
+    /// hidden `--rerun-of <run>` first.
+    pub rerun_of: Option<RunId>,
     /// The packages `--changed` or `--affected` choose, which the client
     /// adds to `args` (`crate::changed::apply`).
     pub select: Option<Selection>,
@@ -153,6 +167,9 @@ struct Cli {
     /// Writable Cargo home: isolated per worktree, or the caller's shared home.
     #[arg(long, value_name = "MODE", value_parser = parse_cargo_home)]
     cargo_home: Option<CargoHome>,
+    /// The run this one reruns, as `cargo heli rerun` says (first of all).
+    #[arg(long, hide = true, value_parser = parse_run)]
+    rerun_of: Option<RunId>,
     /// Run on the workspace members whose files changed since the merge base
     /// with REF (default: the upstream branch, else origin/HEAD), as `-p`.
     #[arg(long, value_name = "REF", num_args = 0..=1, require_equals = true)]
@@ -315,6 +332,20 @@ enum Command {
         #[arg(value_parser = parse_run)]
         run: RunId,
     },
+    /// Run a recorded run again, from its directory, with the current
+    /// environment: by default the latest failed test run in this worktree.
+    Rerun {
+        /// The run, as the footer after it and `status` name it: `r17` (or
+        /// `17`).
+        #[arg(value_parser = parse_run)]
+        run: Option<RunId>,
+        /// Only the tests that failed in it.
+        #[arg(long)]
+        failed: bool,
+        /// Then, once those pass, the whole run.
+        #[arg(long, requires = "failed")]
+        then_all: bool,
+    },
     /// List every directory of the build store, with its state, and evict
     /// what the ladder chooses when the store is over its budget or a
     /// volume under its floor.
@@ -392,6 +423,12 @@ pub fn parse(
     if args.peek().is_some_and(|first| first == "heli") {
         args.next();
     }
+    let args: Vec<OsString> = args.collect();
+    let typed = match args.first() {
+        Some(first) if first == "--rerun-of" => args.get(2..).unwrap_or_default().to_vec(),
+        Some(first) if first.as_encoded_bytes().starts_with(b"--rerun-of=") => args[1..].to_vec(),
+        _ => args.clone(),
+    };
     let cli = Cli::try_parse_from(binary.into_iter().chain(args))?;
     if let Command::Cargo(args) = &cli.command
         && args.first().is_some_and(|subcommand| subcommand == "heli")
@@ -465,6 +502,8 @@ pub fn parse(
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
+                typed,
+                rerun_of: cli.rerun_of,
                 select: None,
             })
         }
@@ -522,6 +561,15 @@ pub fn parse(
             },
         },
         Command::Cancel { run } => Action::Cancel { run },
+        Command::Rerun {
+            run,
+            failed,
+            then_all,
+        } => Action::Rerun {
+            run,
+            failed,
+            then_all,
+        },
         Command::Recycle => Action::Recycle,
         Command::Daemon { warden: true, .. } => Action::Warden,
         Command::Daemon { detach, .. } => Action::Daemon { detach },
@@ -538,6 +586,8 @@ pub fn parse(
                 cargo_home: cli.cargo_home,
                 cache_flags: (cli.no_cache, cli.cache),
                 profile: None,
+                typed,
+                rerun_of: cli.rerun_of,
                 select,
             })
         }
