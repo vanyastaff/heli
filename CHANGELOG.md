@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.0.4
+
+After upgrading, run `cargo heli restart` so that the daemon is the new one:
+runs of an older heli hold the host-wide runtime guard this version no
+longer reads (#108).
 
 ### Added
 
@@ -45,7 +49,6 @@
   directories meanwhile. A volume too full for a rename into the trash gets
   its victims deleted in place, and `doctor` warns about a store under its
   floor (#108).
-
 - **`cargo heli test` through a target's `runner`** (`wasm-bindgen-test-runner`
   for wasm) and for `harness = false` tests: heli passes the test threads in
   `RUST_TEST_THREADS` instead of adding `--test-threads` after `--`, and the

@@ -130,10 +130,23 @@ fn a_run_waiting_for_its_worktree_runs_directly_when_the_daemon_is_lost() {
     let fixture = Fixture::new("basic");
     let echo = fixture.echo_args();
     let gate = fixture.path("gate");
+    let started = fixture.path("fmt-started");
     let mut fmt = fixture.heli(["fmt"]);
-    fmt.env("CARGO", &echo).env("ECHO_WAIT_FOR", &gate);
+    fmt.env("CARGO", &echo)
+        .env("ECHO_WAIT_FOR", &gate)
+        .env("ECHO_STARTS", &started);
     let fmt = start(&mut fmt);
     fixture.wait_for_status("the fmt run", |status| runs(status).len() == 1);
+    // Its command has started (the client hears so), so losing the daemon
+    // is an error for it, not a reason to run the command itself.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fmt's command never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let mut waiting = fixture.heli(["exec", "--"]);
     waiting.arg(&echo).arg("direct");
     let waiting = start(&mut waiting);
