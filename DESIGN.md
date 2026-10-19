@@ -89,10 +89,11 @@ are end-to-end delays, not separately measured download times. That run
 does not pass §12's strict ten-second first-compiler criterion.
 An existing worktree's retained home and an eligible orphan build directory
 can be reused; an entirely new worktree without a donor is not guaranteed
-to start warm. Artifact GC reclaims eligible regenerable data, protects
-active consumers and resumes at idle. Continuous activity can defer it
-indefinitely, protected residual outputs can exceed the budget even at
-idle, and native source homes are outside that budget (§6.3, §6.6).
+to start warm. Artifact GC reclaims eligible regenerable data and protects
+what runs in flight may use: their workspaces' directories, and whatever
+changed since the oldest of them started (§6.3). Protected residual outputs
+can exceed the budget even at idle, and native source homes are outside
+that budget (§6.3, §6.6).
 The recorded 2-GiB FLUI acceptance remains a failed budget check. These
 limits must not be advertised as solved merely because concurrent commands
 or narrower acceptance tests pass.
@@ -1894,25 +1895,43 @@ Safety rules:
 - **Protect runtime, not just compilation.** Cargo 1.99 releases its layout
   locks before executing tests. A public nested-test reproducer, gated after
   compilation, lost its `OUT_DIR` asset to GC with `dir_hours = 0`. Every
-  managed command now holds a shared per-user activity guard for its whole
-  lifetime, including the build/test transition. Independent commands take
-  compatible shared guards; they do not queue behind each other. GC only
-  tries the exclusive guard, rechecks it at eviction, and holds it through
-  the rename, outside the victims and independently of `HELI_STATE_DIR`.
-  An internal command parent also holds the guard until the actual command
-  exits, so killing only the daemon does not expose surviving tests.
-  Nested commands can use another known workspace's cache, so metadata alone
-  cannot safely narrow this protection to an inferred set of directories.
-  Consequently GC conservatively defers reclamation while any managed
-  command runs in that user's activity namespace. Continuous activity can
-  defer the disk target indefinitely; B is a reclamation target, not a hard
-  disk quota. Bare Cargo's compilation locks remain respected, but bare
+  managed command now holds a shared runtime lease of its worktree
+  (`<activity>/worktrees/<hash>/`, the worktree's path in `path`) for its
+  whole lifetime, including the build/test transition. Independent commands
+  take compatible shared leases; they do not queue behind each other. An
+  internal command parent also holds the lease until the actual command
+  exits, so killing only the daemon does not expose surviving tests, and it
+  lets go before it exits. Each holder leaves a marker in the lease while it
+  holds it (`run-<nanos>-<pid>-<n>`, naming the command), so eviction knows
+  when the oldest run in flight started.
+  GC leaves alone (#108):
+  - the directories of a workspace related to a worktree a run is in flight
+    in (the workspace inside the worktree, or around it). It takes those
+    leases exclusively, without waiting, and holds them through the rename,
+    outside the victims and independently of `HELI_STATE_DIR`;
+  - any victim that changed since the oldest run in flight started:
+    nested commands can build and use another workspace's cache, a
+    temporary one without an owner or another known one, and what they
+    wrote is that recent. Ages are compared, so that the test seam's clock
+    and real time agree. Such victims are left out before the ladder
+    chooses, so that it chooses others, and `gc` lists them as skipped
+    ("changed since a run in flight started").
+  heli's own notes in a build directory (`.heli/`) do not count as a
+  change. Older, idle directories go while runs are in flight: one host-wide
+  guard, as before, deferred all eviction for as long as any run was in
+  flight, which on a host of busy agents is always (the store grew to fill
+  its volume). B is a reclamation target, not a hard disk quota. A volume
+  the store is on that is under its floor is a `doctor` warning
+  (`store-floor`). When the volume is too full even to rename a victim into
+  the trash (`os error 112` on NTFS), the victim is deleted in place, under
+  the same locks. Bare Cargo's compilation locks remain respected, but bare
   runtime and detached background descendants require explicit integration
   and are not covered by this managed-command guarantee. All processes using
   the same caches must use the same heli version and activity namespace;
   `HELI_ACTIVITY_DIR` is only for explicitly isolated test/spike environments.
-  It must be absolute. `gc --json` exposes `runtime_busy`, including when an
-  unavailable interlock conservatively prevents proving idle. Failure to
+  It must be absolute. `gc --json` exposes `runtime_busy`: some directories
+  were left alone for runs in flight; an activity namespace that does not
+  resolve leaves everything alone. Failure to
   acquire a run's guard refuses that managed command rather than executing
   it without runtime protection (the narrow G5 exception above).
   A daemon-owned runtime guard releases its file before requesting another

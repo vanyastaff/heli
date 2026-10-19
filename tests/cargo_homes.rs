@@ -591,12 +591,18 @@ fn native_isolated_fallback_keeps_runtime_ownership_after_client_loss() {
 
     client.kill().unwrap();
     client.wait().unwrap();
-    // This is the same external exclusive-lock attempt GC makes. The
-    // command is still gated after the submitting CLI has disappeared.
+    // This is the same external exclusive-lock attempt GC makes, on the
+    // runtime lease of the command's worktree (#108). The command is still
+    // gated after the submitting CLI has disappeared.
+    let leases: Vec<_> = std::fs::read_dir(activity.join("worktrees"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join(".heli-runtime.lock"))
+        .collect();
+    assert_eq!(leases.len(), 1, "one worktree's lease: {leases:?}");
     let external_gc = File::options()
         .read(true)
         .write(true)
-        .open(activity.join(".heli-runtime.lock"))
+        .open(&leases[0])
         .unwrap();
     assert!(
         matches!(external_gc.try_lock(), Err(TryLockError::WouldBlock)),

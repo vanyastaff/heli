@@ -262,7 +262,7 @@ pub fn busy(dir: &Path) -> bool {
 /// `.fingerprint/`, `build/`) but none of the [`LOCKS`] was laid out by a
 /// cargo heli does not know.
 pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
-    if lease::busy() {
+    if in_use(dir) {
         return true;
     }
     let profiles = lock_dirs(&dir.path);
@@ -275,6 +275,33 @@ pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
         kind::LockScope::Profiles => profiles.iter().any(|profile| held(profile)),
     };
     busy || (unknown_layout(&profiles) && recently_changed(&dir.path, now))
+}
+
+/// Whether a run is in flight in the workspace of `dir` (`lease`): heli
+/// leaves it alone, whatever cargo's locks say. An activity namespace that
+/// does not resolve leaves everything alone. (A victim elsewhere that
+/// changed since the oldest run in flight started is left alone at eviction
+/// too: [`changed_in_flight`].)
+pub fn in_use(dir: &Dir) -> bool {
+    if !lease::available() {
+        return true;
+    }
+    dir.workspace
+        .as_deref()
+        .is_some_and(|workspace| lease::busy_for(workspace).is_some())
+}
+
+/// Whether something whose newest file was written at `newest` changed
+/// since the oldest run in flight started: a run's nested cargo may have
+/// built it, for a temporary workspace or another known one, and the run
+/// may read it. Ages are compared, the victim's at `now` (the eviction's
+/// clock, which the test seam may move) and the run's in real time, so that
+/// the two agree whichever clock a test sets.
+pub fn changed_in_flight(newest: Option<u64>, now: u64) -> bool {
+    lease::in_flight_since().is_some_and(|since| {
+        let running = crate::clock::now().saturating_sub(since);
+        newest.is_some_and(|newest| now.saturating_sub(newest) <= running)
+    })
 }
 
 /// Known Cargo locks at any depth, without following links. An unreadable

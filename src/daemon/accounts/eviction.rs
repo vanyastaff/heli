@@ -77,7 +77,7 @@ impl Accounts {
         evict::execute(&mut pass, now);
         if pass.runtime_busy {
             self.log
-                .write("eviction deferred: runtime activity interlock is busy or unavailable");
+                .write("eviction left alone the directories of workspaces a run is in flight in");
         }
         for (victim, why) in &pass.skipped {
             self.log.write(&format!(

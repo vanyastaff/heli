@@ -65,7 +65,8 @@ pub enum Scope {
 /// What a pass found and did.
 #[derive(Debug)]
 pub struct Pass {
-    /// Managed runtime, or an unavailable safety interlock, deferred GC.
+    /// Some directories were left alone: a run is in flight in their
+    /// workspace (`super::lease`).
     pub runtime_busy: bool,
     pub policy: Policy,
     pub dirs: Vec<Surveyed>,
@@ -91,7 +92,6 @@ pub fn plan(
     dry_run: bool,
     scope: Scope,
 ) -> Pass {
-    let runtime_busy = super::lease::busy();
     let policy = Policy::of(config);
     let mut dirs: Vec<Surveyed> = Vec::new();
     for dir in super::survey(config, registry) {
@@ -119,6 +119,7 @@ pub fn plan(
             }
         }
     }
+    let runtime_busy = dirs.iter().any(|surveyed| super::in_use(&surveyed.dir));
     // A shared `target/` directory is not heli's to manage (`super::kind`).
     let used = dirs
         .iter()
@@ -140,7 +141,22 @@ pub fn plan(
     if scope == Scope::Ladder && !goals.any() {
         return pass;
     }
-    let candidates = ladder::candidates(&pass.dirs, &policy, &config.tool_cache_patterns(), now);
+    let mut candidates =
+        ladder::candidates(&pass.dirs, &policy, &config.tool_cache_patterns(), now);
+    // What changed since the oldest run in flight started may be in use
+    // (`super::changed_in_flight`): left out before the ladder chooses, so
+    // that it chooses something else.
+    if super::lease::in_flight_since().is_some() {
+        let (left, kept): (Vec<Victim>, Vec<Victim>) = candidates.into_iter().partition(|victim| {
+            super::changed_in_flight(newest(&pass.dirs[victim.dir], victim), now)
+        });
+        candidates = kept;
+        pass.runtime_busy |= !left.is_empty();
+        pass.skipped.extend(
+            left.into_iter()
+                .map(|victim| (victim, IN_FLIGHT.to_owned())),
+        );
+    }
     pass.victims = match scope {
         Scope::Ladder => ladder::plan(candidates, &pass.dirs, goals),
         Scope::Superseded => candidates
@@ -159,7 +175,10 @@ pub fn execute(pass: &mut Pass, now: u64) {
     for victim in planned {
         match evict(&pass.dirs[victim.dir], &victim, now) {
             Ok(()) => pass.victims.push(victim),
-            Err(why) => pass.skipped.push((victim, why)),
+            Err(why) => {
+                pass.runtime_busy |= why.contains("run in flight");
+                pass.skipped.push((victim, why));
+            }
         }
     }
 }
@@ -282,15 +301,62 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
         return Err("written since the build directory moved".to_owned());
     }
     // Inspecting a large victim above may be slow. Only the final rename
-    // needs the activity interlock: a new managed command takes its shared
-    // guard before Cargo starts, so its arrival makes this try-lock skip.
-    // Keep scans and Cargo-lock discovery outside this critical section.
-    let _runtime = super::lease::exclusive()?;
+    // needs the runtime leases of its workspace: a new managed command there
+    // takes its shared lease before Cargo starts, so its arrival makes this
+    // try-lock skip. Keep scans and Cargo-lock discovery outside this
+    // critical section.
+    if !super::lease::available() {
+        return Err("busy: the runtime activity namespace does not resolve".to_owned());
+    }
+    let _runtime = match surveyed.dir.workspace.as_deref() {
+        Some(workspace) => super::lease::exclusive_for(workspace)?,
+        None => Vec::new(),
+    };
+    if super::changed_in_flight(newest(surveyed, victim), now) {
+        return Err(IN_FLIGHT.to_owned());
+    }
     // Windows does not rename a directory with a file open inside.
     let _inner = (!cfg!(windows)).then_some(inner);
-    trash::put(&victim.path, &trash)
-        .map(drop)
-        .map_err(|error| format!("cannot move it into the trash: {error}"))
+    match trash::put(&victim.path, &trash) {
+        Ok(_) => Ok(()),
+        // A full volume can refuse even a rename into the trash (NTFS needs
+        // room for it): delete the victim where it is, under the same locks
+        // (#108).
+        Err(error) if disk_full(&error) => remove(&victim.path)
+            .map_err(|error| format!("cannot delete it on a full volume: {error}")),
+        Err(error) => Err(format!("cannot move it into the trash: {error}")),
+    }
+}
+
+/// When `victim`, in `surveyed`, last changed: the whole directory as the
+/// survey measured it (without heli's own notes, `ladder::Surveyed`), else
+/// the files under the victim.
+fn newest(surveyed: &Surveyed, victim: &Victim) -> Option<u64> {
+    if victim.path == surveyed.dir.path {
+        surveyed.measure.newest
+    } else {
+        ladder::measure(&victim.path).newest
+    }
+}
+
+/// Why a victim that changed since a run in flight started is left alone.
+const IN_FLIGHT: &str = "busy: changed since a run in flight started";
+
+/// Whether `error` says the volume is full.
+fn disk_full(error: &std::io::Error) -> bool {
+    // ERROR_DISK_FULL (112) and ERROR_HANDLE_DISK_FULL (39) on Windows,
+    // ENOSPC elsewhere.
+    error.kind() == std::io::ErrorKind::StorageFull
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(39 | 112)))
+}
+
+/// Deletes the file or directory `path`.
+fn remove(path: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path)?.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 /// Takes every lock in `locks` that exists, without waiting; the error says
