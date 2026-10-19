@@ -1,5 +1,5 @@
 //! libtest's test runs, compact: the view of `cargo heli test` in compact
-//! and quiet mode (`DESIGN.md` §5, "Output").
+//! and quiet mode (docs/runs.md, "Output").
 //!
 //! heli adds cargo's `--quiet --message-format json`, as for a compile run
 //! (`super::cargo::with_json_messages`), unless the user's arguments choose

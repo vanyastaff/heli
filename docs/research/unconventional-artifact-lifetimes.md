@@ -1,7 +1,7 @@
 # Artifact generations, virtual filesystems and live garbage collection
 
 Research date: 2026-10-15. Exploratory alternatives, not an accepted replacement
-for `DESIGN.md`. Scope: keep arbitrary runtime reads of a run's `OUT_DIR` valid
+for the design (`docs/architecture.md`). Scope: keep arbitrary runtime reads of a run's `OUT_DIR` valid
 while reclaiming **other completed runs**, including nested Cargo, on the
 existing Windows/NTFS host. No production changes or clone benchmarks were made.
 
@@ -205,7 +205,7 @@ filtered-source, moved-`OUT_DIR`, old-recipient and clean-build-equivalence test
 An inode changing is not itself proof of Cargo staleness or freshness. The
 runtime namespace and Cargo's actual freshness inputs must both agree.
 The existing path scanner is in `src/store/scan.rs`; the contract and regression
-fixtures are in `DESIGN.md` section 6.4 and `tests/recycle.rs`.
+fixtures are in `docs/build-store.md` (recycling) and `tests/recycle.rs`.
 
 ## Logical deletion is not physical reclamation
 

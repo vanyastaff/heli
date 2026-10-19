@@ -1,6 +1,6 @@
-//! The daemon's side of the build store (DESIGN.md §6.2): it learns each
-//! workspace a run builds in, writes the owner manifest of its build
-//! directory, and keeps the sizes the store's directories take.
+//! The daemon's side of the build store (docs/build-store.md#accounting): it
+//! learns each workspace a run builds in, writes the owner manifest of its
+//! build directory, and keeps the sizes the store's directories take.
 //!
 //! Its parts, each in a module of its own:
 //!

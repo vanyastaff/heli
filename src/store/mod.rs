@@ -1,5 +1,5 @@
-//! The build store (DESIGN.md §6): cargo's intermediates, kept outside the
-//! worktrees in one store per volume.
+//! The build store (docs/build-store.md): cargo's intermediates, kept outside
+//! the worktrees in one store per volume.
 //!
 //! **Placement** ([`serving`], [`build_dir`]). `cargo heli setup` sets
 //! cargo's `build.build-dir` to `<store>/{workspace-path-hash}`, so each
@@ -16,9 +16,9 @@
 //! every directory the store accounts for, whose it is, its state and its
 //! sizes by category.
 //!
-//! **Eviction** (DESIGN.md §6.3): the [`ladder`] says what to evict over
-//! the budget or under the floor, an [`evict`] pass renames it into the
-//! [`trash`] under cargo's locks, and the trash is deleted afterwards. An
+//! **Eviction** (docs/build-store.md#eviction): the [`ladder`] says what to
+//! evict over the budget or under the floor, an [`evict`] pass renames it into
+//! the [`trash`] under cargo's locks, and the trash is deleted afterwards. An
 //! [`orphan`] counts as unclaimed from the first pass that finds it.
 
 pub mod attribute;

@@ -1,7 +1,7 @@
 # Alternative ownership models for multi-agent Cargo
 
 2026-10-15. Exploratory research and isolated experiments, not an accepted
-replacement for DESIGN.md. The priority is independent useful progress across
+replacement for the design (`docs/architecture.md`). The priority is independent useful progress across
 projects and worktrees on one host; CPU/RAM caps are secondary. Both D: and E:
 on the inspected host report NTFS. The starting production revision was
 `b3c68ee64de8e6a6c3ffd36834e98cfdfac852c5`. Follow-up verification found and

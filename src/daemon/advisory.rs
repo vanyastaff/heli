@@ -1,4 +1,4 @@
-//! Advisory databases for `cargo audit` and `cargo deny` (`DESIGN.md` §5,
+//! Advisory databases for `cargo audit` and `cargo deny` (docs/runs.md,
 //! "Advisory checks"): a verdict of these tools is a verdict on the tree and
 //! on the advisory database, so the key holds the database's commit
 //! (`super::key`). A run that would fetch the database itself first has the

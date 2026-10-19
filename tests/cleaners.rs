@@ -1,5 +1,5 @@
 //! Tools that delete build output themselves (cargo-sweep, cargo-clean-all)
-//! and heli's own eviction never delete at the same time (`DESIGN.md` §5,
+//! and heli's own eviction never delete at the same time (docs/runs.md,
 //! "Tool profiles"): such a run holds heli's eviction lock throughout, and
 //! waits for a pass in progress.
 

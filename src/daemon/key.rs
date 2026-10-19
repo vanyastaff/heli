@@ -1,4 +1,4 @@
-//! A source-aware run's key (DESIGN.md §7): a digest of everything that
+//! A source-aware run's key (docs/result-store.md): a digest of everything that
 //! decides a verification verdict, with artifact ownership for compile runs.
 //!
 //! **Encoding.** Every input is a field, fed to SHA-256 as its name's length,

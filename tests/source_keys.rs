@@ -1,8 +1,9 @@
-//! A run is keyed by its local sources (`DESIGN.md` §7) even when its Cargo
-//! home lacks packages it does not build: optional dependencies no feature
-//! enables, and dependencies of other platforms. A private Cargo home (`[cargo]
-//! home = "isolated"`) holds only what its builds downloaded, so a resolution
-//! of every feature for every platform cannot run offline there (#66).
+//! A run is keyed by its local sources (docs/result-store.md) even when its
+//! Cargo home lacks packages it does not build: optional dependencies no
+//! feature enables, and dependencies of other platforms. A private Cargo home
+//! (`[cargo] home = "isolated"`) holds only what its builds downloaded, so a
+//! resolution of every feature for every platform cannot run offline there
+//! (#66).
 //!
 //! The registry here is a local one whose index names `optional-dep` and
 //! `other-platform-dep` but holds neither package: as in a warm private home,

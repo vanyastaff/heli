@@ -1,5 +1,5 @@
 //! nextest's test runs, compact: the view of `cargo heli nextest run` in
-//! compact and quiet mode (`DESIGN.md` §5, "Output").
+//! compact and quiet mode (docs/runs.md, "Output").
 //!
 //! **nextest's own controls**, which heli adds to the command
 //! ([`with_controls`]) unless the user set them, by flag or by the variable

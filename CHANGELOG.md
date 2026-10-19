@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Documentation.** `DESIGN.md`, the brief heli was built from, is gone.
+  Its contracts are now in `docs/`, one document per part, starting at
+  [docs/architecture.md](docs/architecture.md); its dated measurements and
+  acceptance runs are in
+  [docs/research/acceptance-2026-10.md](docs/research/acceptance-2026-10.md).
+
 ## 0.0.4
 
 After upgrading, run `cargo heli restart` so that the daemon is the new one:
@@ -136,7 +146,7 @@ longer reads (#108).
 ## 0.0.1
 
 The first release. heli schedules cargo on a machine shared by many agents,
-each in its own Git worktree. The contracts are in [DESIGN.md](DESIGN.md).
+each in its own Git worktree. The contracts are in [the architecture docs](docs/architecture.md).
 
 - **One host pool.** A per-user daemon owns a jobserver that every run draws
   from, so N agents never run N × cores jobs. Each run has its own run pool,

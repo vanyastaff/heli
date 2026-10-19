@@ -1,5 +1,5 @@
-//! The host pool (DESIGN.md §4): one jobserver with N slots, which every run
-//! and every cargo, rustc and build script it starts draws from, through
+//! The host pool (docs/host-pool.md): one jobserver with N slots, which every
+//! run and every cargo, rustc and build script it starts draws from, through
 //! `CARGO_MAKEFLAGS` ([`Pool::makeflags`]).
 //!
 //! - **Windows**: a named semaphore in the logon session's namespace, with
@@ -250,7 +250,7 @@ impl Pool {
     }
 }
 
-/// The host pool's target of free slots (DESIGN.md §4, "Bounded top-up"):
+/// The host pool's target of free slots (docs/host-pool.md, "Bounded top-up"):
 /// its `slots` (N), less the slots the memory governor has `withheld`, less
 /// the slots `lent` to run pools (Σ lent). A top-up raises the free slots to
 /// it, never above.

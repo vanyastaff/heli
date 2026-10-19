@@ -1,5 +1,6 @@
-//! The result store (DESIGN.md §7): a verify or test run that already passed
-//! with exactly the same inputs is not run again; heli says so and exits 0.
+//! The result store (docs/result-store.md): a verify or test run that already
+//! passed with exactly the same inputs is not run again; heli says so and exits
+//! 0.
 
 mod support;
 

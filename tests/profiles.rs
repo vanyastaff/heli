@@ -1,4 +1,4 @@
-//! Tool profiles from configuration (`DESIGN.md` §5, "Tool profiles"): the
+//! Tool profiles from configuration (docs/runs.md, "Tool profiles"): the
 //! user's give a tool its class, and a repository's only narrow it.
 
 mod support;

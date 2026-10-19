@@ -1,5 +1,5 @@
 //! `cargo heli exec`, compact: the view of an arbitrary command's output in
-//! compact and quiet mode (`DESIGN.md` §5, "Output").
+//! compact and quiet mode (docs/runs.md, "Output").
 //!
 //! heli knows nothing of the command, so it adds nothing to it, and shows
 //! its output by lines, of both streams together in the order they came

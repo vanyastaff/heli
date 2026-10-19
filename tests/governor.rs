@@ -1,4 +1,4 @@
-//! The memory governor and the bounded top-up (DESIGN.md §4): the daemon
+//! The memory governor and the bounded top-up (docs/host-pool.md): the daemon
 //! withholds slots from the host pool while memory is low, returns them once
 //! it has recovered, and gives the pool back the slots killed processes
 //! lost, never more.
@@ -111,8 +111,8 @@ fn wait_for_sample(fixture: &Fixture, available_mb: u64) -> Value {
 
 /// A heli run in flight, waiting for its gate, until dropped: while it
 /// runs, the pool is never quiet, so no top-up hides what the governor does.
-/// Idle, it keeps one free slot in its run pool (DESIGN.md §4, "Run pools"),
-/// which the host pool counts in use.
+/// Idle, it keeps one free slot in its run pool (docs/host-pool.md, "Run
+/// pools"), which the host pool counts in use.
 struct InFlight {
     run: Option<Child>,
     gate: std::path::PathBuf,

@@ -1,4 +1,4 @@
-//! The process scan of the bounded top-up (DESIGN.md §4): while another
+//! The process scan of the bounded top-up (docs/host-pool.md): while another
 //! process holds the host pool open, a top-up also waits for every process
 //! that runs a cargo job to end.
 //!

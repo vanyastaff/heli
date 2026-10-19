@@ -1,5 +1,5 @@
-//! The memory governor and the bounded top-up (DESIGN.md §4): one thread of
-//! the daemon that watches the machine's memory and keeps the host pool at
+//! The memory governor and the bounded top-up (docs/host-pool.md): one thread
+//! of the daemon that watches the machine's memory and keeps the host pool at
 //! its target of free slots (`crate::pool::target`).
 //!
 //! Every [`TICK`], it **drains** the free slots above the target: a surplus,

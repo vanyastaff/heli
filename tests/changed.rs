@@ -1,4 +1,4 @@
-//! `--changed`, `--affected` and `cargo heli changed` (DESIGN.md §5): the
+//! `--changed`, `--affected` and `cargo heli changed` (docs/runs.md): the
 //! workspace members whose files changed since a base, and with
 //! `--affected` the members depending on them, become the run's `-p` list.
 //!

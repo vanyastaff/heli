@@ -1,7 +1,7 @@
-//! Recycling (DESIGN.md §6.4): a worktree without a build directory gets
-//! the most recently used orphan of its repository, renamed to the build
-//! directory cargo names for it. In one store that is a rename: no copy,
-//! no extra disk, and one build directory still belongs to one worktree.
+//! Recycling (docs/build-store.md#recycling): a worktree without a build
+//! directory gets the most recently used orphan of its repository, renamed to
+//! the build directory cargo names for it. In one store that is a rename: no
+//! copy, no extra disk, and one build directory still belongs to one worktree.
 //!
 //! [`claim`] does it, once cargo has named the build directory
 //! (`crate::store::probe`):
@@ -20,7 +20,7 @@
 //!    is held) whose owner manifest names the same repository, the one with
 //!    the latest last run. Live, busy and unknown directories, orphans of
 //!    other repositories or outside any, and what eviction moved into the
-//!    store's `.trash/` (DESIGN.md §6.3), are never taken.
+//!    store's `.trash/` (docs/build-store.md#eviction), are never taken.
 //! 3. The claim: the donor's owner manifest names the new workspace (which
 //!    lives, so the donor is no orphan any more), keeping its creation
 //!    time, before anything else. From here on no other recycler takes it,
@@ -28,8 +28,8 @@
 //!    gives the donor up (below) gives it its manifest back, unless another
 //!    recycler claimed it since or it moved; one that dies before the
 //!    rename leaves it named after a live workspace, which recycling never
-//!    takes and eviction does (DESIGN.md §6.3), but never a directory that
-//!    names a removed worktree at a live one's place.
+//!    takes and eviction does (docs/build-store.md#eviction), but never a
+//!    directory that names a removed worktree at a live one's place.
 //! 4. What cargo would find: when the donor was last built in
 //!    (`crate::store::record::last_build`), and its source-state record if
 //!    it counts (taken after that build). The new worktree is staged

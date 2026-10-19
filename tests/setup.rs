@@ -1,4 +1,4 @@
-//! `cargo heli ensure` and `cargo heli setup` (DESIGN.md §4, "Reach"): the
+//! `cargo heli ensure` and `cargo heli setup` (docs/host-pool.md, "Reach"): the
 //! daemon on demand, and the environment that lets a bare cargo draw from
 //! its pool. `tests/bare_cargo.rs` covers what a bare cargo then does.
 //!

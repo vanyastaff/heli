@@ -1,4 +1,5 @@
-//! `cargo heli`: cargo for machines shared by many agents (`DESIGN.md`).
+//! `cargo heli`: cargo for machines shared by many agents
+//! (`docs/architecture.md`).
 //!
 //! Modules, from the command line inward:
 //! - [`cli`]: heli's command line, which gives each run its [`class`];

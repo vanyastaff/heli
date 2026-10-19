@@ -232,7 +232,7 @@ on this host. The next section tests their production ownership and GC path.
 ## Explicit production integration
 
 Heli now exposes `deps import`, `--dependency-epoch` on ordinary managed
-commands, and `deps gc`; see [DESIGN §6.5](../../DESIGN.md#65-immutable-dependency-epochs-opt-in-integration).
+commands, and `deps gc`; see [dependency epochs](../build-store.md#dependency-epochs).
 The separate [production canary](../../experiments/dependency-epoch-concurrency.py)
 uses those commands rather than constructing or retiring views itself:
 

@@ -1,6 +1,7 @@
-//! Autostart (DESIGN.md §3, §4 "Reach", §10): the registration that starts
-//! the daemon when the user logs on, in the user's own session, and through
-//! which clients start it afterwards.
+//! Autostart (docs/daemon.md, docs/host-pool.md "Reach",
+//! docs/failure-modes.md): the registration that starts the daemon when the
+//! user logs on, in the user's own session, and through which clients start it
+//! afterwards.
 //!
 //! - **Windows**: a Task Scheduler task (`autostart/task.rs`) that runs only
 //!   while the user is logged on, in the interactive session.

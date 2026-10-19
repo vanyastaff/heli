@@ -1,6 +1,6 @@
 # AGENTS.md
 
-heli: host-level scheduling for cargo on machines shared by many agents. The design is in `DESIGN.md`.
+heli: host-level scheduling for cargo on machines shared by many agents. How it works is in `docs/architecture.md` and the documents it links.
 
 ## Agent skills
 

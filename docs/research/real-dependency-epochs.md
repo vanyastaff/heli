@@ -76,8 +76,8 @@ A separate public-CLI reproducer confirmed a production cache defect: modifying
 a transitive Cargo configuration include returned cached exit 0 instead of
 the actual compile error, exit 101. Commit `4c959b2` keys those include graphs,
 including optional absence and inline/file-relative origins, declines incomplete
-inventories, and invalidates older cache composition markers. DESIGN.md records
-the contract. All 31 `results` tests and all ten `single_flight` tests passed
+inventories, and invalidates older cache composition markers. `docs/result-store.md`
+records the contract. All 31 `results` tests and all ten `single_flight` tests passed
 with an explicitly selected real compiler; all-target strict Clippy and fmt
 also passed. Red/green logs are under `target/include-key-fix/`.
 

@@ -1,4 +1,4 @@
-//! Output modes (`DESIGN.md` §5, "Output"): what the client prints of a
+//! Output modes (docs/runs.md, "Output"): what the client prints of a
 //! compile or verify run in full, compact and quiet mode, how the mode is
 //! chosen, and `cargo heli log <run> --errors`.
 //!

@@ -1,4 +1,4 @@
-//! The per-user configuration file (DESIGN.md §5, "Configuration"): TOML,
+//! The per-user configuration file (docs/runs.md, "Configuration"): TOML,
 //! which the daemon reads as it starts. Where it is: `crate::locations`.
 //!
 //! ```toml

@@ -1,6 +1,6 @@
-//! Where this process runs (DESIGN.md §8, `status`): its session, and on
-//! Windows its window station and desktop. The daemon must run in the
-//! user's interactive session (§3): on Windows that is the window station
+//! Where this process runs (docs/observability.md, `status`): its session, and
+//! on Windows its window station and desktop. The daemon must run in the user's
+//! interactive session (docs/daemon.md): on Windows that is the window station
 //! `WinSta0` of a session other than 0, the services' session.
 
 /// Where a process runs.

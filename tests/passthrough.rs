@@ -198,7 +198,7 @@ fn runs_as_a_cargo_subcommand() {
 }
 
 /// Plain cargo: under heli, cargo draws from the host pool, and `-j` has no
-/// effect under an inherited jobserver (DESIGN.md §4; `tests/pool.rs`).
+/// effect under an inherited jobserver (docs/host-pool.md; `tests/pool.rs`).
 #[test]
 fn the_concurrency_log_records_every_build_script() {
     let fixture = Fixture::new("basic");

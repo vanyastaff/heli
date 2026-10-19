@@ -1,8 +1,8 @@
-//! An eviction pass (DESIGN.md §6.3): the store as it is now, what the
-//! ladder (`super::ladder`) would evict, and, unless the pass is a dry run,
-//! the evictions themselves. `cargo heli gc` makes one pass; the daemon
-//! makes one whenever the store is over its budget or a volume under its
-//! floor (`crate::daemon::accounts`).
+//! An eviction pass (docs/build-store.md#eviction): the store as it is now,
+//! what the ladder (`super::ladder`) would evict, and, unless the pass is a dry
+//! run, the evictions themselves. `cargo heli gc` makes one pass; the daemon
+//! makes one whenever the store is over its budget or a volume under its floor
+//! (`crate::daemon::accounts`).
 //!
 //! **An eviction** never waits. Under cargo's locks, which heli tries and
 //! does not wait for, it renames the victim into the trash (`super::trash`)

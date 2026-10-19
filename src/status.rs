@@ -71,8 +71,8 @@
 //! intermediates (`crate::store::superseded`), which `by_category` counts
 //! too. It is `null` when no daemon answers, or one older
 //! than the build store. `last_gc` is the daemon's last eviction pass that
-//! evicted anything (DESIGN.md §6.3): when, and each victim's `path`, `tier`
-//! and `bytes`; `null` before the first.
+//! evicted anything (docs/build-store.md#eviction): when, and each victim's
+//! `path`, `tier` and `bytes`; `null` before the first.
 
 use serde::{Deserialize, Serialize};
 

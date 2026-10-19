@@ -1,4 +1,4 @@
-//! `--changed` and `--affected` (DESIGN.md §5): run a cargo subcommand on
+//! `--changed` and `--affected` (docs/runs.md): run a cargo subcommand on
 //! the workspace members that changed since a base, and with `--affected`
 //! on every member that depends on them too; `cargo heli changed` only
 //! prints that selection and why.

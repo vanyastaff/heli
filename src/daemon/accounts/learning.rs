@@ -15,18 +15,16 @@
 //! and the repository git names for the workspace. Nothing of this can
 //! fail the run: what goes wrong goes to the daemon's log.
 //!
-//! **Recycling** (DESIGN.md §6.4). When the build directory cargo names is
-//! in a store heli manages and does not exist yet, the run's worktree gets
-//! the most recently used orphan of its repository, renamed into place
-//! (`crate::store::recycle`), before the owner manifest is written. That
-//! must happen before the run's cargo creates the build directory, so the
-//! first run from a directory waits for its learning
-//! ([`Learning::prepared`], at most [`PREPARE_WAIT`]) while a store holds
-//! an orphan of its own repository, which it could get; no other run waits
-//! for it. Each
-//! recycling is a `recycle` event in the event log, with what it moved and
-//! how many units the path scan invalidated, and a note to the run's
-//! clients.
+//! **Recycling** (docs/build-store.md#recycling). When the build directory
+//! cargo names is in a store heli manages and does not exist yet, the run's
+//! worktree gets the most recently used orphan of its repository, renamed into
+//! place (`crate::store::recycle`), before the owner manifest is written. That
+//! must happen before the run's cargo creates the build directory, so the first
+//! run from a directory waits for its learning ([`Learning::prepared`], at most
+//! [`PREPARE_WAIT`]) while a store holds an orphan of its own repository, which
+//! it could get; no other run waits for it. Each recycling is a `recycle` event
+//! in the event log, with what it moved and how many units the path scan
+//! invalidated, and a note to the run's clients.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;

@@ -1,7 +1,7 @@
-//! Recycling (DESIGN.md §6.4): a worktree without a build directory gets
-//! the most recently used orphan of its repository, renamed into place, and
-//! the path scan invalidates every unit that compiled in a path of the
-//! removed worktree or of the old build directory.
+//! Recycling (docs/build-store.md#recycling): a worktree without a build
+//! directory gets the most recently used orphan of its repository, renamed into
+//! place, and the path scan invalidates every unit that compiled in a path of
+//! the removed worktree or of the old build directory.
 //!
 //! Fixture `recycle` holds a repository, `repo/`, and two packages outside
 //! it, `vendor/`, which its members depend on by path: they stand in for
@@ -180,12 +180,12 @@ impl Repo {
     /// Removes worktree `removed` and adds worktree `added`, so that the
     /// first heli run in `added` recycles a build directory for it. The
     /// daemon's look, which recycles too, as it starts, as runs end and
-    /// every minute (DESIGN.md §6.4), would race that run. So the daemon
-    /// that built in `removed` is stopped, with any look it was about to
-    /// make, and a new one has made its first look before `added` exists
-    /// (each pass of its accountant looks first, then counts the stores
-    /// that `status` shows); its next look is a minute away, or after the
-    /// next run's end.
+    /// every minute (docs/build-store.md#recycling), would race that run. So
+    /// the daemon that built in `removed` is stopped, with any look it was
+    /// about to make, and a new one has made its first look before `added`
+    /// exists (each pass of its accountant looks first, then counts the stores
+    /// that `status` shows); its next look is a minute away, or after the next
+    /// run's end.
     fn replace_worktree(&self, removed: &str, added: &str) -> PathBuf {
         self.fixture.kill_daemon();
         self.remove_worktree(removed);

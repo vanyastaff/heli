@@ -41,7 +41,7 @@
 //! ([`RunIds`]): run logs and markers are keyed by them, and on Windows
 //! every logon session has a daemon of its own on the same state directory.
 //!
-//! **The worktree lock** (`DESIGN.md` §5). A run holds its worktree's lock
+//! **The worktree lock** (docs/runs.md). A run holds its worktree's lock
 //! shared when it reads the sources and exclusive when it rewrites them, as
 //! its class says (`Class::worktree_lock`). Turns follow admission order: a
 //! run waits ([`Registry::wait_for_worktree`]) until no run admitted before

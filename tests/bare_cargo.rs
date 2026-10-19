@@ -1,5 +1,5 @@
 //! A bare cargo, started without heli but with the environment
-//! `cargo heli setup` offers (DESIGN.md §4, "Reach"): while a daemon runs,
+//! `cargo heli setup` offers (docs/host-pool.md, "Reach"): while a daemon runs,
 //! it draws from the same host pool as heli's runs; while none runs, it
 //! warns and builds on its own, as if the environment were not there.
 

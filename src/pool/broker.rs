@@ -1,4 +1,4 @@
-//! The broker (DESIGN.md §4, "Run pools"): each heli run draws from a run
+//! The broker (docs/host-pool.md, "Run pools"): each heli run draws from a run
 //! pool of its own, and the broker moves slots between the host pool and
 //! the run pools, every [`TICK`]:
 //!
@@ -272,7 +272,7 @@ impl Broker {
 
     /// Slots the broker has taken out of the host pool and not yet given
     /// back: those lent to run pools, and the test slots held for runs. The
-    /// host pool's top-up target leaves them out (DESIGN.md §4, "Bounded
+    /// host pool's top-up target leaves them out (docs/host-pool.md, "Bounded
     /// top-up").
     pub fn lent(&self) -> u32 {
         self.lent.load(Ordering::SeqCst)

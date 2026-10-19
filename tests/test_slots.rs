@@ -1,4 +1,4 @@
-//! Test runs (DESIGN.md §5, lifecycle step 6): `cargo heli test` and
+//! Test runs (docs/runs.md, lifecycle step 6): `cargo heli test` and
 //! `cargo heli nextest run` build first, then take test slots from the pool
 //! and run the tests with as many threads.
 //!

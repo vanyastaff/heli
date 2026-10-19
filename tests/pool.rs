@@ -1,5 +1,5 @@
-//! The host pool (DESIGN.md §4): the daemon owns one jobserver with N slots,
-//! and every run draws from it.
+//! The host pool (docs/host-pool.md): the daemon owns one jobserver with N
+//! slots, and every run draws from it.
 
 mod support;
 

@@ -1,4 +1,4 @@
-//! The endpoint's owner (DESIGN.md §3, "The endpoint"): on Windows the
+//! The endpoint's owner (docs/daemon.md, "The endpoint"): on Windows the
 //! daemon's pipe is owned by the user's SID, elevated or not, and a client
 //! talks only to a pipe owned by its own user's SID: not to one owned by
 //! the Administrators group, which any elevated process of an administrator

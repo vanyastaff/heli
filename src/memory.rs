@@ -1,4 +1,4 @@
-//! The machine's memory, as the memory governor watches it (DESIGN.md §4,
+//! The machine's memory, as the memory governor watches it (docs/host-pool.md,
 //! "Memory governor"): available physical memory and, on Windows, available
 //! commit, where allocations fail at the commit limit before RAM is full.
 //!

@@ -78,7 +78,8 @@ the tools installed in your own Cargo home, and `--help`, `-h` and `--version`
 are answered. It also refuses an explicit switch to shared inside an already
 isolated invocation. Arbitrary external tools can have their own Cargo-home
 assumptions. `cargo heli doctor` lists what heli does with each installed
-tool; the tool profiles and the compatibility matrix are in DESIGN.md §5.
+tool; the tool profiles and the compatibility matrix are in
+[runs](runs.md#tool-profiles).
 
 Give intermediate artifacts a separate path per workspace. For a project on
 Windows drive D, its `.cargo/config.toml` can contain:
@@ -193,7 +194,7 @@ promise that Cargo itself never briefly waits. Do not give independent lock
 files to multiple Cargo homes that symlink the same mutable registry cache.
 Immutable shared vendor snapshots with private Cargo homes are available
 through the explicit `deps import` / `--dependency-epoch` profile described in
-[DESIGN §6.5](../DESIGN.md#65-immutable-dependency-epochs-opt-in-integration).
+[dependency epochs](build-store.md#dependency-epochs).
 They are not selected automatically. The dependency store currently has
 explicit GC rather than automatic capacity enforcement, and private homes
 are retained. Its bytes are outside `[store] budget_mb`; enabling the profile
@@ -224,7 +225,7 @@ both worktrees remain clean and the recorded inputs stay unchanged. Idle
 accounting is 4,771,735,920 bytes under an explicit 8-GiB artifact budget,
 with no pending trash. Native source homes remain outside that budget. This
 does not establish a full-suite speedup or universal absence of waits.
-The dated [DESIGN acceptance record](../DESIGN.md#12-plan)
+The dated [acceptance record](research/acceptance-2026-10.md#plan-and-acceptance-runs)
 contains the scopes, timings and invalid GC setup finding.
 
 There is also a real contention case: a Cargo download waiting on an HTTP

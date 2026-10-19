@@ -1,10 +1,11 @@
-//! Scratch copies that cargo tools leave outside the store (`DESIGN.md`
-//! §6.3, tier 0): cargo-mutants copies the workspace into the system's
-//! temporary directory for its builds (`mutants-*` on Windows, to keep paths
-//! short, `cargo-mutants-<source directory>-*` elsewhere) and deletes each
-//! copy when it is done with it. A run that is cancelled or killed leaves
-//! its copies behind, each a whole source tree with a `target/` of its own:
-//! the disk fills with no workspace that will ever use them.
+//! Scratch copies that cargo tools leave outside the store (
+//! docs/build-store.md#eviction, tier 0): cargo-mutants copies the workspace
+//! into the system's temporary directory for its builds (`mutants-*` on
+//! Windows, to keep paths short, `cargo-mutants-<source directory>-*`
+//! elsewhere) and deletes each copy when it is done with it. A run that is
+//! cancelled or killed leaves its copies behind, each a whole source tree with
+//! a `target/` of its own: the disk fills with no workspace that will ever use
+//! them.
 //!
 //! [`find`] lists them: directories of [`root`] with one of those names that
 //! hold a `Cargo.toml`. The ladder evicts one once nothing in it was written

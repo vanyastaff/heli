@@ -1,6 +1,6 @@
 //! The compatibility matrix (spec #38): popular cargo tools, run through
 //! heli against the `tools` fixture, keep their exit codes and output, get
-//! the class their profile gives (`DESIGN.md` §5, "Tool profiles"), and,
+//! the class their profile gives (docs/runs.md, "Tool profiles"), and,
 //! where they are cached verifications, are answered from the result store
 //! the second time.
 //!

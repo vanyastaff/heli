@@ -1,5 +1,5 @@
 //! Cargo's diagnostics, compact: the view of build, check, clippy and doc
-//! runs in compact and quiet mode (`DESIGN.md` §5, "Output").
+//! runs in compact and quiet mode (docs/runs.md, "Output").
 //!
 //! heli adds `--quiet --message-format json` to the command
 //! ([`with_json_messages`]), so cargo prints no line per unit and reports

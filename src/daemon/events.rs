@@ -1,5 +1,5 @@
-//! The daemon's event log (DESIGN.md §8): what it decided about runs, the
-//! host pool and the build store, one JSON object per line, for people and
+//! The daemon's event log (docs/observability.md): what it decided about runs,
+//! the host pool and the build store, one JSON object per line, for people and
 //! tools.
 //!
 //! Each event has `at` (seconds since 1970, UTC) and `event`, then fields of

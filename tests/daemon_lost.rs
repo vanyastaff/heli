@@ -1,5 +1,5 @@
 //! A daemon lost before a run's command started fails nothing (G5,
-//! DESIGN.md §3, "A run"): the daemon says when the command has started
+//! docs/daemon.md, "A run"): the daemon says when the command has started
 //! (`Spawned`), and until then a client that loses it runs the command
 //! itself, after one warning. Once the command has started, a lost daemon
 //! is an error: the command may have run.
