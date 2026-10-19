@@ -51,7 +51,8 @@ pub fn put(victim: &Path, trash: &Path) -> io::Result<PathBuf> {
         std::process::id(),
         PUTS.fetch_add(1, Ordering::Relaxed)
     ));
-    // Twice: a trash emptied at the same time may go away in between.
+    // Again when a trash emptied at the same time went away in between, or
+    // Windows found a handle open inside the victim.
     let mut tries = 0;
     loop {
         tries += 1;
@@ -77,9 +78,27 @@ pub fn put(victim: &Path, trash: &Path) -> io::Result<PathBuf> {
             Ok(()) => return Ok(place),
             Err(error)
                 if tries < 2 && error.kind() == io::ErrorKind::NotFound && victim.exists() => {}
+            // Windows does not rename a directory while a handle is open
+            // inside it, and handles come and go: a search indexer's, an
+            // antivirus scan of a fresh file, a `status` passing through.
+            // Such a handle is gone in a moment; this waits for a few (#110).
+            Err(error) if cfg!(windows) && tries <= HELD_TRIES && held_open(&error) => {
+                std::thread::sleep(HELD_PAUSE);
+            }
             Err(error) => return Err(error),
         }
     }
+}
+
+/// How many times a rename that Windows refuses for an open handle is tried
+/// again, and the pause before each: half a second in all.
+const HELD_TRIES: u32 = 10;
+const HELD_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Whether `error` says a handle is open in the directory (Windows:
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`).
+fn held_open(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
 }
 
 /// The bytes in `trash`, still to be deleted.

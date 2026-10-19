@@ -941,7 +941,7 @@ fn deleting_a_large_victim_does_not_hold_up_cargo() {
     set_clock(&fixture, clock);
     configure(&fixture, "budget_mb = 0\n");
 
-    let gc = fixture
+    let mut gc = fixture
         .heli(["gc", "--json"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -955,6 +955,18 @@ fn deleting_a_large_victim_does_not_hold_up_cargo() {
             !(partial && large.exists()),
             "the victim is deleted in place"
         );
+        // A gc that is over with the victim still here skipped it, and its
+        // document says why (#110): no use waiting for the deadline.
+        if let Some(status) = gc.try_wait().expect("inspect heli gc")
+            && large.exists()
+        {
+            let output = gc.wait_with_output().expect("collect heli gc");
+            panic!(
+                "gc exited ({status}) and left the victim: {}{}",
+                text(&output.stdout),
+                text(&output.stderr)
+            );
+        }
         assert!(Instant::now() < deadline, "the victim never left");
         std::thread::sleep(Duration::from_millis(5));
     }
