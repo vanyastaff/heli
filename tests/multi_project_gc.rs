@@ -320,8 +320,10 @@ exit $LASTEXITCODE
         "OUT_DIR must be in the shared store: {}",
         asset.display()
     );
+    let mut other_project = None;
     if check_other_project {
         let other = fixture.copy_workspace("second-runtime-project");
+        other_project = Some(other.clone());
         let mut second = fixture
             .heli(["--no-cache", "check", "--quiet", "-p", "echo-args"])
             .current_dir(&other)
@@ -367,8 +369,32 @@ exit $LASTEXITCODE
         assert!(asset.exists(), "runtime asset exists after daemon death");
         assert!(!done.exists(), "runtime is still gated after daemon death");
     }
+    // An idle build directory, untouched since long before the run in
+    // flight started, of no workspace a run is in: the run holds back only
+    // what it may use, so this one goes over the budget meanwhile (#108).
+    let idle = store.join("ab").join("0123456789abcd");
+    if other_project.is_some() {
+        let profile = idle.join("debug");
+        std::fs::create_dir_all(profile.join("deps")).expect("an idle build directory");
+        std::fs::File::create(profile.join(".cargo-lock"))
+            .and_then(|lock| {
+                lock.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            })
+            .expect("cargo's lock, free and old");
+        let data = std::fs::File::create(profile.join("deps").join("old-data")).expect("old data");
+        data.set_len(1 << 20).expect("fill it");
+        data.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .expect("date it long ago");
+    }
     let eviction = gc(&fixture);
     assert_eq!(eviction["runtime_busy"], true, "{eviction}");
+    if other_project.is_some() {
+        assert!(
+            !idle.exists(),
+            "an idle directory is evicted while a run is in flight elsewhere: {eviction}"
+        );
+        assert!(asset.exists(), "the run's own asset stays");
+    }
     let survived = asset.exists();
     std::fs::write(&gate, "continue").expect("release runtime workload");
     let output = child.wait_with_output().expect("collect runtime workload");

@@ -36,6 +36,16 @@
 
 ### Fixed
 
+- **Eviction on a busy host.** One host-wide runtime guard deferred all
+  eviction while any run was in flight, which on a host of busy agents is
+  always: the build store filled its volume. Runs now hold a lease of their
+  worktree. Eviction leaves alone the directories of workspaces with a run
+  in flight, and anything that changed since the oldest run in flight
+  started (what a test's nested cargo built). It evicts older, idle
+  directories meanwhile. A volume too full for a rename into the trash gets
+  its victims deleted in place, and `doctor` warns about a store under its
+  floor (#108).
+
 - **`cargo heli test` through a target's `runner`** (`wasm-bindgen-test-runner`
   for wasm) and for `harness = false` tests: heli passes the test threads in
   `RUST_TEST_THREADS` instead of adding `--test-threads` after `--`, and the

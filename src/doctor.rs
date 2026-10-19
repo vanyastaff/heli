@@ -92,6 +92,9 @@ pub struct Inputs {
     /// The build store that serves the working directory, when it exists:
     /// a configured `[store] paths` entry or the volume's default store.
     pub store: Option<PathBuf>,
+    /// The store's volume's free bytes, and `[store] floor_mb` in bytes,
+    /// when both are known.
+    pub store_space: Option<(u64, u64)>,
     /// The event log's lines, oldest first (the rotated file, then the
     /// current one).
     pub events: Vec<String>,
@@ -210,6 +213,10 @@ pub fn gather(cwd: &Path) -> Inputs {
         inputs.store = crate::store::serving(&store, cwd)
             .ok()
             .filter(|store| store.is_dir());
+        inputs.store_space = inputs.store.as_deref().and_then(|dir| {
+            let floor = store.floor_mb?.saturating_mul(1 << 20);
+            Some((crate::store::volume::free(dir)?, floor))
+        });
     }
     inputs.repository_profiles =
         crate::profiles::repository(&crate::worktree::of(cwd)).unwrap_or_default();
@@ -475,6 +482,22 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             ),
         );
     }
+    if let (Some(store), Some((free, floor))) = (&inputs.store, inputs.store_space)
+        && free < floor
+    {
+        let gib = |bytes: u64| bytes as f64 / f64::from(1u32 << 30);
+        add(
+            "store-floor",
+            "warn",
+            format!(
+                "The volume of the build store {} has {:.1} GiB free, under its floor of {:.1} GiB ([store] floor_mb): builds may fail for lack of space, and eviction is behind.",
+                store.display(),
+                gib(free),
+                gib(floor)
+            ),
+            "Run `cargo heli gc` (or `cargo heli gc --superseded`), and check `cargo heli gc --dry-run` for what is left alone and why.",
+        );
+    }
     if let Some(threads) =
         env("RUST_TEST_THREADS").or_else(|| env_table_test_threads(&inputs.configs))
     {
@@ -635,6 +658,23 @@ mod tests {
             ids(&diagnose(&inputs)),
             ["jobs", "target-dir", "rustc-wrapper", "linker"]
         );
+    }
+
+    #[test]
+    fn a_store_under_its_floor_is_reported() {
+        let with = |free: u64| Inputs {
+            store: Some(PathBuf::from("D:/heli-cache")),
+            store_space: Some((free, 50 << 30)),
+            ..Inputs::default()
+        };
+        let report = diagnose(&with(300 << 20));
+        assert_eq!(ids(&report), ["store-unused", "store-floor"]);
+        assert!(
+            report.findings[1].message.contains("0.3 GiB free"),
+            "{:?}",
+            report.findings[1]
+        );
+        assert_eq!(ids(&diagnose(&with(60 << 30))), ["store-unused"]);
     }
 
     #[test]

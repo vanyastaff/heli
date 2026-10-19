@@ -1066,6 +1066,10 @@ fn the_daemon_evicts_when_over_budget() {
 #[test]
 fn runtime_becoming_idle_retries_a_deferred_eviction() {
     let fixture = Fixture::new("basic");
+    // The stand-in for the run in flight, built before the store is set up:
+    // a bare build of it there would leave a unit eviction may take before
+    // the run holds its lease.
+    let echo = fixture.echo_args();
     set_clock(&fixture, now() + 100 * HOUR);
     configure(
         &fixture,
@@ -1073,46 +1077,35 @@ fn runtime_becoming_idle_retries_a_deferred_eviction() {
     );
     let workspace = fixture.workspace();
     use_store(&fixture, &workspace);
-    let activity = fixture.path("activity");
-    std::fs::create_dir_all(&activity).unwrap();
-    let guard = File::options()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(activity.join(".heli-runtime.lock"))
-        .unwrap();
-    guard.lock_shared().unwrap();
-    let build = build_in(&fixture, &workspace, "echo-args");
-    wait_for("a pass deferred by runtime activity", || {
-        fixture
-            .daemon_log()
-            .contains("eviction deferred: runtime activity interlock is busy or unavailable")
-            .then_some(())
-    });
-    assert!(fixture.events_named("evict").is_empty());
+    // A run in flight in the workspace holds its runtime lease (#108).
     let ready = fixture.path("exec-started");
     let release = fixture.path("exec-release");
-    let echo = workspace
-        .join("target/debug")
-        .join(format!("echo-args{}", std::env::consts::EXE_SUFFIX));
-    assert!(echo.is_file(), "{}", echo.display());
-    let mut child = fixture
-        .heli(["exec", "--"])
-        .arg(echo)
+    let mut child = heli_in(&fixture, &workspace, &["exec", "--"])
+        .arg(&echo)
         .env("ECHO_STARTS", &ready)
         .env("ECHO_WAIT_FOR", &release)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    wait_for("the last managed run to start", || {
+    wait_for("the run in flight to start", || {
         ready.is_file().then_some(())
     });
-    drop(guard);
+    let build = build_in(&fixture, &workspace, "echo-args");
+    wait_for("a pass that leaves the workspace alone", || {
+        fixture
+            .daemon_log()
+            .contains("eviction left alone the directories of workspaces a run is in flight in")
+            .then_some(())
+    });
+    let early = fixture.events_named("evict");
+    assert!(
+        early.is_empty(),
+        "evicted while the run was in flight: {early:?}"
+    );
     std::fs::write(&release, "go").unwrap();
     assert!(child.wait().unwrap().success());
-    let until = Instant::now() + Duration::from_secs(3);
+    let until = Instant::now() + Duration::from_secs(10);
     while fixture.events_named("evict").is_empty() && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }

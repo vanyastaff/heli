@@ -653,8 +653,7 @@ impl Daemon {
         // Shared by all commands, including the gap between build and test
         // phases. A separate runner owns the same guard while each actual
         // child runs, so a daemon crash cannot expose its runtime assets.
-        let activity =
-            crate::store::lease::directory().and_then(|root| crate::store::lease::shared(&root));
+        let activity = runtime_lease(request).and_then(|root| crate::store::lease::shared(&root));
         let _activity = match activity {
             Ok(activity) => RuntimeActivity {
                 guard: Some(activity),
@@ -776,7 +775,7 @@ impl Daemon {
         run: &mut Execution<'_, '_>,
         argv: &[OsString],
     ) -> Result<(i32, Option<i32>), Reply> {
-        let activity = crate::store::lease::directory().map_err(|error| Reply::SpawnFailed {
+        let activity = runtime_lease(run.request).map_err(|error| Reply::SpawnFailed {
             not_found: false,
             message: error.to_string(),
         })?;
@@ -987,13 +986,19 @@ impl Drop for Serving<'_> {
     }
 }
 
+/// The runtime lease root of `request`'s worktree (`crate::store::lease`),
+/// which its commands hold while they run.
+fn runtime_lease(request: &RunRequest) -> std::io::Result<PathBuf> {
+    crate::store::lease::worktree_root(&crate::worktree::of(&request.cwd()))
+}
+
 /// The exit code clients of a run cancelled before it started exit with.
 const NEVER_STARTED: i32 = 1;
 
 /// Release protection before asking the accountant to retry, on every exit
 /// path, including cancellation, a reused verdict and a spawn failure.
 struct RuntimeActivity<'a> {
-    guard: Option<File>,
+    guard: Option<crate::store::lease::Shared>,
     accounts: &'a accounts::Accounts,
 }
 

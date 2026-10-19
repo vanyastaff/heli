@@ -245,12 +245,12 @@ impl Surveyed {
     /// `dir` as it is at `now`; `orphaned_since` says since when an orphan
     /// is unclaimed.
     pub fn of(dir: Dir, now: u64, orphaned_since: impl FnOnce(&Dir) -> Option<u64>) -> Self {
+        let measure = measure_root(&dir);
         let state = if super::busy_for_eviction(&dir, now) {
             State::Busy
         } else {
             dir.state()
         };
-        let measure = measure_root(&dir);
         let last_run = dir.owner.as_ref().map(|owner| owner.last_run);
         let last_use = measure.newest.max(last_run).unwrap_or(0);
         let orphaned_since = (state == State::Orphan)
@@ -276,7 +276,13 @@ fn measure_root(dir: &Dir) -> Measure {
             if dir.own_trash().is_some_and(|own| entry.file_name() == own) {
                 continue;
             }
-            total.add(measure(&entry.path()));
+            let mut measured = measure(&entry.path());
+            // heli's own notes in `.heli/` (owner, orphan, attribution) are
+            // no use of the directory: their bytes count, their times not.
+            if entry.file_name() == ".heli" {
+                measured.newest = None;
+            }
+            total.add(measured);
         }
     }
     if total.newest.is_none() {

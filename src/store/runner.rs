@@ -82,7 +82,7 @@ pub fn main(
         .iter()
         .map(|root| super::lease::shared(root))
         .collect::<io::Result<Vec<_>>>();
-    let _guards = match guards {
+    let guards = match guards {
         Ok(guards) => guards,
         Err(error) => fail(error),
     };
@@ -109,7 +109,11 @@ pub fn main(
         Err(error) => fail(error),
     };
     if direct {
-        crate::direct::exit_as(wait(&mut child));
+        let status = wait(&mut child);
+        // `exit_as` skips destructors: let go of the leases, and their
+        // markers, before it, not when the OS has torn the process down.
+        drop(guards);
+        crate::direct::exit_as(status);
     }
     // This frame precedes every byte from either actual command stream.
     // Losing the daemon must not kill the command or release its leases.
@@ -144,6 +148,7 @@ pub fn main(
             break;
         }
     }
+    drop(guards);
     crate::direct::exit_as(status)
 }
 

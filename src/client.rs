@@ -246,7 +246,9 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         }
     }
     if let Some(prepared) = &prepared {
-        let activity = crate::store::lease::directory().unwrap_or_else(|error| {
+        let worktree =
+            crate::worktree::of(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let activity = crate::store::lease::worktree_root(&worktree).unwrap_or_else(|error| {
             eprintln!("cargo-heli: cannot protect direct execution: {error}");
             std::process::exit(USAGE);
         });
