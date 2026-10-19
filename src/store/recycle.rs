@@ -171,6 +171,11 @@ pub fn claim(
         if exists(build_dir) {
             return Ok(None);
         }
+        // Since the scan: a worktree made back at the donor's place makes
+        // it live again, and eviction may have moved it away.
+        if donor.state() != State::Orphan {
+            continue;
+        }
         let Some(owner) = donor.owner.clone() else {
             continue;
         };
