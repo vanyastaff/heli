@@ -305,6 +305,9 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     // takes its shared lease before Cargo starts, so its arrival makes this
     // try-lock skip. Keep scans and Cargo-lock discovery outside this
     // critical section.
+    // Measured now, not as the survey found it: on a large store the plan
+    // is minutes old, and a run's nested cargo may have written here since.
+    let newest = newest(surveyed, victim);
     if !super::lease::available() {
         return Err("busy: the runtime activity namespace does not resolve".to_owned());
     }
@@ -312,7 +315,7 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
         Some(workspace) => super::lease::exclusive_for(workspace)?,
         None => Vec::new(),
     };
-    if super::changed_in_flight(newest(surveyed, victim)) {
+    if super::changed_in_flight(newest) {
         return Err(IN_FLIGHT.to_owned());
     }
     // Windows does not rename a directory with a file open inside.
@@ -328,12 +331,12 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     }
 }
 
-/// When `victim`, in `surveyed`, last changed: the whole directory as the
-/// survey measured it (without heli's own notes, `ladder::Surveyed`), else
-/// the files under the victim.
+/// When `victim`, in `surveyed`, last changed, measured now: the whole
+/// directory as the survey measures it (without heli's own notes and its
+/// trash, `ladder::Surveyed`), else the files under the victim.
 fn newest(surveyed: &Surveyed, victim: &Victim) -> Option<u64> {
     if victim.path == surveyed.dir.path {
-        surveyed.measure.newest
+        ladder::measure_root(&surveyed.dir).newest
     } else {
         ladder::measure(&victim.path).newest
     }
