@@ -294,14 +294,10 @@ pub fn in_use(dir: &Dir) -> bool {
 /// Whether something whose newest file was written at `newest` changed
 /// since the oldest run in flight started: a run's nested cargo may have
 /// built it, for a temporary workspace or another known one, and the run
-/// may read it. Ages are compared, the victim's at `now` (the eviction's
-/// clock, which the test seam may move) and the run's in real time, so that
-/// the two agree whichever clock a test sets.
-pub fn changed_in_flight(newest: Option<u64>, now: u64) -> bool {
-    lease::in_flight_since().is_some_and(|since| {
-        let running = crate::clock::now().saturating_sub(since);
-        newest.is_some_and(|newest| now.saturating_sub(newest) <= running)
-    })
+/// may read it. Both are real times (file times and the runs' markers), never
+/// the test seam's clock, which only ages the ladder's tiers.
+pub fn changed_in_flight(newest: Option<u64>) -> bool {
+    lease::in_flight_since().is_some_and(|since| newest.is_some_and(|newest| newest >= since))
 }
 
 /// Known Cargo locks at any depth, without following links. An unreadable

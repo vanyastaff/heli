@@ -1066,6 +1066,10 @@ fn the_daemon_evicts_when_over_budget() {
 #[test]
 fn runtime_becoming_idle_retries_a_deferred_eviction() {
     let fixture = Fixture::new("basic");
+    // The stand-in for the run in flight, built before the store is set up:
+    // a bare build of it there would leave a unit eviction may take before
+    // the run holds its lease.
+    let echo = fixture.echo_args();
     set_clock(&fixture, now() + 100 * HOUR);
     configure(
         &fixture,
@@ -1077,7 +1081,7 @@ fn runtime_becoming_idle_retries_a_deferred_eviction() {
     let ready = fixture.path("exec-started");
     let release = fixture.path("exec-release");
     let mut child = heli_in(&fixture, &workspace, &["exec", "--"])
-        .arg(fixture.echo_args())
+        .arg(&echo)
         .env("ECHO_STARTS", &ready)
         .env("ECHO_WAIT_FOR", &release)
         .stdout(std::process::Stdio::null())
@@ -1094,7 +1098,11 @@ fn runtime_becoming_idle_retries_a_deferred_eviction() {
             .contains("eviction left alone the directories of workspaces a run is in flight in")
             .then_some(())
     });
-    assert!(fixture.events_named("evict").is_empty());
+    let early = fixture.events_named("evict");
+    assert!(
+        early.is_empty(),
+        "evicted while the run was in flight: {early:?}"
+    );
     std::fs::write(&release, "go").unwrap();
     assert!(child.wait().unwrap().success());
     let until = Instant::now() + Duration::from_secs(10);

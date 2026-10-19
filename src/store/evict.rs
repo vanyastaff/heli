@@ -147,9 +147,9 @@ pub fn plan(
     // (`super::changed_in_flight`): left out before the ladder chooses, so
     // that it chooses something else.
     if super::lease::in_flight_since().is_some() {
-        let (left, kept): (Vec<Victim>, Vec<Victim>) = candidates.into_iter().partition(|victim| {
-            super::changed_in_flight(newest(&pass.dirs[victim.dir], victim), now)
-        });
+        let (left, kept): (Vec<Victim>, Vec<Victim>) = candidates
+            .into_iter()
+            .partition(|victim| super::changed_in_flight(newest(&pass.dirs[victim.dir], victim)));
         candidates = kept;
         pass.runtime_busy |= !left.is_empty();
         pass.skipped.extend(
@@ -312,7 +312,7 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
         Some(workspace) => super::lease::exclusive_for(workspace)?,
         None => Vec::new(),
     };
-    if super::changed_in_flight(newest(surveyed, victim), now) {
+    if super::changed_in_flight(newest(surveyed, victim)) {
         return Err(IN_FLIGHT.to_owned());
     }
     // Windows does not rename a directory with a file open inside.

@@ -1912,8 +1912,8 @@ Safety rules:
   - any victim that changed since the oldest run in flight started:
     nested commands can build and use another workspace's cache, a
     temporary one without an owner or another known one, and what they
-    wrote is that recent. Ages are compared, so that the test seam's clock
-    and real time agree. Such victims are left out before the ladder
+    wrote is that recent. Both are real times (file times and the runs'
+    markers), never the test seam's clock. Such victims are left out before the ladder
     chooses, so that it chooses others, and `gc` lists them as skipped
     ("changed since a run in flight started").
   heli's own notes in a build directory (`.heli/`) do not count as a
