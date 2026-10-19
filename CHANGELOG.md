@@ -1,14 +1,52 @@
 # Changelog
 
-## Unreleased
+## 0.0.5
+
+After upgrading, run `cargo heli restart` so that the daemon is the new one:
+the eviction, recycling and trash fixes below are the daemon's.
+
+### Fixed
+
+- **Tools that rewrite the sources through another tool** take the worktree
+  lock exclusively, as `cargo clippy --fix` and `cargo insta accept` do.
+  `cargo hack clippy --fix`, `cargo hack fix`, `cargo ndk … clippy --fix`,
+  `cargo ndk … fix` and `cargo insta test --accept` (also `--accept-unseen`
+  and `--force-update-snapshots`) ran as verify or exec runs, under the
+  shared side of the lock, beside builds in the same worktree.
+  `cargo insta test --review` runs directly, as `insta review` does. And
+  `cargo heli +nightly heli …` is refused as `cargo heli heli …` is, instead
+  of running heli again down to the nesting limit (#115).
+- **`setup` and `autostart` replace the user's files whole.** Shell
+  profiles, editor settings, service definitions and the daemon's record
+  were written in place: a crash, a kill or a full volume in the middle left
+  the file truncated, and a profile kept as a link into a dotfiles
+  repository was replaced by a copy. The content now goes to a temporary
+  file beside the target and is renamed over it, keeping the target's
+  permissions and following a link (#115).
+- **Eviction measures a whole-directory victim again** just before moving
+  it. The in-flight check used the survey's measure, taken when the pass
+  was planned, minutes earlier on a large store, so what a run's nested
+  cargo wrote there since went unseen (#115).
+- **Recycling checks that a donor is still an orphan** just before claiming
+  it. The orphans were decided when the store was scanned, and a worktree
+  made back at a donor's place meanwhile would have had its build directory
+  renamed away (#115).
+- **Windows: the rename into the trash is tried again** when a handle is
+  open inside the victim (a search indexer's, an antivirus scan of a fresh
+  file, a `status` passing through), up to ten times 50 ms apart. One such
+  handle made `gc` skip the victim and exit 0 (#110).
 
 ### Changed
 
+- **Release binaries** are built with link-time optimization in one codegen
+  unit. Symbols stay, so a panic's backtrace in a bug report names its
+  functions (#115).
 - **Documentation.** `DESIGN.md`, the brief heli was built from, is gone.
   Its contracts are now in `docs/`, one document per part, starting at
   [docs/architecture.md](docs/architecture.md); its dated measurements and
   acceptance runs are in
-  [docs/research/acceptance-2026-10.md](docs/research/acceptance-2026-10.md).
+  [docs/research/acceptance-2026-10.md](docs/research/acceptance-2026-10.md)
+  (#116).
 
 ## 0.0.4
 
