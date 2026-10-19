@@ -65,6 +65,8 @@ mod setup;
 mod source;
 mod status;
 mod store;
+#[cfg(test)]
+mod test_tmp;
 mod user_env;
 mod worktree;
 

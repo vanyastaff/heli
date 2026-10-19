@@ -230,7 +230,7 @@ mod tests {
     /// this crate under a templated `build-dir` ends in it.
     #[test]
     fn hashes_as_cargo_does() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = crate::test_tmp::tempdir();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(ws.join("src")).expect("dir");
         std::fs::write(
