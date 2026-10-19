@@ -7,7 +7,6 @@ on:
       - src/**
       - Cargo.toml
       - Cargo.lock
-      - rust-toolchain.toml
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
       - experiments/isolated-home-concurrency.py
@@ -22,7 +21,6 @@ on:
       - src/**
       - Cargo.toml
       - Cargo.lock
-      - rust-toolchain.toml
       - experiments/package-epoch-views.py
       - experiments/real-download-hol.py
       - experiments/isolated-home-concurrency.py
