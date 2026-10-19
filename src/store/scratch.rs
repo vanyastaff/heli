@@ -11,7 +11,7 @@
 //! for `[store] scratch_hours` and no cargo holds a lock inside it, first of
 //! all. Its trash is [`trash`], in the same directory, so on its volume.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Overrides where scratch copies are looked for; tests point it at a
 /// directory of their own, so they never touch the machine's.
@@ -27,7 +27,12 @@ pub fn root() -> PathBuf {
 
 /// The scratch copies in [`root`], in order.
 pub fn find() -> Vec<PathBuf> {
-    let mut found: Vec<PathBuf> = super::subdirs(&root())
+    find_in(&root())
+}
+
+/// The scratch copies in `root`, in order.
+fn find_in(root: &Path) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = super::subdirs(root)
         .into_iter()
         .filter(|dir| {
             dir.file_name()
@@ -69,13 +74,11 @@ mod tests {
             std::fs::write(dir.path().join(name).join("Cargo.toml"), "").expect("manifest");
         }
         std::fs::write(dir.path().join("mutants-file"), "").expect("file");
-        // SAFETY of the test: nextest runs each test in a process of its own.
-        unsafe { std::env::set_var(VAR, dir.path()) };
-        let names: Vec<String> = find()
+        let names: Vec<String> = find_in(dir.path())
             .iter()
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["cargo-mutants-app-x9", "mutants-a1b2"]);
-        assert_eq!(trash(), dir.path().join(".heli-trash"));
+        assert_eq!(trash(), root().join(".heli-trash"));
     }
 }
