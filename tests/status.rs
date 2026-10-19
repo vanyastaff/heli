@@ -1,6 +1,6 @@
-//! `cargo heli status` describes the daemon (DESIGN.md §8): where it runs,
-//! so that a user sees it runs in their interactive session, which tests
-//! that drive the desktop need (§3).
+//! `cargo heli status` describes the daemon (docs/observability.md): where it
+//! runs, so that a user sees it runs in their interactive session, which tests
+//! that drive the desktop need (docs/daemon.md).
 
 mod support;
 

@@ -1,4 +1,4 @@
-//! Output of test runs and of `exec` (`DESIGN.md` §5, "Output"): what the
+//! Output of test runs and of `exec` (docs/runs.md, "Output"): what the
 //! client prints of `cargo heli nextest run`, `cargo heli test` and
 //! `cargo heli exec` in compact and quiet mode, and
 //! `cargo heli log <run> --test <name>`.

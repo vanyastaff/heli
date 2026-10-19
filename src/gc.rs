@@ -1,10 +1,11 @@
 //! `cargo heli gc [--superseded] [--dry-run] [--json]`: every directory the build store
 //! accounts for (`crate::store::survey`), with its state and size, and an
-//! eviction pass over them (DESIGN.md §6.3, `crate::store::evict`): over
-//! the budget or under the floor, the victims the ladder chooses, each with
-//! its tier and reason. `gc` evicts them, logs each eviction in the event
-//! log (`crate::daemon::events`) and deletes the trash before it exits, at
-//! low I/O priority; `--dry-run` only names them, and changes nothing.
+//! eviction pass over them (docs/build-store.md#eviction,
+//! `crate::store::evict`): over the budget or under the floor, the victims the
+//! ladder chooses, each with its tier and reason. `gc` evicts them, logs each
+//! eviction in the event log (`crate::daemon::events`) and deletes the trash
+//! before it exits, at low I/O priority; `--dry-run` only names them, and
+//! changes nothing.
 //!
 //! **`--superseded`** reclaims every superseded directory in the registered
 //! `target/` directories (`crate::store::superseded`, tier 6) now, whatever

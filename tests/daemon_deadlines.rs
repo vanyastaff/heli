@@ -37,7 +37,7 @@ fn post_handshake_silence_falls_back_within_five_seconds() {
     fake.received();
     assert!(
         completed,
-        "DESIGN sections 3/10 require fallback after 5 seconds without a daemon answer; \
+        "docs/daemon.md requires fallback after 5 seconds without a daemon answer; \
          the public CLI remained blocked for 7 seconds after a successful handshake. \
          stdout={:?}; stderr={:?}",
         String::from_utf8_lossy(&output.stdout),

@@ -1,4 +1,4 @@
-//! Test runs (DESIGN.md §5, lifecycle step 6): runs of class test
+//! Test runs (docs/runs.md, lifecycle step 6): runs of class test
 //! (`crate::class`: `cargo heli test …` and `cargo heli nextest run …`) run
 //! in two phases.
 //!

@@ -1,5 +1,5 @@
-//! Run pools and the broker (DESIGN.md §4, "Run pools"): each run draws from
-//! a pool of its own, which the daemon's broker fills from the host pool.
+//! Run pools and the broker (docs/host-pool.md, "Run pools"): each run draws
+//! from a pool of its own, which the daemon's broker fills from the host pool.
 //!
 //! The runs here are the `jobs` fixture: a jobserver client whose workers
 //! each take a slot, hold it a moment, give it back and ask for the next,

@@ -1,6 +1,7 @@
-//! `cargo heli setup --autostart` and `--no-autostart` (DESIGN.md §3, §4
-//! "Reach", §10): the daemon registered to start at logon, in the user's
-//! session, and clients that start it through that registration.
+//! `cargo heli setup --autostart` and `--no-autostart` (docs/daemon.md,
+//! docs/host-pool.md "Reach", docs/failure-modes.md): the daemon registered to
+//! start at logon, in the user's session, and clients that start it through
+//! that registration.
 //!
 //! Every test runs as a user with a temporary home ([`Fixture::with_home`]),
 //! so heli's default locations are in that home, and with the fake service

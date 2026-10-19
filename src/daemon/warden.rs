@@ -1,5 +1,5 @@
 //! The pool's warden, on Unix: a small process each daemon starts, which
-//! outlives it to remove the FIFO it leaves behind (DESIGN.md §4,
+//! outlives it to remove the FIFO it leaves behind (docs/host-pool.md,
 //! "Lifetime").
 //!
 //! A FIFO's path outlives every process that holds it, and once nobody holds

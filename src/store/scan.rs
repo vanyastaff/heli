@@ -1,14 +1,14 @@
-//! The path scan (DESIGN.md §6.4, "What cargo does not track"): cargo
-//! leaves the variables it sets itself out of its freshness tracking
-//! (`OUT_DIR`, `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*`,
-//! `CARGO_TARGET_TMPDIR`; cargo's `dep_info.rs`), so a unit that compiled
-//! one in stays fresh when its build directory moves, and keeps the old
-//! path. rustc still records each value it read in its own dep-info, as a
-//! line `# env-dep:NAME=value`, with `\`, line feed and carriage return
-//! escaped as `\\`, `\n` and `\r` (`escape_dep_env` in rustc; on Windows,
-//! `# env-dep:CARGO_MANIFEST_DIR=E:\\heli`). [`invalidate`] deletes the
-//! fingerprint of every unit that read a value under one of the old paths,
-//! and cargo rebuilds those units.
+//! The path scan (docs/build-store.md#recycling, "What cargo does not track"):
+//! cargo leaves the variables it sets itself out of its freshness tracking
+//! (`OUT_DIR`, `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*`, `CARGO_TARGET_TMPDIR`;
+//! cargo's `dep_info.rs`), so a unit that compiled one in stays fresh when its
+//! build directory moves, and keeps the old path. rustc still records each
+//! value it read in its own dep-info, as a line `# env-dep:NAME=value`, with
+//! `\`, line feed and carriage return escaped as `\\`, `\n` and `\r`
+//! (`escape_dep_env` in rustc; on Windows, `#
+//! env-dep:CARGO_MANIFEST_DIR=E:\\heli`). [`invalidate`] deletes the
+//! fingerprint of every unit that read a value under one of the old paths, and
+//! cargo rebuilds those units.
 //!
 //! **Where cargo keeps them**, checked against cargo 1.99's layout of a
 //! build directory, in each profile directory (`<profile>/`, or

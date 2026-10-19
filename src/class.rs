@@ -1,4 +1,4 @@
-//! Run classes (`DESIGN.md` §5, "Classes"): what kind of work a run does,
+//! Run classes (docs/runs.md, "Classes"): what kind of work a run does,
 //! read from its command line, and so what heli gives it.
 //!
 //! | Class   | Subcommands                 | Run pool | Test slots | Result store | Worktree lock |
@@ -62,7 +62,7 @@ pub enum Runner {
     Nextest,
 }
 
-/// A built-in tool profile (`DESIGN.md` §5, "Tool profiles"): what heli
+/// A built-in tool profile (docs/runs.md, "Tool profiles"): what heli
 /// does with `cargo <name> <args>` for each of `names`, as a declarative
 /// record. The first of `rules` whose condition holds decides, else
 /// `otherwise`. Tools that rewrite the worktree are mutate runs, so that they
@@ -530,7 +530,7 @@ pub fn is_cargo_builtin(tool: &str) -> bool {
 }
 
 /// Whether `cargo <args>` runs in the client, but drawing from the host pool
-/// (`DESIGN.md` §5, "Tool profiles"), instead of in the daemon: what a
+/// (docs/runs.md, "Tool profiles"), instead of in the daemon: what a
 /// built-in profile runs directly ([`TOOLS`]), and, when stdin is a
 /// terminal, every exec command of a tool heli has no profile for.
 pub fn runs_directly(args: &[OsString], stdin_is_terminal: bool) -> bool {

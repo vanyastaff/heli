@@ -1,4 +1,4 @@
-//! Priorities (DESIGN.md §4, "Priorities"): a run's weight in the broker's
+//! Priorities (docs/host-pool.md, "Priorities"): a run's weight in the broker's
 //! shares, interactive 4, normal 1, background ¼.
 //!
 //! The runs here are the `jobs` fixture (see `run_pools.rs`): each worker

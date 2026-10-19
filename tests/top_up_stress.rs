@@ -1,4 +1,4 @@
-//! The bounded top-up under stress (DESIGN.md §4, #26): while bare cargos
+//! The bounded top-up under stress (docs/host-pool.md, #26): while bare cargos
 //! draw from the host pool and are killed at random, losing the slots they
 //! hold, no top-up ever lets more than N jobs hold slots at once, and no
 //! cargo is refused a slot it gives back. Each time they are gone and the

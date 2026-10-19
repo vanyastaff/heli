@@ -1,4 +1,4 @@
-//! Survivors and direct-in-pool runs (`DESIGN.md` §5, "Tool profiles").
+//! Survivors and direct-in-pool runs (docs/runs.md, "Tool profiles").
 
 mod support;
 

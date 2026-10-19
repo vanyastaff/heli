@@ -1,6 +1,6 @@
-//! Superseded intermediates (DESIGN.md §6.3, #92): what a registered
-//! `target/` directory still holds of cargo's intermediates after its
-//! workspace moved them to a build directory elsewhere (`build.build-dir`,
+//! Superseded intermediates (docs/build-store.md#eviction, #92): what a
+//! registered `target/` directory still holds of cargo's intermediates after
+//! its workspace moved them to a build directory elsewhere (`build.build-dir`,
 //! as `cargo heli setup` sets it).
 //!
 //! In a registered, non-shared `target/` directory apart from its build

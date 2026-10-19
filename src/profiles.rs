@@ -1,4 +1,4 @@
-//! Tool profiles from configuration (`DESIGN.md` §5, "Tool profiles"): the
+//! Tool profiles from configuration (docs/runs.md, "Tool profiles"): the
 //! user's, in heli's configuration file, and a repository's, in its
 //! committed `.config/heli.toml`. Both use the same table:
 //!

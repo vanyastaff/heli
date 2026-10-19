@@ -1,7 +1,7 @@
-//! The source-state record (DESIGN.md §6.4, "Precise"): `.heli/sources` in
-//! a build directory, what the files of its worktree were when cargo last
-//! built there, so that a worktree that recycles the directory can look to
-//! cargo as that one did.
+//! The source-state record (docs/build-store.md#recycling, "Precise"):
+//! `.heli/sources` in a build directory, what the files of its worktree were
+//! when cargo last built there, so that a worktree that recycles the directory
+//! can look to cargo as that one did.
 //!
 //! ```json
 //! {"taken_at":1791911112123456700,

@@ -1,4 +1,4 @@
-//! The worktree lock (`DESIGN.md` §5): heli runs that read a worktree hold
+//! The worktree lock (docs/runs.md): heli runs that read a worktree hold
 //! its lock shared, mutate runs (`fmt`, `fix`, `clippy --fix`) hold it
 //! exclusive. A run that has to wait says for which runs, and `status` shows
 //! the wait.

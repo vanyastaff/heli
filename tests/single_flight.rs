@@ -1,4 +1,4 @@
-//! Single-flight (DESIGN.md §5, lifecycle step 3): a verify or test run
+//! Single-flight (docs/runs.md, lifecycle step 3): a verify or test run
 //! whose key matches a run in flight anywhere on the machine attaches to
 //! that run, from any worktree, instead of starting another. Its client gets
 //! the run's output from its first byte and its exit code.
@@ -32,9 +32,9 @@ fn git(dir: &Path, args: &[&str]) {
 /// same key. Its cargo is a copy of `echo-args` (it prints its arguments,
 /// counts its starts, waits for the gate, and exits 0 unless told
 /// otherwise), named `fake-cargo` so that the build store does not ask it
-/// for metadata (DESIGN.md §6.2), which would count as a start; its `rustc`
-/// is another copy. Both answer version requests as [`Twins::set_version`]
-/// sets them.
+/// for metadata (docs/build-store.md#accounting), which would count as a start;
+/// its `rustc` is another copy. Both answer version requests as
+/// [`Twins::set_version`] sets them.
 struct Twins {
     fixture: Fixture,
     /// The second worktree.
@@ -1242,7 +1242,7 @@ fn keyings(log: &Path) -> usize {
 /// again once admitted. A run that waits at its worktree lock is keyed
 /// again after the wait. Each passing run is keyed once more after its
 /// steps, every input read anew, to be recorded only under an unchanged
-/// key (DESIGN.md §7).
+/// key (docs/result-store.md).
 #[test]
 fn a_run_that_waits_for_nothing_is_keyed_once() {
     let twins = Twins::new();

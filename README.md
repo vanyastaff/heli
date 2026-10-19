@@ -76,7 +76,9 @@ It is not a hard disk quota; private native Cargo homes are retained outside
 the artifact budget. See [the operating guide](docs/multi-agent.md) for store
 placement, budgets, credentials, fallback and supported-tool limits.
 
-The contracts and dated acceptance evidence are in [DESIGN.md](DESIGN.md).
+How heli works, part by part, is in [the architecture docs](docs/architecture.md);
+the dated acceptance evidence is in
+[docs/research](docs/research/acceptance-2026-10.md).
 
 ## Cargo tools
 

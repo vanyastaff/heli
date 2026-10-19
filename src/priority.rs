@@ -1,4 +1,4 @@
-//! A run's priority (DESIGN.md §4, "Priorities"): how large its share of
+//! A run's priority (docs/host-pool.md, "Priorities"): how large its share of
 //! the host pool is beside the other runs'. A person waiting at a terminal
 //! runs `interactive`, agents run `normal`, and long work nobody waits for
 //! (mutation testing, full sweeps) runs `background`.

@@ -1,4 +1,4 @@
-//! `cargo heli rerun`: runs a recorded run again (`DESIGN.md` §5,
+//! `cargo heli rerun`: runs a recorded run again (docs/runs.md,
 //! "Reruns").
 //!
 //! - **What runs.** The run's record starts with its command line as typed

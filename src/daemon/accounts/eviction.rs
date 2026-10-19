@@ -1,13 +1,13 @@
-//! **Eviction** (DESIGN.md §6.3). With a budget or a floor configured, the
-//! accountant also keeps the orphans' notes (`crate::store::orphan`) at
-//! each look, and when its figures are over the budget, or a volume they
-//! are on has less free than the floor, it makes an eviction pass
-//! (`crate::store::evict`), unless `gc` is making one. Each eviction goes
-//! to the event log; `status` shows the last pass that evicted anything
-//! (`last_gc`). Its clock is the test seam's in debug builds that set one.
-//! A thread of its own deletes what is in the trash, at low I/O priority:
-//! after each pass, and every [`LOOK`], which also clears what a `gc`
-//! that was stopped left there.
+//! **Eviction** (docs/build-store.md#eviction). With a budget or a floor
+//! configured, the accountant also keeps the orphans' notes
+//! (`crate::store::orphan`) at each look, and when its figures are over the
+//! budget, or a volume they are on has less free than the floor, it makes an
+//! eviction pass (`crate::store::evict`), unless `gc` is making one. Each
+//! eviction goes to the event log; `status` shows the last pass that evicted
+//! anything (`last_gc`). Its clock is the test seam's in debug builds that set
+//! one. A thread of its own deletes what is in the trash, at low I/O priority:
+//! after each pass, and every [`LOOK`], which also clears what a `gc` that was
+//! stopped left there.
 
 use std::fs::{File, TryLockError};
 use std::path::PathBuf;

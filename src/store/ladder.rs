@@ -1,6 +1,6 @@
-//! The eviction ladder (DESIGN.md §6.3): what heli evicts when the build
-//! store is over its budget B or a volume is under its free-space floor F,
-//! cheapest to regenerate first.
+//! The eviction ladder (docs/build-store.md#eviction): what heli evicts when
+//! the build store is over its budget B or a volume is under its free-space
+//! floor F, cheapest to regenerate first.
 //!
 //! **When.** Over budget (every build directory and registered `target/`
 //! directory together take more than B), heli evicts until they take at

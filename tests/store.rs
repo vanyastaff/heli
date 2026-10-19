@@ -1,7 +1,8 @@
-//! The build store (DESIGN.md §6.1, §6.2): `cargo heli setup` points cargo's
-//! `build.build-dir` at a store, the daemon writes an owner manifest into
-//! each build directory and keeps their sizes, and `cargo heli gc
-//! --dry-run` lists every directory with its state and size.
+//! The build store (docs/build-store.md#placement,
+//! docs/build-store.md#accounting): `cargo heli setup` points cargo's
+//! `build.build-dir` at a store, the daemon writes an owner manifest into each
+//! build directory and keeps their sizes, and `cargo heli gc --dry-run` lists
+//! every directory with its state and size.
 //!
 //! Every store here is in the fixture's temporary directory (`[store]
 //! paths` in its configuration), every `setup` runs in its temporary home
@@ -1327,7 +1328,7 @@ fn setup_replaces_only_its_own_build_dir() {
 
 /// The first run from a directory waits for its build directory to be
 /// recycled only while a store holds an orphan of its own repository
-/// (DESIGN.md §5, "Where a run can wait"): an orphan of another repository
+/// (docs/runs.md, "Where a run can wait"): an orphan of another repository
 /// keeps no run waiting. Here cargo's answer about the workspace (the fake
 /// cargo's `metadata`) does not come until the gate opens; the run starts
 /// all the same.

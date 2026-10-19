@@ -1,5 +1,5 @@
 //! Run classes: each run is classified by its subcommand and arguments
-//! (`DESIGN.md` §5, "Classes"), and `status` shows the class.
+//! (docs/runs.md, "Classes"), and `status` shows the class.
 
 mod support;
 

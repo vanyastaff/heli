@@ -1,4 +1,4 @@
-//! **Source-state records** (DESIGN.md §6.4, "Precise";
+//! **Source-state records** (docs/build-store.md#recycling, "Precise";
 //! `crate::store::record`), which make the next recycling of a build
 //! directory precise. A run's build directory in a store heli manages, in a
 //! repository, gets one as the run ends ([`super::Learning::ended`], which

@@ -7,12 +7,12 @@
 //! ```
 //!
 //! The ladder's tier 2 takes an orphan only once it has been unclaimed for
-//! 24 h (`super::ladder`), so recycling (DESIGN.md §6.4) has that long to
-//! claim it. The note counts only while it names the workspace of the owner
-//! manifest and is no older than its last run: a recycled directory names
-//! its new workspace, and a worktree that came back ran since. A directory
-//! found live loses its note. Without a note that counts, an orphan is
-//! unclaimed since now, so a pass that cannot write (`gc --dry-run`) never
+//! 24 h (`super::ladder`), so recycling (docs/build-store.md#recycling) has
+//! that long to claim it. The note counts only while it names the workspace of
+//! the owner manifest and is no older than its last run: a recycled directory
+//! names its new workspace, and a worktree that came back ran since. A
+//! directory found live loses its note. Without a note that counts, an orphan
+//! is unclaimed since now, so a pass that cannot write (`gc --dry-run`) never
 //! makes one evictable. Times are whole seconds since 1970.
 
 use std::io;

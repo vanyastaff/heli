@@ -1,4 +1,4 @@
-//! A client reads a newer daemon of the same protocol (DESIGN.md §3, "The
+//! A client reads a newer daemon of the same protocol (docs/daemon.md, "The
 //! protocol"): fields and values a later daemon adds never keep an older
 //! client from reading what it knows.
 

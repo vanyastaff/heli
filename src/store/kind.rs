@@ -1,7 +1,7 @@
-//! What each kind of directory is to the build store (DESIGN.md §6): the one
-//! place for every rule that depends on it, so that a new kind is a new
-//! variant here, which the compiler then asks to be decided in each rule
-//! below, and nowhere else.
+//! What each kind of directory is to the build store (docs/build-store.md): the
+//! one place for every rule that depends on it, so that a new kind is a new
+//! variant here, which the compiler then asks to be decided in each rule below,
+//! and nowhere else.
 //!
 //! | Kind    | Busy while a cargo lock is held | Trash                   | Tool caches | Its own rungs (`super::ladder`)                |
 //! |---------|---------------------------------|-------------------------|-------------|------------------------------------------------|

@@ -1,5 +1,5 @@
 //! What the client prints of a run: the tool's output in the chosen mode,
-//! then heli's closing line (`DESIGN.md` §5, "Output").
+//! then heli's closing line (docs/runs.md, "Output").
 //!
 //! **Modes** ([`Mode`]), chosen by [`choose`]: `--output` or `-q` before the
 //! subcommand, else `HELI_OUTPUT` ([`VAR`]), else `[output] mode` in the

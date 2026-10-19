@@ -1,5 +1,5 @@
 //! Whether anything compiles for cargo now: half of the quiescence that the
-//! host pool's top-up waits for (DESIGN.md §4, "Bounded top-up").
+//! host pool's top-up waits for (docs/host-pool.md, "Bounded top-up").
 //!
 //! The processes that run cargo's jobs, and hold its slots, are `rustc`,
 //! `rustdoc`, `clippy-driver` and build scripts (`build-script-*`); and

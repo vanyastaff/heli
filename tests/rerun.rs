@@ -1,4 +1,4 @@
-//! `cargo heli rerun` (`DESIGN.md` §5, "Reruns"): a recorded run again,
+//! `cargo heli rerun` (docs/runs.md, "Reruns"): a recorded run again,
 //! whole or only its failed tests, linked to the run it reruns.
 //!
 //! Fixture crates: `many-tests` (100 tests, of which `HELI_FIXTURE_FAIL`

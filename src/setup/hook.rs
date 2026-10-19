@@ -1,6 +1,6 @@
-//! The repository's git `post-checkout` hook (DESIGN.md §6.4): git runs it
-//! after every checkout, and `git worktree add` checks the new worktree
-//! out, from the null commit. Then the hook runs `cargo-heli recycle`
+//! The repository's git `post-checkout` hook (docs/build-store.md#recycling):
+//! git runs it after every checkout, and `git worktree add` checks the new
+//! worktree out, from the null commit. Then the hook runs `cargo-heli recycle`
 //! (`crate::recycle`) in the new worktree, which gets a removed worktree's
 //! build directory before anything builds in it. Any other checkout, whose
 //! first argument is a real commit, does nothing.

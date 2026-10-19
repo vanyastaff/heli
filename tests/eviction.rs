@@ -1,7 +1,7 @@
-//! The eviction ladder (DESIGN.md §6.3): over the budget B, or under the
-//! free-space floor F, `cargo heli gc` and the daemon evict what is cheapest
-//! to regenerate first, rename each victim into the trash under cargo's
-//! lock and delete it afterwards, and never touch a busy directory or
+//! The eviction ladder (docs/build-store.md#eviction): over the budget B, or
+//! under the free-space floor F, `cargo heli gc` and the daemon evict what is
+//! cheapest to regenerate first, rename each victim into the trash under
+//! cargo's lock and delete it afterwards, and never touch a busy directory or
 //! anything through a link.
 //!
 //! Ages come from the injected clock (`[test] clock_ms`) and the times of
@@ -1188,7 +1188,7 @@ fn the_daemon_finds_orphans() {
     let linked = add_worktree(&main, "linked");
     let orphan = build_in(&fixture, &linked, "echo-args");
     // The main worktree has a build directory of its own, so that its runs
-    // below recycle nothing (DESIGN.md §6.4).
+    // below recycle nothing (docs/build-store.md#recycling).
     build_in(&fixture, &main, "echo-args");
     git(
         &main,

@@ -1,5 +1,5 @@
 //! The run log: the daemon's record of each run's output, which
-//! `cargo heli log <run>` prints whole or in part (`DESIGN.md` §5, "Output").
+//! `cargo heli log <run>` prints whole or in part (docs/runs.md, "Output").
 //!
 //! **Records.** One file per run, `<run>.log` in `Locations::run_logs`
 //! (`runs/` in the state directory), written by the daemon as the output

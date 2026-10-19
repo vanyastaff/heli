@@ -1,7 +1,7 @@
-//! Recycling (DESIGN.md §6.4): a worktree without a build directory gets
-//! the most recently used orphan of its repository, renamed into place, and
-//! the path scan invalidates every unit that compiled in a path of the
-//! removed worktree or of the old build directory.
+//! Recycling (docs/build-store.md#recycling): a worktree without a build
+//! directory gets the most recently used orphan of its repository, renamed into
+//! place, and the path scan invalidates every unit that compiled in a path of
+//! the removed worktree or of the old build directory.
 //!
 //! Fixture `recycle` holds a repository, `repo/`, and two packages outside
 //! it, `vendor/`, which its members depend on by path: they stand in for
@@ -180,12 +180,12 @@ impl Repo {
     /// Removes worktree `removed` and adds worktree `added`, so that the
     /// first heli run in `added` recycles a build directory for it. The
     /// daemon's look, which recycles too, as it starts, as runs end and
-    /// every minute (DESIGN.md §6.4), would race that run. So the daemon
-    /// that built in `removed` is stopped, with any look it was about to
-    /// make, and a new one has made its first look before `added` exists
-    /// (each pass of its accountant looks first, then counts the stores
-    /// that `status` shows); its next look is a minute away, or after the
-    /// next run's end.
+    /// every minute (docs/build-store.md#recycling), would race that run. So
+    /// the daemon that built in `removed` is stopped, with any look it was
+    /// about to make, and a new one has made its first look before `added`
+    /// exists (each pass of its accountant looks first, then counts the stores
+    /// that `status` shows); its next look is a minute away, or after the next
+    /// run's end.
     fn replace_worktree(&self, removed: &str, added: &str) -> PathBuf {
         self.fixture.kill_daemon();
         self.remove_worktree(removed);
@@ -439,6 +439,15 @@ fn a_new_worktree_builds_warm_in_a_removed_ones_build_directory() {
 /// each run.
 fn record_file(dir: &Path) -> PathBuf {
     dir.join(".heli").join("sources")
+}
+
+/// Waits for the source-state record of build directory `dir`. A run waits
+/// for it as it ends, but ten seconds at most (the daemon's `RECORD_WAIT`),
+/// so on a slow machine it may come a moment after the run.
+fn wait_for_record(dir: &Path) {
+    wait_for("the source-state record", || {
+        record_file(dir).is_file().then_some(())
+    });
 }
 
 /// Deletes the source-state record of build directory `dir`, which the
@@ -1482,7 +1491,7 @@ fn recycled_build(in_a: impl FnOnce(&Path), in_b: impl FnOnce(&Repo, &Path)) -> 
     in_a(&a);
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
-    assert!(record_file(&a_dir).is_file(), "a's run left a record");
+    wait_for_record(&a_dir);
     let b = repo.replace_worktree("a", "b");
     in_b(&repo, &b);
 
@@ -1791,6 +1800,7 @@ fn a_build_dated_just_before_the_record_makes_recycling_conservative() {
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    wait_for_record(&a_dir);
     // No daemon, which could write a record after this build.
     repo.fixture.kill_daemon();
     let record = std::fs::read_to_string(record_file(&a_dir)).expect("a's record");
@@ -1903,7 +1913,7 @@ fn a_file_changed_right_after_staging_keeps_its_time() {
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
-    assert!(record_file(&a_dir).is_file(), "a's run left a record");
+    wait_for_record(&a_dir);
     let b = repo.replace_worktree("a", "b");
     // Dated otherwise than b's index says, so that git reads it again, and
     // runs the filter, as heli stages b.
@@ -2055,6 +2065,7 @@ fn a_record_that_counts_is_not_written_again() {
     let a = repo.add_worktree("a");
     repo.build(&a);
     let a_dir = repo.build_dir_of(&a);
+    wait_for_record(&a_dir);
     let record = || std::fs::read_to_string(record_file(&a_dir)).expect("a's record");
     let counting = record();
     repo.fixture.kill_daemon();

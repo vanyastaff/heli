@@ -128,7 +128,7 @@ pub fn spawn(
 /// How long the daemon waits for `sccache --start-server` to return.
 const SURVIVOR_START: Duration = Duration::from_secs(5);
 
-/// Survivors (`DESIGN.md` §5, "Tool profiles"): a compiler cache server that
+/// Survivors (docs/runs.md, "Tool profiles"): a compiler cache server that
 /// a run's `RUSTC_WRAPPER=sccache` would start inside the run ends with the
 /// run's process tree, so cancelling one build cold-starts everyone's cache.
 /// The daemon starts it first, outside any run's tree. A server that already

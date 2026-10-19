@@ -1,4 +1,4 @@
-//! Run ids (DESIGN.md §5, "Run ids"): `r<number>`, unique for the life of
+//! Run ids (docs/runs.md, "Run ids"): `r<number>`, unique for the life of
 //! the state directory. The daemon gives them (`crate::daemon::registry`);
 //! records, markers, the protocol and `cancel` name runs by them. On the
 //! wire and on disk an id is its text, `r17`.

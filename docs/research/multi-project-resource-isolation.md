@@ -4,8 +4,10 @@ Research date: 2026-10-15. Scope: concurrent Cargo projects and worktrees on
 one host, including nested Cargo, with automatic reclamation. This document
 supports the runtime experiment and records one confirmed defect reported by
 its investigator; it does not claim final operational acceptance.
-The authoritative behavior contract remains `DESIGN.md`, especially G1–G3,
-the host pool (§4), build store (§6) and operational acceptance (§12).
+The authoritative behavior contract remains the design
+([architecture](../architecture.md)), especially G1–G3, the
+[host pool](../host-pool.md), the [build store](../build-store.md) and
+operational acceptance ([acceptance runs](acceptance-2026-10.md#plan-and-acceptance-runs)).
 
 ## Conclusions
 
@@ -37,7 +39,7 @@ sizes. The practical order is:
    deliberately takes one per-user machine-wide lock across checkouts, and
    only documents its own `FLUI_XTASK_NO_LOCK` escape hatch and nested-lock
    marker. The inspected module has no `HELI_RUN` check. heli's adoption
-   instructions in DESIGN §9 therefore describe a consumer integration that
+   instructions ([adoption in flui](acceptance-2026-10.md#adoption-in-flui-worked-example)) therefore describe a consumer integration that
    must be verified, not assumed to exist. This finding describes the earlier
    compatibility baseline; the follow-up consumer fix and held-lock experiment
    are recorded below.

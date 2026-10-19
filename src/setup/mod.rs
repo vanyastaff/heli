@@ -1,4 +1,4 @@
-//! `cargo heli setup` (DESIGN.md §4, "Reach"): offers the environment that
+//! `cargo heli setup` (docs/host-pool.md, "Reach"): offers the environment that
 //! makes a bare cargo draw from the host pool, and writes it where agents
 //! and shells pick it up, each file only once the user has agreed.
 //!

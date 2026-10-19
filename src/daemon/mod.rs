@@ -96,7 +96,7 @@ const BIND_WAIT: Duration = Duration::from_secs(5);
 /// there ([`Daemon::exit_if_retired`]), before it exits where it is.
 const WAKE_WAIT: Duration = Duration::from_secs(1);
 
-/// The longest a test run waits for its test slots (DESIGN.md §5, "Where a
+/// The longest a test run waits for its test slots (docs/runs.md, "Where a
 /// run can wait").
 const TEST_SLOT_WAIT: Duration = Duration::from_secs(5);
 
@@ -703,7 +703,8 @@ impl Daemon {
             }
         };
         // A worktree without a build directory may get a recycled one,
-        // which must be in place before cargo starts (DESIGN.md §6.4).
+        // which must be in place before cargo starts
+        // (docs/build-store.md#recycling).
         if let Some(recycled) = learning.and_then(accounts::Learning::prepared) {
             live.note(&recycled.describe());
         }
@@ -737,9 +738,9 @@ impl Daemon {
         if let Some(loans) = self.broker.close(id) {
             self.events.record("loans", loans_event(id, &loans));
         }
-        // Its build directory's source-state record (DESIGN.md §6.4), before
-        // its clients hear it ended: a worktree removed right after its last
-        // run leaves a record of it.
+        // Its build directory's source-state record
+        // (docs/build-store.md#recycling), before its clients hear it ended: a
+        // worktree removed right after its last run leaves a record of it.
         if let Some(learning) = learning {
             learning.ended();
         }
