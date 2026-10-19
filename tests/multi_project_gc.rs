@@ -296,7 +296,10 @@ exit $LASTEXITCODE
         .expect("start nested Cargo runtime workload");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     let asset = loop {
-        if let Ok(path) = std::fs::read_to_string(&ready) {
+        // The file is made before its content is in it: empty, not ready.
+        if let Ok(path) = std::fs::read_to_string(&ready)
+            && !path.is_empty()
+        {
             break std::path::PathBuf::from(path);
         }
         if child
