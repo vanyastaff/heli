@@ -65,8 +65,8 @@ pub fn find(
             if spared || !super::is_real_dir(&dir) {
                 continue;
             }
-            let held = measure(&dir);
-            if untouched(held, separation.since) {
+            if untouched(&dir, separation.since) {
+                let held = measure(&dir);
                 found.push((dir, held));
             }
         }
@@ -86,9 +86,38 @@ pub fn bytes(root: &Path, separation: &Separation, tool_caches: &[String]) -> u6
 /// Whether the directory `dir` is still superseded since `since`: nothing
 /// in it was written after.
 pub fn still(dir: &Path, since: u64) -> bool {
-    untouched(measure(dir), since)
+    untouched(dir, since)
 }
 
-fn untouched(held: Measure, since: u64) -> bool {
-    held.newest.is_none_or(|newest| newest <= since)
+/// Whether no file under `dir` was written after `since`. Only files count:
+/// a directory's own time changes when an entry is added or removed (even
+/// an empty `build/` of a workspace without build scripts, on macOS), and
+/// an empty directory holds nothing cargo could read.
+fn untouched(dir: &Path, since: u64) -> bool {
+    newest_file(dir).is_none_or(|newest| newest <= since)
+}
+
+/// When a file under `dir` was last written, never through a link; `None`
+/// without any file.
+fn newest_file(dir: &Path) -> Option<u64> {
+    let mut newest = None;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file()
+                && let Ok(modified) = entry.metadata().and_then(|meta| meta.modified())
+            {
+                newest = newest.max(Some(crate::clock::unix_seconds(modified)));
+            }
+        }
+    }
+    newest
 }
