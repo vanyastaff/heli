@@ -13,7 +13,7 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 use crate::changed::Selection;
-use crate::class::Class;
+use crate::class::{self, Class};
 use crate::config::CargoHome;
 use crate::output::Mode;
 use crate::priority::Priority;
@@ -451,7 +451,7 @@ pub fn parse(
     };
     let cli = Cli::try_parse_from(binary.into_iter().chain(args))?;
     if let Command::Cargo(args) = &cli.command
-        && args.first().is_some_and(|subcommand| subcommand == "heli")
+        && class::subcommand(args).is_some_and(|(subcommand, _)| subcommand == "heli")
     {
         return Err(Cli::command().error(
             ErrorKind::InvalidSubcommand,

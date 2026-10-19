@@ -196,12 +196,20 @@ const TOOLS: &[Tool] = &[
         cleaner: None,
     },
     Tool {
+        // `insta test` writes the snapshots with `--accept`,
+        // `--accept-unseen` or `--force-update-snapshots`, and reviews them
+        // at the terminal with `--review`, as `accept` and `review` do.
         names: &["insta"],
-        summary: "accept/reject mutate (exclusive lock); review runs directly in the pool, test as exec",
+        summary: "accept/reject and test --accept mutate (exclusive lock); review runs directly in the pool, test as exec",
         valued: &[],
         rules: &[
             (When::Word(&["accept", "reject"]), Run(Class::Mutate)),
+            (
+                When::Arg(&["--accept", "--accept-unseen", "--force-update-snapshots"]),
+                Run(Class::Mutate),
+            ),
             (When::Word(&["review"]), Direct),
+            (When::Arg(&["--review"]), Direct),
         ],
         otherwise: Run(Class::Exec),
         writes_home: false,
@@ -293,9 +301,14 @@ const TOOLS: &[Tool] = &[
     Tool {
         // It runs check or clippy over feature combinations.
         names: &["hack"],
-        summary: "check/clippy verify cached; other commands exec",
+        summary: "check/clippy verify cached, fix and --fix mutate (exclusive lock); other commands exec",
         valued: &[],
-        rules: &[(When::Arg(&["check", "clippy"]), Run(Class::Verify))],
+        rules: &[
+            // `cargo hack clippy --fix` and `cargo hack fix` rewrite the
+            // sources, over every feature combination.
+            (When::Arg(&["--fix", "fix"]), Run(Class::Mutate)),
+            (When::Arg(&["check", "clippy"]), Run(Class::Verify)),
+        ],
         otherwise: Run(Class::Exec),
         writes_home: false,
         background: false,
@@ -358,7 +371,7 @@ const TOOLS: &[Tool] = &[
         // API level are in the argv, and the NDK's location in the
         // environment; cross builds never share across them.
         names: &["ndk"],
-        summary: "build compile, check/clippy verify cached, keyed by target, API level and NDK version; else exec",
+        summary: "build compile, check/clippy verify cached, fix and --fix mutate, keyed by target, API level and NDK version; else exec",
         valued: &[
             "-t",
             "--target",
@@ -369,6 +382,8 @@ const TOOLS: &[Tool] = &[
             "--manifest-path",
         ],
         rules: &[
+            (When::Arg(&["--fix"]), Run(Class::Mutate)),
+            (When::Word(&["fix"]), Run(Class::Mutate)),
             (When::Word(&["build", "b", "rustc"]), Run(Class::Compile)),
             (When::Word(&["check", "c", "clippy"]), Run(Class::Verify)),
         ],
@@ -715,6 +730,37 @@ mod tests {
             Class::of_cargo(&args(&["hakari", "-q", "generate"])),
             Class::Mutate
         );
+    }
+
+    /// An option that rewrites the sources makes a tool's run mutate,
+    /// whatever its subcommand alone would be; after `--` it is the
+    /// tests' and does not count.
+    #[test]
+    fn options_that_write_the_sources_mutate() {
+        for words in [
+            &["insta", "test", "--accept"][..],
+            &["insta", "test", "-p", "a", "--force-update-snapshots"],
+            &["insta", "test", "--accept-unseen"],
+            &["hack", "clippy", "--each-feature", "--fix"],
+            &["hack", "--each-feature", "fix"],
+            &["ndk", "-t", "arm64-v8a", "clippy", "--fix"],
+            &["ndk", "-t", "arm64-v8a", "fix"],
+        ] {
+            assert_eq!(Class::of_cargo(&args(words)), Class::Mutate, "{words:?}");
+        }
+        assert_eq!(
+            Class::of_cargo(&args(&["insta", "test", "--check"])),
+            Class::Exec
+        );
+        assert_eq!(
+            Class::of_cargo(&args(&["insta", "test", "--", "--accept"])),
+            Class::Exec
+        );
+        assert_eq!(
+            Class::of_cargo(&args(&["hack", "clippy", "--", "--fix"])),
+            Class::Verify
+        );
+        assert!(runs_directly(&args(&["insta", "test", "--review"]), false));
     }
 
     #[test]

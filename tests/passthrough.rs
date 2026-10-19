@@ -219,21 +219,27 @@ fn the_concurrency_log_records_every_build_script() {
     );
 }
 
-/// `cargo heli heli …` would make heli run itself; it is refused up front.
+/// `cargo heli heli …` would make heli run itself; it is refused up front,
+/// also after a toolchain.
 #[test]
 fn heli_is_not_a_subcommand_of_itself() {
     let fixture = Fixture::new("basic");
     // The first `heli` is the one cargo passes; the second is the subcommand.
-    let output = fixture
-        .heli(["heli", "heli", "exec", "--", "x"])
-        .output()
-        .expect("run heli");
-    assert_eq!(output.status.code(), Some(2));
-    assert!(
-        text(&output.stderr).contains("would run heli again"),
-        "{}",
-        text(&output.stderr)
-    );
+    for words in [
+        &["heli", "heli", "exec", "--", "x"][..],
+        &["heli", "+nightly", "heli", "exec", "--", "x"],
+    ] {
+        let output = fixture
+            .heli(words.iter().copied())
+            .output()
+            .expect("run heli");
+        assert_eq!(output.status.code(), Some(2), "{words:?}");
+        assert!(
+            text(&output.stderr).contains("would run heli again"),
+            "{words:?}: {}",
+            text(&output.stderr)
+        );
+    }
 }
 
 /// Each command heli runs sees `HELI_DEPTH` one deeper, and heli refuses to

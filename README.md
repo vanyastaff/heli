@@ -145,6 +145,8 @@ cargo test --locked --no-fail-fast
 Tests that exercise real nextest runs fail immediately with installation
 guidance and Cargo's original diagnostic if that probe fails; they never
 silently skip. Argument-only tests using a stand-in Cargo need no nextest.
+Some tests also run `rustfmt`, `clippy` and `git`, and on Windows MSVC's
+`cl.exe`: have them installed (`rustfmt` and `clippy` are rustup components).
 CI runs the complete suite and `cargo doc --no-deps --locked` with
 `RUSTDOCFLAGS="-D warnings"` on Windows, Linux and macOS.
 It also checks all targets with the minimum supported Rust, pinned to 1.99.0,

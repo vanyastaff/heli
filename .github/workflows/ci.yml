@@ -8,12 +8,19 @@ on:
 permissions:
   contents: read
 
+# One run per branch at a time: a push to a pull request cancels the run of
+# its last push; on main, every push gets its run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   msrv:
     name: MSRV 1.99.0 (${{ matrix.os }})
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -27,6 +34,7 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -50,5 +58,8 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --locked
+      - name: package (what the crate ships builds on its own)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo package --locked
       - name: test
         run: cargo test --locked --no-fail-fast

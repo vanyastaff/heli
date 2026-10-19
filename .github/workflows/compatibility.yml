@@ -20,13 +20,10 @@ on:
       - .github/workflows/compatibility.yml
   pull_request:
     paths:
-      - src/class.rs
-      - src/profiles.rs
-      - src/client.rs
-      - src/daemon/**
-      - src/store/**
+      - src/**
       - tests/tool_compatibility.rs
       - tests/fixtures/tools/**
+      - tests/support/**
       - .github/workflows/compatibility.yml
 
 permissions:

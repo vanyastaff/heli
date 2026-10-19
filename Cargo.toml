@@ -74,3 +74,10 @@ rustix = { version = "1.1", features = ["pty"] }
 # Locate installed MSVC even when a shell omits ProgramFiles variables.
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Com", "Win32_UI_Shell"] }
+
+# The binaries of a release (`.github/workflows/release.yml`): link-time
+# optimization in one codegen unit, for speed and size. Symbols stay, so a
+# panic's backtrace in a bug report names its functions.
+[profile.release]
+codegen-units = 1
+lto = true

@@ -269,7 +269,7 @@ impl Surveyed {
 }
 
 /// The files of the directory `dir`, as [`Surveyed::measure`] counts them.
-fn measure_root(dir: &Dir) -> Measure {
+pub(super) fn measure_root(dir: &Dir) -> Measure {
     let mut total = Measure::default();
     if let Ok(entries) = std::fs::read_dir(&dir.path) {
         for entry in entries.filter_map(Result::ok) {

@@ -122,7 +122,7 @@ fn project(root: &Path) {
     write(
         &root.join("build.rs"),
         r#"
-use std::{env, fs, path::Path, thread, time::Duration};
+use std::{env, fs, path::Path, thread, time::{Duration, Instant}};
 fn main() {
     let ready = env::var("EPOCH_READY").unwrap();
     let release = env::var("EPOCH_RELEASE").unwrap();
@@ -130,7 +130,12 @@ fn main() {
     if let Ok(report) = env::var("EPOCH_ENV_REPORT") {
         fs::write(report, env::var("HELI_HOME_CANARY").unwrap()).unwrap();
     }
-    while !Path::new(&release).is_file() { thread::sleep(Duration::from_millis(20)); }
+    // Bounded, so a test that fails before the release does not hold cargo.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !Path::new(&release).is_file() {
+        assert!(Instant::now() < deadline, "the release never came");
+        thread::sleep(Duration::from_millis(20));
+    }
     let source = env::var("EPOCH_SOURCE").unwrap();
     assert!(fs::read_to_string(source).unwrap().contains("VALUE: u32 = 7"));
     if let Ok(done) = env::var("EPOCH_DONE") { fs::write(done, "read after collection").unwrap(); }
