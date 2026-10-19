@@ -31,6 +31,7 @@
 //!   [`run_id`], [`priority`]:
 //!   what both sides share.
 
+mod atomic;
 mod autostart;
 mod changed;
 mod class;

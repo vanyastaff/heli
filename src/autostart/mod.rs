@@ -208,7 +208,7 @@ impl Registration {
         let record = Record::new(&self.program, &self.locations);
         let json = serde_json::to_string(&record).expect("BUG: the record serializes");
         self.locations.create_state_dir()?;
-        std::fs::write(record_path(&self.locations), json)
+        crate::atomic::write(&record_path(&self.locations), json.as_bytes())
     }
 
     /// Removes the record, so that clients start the daemon themselves.
@@ -224,10 +224,7 @@ impl Step {
     /// Takes the step.
     pub fn take(&self) -> Result<(), String> {
         match self {
-            Self::Write { path, content } => path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(path, content.bytes()))
+            Self::Write { path, content } => crate::atomic::write(path, &content.bytes())
                 .map_err(|error| format!("cannot write {}: {error}", path.display())),
             Self::Link { path, target } => link(path, target)
                 .map_err(|error| format!("cannot link {}: {error}", path.display())),

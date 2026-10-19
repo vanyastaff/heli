@@ -373,17 +373,13 @@ impl Offer {
             println!("Left as it was.");
             return true;
         }
-        let written = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|()| std::fs::write(&path, content))
-            .and_then(|()| {
-                if executable {
-                    make_executable(&path)
-                } else {
-                    Ok(())
-                }
-            });
+        let written = crate::atomic::write(&path, content.as_bytes()).and_then(|()| {
+            if executable {
+                make_executable(&path)
+            } else {
+                Ok(())
+            }
+        });
         match written {
             Ok(()) => {
                 println!("Written.");
