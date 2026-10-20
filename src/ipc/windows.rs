@@ -58,6 +58,19 @@ impl Listener {
         })
     }
 
+    /// Creates the next instances of the pipe `path`, which a retiring
+    /// daemon of this user created first (docs/daemon.md, "Handover").
+    pub fn join(path: &Path) -> io::Result<Self> {
+        let name = wide(path.as_os_str());
+        let security = OwnerOnly::new()?;
+        let pending = create_instance(&name, &security, false)?;
+        Ok(Self {
+            name,
+            security,
+            pending,
+        })
+    }
+
     /// Waits for the next client.
     pub fn accept(&mut self) -> io::Result<Stream> {
         loop {

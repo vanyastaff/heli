@@ -74,10 +74,12 @@ fn status_shows_the_daemon_version() {
     assert!(!stdout.contains("older than"), "{stdout}");
 }
 
-/// `stop` lets the run in flight finish, then the daemon exits, and the
-/// next call starts a new one.
+/// `stop` hands over at once (docs/daemon.md, "Handover", #126): the
+/// daemon stops listening and lets its run in flight finish; `status`
+/// shows it retiring with that run; the next call starts a new daemon
+/// meanwhile; the old one exits once its run has ended.
 #[test]
-fn stop_lets_the_runs_end_then_the_daemon_exits() {
+fn stop_hands_over_and_lets_the_runs_end() {
     let fixture = Fixture::new("basic");
     let gate = fixture.path("gate");
     let (call, pid) = gated_run(&fixture, &gate);
@@ -86,20 +88,65 @@ fn stop_lets_the_runs_end_then_the_daemon_exits() {
     assert_success(&output, "cargo heli stop");
     let stderr = text(&output.stderr);
     assert!(
-        stderr.contains(&format!("(pid {pid})"))
+        stderr.contains(&format!("(pid {pid}) hands over to a new daemon"))
             && stderr.contains("exits once its 1 run(s) in flight end"),
         "{stderr}"
     );
-    assert_eq!(fixture.daemon_pid(), Some(pid), "still there with its run");
+    let status = fixture.wait_for_status("the daemon to hand over", |status| {
+        status["daemon"].is_null() && status["retiring"][0]["pid"] == pid
+    });
+    assert_eq!(
+        status["retiring"][0]["runs"].as_array().map(Vec::len),
+        Some(1),
+        "{status}"
+    );
+
+    let replacement = daemon(&fixture);
+    assert_ne!(replacement, pid);
+    let status = fixture.status();
+    assert_eq!(status["retiring"][0]["pid"], pid, "{status}");
 
     std::fs::write(&gate, "").expect("open the gate");
     let output = finish(call);
     assert_success(&output, "the run in flight");
     assert_eq!(text(&output.stdout), "arg: \"in flight\"\n");
-    fixture.wait_for_status("the daemon to exit", |status| status["daemon"].is_null());
+    fixture.wait_for_status("the retiring daemon to exit", |status| {
+        status["retiring"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(fixture.daemon_pid(), Some(replacement));
+}
 
-    let replacement = daemon(&fixture);
-    assert_ne!(replacement, pid);
+/// `restart` with a run in flight starts the new daemon at once; `cancel`
+/// of the old daemon's run, asked of the new one, reaches it (#126).
+#[test]
+fn restart_under_load_and_cancel_through_the_new_daemon() {
+    let fixture = Fixture::new("basic");
+    let gate = fixture.path("gate");
+    let (call, pid) = gated_run(&fixture, &gate);
+    let run = runs(&fixture.status())[0]["id"]
+        .as_str()
+        .expect("an id")
+        .to_owned();
+
+    let output = fixture
+        .heli(["restart"])
+        .output()
+        .expect("run heli restart");
+    assert_success(&output, "cargo heli restart");
+    let replacement = fixture.daemon_pid().expect("a new daemon");
+    assert_ne!(replacement, pid, "{}", text(&output.stderr));
+
+    let output = fixture
+        .heli(["cancel", &run])
+        .output()
+        .expect("run heli cancel");
+    assert_success(&output, "cargo heli cancel");
+    let output = finish(call);
+    assert!(!output.status.success(), "the run was cancelled");
+    fixture.wait_for_status("the retiring daemon to exit", |status| {
+        status["retiring"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(fixture.daemon_pid(), Some(replacement));
 }
 
 /// `stop --now --yes` cancels the runs in flight, and the daemon exits.

@@ -120,6 +120,23 @@ pub struct Status {
     /// older daemon, and while the budget can be met.
     #[serde(default)]
     pub unmet_budget: Option<UnmetBudget>,
+    /// Daemons that handed their endpoint over to this one and still serve
+    /// their runs in flight (docs/daemon.md, "Handover", #126); absent from
+    /// an older daemon.
+    #[serde(default)]
+    pub retiring: Vec<Retiring>,
+}
+
+/// A daemon that handed over and serves its runs to their end
+/// (`crate::daemon::retiring`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Retiring {
+    pub pid: u32,
+    pub version: String,
+    /// Since when it retires, in seconds since 1970.
+    pub since: u64,
+    /// Its runs in flight, as it last wrote them.
+    pub runs: Vec<Run>,
 }
 
 /// A budget the daemon's eviction passes cannot meet
@@ -408,6 +425,7 @@ impl Status {
             disk: None,
             last_gc: None,
             unmet_budget: None,
+            retiring: Vec::new(),
         }
     }
 
@@ -476,36 +494,20 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
-            let mut state = match &run.exit {
-                Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
-                None if run.waiting_for.is_empty() => {
-                    format!("{}, {} attached", run.phase.name(), run.attached_clients)
-                }
-                None => format!(
-                    "waiting for {}, {} attached",
-                    run.waiting_for.join(", "),
-                    run.attached_clients
-                ),
-            };
-            let priority = if run.priority.is_normal() {
-                String::new()
-            } else {
-                format!("{}  ", run.priority)
-            };
-            if let Some(of) = &run.rerun_of {
-                state.push_str(&format!(", rerun of {of}"));
-            }
+            text.push_str(&run_line(label, run, &age));
+        }
+        for retiring in &self.retiring {
             text.push_str(&format!(
-                "{label:<6}  {}  {}  {}  {}  {state}  {priority}{} slot{}, share {}  {}s\n",
-                run.id,
-                run.worktree,
-                run.argv.join(" "),
-                class_of(run),
-                run.slots,
-                if run.slots == 1 { "" } else { "s" },
-                slots(run.share),
-                age(run.started_at)
+                "retiring daemon {} ({}), handed over {}s ago: {} run{} in flight\n",
+                retiring.pid,
+                retiring.version,
+                age(retiring.since),
+                retiring.runs.len(),
+                if retiring.runs.len() == 1 { "" } else { "s" }
             ));
+            for run in &retiring.runs {
+                text.push_str(&run_line("", run, &age));
+            }
         }
         if let Some(disk) = &self.disk {
             let mut label = "disk";
@@ -604,6 +606,41 @@ fn used(used: u64, by_category: &Sizes) -> String {
     } else {
         format!("{} ({})", sizes::human(used), parts.join(", "))
     }
+}
+
+/// One run's line of the text form, under `label`; `age` turns a time into
+/// seconds ago.
+fn run_line(label: &str, run: &Run, age: &dyn Fn(u64) -> u64) -> String {
+    let mut state = match &run.exit {
+        Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
+        None if run.waiting_for.is_empty() => {
+            format!("{}, {} attached", run.phase.name(), run.attached_clients)
+        }
+        None => format!(
+            "waiting for {}, {} attached",
+            run.waiting_for.join(", "),
+            run.attached_clients
+        ),
+    };
+    let priority = if run.priority.is_normal() {
+        String::new()
+    } else {
+        format!("{}  ", run.priority)
+    };
+    if let Some(of) = &run.rerun_of {
+        state.push_str(&format!(", rerun of {of}"));
+    }
+    format!(
+        "{label:<6}  {}  {}  {}  {}  {state}  {priority}{} slot{}, share {}  {}s\n",
+        run.id,
+        run.worktree,
+        run.argv.join(" "),
+        class_of(run),
+        run.slots,
+        if run.slots == 1 { "" } else { "s" },
+        slots(run.share),
+        age(run.started_at)
+    )
 }
 
 /// A run's class as the text form shows it, with the profile that gave it

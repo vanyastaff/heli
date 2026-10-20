@@ -54,6 +54,12 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `build_scripts`, `fingerprints`, `tool_caches`, `other`, in bytes); and
   `targets`, one entry per registered `target/` directory, with `path`,
   `used` and `by_category`. `null` when no daemon answers;
+- `retiring`: the daemons that handed over to this one and still serve
+  their runs ([handover](daemon.md#handover)), each with `pid`, `version`,
+  `since` and `runs` (as in `runs`, as the retiring daemon last wrote
+  them); with no daemon answering, the client reads them itself. The
+  text form has a line for each, `retiring daemon 4242 (0.0.5), handed
+  over 120s ago: 2 runs in flight`, then its runs;
 - `last_gc`: the daemon's last eviction pass that evicted anything ([eviction](build-store.md#eviction)):
   `at`, and `evicted`, one entry per victim with its `path`, `tier` and
   `bytes`; `null` before the first, and when no daemon answers;

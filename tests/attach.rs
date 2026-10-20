@@ -137,11 +137,12 @@ fn the_same_command_attaches_to_the_run_in_flight() {
     assert_eq!(started.lines().count(), 1, "the command started once");
 }
 
-/// A daemon asked to retire starts no new run, but still attaches a client
-/// to the same command in flight rather than leave it to run the command a
-/// second time; it exits once both have heard the end.
+/// A daemon asked to retire with a run in flight hands over at once
+/// (docs/daemon.md, "Handover", #126): a new daemon serves the next client,
+/// even of the same command, and its `status` lists the old daemon's run
+/// apart; the old daemon serves its run to the end, and then exits.
 #[test]
-fn a_retiring_daemon_still_attaches_to_its_runs() {
+fn a_retiring_daemon_hands_over_and_serves_its_runs() {
     use std::io::{Read, Write};
 
     let fixture = Fixture::new("basic");
@@ -153,7 +154,9 @@ fn a_retiring_daemon_still_attaches_to_its_runs() {
         start(&mut call)
     };
     let first = call();
-    fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let before = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let old_pid = before["daemon"]["pid"].clone();
+    let old_run = runs(&before)[0]["id"].clone();
     // The handshake every version speaks, from a client of a newer protocol.
     let mut newer = support::endpoint::connect(&fixture.endpoint());
     newer.write_all(b"HELI").expect("send the magic");
@@ -165,15 +168,32 @@ fn a_retiring_daemon_still_attaches_to_its_runs() {
     let _ = newer.read_to_end(&mut Vec::new());
 
     let second = call();
-    fixture.wait_for_status("the second client", |status| {
-        runs(status)[0]["attached_clients"] == 2
+    let both = fixture.wait_for_status("a new daemon with the second run", |status| {
+        status["daemon"]["pid"] != old_pid
+            && runs(status).len() == 1
+            && status["retiring"][0]["runs"]
+                .as_array()
+                .is_some_and(|runs| runs.len() == 1)
     });
+    assert_eq!(both["retiring"][0]["pid"], old_pid, "{both}");
+    assert_eq!(both["retiring"][0]["runs"][0]["id"], old_run, "{both}");
+    assert_ne!(runs(&both)[0]["id"], old_run, "{both}");
+    let shown = fixture.heli(["status"]).output().expect("run status");
+    let shown = text(&shown.stdout);
+    assert!(
+        shown.contains(&format!("retiring daemon {old_pid} ("))
+            && shown.contains(": 1 run in flight"),
+        "{shown}"
+    );
+
     std::fs::write(&gate, "").expect("open the gate");
     for output in [finish(first), finish(second)] {
         assert_success(&output, "cargo heli exec");
         assert_eq!(text(&output.stdout), "arg: \"in flight\"\n");
     }
-    fixture.wait_for_status("the daemon to exit", |status| status["daemon"].is_null());
+    fixture.wait_for_status("the retiring daemon to exit", |status| {
+        status["retiring"].as_array().is_some_and(Vec::is_empty)
+    });
 }
 
 /// On Windows, where variable names ignore case, a variable spelled in

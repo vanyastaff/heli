@@ -75,6 +75,9 @@ pub struct Accounts {
     said: Mutex<Option<eviction::Said>>,
     log: Log,
     events: Arc<Events>,
+    /// Set once the daemon has handed over (`crate::daemon::retiring`): the
+    /// accountant stops, and the new daemon's keeps the store.
+    handed_over: Arc<std::sync::atomic::AtomicBool>,
     /// The directories a run was learnt from, its build directory recycled
     /// if it could be: later runs from there never wait.
     prepared: Mutex<BTreeSet<PathBuf>>,
@@ -115,6 +118,7 @@ impl Accounts {
         config_file: PathBuf,
         log: Log,
         events: Arc<Events>,
+        handed_over: Arc<std::sync::atomic::AtomicBool>,
     ) -> Arc<Self> {
         // Only creating the final directory ourselves proves exclusive cache
         // ownership. Existing/default stores keep their previous policy.
@@ -141,6 +145,7 @@ impl Accounts {
             said: Mutex::new(None),
             log,
             events,
+            handed_over,
             prepared: Mutex::new(BTreeSet::new()),
             recording: Mutex::new(Vec::new()),
         });
@@ -228,6 +233,9 @@ impl Accounts {
         let mut looked = BTreeSet::new();
         let mut held = BTreeSet::new();
         loop {
+            if self.handed_over.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             // Each run that ended is in `ended` once: after it ended, the
             // survey below sees every directory it built.
             let ended = {

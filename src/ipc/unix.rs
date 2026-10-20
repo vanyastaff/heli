@@ -42,6 +42,12 @@ impl Listener {
         Ok(Self { inner })
     }
 
+    /// Listens at `path` after a retiring daemon handed over (docs/daemon.md,
+    /// "Handover"): it no longer listens there, so this is [`Self::bind`].
+    pub fn join(path: &Path) -> io::Result<Self> {
+        Self::bind(path)
+    }
+
     /// Waits for the next client.
     pub fn accept(&mut self) -> io::Result<Stream> {
         let (stream, _) = self.inner.accept()?;
