@@ -42,16 +42,32 @@ fn survey(fixture: &Fixture) -> Value {
     serde_json::from_slice(&output.stdout).expect("survey JSON")
 }
 
+/// `gc`, then a survey of what is left, again until the store is within
+/// the budget: 30 s at most. A run ends on the daemon a moment after its
+/// client exits (it waits for the source-state record, ten seconds at
+/// most), and until then its lease keeps what its nested Cargo built.
+fn reclaimed(fixture: &Fixture) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let eviction = gc(fixture);
+        let listing = survey(fixture);
+        if listing["used"].as_u64().expect("accounted bytes") <= 16 << 20 {
+            return listing;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "completed nested Cargo left unreclaimable artifacts above budget: {listing}\n\
+             last eviction: {eviction}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn nested_cargo_artifacts_can_be_reclaimed_under_the_shared_budget() {
     let (fixture, store) = configured();
     nested_build(&fixture, &store);
-    gc(&fixture);
-    let listing = survey(&fixture);
-    assert!(
-        listing["used"].as_u64().expect("accounted bytes") <= 16 << 20,
-        "completed nested Cargo left unreclaimable artifacts above budget: {listing}"
-    );
+    reclaimed(&fixture);
 }
 
 #[test]
@@ -160,12 +176,7 @@ fn gc_preserves_a_busy_nested_cargo_then_reclaims_it_after_completion() {
     assert!(busy.exists(), "GC removed a busy child build directory");
     std::fs::write(gate, "open").expect("release child");
     assert!(child.wait().expect("wait for build").success());
-    gc(&fixture);
-    let listing = survey(&fixture);
-    assert!(
-        listing["used"].as_u64().expect("bytes") <= 16 << 20,
-        "{listing}"
-    );
+    reclaimed(&fixture);
     assert!(!busy.exists(), "completed nested cache was not reclaimed");
 }
 
