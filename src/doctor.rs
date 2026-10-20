@@ -104,6 +104,9 @@ pub struct Inputs {
     pub repository_profiles: Vec<Rule>,
     /// The running daemon's cargo-heli version, when one answers.
     pub daemon_version: Option<String>,
+    /// The budget the running daemon's eviction passes cannot meet, when
+    /// its status says so (`crate::status::UnmetBudget`, #122).
+    pub unmet_budget: Option<crate::status::UnmetBudget>,
     /// The versions of cargo-heli that the Cargo home's `.crates.toml`
     /// lists with no program: installs that could not replace the running
     /// one ([`failed_installs`]).
@@ -248,7 +251,11 @@ pub fn gather(cwd: &Path) -> Inputs {
             }
         }
     }
-    inputs.daemon_version = crate::client::daemon_version();
+    let status = crate::client::daemon_status();
+    inputs.daemon_version = status
+        .as_ref()
+        .and_then(|status| status.daemon.as_ref()?.version.clone());
+    inputs.unmet_budget = status.and_then(|status| status.unmet_budget);
     if let Some(home) = inputs.cargo_home.clone()
         && let Ok(text) = std::fs::read_to_string(home.join(".crates.toml"))
     {
@@ -535,6 +542,18 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Run `cargo heli gc` (or `cargo heli gc --superseded`), and check `cargo heli gc --dry-run` for what is left alone and why.",
         );
     }
+    if let Some(unmet) = &inputs.unmet_budget {
+        add(
+            "store-budget",
+            "warn",
+            format!(
+                "The build store's {}: eviction cannot bring the store under the budget while they build, so it keeps the live workspaces' idle directories whole (evicted after dir_hours, each would be rebuilt as soon as its workspace is used again) and takes only their old units, incremental/ and tool caches, with the orphans, scratch copies and superseded intermediates. The store takes {:.1} GiB.",
+                unmet.describe(),
+                unmet.used as f64 / f64::from(1u32 << 30)
+            ),
+            "Raise [store] budget_mb above what the workspaces that build at once take, and set [store] floor_mb so that the volume stays protected while the store is over its budget.",
+        );
+    }
     if let Some(threads) =
         env("RUST_TEST_THREADS").or_else(|| env_table_test_threads(&inputs.configs))
     {
@@ -781,6 +800,36 @@ mod tests {
             report.findings[1]
         );
         assert_eq!(ids(&diagnose(&with(60 << 30))), ["store-unused"]);
+    }
+
+    /// A budget the daemon's passes cannot meet is reported, with what
+    /// holds it (#122).
+    #[test]
+    fn a_budget_the_daemon_cannot_meet_is_reported() {
+        let inputs = Inputs {
+            unmet_budget: Some(crate::status::UnmetBudget {
+                budget: 100 << 30,
+                used: 386 << 30,
+                busy_dirs: 18,
+                busy_bytes: 200 << 30,
+                since: 0,
+            }),
+            ..Inputs::default()
+        };
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["store-budget"]);
+        assert!(
+            report.findings[0]
+                .message
+                .contains("budget 100.0 GiB cannot be met: 18 busy directories hold 200.0 GiB"),
+            "{:?}",
+            report.findings[0]
+        );
+        assert!(
+            report.findings[0].message.contains("386.0 GiB"),
+            "{:?}",
+            report.findings[0]
+        );
     }
 
     #[test]

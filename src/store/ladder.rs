@@ -463,6 +463,13 @@ pub(super) fn tool_caches_in(root: &Path, patterns: &[String]) -> Vec<(PathBuf, 
 #[derive(Debug, Clone, Default)]
 pub struct Goals {
     pub budget: u64,
+    /// The budget cannot be met: the busy directories alone hold more than
+    /// the target, so evicting a live directory whole would only have it
+    /// rebuilt, over budget all the same. Then a live directory's whole
+    /// rung ([`Tier::BuildDir`]) does not serve the budget; its other
+    /// rungs and the other directories' do, and the floors are served as
+    /// ever (#122).
+    pub budget_unmet: bool,
     pub floors: Vec<(PathBuf, u64)>,
 }
 
@@ -474,7 +481,8 @@ impl Goals {
 
 /// The victims to evict, from `candidates` in their order, until `goals`
 /// are met: each frees what it holds beyond the victims inside it taken
-/// before, and is taken only if it serves a goal not yet met.
+/// before, and is taken only if it serves a goal not yet met (for an
+/// unmet budget, a live directory whole does not).
 pub fn plan(candidates: Vec<Victim>, dirs: &[Surveyed], mut goals: Goals) -> Vec<Victim> {
     let mut planned: Vec<Victim> = Vec::new();
     for mut victim in candidates {
@@ -502,7 +510,11 @@ pub fn plan(candidates: Vec<Victim>, dirs: &[Surveyed], mut goals: Goals) -> Vec
             .iter_mut()
             .find(|(root, need)| *need > 0 && Some(root.as_path()) == volume);
         let serves_floor = floor.is_some();
-        if goals.budget == 0 && !serves_floor {
+        let kept_whole = goals.budget_unmet
+            && victim.tier == Tier::BuildDir
+            && dirs[victim.dir].state == State::Live;
+        let serves_budget = goals.budget > 0 && !kept_whole;
+        if !serves_budget && !serves_floor {
             continue;
         }
         if let Some((_, need)) = floor {

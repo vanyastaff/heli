@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use super::Log;
 use super::events::Events;
 use crate::config::StoreConfig;
-use crate::status::{Disk, LastGc, StoreUse, TargetUse};
+use crate::status::{Disk, LastGc, StoreUse, TargetUse, UnmetBudget};
 use crate::store::ladder::Policy;
 use crate::store::registry::Registry;
 use crate::store::sizes::Sizes;
@@ -67,6 +67,12 @@ pub struct Accounts {
     trash_wake: Condvar,
     /// The last eviction pass that evicted anything.
     last_gc: Mutex<Option<LastGc>>,
+    /// The budget the passes cannot meet, while they cannot
+    /// (`eviction`).
+    unmet_budget: Mutex<Option<UnmetBudget>>,
+    /// What the last pass wrote to the log, to write the same once
+    /// (`eviction`).
+    said: Mutex<Option<eviction::Said>>,
     log: Log,
     events: Arc<Events>,
     /// The directories a run was learnt from, its build directory recycled
@@ -131,6 +137,8 @@ impl Accounts {
             trash: Mutex::new(false),
             trash_wake: Condvar::new(),
             last_gc: Mutex::new(None),
+            unmet_budget: Mutex::new(None),
+            said: Mutex::new(None),
             log,
             events,
             prepared: Mutex::new(BTreeSet::new()),
@@ -149,6 +157,15 @@ impl Accounts {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// The budget the eviction passes cannot meet, while they cannot
+    /// (`eviction`, #122).
+    pub fn unmet_budget(&self) -> Option<UnmetBudget> {
+        *self
+            .unmet_budget
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Retry after releasing a managed runtime guard. Keep the request in
@@ -253,6 +270,8 @@ impl Accounts {
                 orphan::keep(&dirs, now);
                 if self.over_limits() {
                     self.evict(&registry, now);
+                } else {
+                    self.budget_met();
                 }
             }
             // A run that ended during this pass, or an eviction, needs

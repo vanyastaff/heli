@@ -889,6 +889,7 @@ impl Daemon {
             runs: self.runs(),
             disk: Some(self.accounts.disk()),
             last_gc: self.accounts.last_gc(),
+            unmet_budget: self.accounts.unmet_budget(),
         }
     }
 

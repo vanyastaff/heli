@@ -243,6 +243,25 @@ taken before counts only what is left in it, and nothing inside a victim
 taken before is one. The clock is the test seam's in debug builds that set
 one ([runs](runs.md)).
 
+**A budget that cannot be met.** The ladder cannot touch a busy
+directory, so when the busy directories alone hold more than the target
+(85 % of B), no pass can bring the store under the budget: evicting the
+live workspaces' idle directories whole only has each rebuilt as soon as
+its workspace is used again, on a host that is already saturated, and the
+store is over budget all the same (a rebuild storm: 188 directories, 663
+GiB, in four hours on one host, #122). So while that lasts, rung 5 of a
+live directory does not serve the budget: the live directories are kept
+whole, and everything else on the ladder goes as ever, their old units
+(1), `incremental/` (3) and tool caches (4) among it, with the scratch
+copies (0), orphans (2), build directories of no known workspace (5) and
+superseded intermediates (6). The floor is served from every rung as
+ever: a volume under it really is full. `gc --dry-run` says so on its
+budget line (`budget_unmet` in its JSON), `status` on a `budget` line
+with how long it has lasted (`unmet_budget`), and `doctor` as
+`store-budget`. The fix is the configuration's: a budget above what the
+workspaces that build at once take, and a floor to protect the volume
+meanwhile.
+
 Which directories have which tiers:
 
 - A busy directory has none.
@@ -371,7 +390,13 @@ orphans' notes ([recycling](#recycling)) and makes a pass when its figures are o
 volume they are on is under F. One pass evicts at a time (`evict.lock` in
 the state directory): `gc` waits for the daemon's, and the daemon skips its
 own while `gc` runs. `status` shows the daemon's last pass that evicted
-anything ([observability](observability.md)).
+anything ([observability](observability.md)). The daemon's log gets what a
+pass found: the directories left alone for runs in flight, each victim
+skipped and why, the budget it cannot meet, and what it evicted. A pass
+that evicts nothing and finds the same as the pass before writes nothing
+(on a host where runs are always in flight, one every look wrote the same
+ten lines, 16.7k a day, #122); once an hour, one line says how many passes
+found the same and what that is now.
 
 ## Recycling
 
