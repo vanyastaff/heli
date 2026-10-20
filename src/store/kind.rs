@@ -9,6 +9,7 @@
 //! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 6 superseded intermediates, 4 tool caches      |
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
 //! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
+//! | crate   | anywhere inside                 | `<store>/.trash`        | none        | 8 entry no build directory links               |
 //!
 //! Every kind but shared also has the ladder's incremental rungs, 1 and 3.
 //! A shared `target/` directory, seen for more than one workspace (a global
@@ -44,6 +45,9 @@ pub enum Kind {
     /// (`super::registry::Target::shared`).
     #[serde(rename = "shared")]
     SharedTarget,
+    /// An entry of the shared crates in a store (`crate::crates`): it
+    /// counts only what no build directory links.
+    Crate,
 }
 
 /// Where a cargo's lock makes a directory busy.
@@ -64,6 +68,7 @@ impl Kind {
             Self::Target => "target",
             Self::Scratch => "scratch",
             Self::SharedTarget => "shared",
+            Self::Crate => "crate",
         }
     }
 
@@ -76,7 +81,7 @@ impl Kind {
     /// Where a cargo's lock makes a directory of this kind busy.
     pub fn lock_scope(self) -> LockScope {
         match self {
-            Self::Build | Self::Scratch => LockScope::Anywhere,
+            Self::Build | Self::Scratch | Self::Crate => LockScope::Anywhere,
             Self::Target | Self::SharedTarget => LockScope::Profiles,
         }
     }
@@ -86,7 +91,7 @@ impl Dir {
     /// Where an eviction renames its victims, on its volume.
     pub fn trash(&self) -> Option<PathBuf> {
         match self.kind {
-            Kind::Build => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
+            Kind::Build | Kind::Crate => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
             Kind::Target | Kind::SharedTarget => Some(self.path.join(TARGET_TRASH)),
             Kind::Scratch => Some(super::scratch::trash()),
         }
@@ -97,7 +102,7 @@ impl Dir {
     pub fn own_trash(&self) -> Option<&'static str> {
         match self.kind {
             Kind::Target | Kind::SharedTarget => Some(TARGET_TRASH),
-            Kind::Build | Kind::Scratch => None,
+            Kind::Build | Kind::Scratch | Kind::Crate => None,
         }
     }
 
@@ -105,7 +110,7 @@ impl Dir {
     pub fn tool_caches(&self, config: &StoreConfig) -> Vec<String> {
         match self.kind {
             Kind::Target => config.tool_cache_patterns(),
-            Kind::Build | Kind::Scratch | Kind::SharedTarget => Vec::new(),
+            Kind::Build | Kind::Scratch | Kind::SharedTarget | Kind::Crate => Vec::new(),
         }
     }
 }
@@ -232,6 +237,20 @@ pub fn rungs(
             rungs
         }
         (Kind::SharedTarget, _) => Vec::new(),
+        (Kind::Crate, State::Unknown) => {
+            if idle < policy.crate_age {
+                return Vec::new();
+            }
+            whole(
+                Tier::Crate,
+                idle,
+                format!(
+                    "shared crate no build directory links, unused for {}",
+                    hours(idle)
+                ),
+            )
+        }
+        (Kind::Crate, _) => Vec::new(),
     }
 }
 
@@ -315,5 +334,16 @@ pub fn kept(surveyed: &Surveyed, policy: &Policy, now: u64, idle: u64) -> Option
             "shared",
             "shared by workspaces: not heli's to manage".to_owned(),
         ),
+        (Kind::Crate, State::Live) => kept(
+            "shared crates linked into build directories",
+            "linked into build directories: it goes with them".to_owned(),
+        ),
+        (Kind::Crate, _) => (idle < policy.crate_age).then(|| Kept {
+            group: "shared crates within crate_hours",
+            why: format!(
+                "shared crate unused for {}",
+                of(idle, policy.crate_age, "crate_hours")
+            ),
+        }),
     }
 }

@@ -20,6 +20,8 @@
 //!    cargo built in them, and no heli run) untouched for 1 h
 //!    (`unknown_hours`), oldest first: what tests that run cargo in
 //!    temporary workspaces leave behind;
+//! 8. entries of the shared crates (`crate::crates`) no build directory
+//!    links, unused for 24 h (`crate_hours`), longest unused first;
 //! 1. `incremental/<unit>` directories untouched for 24 h (`unit_hours`),
 //!    oldest first across every directory;
 //! 2. orphans no worktree claimed for 24 h (`orphan_hours`), longest
@@ -94,6 +96,8 @@ pub struct Policy {
     /// Tier 7: how long a build directory of no known workspace is
     /// untouched.
     pub unknown_age: u64,
+    /// Tier 8: how long a shared crate no build directory links is unused.
+    pub crate_age: u64,
 }
 
 impl Policy {
@@ -109,6 +113,7 @@ impl Policy {
             dir_age: hours(config.dir_hours, 168),
             scratch_age: hours(config.scratch_hours, 1),
             unknown_age: hours(config.unknown_hours, 1),
+            crate_age: hours(config.crate_hours, 24),
         }
     }
 
@@ -121,6 +126,7 @@ impl Policy {
             dir_age: 0,
             scratch_age: 0,
             unknown_age: 0,
+            crate_age: 0,
             ..self
         }
     }
@@ -169,6 +175,7 @@ pub enum Tier {
     Superseded,
     Scratch,
     Unknown,
+    Crate,
     Unit,
     Orphan,
     Incremental,
@@ -181,6 +188,7 @@ impl Tier {
         match self {
             Self::Scratch => 0,
             Self::Unknown => 7,
+            Self::Crate => 8,
             Self::Unit => 1,
             Self::Orphan => 2,
             Self::Incremental => 3,
@@ -301,8 +309,14 @@ impl Surveyed {
     }
 }
 
-/// The files of the directory `dir`, as [`Surveyed::measure`] counts them.
+/// The files of the directory `dir`, as [`Surveyed::measure`] counts them:
+/// for an entry of the shared crates, what no build directory links, and
+/// its last use.
 pub(super) fn measure_root(dir: &Dir) -> Measure {
+    if dir.kind == super::Kind::Crate {
+        let (bytes, newest) = crate::crates::unshared(&dir.path);
+        return Measure { bytes, newest };
+    }
     let mut total = Measure::default();
     if let Ok(entries) = std::fs::read_dir(&dir.path) {
         for entry in entries.filter_map(Result::ok) {
@@ -387,7 +401,7 @@ pub fn urgent(
     victims.retain(|victim| victim.tier != Tier::Superseded);
     // What no live workspace will miss first, live directories whole last.
     let rank = |victim: &Victim| match (victim.tier, dirs[victim.dir].state) {
-        (Tier::Scratch | Tier::Unknown | Tier::Orphan, _) => 0,
+        (Tier::Scratch | Tier::Unknown | Tier::Crate | Tier::Orphan, _) => 0,
         (Tier::Unit | Tier::Incremental | Tier::ToolCache, _) => 1,
         (Tier::BuildDir | Tier::Superseded, _) => 2,
     };

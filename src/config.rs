@@ -48,6 +48,9 @@
 //! dir_hours = 168
 //! scratch_hours = 1    # tier 0: scratch copies cargo-mutants left behind
 //! unknown_hours = 1    # tier 7: build directories of no known workspace
+//! shared_crates = true # each registry crate compiled once per store
+//!                      # (docs/build-store.md#shared-crates); default false
+//! crate_hours = 24     # tier 8: shared crates no build directory links
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -95,6 +98,10 @@ pub struct ClientConfig {
     pub cargo: CargoConfig,
     pub output: OutputConfig,
     pub profiles: crate::profiles::Profiles,
+    /// `[store]`, for what the client sets up (`crate::crates`); the
+    /// default when it does not parse, since the store is the daemon's to
+    /// report on.
+    pub store: StoreConfig,
 }
 
 impl ClientConfig {
@@ -125,6 +132,11 @@ impl ClientConfig {
             cargo,
             output,
             profiles,
+            store: value
+                .get("store")
+                .cloned()
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -175,6 +187,12 @@ pub struct StoreConfig {
     /// cargo built in them, and no heli run), untouched this many hours;
     /// default 1.
     pub unknown_hours: Option<u64>,
+    /// Compile each registry dependency once per volume, and keep it once,
+    /// linked into every build directory (`crate::crates`); default off.
+    pub shared_crates: bool,
+    /// Tier 8: shared crates no build directory links, unused this many
+    /// hours; default 24.
+    pub crate_hours: Option<u64>,
 }
 
 /// Tool caches heli knows without configuration: cargo-llvm-cov's own

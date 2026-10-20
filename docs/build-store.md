@@ -198,10 +198,10 @@ without them, nothing is evicted. Over budget, heli evicts down to 85 % of
 B. Under the floor, it evicts on that volume until F is free there,
 counting what its trash still holds as free. It evicts what is cheapest to
 regenerate first, oldest first within each tier (the ages are `[store]
-scratch_hours`, `unknown_hours`, `unit_hours`, `orphan_hours`, `idle_hours`
-and `dir_hours`).
-A tier's number names it and does not rank it: tiers 6 and 7, the newest,
-come where they belong (6 first, 7 after 0), so that the numbers `gc`,
+scratch_hours`, `unknown_hours`, `crate_hours`, `unit_hours`, `orphan_hours`,
+`idle_hours` and `dir_hours`).
+A tier's number names it and does not rank it: tiers 6, 7 and 8, the newest,
+come where they belong (6 first, 7 after 0, 8 after 7), so that the numbers `gc`,
 `status` and the event log already showed keep their meaning.
 
 6. Superseded intermediates in registered `target/` directories ([accounting](#accounting)),
@@ -223,6 +223,11 @@ come where they belong (6 first, 7 after 0), so that the numbers `gc`,
    a user-wide `build-dir`, and on a host of agents they pile up by the
    hundred in a day (#134). Reason: `build directory of no known
    workspace, untouched for N h`.
+8. Shared crates ([shared crates](#shared-crates)) that no build directory
+   links, unused for 24 h (`crate_hours`), whole. A build directory that
+   links an entry keeps it, however old; the entry goes once the build
+   directories that linked it are gone. Reason: `shared crate no build
+   directory links, unused for N h`.
 1. `incremental/<unit>` directories untouched for 24 h, oldest first across
    the store. Each unit ever built leaves one; in the example they make up
    114 GB of one worktree.
@@ -237,7 +242,7 @@ come where they belong (6 first, 7 after 0), so that the numbers `gc`,
 
 A registered `target/` directory seen for two workspaces (a global `CARGO_TARGET_DIR` or `build.target-dir`) is `shared` from then on. It is not heli's to manage: it has no rungs, not even 1 and 3, and does not count toward B. `gc` and `status` list it as shared (#65).
 
-What depends on a directory's kind (build, target, scratch or shared) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches, its own rungs (6, 0, 7, 2, 4 and 5) and the rule that keeps it whole; rungs 1 and 3 apply to every kind.
+What depends on a directory's kind (build, target, scratch, shared or crate) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches, its own rungs (6, 0, 7, 8, 2, 4 and 5) and the rule that keeps it whole; rungs 1 and 3 apply to every kind.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
 days, cargo-sweep's approach (out of scope for now).
@@ -310,6 +315,8 @@ Which directories have which tiers:
   where a store came from and no longer decides what is reclaimed: until
   0.0.5 an unknown directory went whole only in such a root, so stores
   that existed before heli kept every nested build forever (#134).
+- A shared crate entry has tier 8 only, and only while no build directory
+  links it; it is checked again before eviction.
 - A registered `target/` directory has tiers 1 and 3 where cargo keeps its
   intermediates there (no `build-dir`), tier 6 where it kept them before
   `build-dir` moved them, and tier 4. It is in the user's worktree, so it
@@ -681,6 +688,64 @@ worktree git cannot stage gets no recycled directory.
 btrfs, XFS, APFS), recycling can clone instead of renaming, preserving mtimes.
 A *live* worktree can then donate, forking a warm build directory. The same
 rules apply.
+
+## Shared crates
+
+Every worktree of a host builds the same registry crates: tokio, serde,
+syn, each once per build directory, and a host of agents keeps hundreds of
+build directories (#139). With `[store] shared_crates = true` heli compiles
+each of them once per store and links the result into every build
+directory that needs it.
+
+heli does this as cargo's `RUSTC_WRAPPER`: the client sets the variable to
+its own binary (with `HELI_SHARED_CRATES=1`) unless a wrapper is already
+configured, in the environment or in `build.rustc-wrapper`; it then stays
+out of the way. The wrapper (`src/crates.rs`) shares a compilation only
+when all of these hold, and otherwise runs rustc unchanged:
+
+- cargo capped its lints (`--cap-lints allow`), which it does for every
+  package that is not a local one: registry, git and vendored crates;
+- it is not incremental, and has `--crate-name`, `-C extra-filename`,
+  `--out-dir` and a root source file inside `CARGO_MANIFEST_DIR`;
+- its build directory is one of a store's, `<store>/<2 hex>/<hex>`
+  (`build-dir = "<store>/{workspace-path-hash}"`, as [placement](#placement)
+  sets it).
+
+Its key is a SHA-256 of what decides the output: `rustc -vV`, the
+arguments with the build directory replaced by a placeholder, the digest
+of every `--extern` file, cargo's `CARGO_PKG_*`, `CARGO_MANIFEST_*` and
+`CARGO_CRATE_NAME` variables, the variables the package's build script set
+for the compiler, and the digests of the files in its `OUT_DIR`. The
+metadata hash cargo puts in each file name is the same in every worktree
+for the same crate, version, features and profile, so the names match.
+
+The store keeps an entry per key in `<store>/.crates/<2 hex>/<key>`: the
+output files, `meta.json` (the files, the dep-info, rustc's JSON messages,
+and the environment variables and files the compilation read, from the
+dep-info's `env-dep` lines) and `used`, touched on each use.
+
+- **Hit**: the wrapper checks the recorded variables and files, hardlinks
+  the files into `--out-dir`, writes the dep-info with the build directory
+  filled in, and replays rustc's messages, so cargo sees what it would
+  have seen. Linked files keep the entry's mtime; when a dependency in this
+  build directory is newer than the entry (built after it), the files are
+  copied with the current time instead, so that cargo's freshness check,
+  which compares mtimes, finds them fresh.
+- **Miss**: one compilation per key at a time (a lock in
+  `.crates/.locks`); the others wait, then hit. rustc writes to a staging
+  directory, and each artifact is linked into `--out-dir` the moment rustc
+  announces it, so pipelined dependents start on the `.rmeta` as they
+  would. Then the staging directory becomes the entry.
+
+Anything the wrapper cannot do (no hardlinks across volumes, an entry gone
+mid-use) falls back to copying or to rustc itself: sharing can make a
+build faster and never fail it.
+
+Accounting counts an entry's files once, in `.crates/`, by link count:
+`status` shows what no build directory links (`crates` in the `disk`
+line, `disk.crates` in its JSON), and `gc` lists each entry as `crate`,
+`live` while a build directory links it. A crate entry counts toward B,
+and [eviction](#eviction) takes it by tier 8.
 
 ## Dependency epochs
 

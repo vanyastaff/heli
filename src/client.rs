@@ -184,10 +184,14 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
             eprintln!("cargo-heli: cannot prepare isolated Cargo home: {reason}");
             std::process::exit(USAGE);
         });
-    let dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
+    let mut dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
+    // Each registry crate compiled once (`crate::crates`, #139).
+    if let Ok(cwd) = std::env::current_dir() {
+        dependency_env.extend(crate::crates::environment(&config.store, &cwd));
+    }
     // Held until this process ends, with the run: heli's own eviction and a
     // tool that deletes build output never delete at the same time.
     let _cleaning = (!invocation.exec)
