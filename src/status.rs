@@ -51,6 +51,9 @@
 //! waiting for its worktree's lock has `waiting_since` and, in
 //! `waiting_for`, the runs it waits for; otherwise they are `null` and
 //! empty. `class` is `null` only from a daemon older than run classes.
+//! `detached_since` is since when no client follows a run in flight
+//! (`null` while one does), and `exit.detached` says the daemon cancelled
+//! the run for having no client (docs/runs.md, "Detach").
 //! `profile` says where the class came from (`crate::profiles::Source::
 //! name`), `null` from a client or daemon older than profiles.
 //! `rerun_of` names the run a rerun reruns (`cargo heli rerun`); it is
@@ -320,6 +323,11 @@ pub struct Run {
     /// those that attached to it.
     #[serde(default)]
     pub attached_clients: u32,
+    /// Since when no client follows the run, while it is in flight
+    /// (docs/runs.md, "Detach"); `null` while one does, and from a daemon
+    /// older than this.
+    #[serde(default)]
+    pub detached_since: Option<u64>,
     /// When it ended; `null` while it runs.
     #[serde(default)]
     pub ended_at: Option<u64>,
@@ -336,22 +344,28 @@ pub struct Exit {
     pub code: i32,
     /// On Unix, the signal that killed it.
     pub signal: Option<i32>,
-    /// Whether `cargo heli cancel` ended it.
+    /// Whether `cargo heli cancel` ended it, or the daemon, for having no
+    /// client (`detached`).
     pub cancelled: bool,
+    /// Whether the daemon cancelled it for having no client while other
+    /// runs waited for slots (docs/runs.md, "Detach").
+    #[serde(default)]
+    pub detached: bool,
 }
 
 impl Exit {
     /// `exit <code>` or `signal <n>`, after `cancelled, ` for a cancelled
-    /// run.
+    /// run (`cancelled (no client), ` for one cancelled for having no
+    /// client).
     pub fn describe(&self) -> String {
         let ending = match self.signal {
             Some(signal) => format!("signal {signal}"),
             None => format!("exit {}", self.code),
         };
-        if self.cancelled {
-            format!("cancelled, {ending}")
-        } else {
-            ending
+        match (self.cancelled, self.detached) {
+            (true, true) => format!("cancelled (no client), {ending}"),
+            (true, false) => format!("cancelled, {ending}"),
+            (false, _) => ending,
         }
     }
 }
@@ -476,16 +490,16 @@ impl Status {
         }
         for (index, run) in self.runs.iter().enumerate() {
             let label = if index == 0 { "runs" } else { "" };
+            let clients = match run.detached_since {
+                Some(since) => format!("no client for {}s", age(since)),
+                None => format!("{} attached", run.attached_clients),
+            };
             let mut state = match &run.exit {
                 Some(exit) => format!("{}, {}", run.phase.name(), exit.describe()),
                 None if run.waiting_for.is_empty() => {
-                    format!("{}, {} attached", run.phase.name(), run.attached_clients)
+                    format!("{}, {clients}", run.phase.name())
                 }
-                None => format!(
-                    "waiting for {}, {} attached",
-                    run.waiting_for.join(", "),
-                    run.attached_clients
-                ),
+                None => format!("waiting for {}, {clients}", run.waiting_for.join(", ")),
             };
             let priority = if run.priority.is_normal() {
                 String::new()
