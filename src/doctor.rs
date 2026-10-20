@@ -102,6 +102,15 @@ pub struct Inputs {
     pub profiles: Profiles,
     /// The profiles of the repository's `.config/heli.toml`.
     pub repository_profiles: Vec<Rule>,
+    /// The running daemon's cargo-heli version, when one answers.
+    pub daemon_version: Option<String>,
+    /// The versions of cargo-heli that the Cargo home's `.crates.toml`
+    /// lists with no program: installs that could not replace the running
+    /// one ([`failed_installs`]).
+    pub failed_installs: Vec<String>,
+    /// The programs an upgrade put aside beside this one and could not
+    /// delete yet (`crate::upgrade::aside`).
+    pub old_programs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -239,6 +248,15 @@ pub fn gather(cwd: &Path) -> Inputs {
             }
         }
     }
+    inputs.daemon_version = crate::client::daemon_version();
+    if let Some(home) = inputs.cargo_home.clone()
+        && let Ok(text) = std::fs::read_to_string(home.join(".crates.toml"))
+    {
+        inputs.failed_installs = failed_installs(&text);
+    }
+    if let Ok(program) = std::env::current_exe() {
+        inputs.old_programs = crate::upgrade::aside(&program);
+    }
     for var in VARS {
         if let Some(value) = std::env::var_os(var).filter(|value| !value.is_empty()) {
             inputs
@@ -247,6 +265,25 @@ pub fn gather(cwd: &Path) -> Inputs {
         }
     }
     inputs
+}
+
+/// The versions of cargo-heli that `crates_toml`, the text of the Cargo
+/// home's `.crates.toml`, lists with no program: `cargo install` writes
+/// the entry once it has built the crate, and on Windows then fails to
+/// replace a running program.
+fn failed_installs(crates_toml: &str) -> Vec<String> {
+    let Ok(table) = crates_toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(toml::Value::Table(installed)) = table.get("v1") else {
+        return Vec::new();
+    };
+    installed
+        .iter()
+        .filter(|(_, programs)| programs.as_array().is_some_and(Vec::is_empty))
+        .filter_map(|(name, _)| name.strip_prefix("cargo-heli ")?.split_whitespace().next())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// The names `X` of the `cargo-X` programs in `dirs`, sorted, without heli
@@ -574,6 +611,40 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Set HELI_STATE_DIR and HELI_CONFIG, as user environment variables so that every process gets them, to paths outside AppData, for example %USERPROFILE%\\.heli\\state and %USERPROFILE%\\.heli\\config.toml.",
         );
     }
+    let client = env!("CARGO_PKG_VERSION");
+    if let Some(version) = &inputs.daemon_version
+        && crate::status::older(version, client)
+    {
+        add(
+            "daemon-version",
+            "warn",
+            format!(
+                "the heli daemon is cargo-heli {version}, older than this cargo-heli ({client}); runs go through the old one until it is replaced."
+            ),
+            "Run `cargo heli restart`: it waits for the runs in flight (`--now` cancels them).",
+        );
+    }
+    for version in &inputs.failed_installs {
+        add(
+            "install-failed",
+            "warn",
+            format!(
+                "`cargo install` of cargo-heli {version} left no program: the Cargo home's .crates.toml lists it with none. A running cargo-heli cannot be overwritten on Windows."
+            ),
+            "Run `cargo heli self-upgrade`: it installs beside the running program and swaps it in by renaming.",
+        );
+    }
+    for old in &inputs.old_programs {
+        add(
+            "old-program",
+            "note",
+            format!(
+                "{} is a previous version `cargo heli self-upgrade` put aside and could not delete yet (something still runs it).",
+                old.display()
+            ),
+            "Delete it once nothing runs it; the next `cargo heli self-upgrade` tries again.",
+        );
+    }
     Report {
         schema: SCHEMA,
         tools,
@@ -658,6 +729,41 @@ mod tests {
             ids(&diagnose(&inputs)),
             ["jobs", "target-dir", "rustc-wrapper", "linker"]
         );
+    }
+
+    /// An older daemon, an install that left no program and an old program
+    /// put aside are each reported; a daemon of this version is not.
+    #[test]
+    fn an_old_daemon_a_failed_install_and_an_old_program_are_reported() {
+        let inputs = Inputs {
+            daemon_version: Some("0.0.1".to_owned()),
+            failed_installs: vec!["0.0.5".to_owned()],
+            old_programs: vec![PathBuf::from("cargo-heli.exe.old-0.0.4")],
+            ..Inputs::default()
+        };
+        let report = diagnose(&inputs);
+        assert_eq!(
+            ids(&report),
+            ["daemon-version", "install-failed", "old-program"]
+        );
+        assert!(
+            report.findings[0].message.contains("cargo-heli 0.0.1"),
+            "{:?}",
+            report.findings[0]
+        );
+        let current = Inputs {
+            daemon_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            ..Inputs::default()
+        };
+        assert!(diagnose(&current).findings.is_empty());
+        assert_eq!(
+            failed_installs(
+                "[v1]\n\"cargo-heli 0.0.4 (registry+x)\" = [\"cargo-heli.exe\"]\n\
+                 \"cargo-heli 0.0.5 (registry+x)\" = []\n\"cargo-nextest 0.9.1 (registry+x)\" = []\n"
+            ),
+            ["0.0.5"]
+        );
+        assert_eq!(failed_installs("not toml"), Vec::<String>::new());
     }
 
     #[test]

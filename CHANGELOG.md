@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- **`cargo heli self-upgrade`** installs a newer cargo-heli beside the
+  running one (`<state directory>/upgrade`), swaps it in by renaming, and
+  replaces the daemon as `restart` does (`--now`, `--yes`; `--to VERSION`,
+  `--path DIR`). `cargo install` alone cannot replace the program while the
+  daemon and the waiting clients run it: on Windows it fails and leaves
+  `cargo-heli <version> = []` in `.crates.toml`. `doctor` now says when the
+  daemon is older than the client, when `.crates.toml` records such a
+  failed install, and when an old program put aside is still there (#125).
+
 ### Fixed
 
 - **`--changed` and `--affected` take nextest's `-E`.** A filterset selects

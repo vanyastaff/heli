@@ -17,6 +17,10 @@
 //!   two writes an empty file named after its process id in that directory;
 //! - `ECHO_WAIT_FOR` names a file: waits until it exists (60 s at most).
 //!
+//! As a fake `cargo install … --root <dir>`, with `ECHO_INSTALL_FROM` naming
+//! a file, it first copies that file to `<dir>/bin/cargo-heli` (with the
+//! platform's suffix; `ECHO_INSTALL_AS` names it otherwise).
+//!
 //! First of all (after a version request, below), with `ECHO_STARTS` naming
 //! a file, it appends a line there, so a test can count how many times it
 //! started.
@@ -123,6 +127,19 @@ fn main() {
             .open(starts)
             .and_then(|mut file| file.write_all(b"started\n"))
             .expect("append to ECHO_STARTS");
+    }
+    if let Some(from) = std::env::var_os("ECHO_INSTALL_FROM")
+        && args.iter().any(|arg| arg == "install")
+        && let Some(root) = args
+            .iter()
+            .position(|arg| arg == "--root")
+            .and_then(|at| args.get(at + 1))
+    {
+        let bin = Path::new(root).join("bin");
+        std::fs::create_dir_all(&bin).expect("create the install root");
+        let name = std::env::var_os("ECHO_INSTALL_AS")
+            .unwrap_or_else(|| format!("cargo-heli{}", std::env::consts::EXE_SUFFIX).into());
+        std::fs::copy(&from, bin.join(name)).expect("install the program");
     }
     for arg in args {
         println!("arg: {arg:?}");

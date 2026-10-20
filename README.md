@@ -25,8 +25,11 @@ cargo heli ensure
 cargo heli doctor
 ```
 
-After installing a new version, `cargo heli restart` replaces the running
-daemon once its runs have ended; `cargo heli status` shows its version.
+To move to a new version, run `cargo heli self-upgrade`: it installs the
+version beside the running program, swaps it in, and replaces the daemon
+once its runs have ended (`--now` cancels them); `cargo heli status` shows
+the daemon's version. A version installed by hand needs only the last
+step, `cargo heli restart`.
 
 In each agent's worktree, keep Cargo's checkout-local `target/` and run:
 

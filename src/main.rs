@@ -69,6 +69,7 @@ mod status;
 mod store;
 #[cfg(test)]
 mod test_tmp;
+mod upgrade;
 mod user_env;
 mod worktree;
 
@@ -107,6 +108,7 @@ fn main() {
         cli::Action::Status { json } => client::status(json),
         cli::Action::Ensure => client::ensure(depth),
         cli::Action::Stop { now, yes, restart } => client::stop(now, yes, restart.then_some(depth)),
+        cli::Action::SelfUpgrade { now, yes, source } => upgrade::main(now, yes, source),
         cli::Action::Setup { print, autostart } => setup::main(print, autostart),
         cli::Action::Changed {
             affected,

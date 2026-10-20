@@ -343,7 +343,9 @@ daemon, `stop` says so and exits 0. **`cargo heli restart`**, with the same
 flags, stops the daemon, waits until it has exited (or another client has
 started a new one), then starts one as `ensure` does, through the autostart
 registration when its record names this program, and names its pid and
-version. `status` shows the daemon's version and program (`version` and
+version. **`cargo heli self-upgrade`** first puts a newer version in this
+program's place, then does the same with it (docs/daemon.md, "Upgrading").
+`status` shows the daemon's version and program (`version` and
 `executable` in the JSON document, `null` from a daemon older than them),
 and the text form says when the daemon is older than the client, with
 `restart` as the fix (#87).

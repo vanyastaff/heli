@@ -33,6 +33,13 @@ pub enum Action {
     /// Ask the daemon to exit once its runs end; with `now`, cancel them
     /// first (`yes`: without asking). With `restart`, then start a new one.
     Stop { now: bool, yes: bool, restart: bool },
+    /// Install a newer cargo-heli beside this one, swap it in, and replace
+    /// the daemon (`crate::upgrade`).
+    SelfUpgrade {
+        now: bool,
+        yes: bool,
+        source: crate::upgrade::Source,
+    },
     /// Offer the environment that lets a bare cargo draw from the pool;
     /// with `print`, only show it. `autostart` registers the daemon to start
     /// at logon (`Some(true)`), removes that registration (`Some(false)`),
@@ -286,6 +293,24 @@ enum Command {
         #[arg(long, short, requires = "now")]
         yes: bool,
     },
+    /// Install a newer cargo-heli beside this one, swap it in, and replace
+    /// heli's daemon as `restart` does. `cargo install` alone cannot replace
+    /// the program while the daemon and the clients run it (Windows).
+    SelfUpgrade {
+        /// Cancel the runs in flight instead of waiting for them, after a
+        /// confirmation.
+        #[arg(long)]
+        now: bool,
+        /// Cancel without asking.
+        #[arg(long, short, requires = "now")]
+        yes: bool,
+        /// The version to install; by default the newest on crates.io.
+        #[arg(long, value_name = "VERSION", conflicts_with = "path")]
+        to: Option<String>,
+        /// Build this checkout of heli instead of a version from crates.io.
+        #[arg(long, value_name = "DIR")]
+        path: Option<std::path::PathBuf>,
+    },
     /// Offer to set `CARGO_MAKEFLAGS` for agents and shells, so that a bare
     /// cargo draws from heli's pool; each file is written only on a yes.
     Setup {
@@ -534,6 +559,14 @@ pub fn parse(
             now,
             yes,
             restart: false,
+        },
+        Command::SelfUpgrade { now, yes, to, path } => Action::SelfUpgrade {
+            now,
+            yes,
+            source: match path {
+                Some(path) => crate::upgrade::Source::Path(path),
+                None => crate::upgrade::Source::Crate { version: to },
+            },
         },
         Command::Restart { now, yes } => Action::Stop {
             now,
