@@ -40,6 +40,7 @@ mod cli;
 mod client;
 mod clock;
 mod config;
+mod crates;
 mod daemon;
 mod dependencies;
 mod dependency_home;
@@ -79,7 +80,12 @@ use std::ffi::OsString;
 const REFUSED: i32 = 2;
 
 fn main() {
-    let action = match cli::parse(std::env::args_os(), cargo_program()) {
+    // cargo's `RUSTC_WRAPPER`, in a run heli set it for (`crates`).
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if crates::wrapping(&args) {
+        crates::main(args);
+    }
+    let action = match cli::parse(args, cargo_program()) {
         Ok(action) => action,
         Err(error) => error.exit(),
     };

@@ -188,6 +188,10 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
+    // Each registry crate compiled once (`crate::crates`, #139).
+    if let Ok(cwd) = std::env::current_dir() {
+        dependency_env.extend(crate::crates::environment(&config.store, &cwd));
+    }
     // A store whose volume is under its floor sends the build elsewhere
     // (`crate::store::placement`, #135).
     if let Ok(cwd) = std::env::current_dir()

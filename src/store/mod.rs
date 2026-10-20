@@ -111,6 +111,13 @@ impl Dir {
     /// The sizes of its files, by category (`sizes`), with the tool caches
     /// of its kind ([`kind`]).
     pub fn scan(&self, config: &StoreConfig) -> Sizes {
+        if self.kind == Kind::Crate {
+            // What no build directory links: the rest counts in theirs.
+            return Sizes {
+                other: crate::crates::unshared(&self.path).0,
+                ..Sizes::default()
+            };
+        }
         sizes::scan(&self.path, &self.tool_caches(config))
     }
 
@@ -133,6 +140,14 @@ impl Dir {
         };
         if held {
             return State::Busy;
+        }
+        if self.kind == Kind::Crate {
+            // Live while a build directory links it.
+            return if crate::crates::linked(&self.path) {
+                State::Live
+            } else {
+                State::Unknown
+            };
         }
         match &self.workspace {
             Some(workspace) if self.kind.workspace_exists(workspace) => State::Live,
@@ -198,6 +213,18 @@ pub fn survey(config: &StoreConfig, registry: &Registry, state_dir: &Path) -> Ve
                     }),
                     _ => None,
                 },
+            });
+        }
+    }
+    for store in stores(config, registry) {
+        for path in crate::crates::entries(&store) {
+            dirs.push(Dir {
+                kind: Kind::Crate,
+                path,
+                store: Some(store.clone()),
+                workspace: None,
+                owner: None,
+                separation: None,
             });
         }
     }
