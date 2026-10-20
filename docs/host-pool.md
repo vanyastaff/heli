@@ -201,6 +201,46 @@ the broker shares: a run alone still borrows every slot, a background run
 gets slots whenever nobody else waits, and test slots come from the weighted
 share ([runs](runs.md)). The memory governor treats every priority alike.
 
+## Saturation
+
+The pool is **saturated** while the host pool has no free slot, two runs
+or more are active, and one of them waits for a slot (#127); a spell of
+it ends only after a second without (a slot given back and taken again
+leaves it free for a moment). heli queues
+nothing for it (G1): each run keeps its share, and a run of the whole
+workspace among 17 others gets a slot or two, its tests one thread. What
+heli does is say so, where the agents and the operator look:
+
+- **`status`**: the `pool` line adds how long the pool has been saturated,
+  the runs waiting for slots out of the active ones, and the median and
+  90th percentile of every run's waits for a lent slot over the last 10
+  minutes (the waits only while it is saturated or the 90th percentile is
+  a second or more):
+  `pool    32 slots: 32 in use, 0 free, 0 withheld; saturated for 4.2 min, 17 of 18 runs waiting for slots; slot wait p50 45 s, p90 5.6 min (last 10 min)`.
+  The JSON has them in `saturation`: `active_runs`, `waiting_runs`,
+  `saturated_s`, `wait_p50_ms`, `wait_p90_ms` and `window_s`
+  ([observability](observability.md)).
+- **The run's stderr**: a run that joins a pool saturated for 5 s or more
+  (`SATURATED_AFTER`; every build fills the pool for moments as its units
+  start and end) and that selects the whole workspace (`--workspace`,
+  `--all`, or eight `-p` or more) gets one header line before its command
+  starts: `cargo-heli: r2096: 18 runs share 32 slots, saturated for 340 s;
+  this run gets about 2. Narrow it (--affected, -p) or run it with
+  --priority background.` A run of a few packages, `cargo heli exec` and
+  quiet output that succeeded do not show it.
+- **The event log**: each spell that lasted 5 s or more is a `saturated`
+  event as it ends, and a nextest run that failed while the pool was
+  saturated logs the tests its slow-timeout killed as `timeouts`.
+- **`doctor`**: `pool-saturated` when the pool was saturated for more than
+  half of the last hour, with the most runs and waiting runs and the
+  advice above; `nested-cargo-timeouts` when nextest timed tests out while
+  it was. A test that runs cargo itself (a generated project, a facade
+  check) waits for slots like any build, and under a saturated pool it
+  outlasts its slow-timeout.
+
+The fix stays on the agents' side: `--affected` (which also takes
+nextest's `-E`), short `-p` lists, and `--priority background` for sweeps.
+
 ## Properties
 
 - **Progress.** Each process the make protocol starts owns one implicit slot

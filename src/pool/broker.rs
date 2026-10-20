@@ -48,12 +48,21 @@
 //! slot or waits; a run that only keeps a free slot in its pool is idle and
 //! does not count for shares.
 //!
+//! **Saturation** (docs/host-pool.md, "Saturation"): the pool is saturated
+//! while the host pool has no free slot, two runs or more are active and
+//! one of them waits; a spell of it ends once it has not been for [`CALM`].
+//! Nothing changes for that: no run is held back. The
+//! broker only counts it, for `status` and the runs' stderr
+//! ([`Broker::pressure`], [`Broker::crowding`]), and reports each spell
+//! that lasted [`SATURATED_AFTER`] or more as it ends ([`Spell`]). It also
+//! keeps every run's waits for a lent slot over the last [`WINDOW`].
+//!
 //! The broker counts every slot it takes out of the host pool, and stops
 //! counting it as it gives it back, each as one step under the host pool's
 //! lock ([`Pool::lend`], [`Pool::repay`]): [`Broker::lent`], which the host
 //! pool's top-up and drain read under that lock, is always exact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::io;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -70,8 +79,27 @@ pub const TICK: Duration = Duration::from_millis(20);
 /// How many waits for a lent slot a run's [`Loans`] keeps, for the median.
 const KEPT_WAITS: usize = 1 << 16;
 
+/// How long the waits for a lent slot that `status` counts go back.
+pub const WINDOW: Duration = Duration::from_secs(600);
+
+/// How many of those waits the broker keeps, at most.
+const KEPT_RECENT: usize = 1 << 16;
+
+/// How long the pool must have been saturated before a run that joins it is
+/// told, and before a spell of it is reported. Every build fills the pool
+/// for moments as its units start and end; a few seconds of it is no news.
+pub const SATURATED_AFTER: Duration = Duration::from_secs(5);
+
+/// How long the pool must stay unsaturated for a spell to end while two
+/// runs or more are open. A run that gives a slot back and asks for the
+/// next one leaves it free for a tick or two; that is no end of the crowd.
+const CALM: Duration = Duration::from_secs(1);
+
 pub struct Broker {
     host: Arc<Pool>,
+    /// Told of each spell of saturation that lasted [`SATURATED_AFTER`], as
+    /// it ends.
+    report: Box<dyn Fn(&Spell) + Send + Sync>,
     /// The slots taken out of the host pool: every run's holdings.
     lent: AtomicU32,
     state: Mutex<State>,
@@ -82,6 +110,57 @@ pub struct Broker {
 #[derive(Default)]
 struct State {
     runs: BTreeMap<RunId, Run>,
+    /// The spell of saturation going on, if one is.
+    saturated: Option<Spell>,
+    /// Since when the pool has not been saturated, while a spell goes on:
+    /// the spell ends after [`CALM`] of it.
+    calm_since: Option<Instant>,
+    /// Every run's waits for a lent slot over the last [`WINDOW`], each
+    /// with when it ended, oldest first.
+    recent: VecDeque<(Instant, Duration)>,
+}
+
+/// A spell of saturation (see the module docs).
+#[derive(Debug, Clone)]
+pub struct Spell {
+    /// When it began.
+    pub since: Instant,
+    /// When it began, in seconds since 1970.
+    pub since_unix: u64,
+    /// How long it lasted: so far, while it goes on.
+    pub lasted: Duration,
+    /// The most runs active at once in it.
+    pub most_active: u32,
+    /// The most runs waiting at once in it.
+    pub most_waiting: u32,
+}
+
+/// How crowded the pool is, for `status` ([`Broker::pressure`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Pressure {
+    /// The runs that use slots or wait for one.
+    pub active_runs: u32,
+    /// The runs that wait for a slot while the pool is saturated; 0 while
+    /// it is not.
+    pub waiting_runs: u32,
+    /// How long the pool has been saturated, while it is.
+    pub saturated_for: Option<Duration>,
+    /// The median and the 90th percentile of the waits for a lent slot
+    /// over the last [`WINDOW`]; `None` without any.
+    pub wait_p50: Option<Duration>,
+    pub wait_p90: Option<Duration>,
+}
+
+/// How crowded the pool is for a run that just joined it
+/// ([`Broker::crowding`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Crowding {
+    /// The runs that share the pool, the new one among them.
+    pub runs: u32,
+    /// The run's share of the capacity.
+    pub share: f64,
+    /// How long the pool has been saturated.
+    pub saturated_for: Duration,
 }
 
 /// What the broker knows of a run.
@@ -131,6 +210,8 @@ pub struct Loans {
     pub reclaimed: u32,
     /// The most slots the run was seen using.
     pub most: u32,
+    /// Whether the pool was saturated at some time while the run was open.
+    pub saturated: bool,
     /// How long the run waited for each lent slot, at most: from when its
     /// pool was last seen with a free slot. The first [`KEPT_WAITS`].
     waits: Vec<Duration>,
@@ -150,9 +231,10 @@ pub struct Usage {
 impl Broker {
     /// A broker lending the slots of `host`. It works in a thread of its
     /// own for as long as the process lives.
-    pub fn start(host: Arc<Pool>) -> Arc<Self> {
+    pub fn start(host: Arc<Pool>, report: Box<dyn Fn(&Spell) + Send + Sync>) -> Arc<Self> {
         let broker = Arc::new(Self {
             host,
+            report,
             lent: AtomicU32::new(0),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -295,6 +377,52 @@ impl Broker {
             .collect()
     }
 
+    /// How crowded the pool is now.
+    pub fn pressure(&self) -> Pressure {
+        let mut state = self.lock();
+        let now = Instant::now();
+        state.observe(now);
+        state.forget_waits(now);
+        let mut waits: Vec<Duration> = state.recent.iter().map(|&(_, wait)| wait).collect();
+        waits.sort_unstable();
+        let percentile = |p: usize| {
+            waits
+                .get((waits.len() * p / 100).min(waits.len().saturating_sub(1)))
+                .copied()
+        };
+        let saturated = state.saturated.as_ref();
+        Pressure {
+            active_runs: state.active(),
+            waiting_runs: if saturated.is_some() {
+                state.waiting()
+            } else {
+                0
+            },
+            saturated_for: saturated.map(|spell| now.saturating_duration_since(spell.since)),
+            wait_p50: percentile(50),
+            wait_p90: percentile(90),
+        }
+    }
+
+    /// How crowded the pool is for run `id`, which just joined it: `None`
+    /// unless it has been saturated for [`SATURATED_AFTER`] or more.
+    pub fn crowding(&self, id: RunId) -> Option<Crowding> {
+        let mut state = self.lock();
+        let now = Instant::now();
+        state.observe(now);
+        let saturated_for = now.saturating_duration_since(state.saturated.as_ref()?.since);
+        if saturated_for < SATURATED_AFTER {
+            return None;
+        }
+        let shares = self.shares(&state);
+        let run = state.runs.get(&id)?;
+        Some(Crowding {
+            runs: state.active().max(1),
+            share: shares.of(run),
+            saturated_for,
+        })
+    }
+
     /// Slots the broker has taken out of the host pool and not yet given
     /// back: those lent to run pools, and the test slots held for runs. The
     /// host pool's top-up target leaves them out (docs/host-pool.md, "Bounded
@@ -352,12 +480,61 @@ impl Broker {
                 break;
             }
             let run = state.runs.get_mut(&id).expect("BUG: a run just chosen");
-            if !run.lend(now) {
-                self.give_host();
-                break;
+            match run.lend(now) {
+                None => {
+                    self.give_host();
+                    break;
+                }
+                Some(Some(wait)) => {
+                    if state.recent.len() >= KEPT_RECENT {
+                        state.recent.pop_front();
+                    }
+                    state.recent.push_back((now, wait));
+                }
+                Some(None) => {}
             }
         }
         self.reclaim(state);
+        self.watch_saturation(state, now);
+    }
+
+    /// Starts, extends or ends the spell of saturation by the pools as
+    /// counted at `now` (see the module docs).
+    fn watch_saturation(&self, state: &mut State, now: Instant) {
+        state.forget_waits(now);
+        let active = state.active();
+        let waiting = state.waiting();
+        let saturated = active >= 2 && waiting >= 1 && self.host.free().unwrap_or(0) == 0;
+        if saturated {
+            state.calm_since = None;
+            let spell = state.saturated.get_or_insert_with(|| Spell {
+                since: now,
+                since_unix: crate::clock::now(),
+                lasted: Duration::ZERO,
+                most_active: 0,
+                most_waiting: 0,
+            });
+            spell.lasted = now.saturating_duration_since(spell.since);
+            spell.most_active = spell.most_active.max(active);
+            spell.most_waiting = spell.most_waiting.max(waiting);
+            for run in state.runs.values_mut() {
+                run.loans.saturated = true;
+            }
+        } else if state.saturated.is_some() {
+            let calm_since = *state.calm_since.get_or_insert(now);
+            // Fewer than two runs left is an end at once: the broker may
+            // not look again before another comes. A run between two slots
+            // is no longer active for a moment, but still there.
+            if state.runs.len() >= 2 && now.saturating_duration_since(calm_since) < CALM {
+                return;
+            }
+            state.calm_since = None;
+            let mut spell = state.saturated.take().expect("BUG: a spell just seen");
+            spell.lasted = calm_since.saturating_duration_since(spell.since);
+            if spell.lasted >= SATURATED_AFTER {
+                (self.report)(&spell);
+            }
+        }
     }
 
     /// Decides which runs give slots back (see the module docs), and starts
@@ -506,6 +683,29 @@ impl Broker {
 }
 
 impl State {
+    /// The runs that use slots or wait for one.
+    fn active(&self) -> u32 {
+        let active = self.runs.values().filter(|run| run.active()).count();
+        u32::try_from(active).unwrap_or(u32::MAX)
+    }
+
+    /// The runs that wait for a slot.
+    fn waiting(&self) -> u32 {
+        let waiting = self.runs.values().filter(|run| run.waiting()).count();
+        u32::try_from(waiting).unwrap_or(u32::MAX)
+    }
+
+    /// Forgets the waits older than [`WINDOW`] at `now`.
+    fn forget_waits(&mut self, now: Instant) {
+        while self
+            .recent
+            .front()
+            .is_some_and(|&(at, _)| now.saturating_duration_since(at) > WINDOW)
+        {
+            self.recent.pop_front();
+        }
+    }
+
     /// Counts every run pool's free slots.
     fn observe(&mut self, now: Instant) {
         for run in self.runs.values_mut() {
@@ -627,26 +827,24 @@ impl Run {
     }
 
     /// Gives the run a slot taken from the host pool: a test slot when it
-    /// waits for one, else a slot in its pool. `false` when it could not,
-    /// and the slot is still the caller's.
-    fn lend(&mut self, now: Instant) -> bool {
+    /// waits for one, else a slot in its pool, with how long it waited for
+    /// it. `None` when it could not, and the slot is still the caller's.
+    fn lend(&mut self, now: Instant) -> Option<Option<Duration>> {
         if self.test_held < self.test_wanted {
             self.test_held += 1;
-            return true;
+            return Some(None);
         }
-        let Some(pool) = &self.pool else {
-            return false;
-        };
+        let pool = self.pool.as_ref()?;
         if !pool.give().unwrap_or(false) {
-            return false;
+            return None;
         }
         self.lent += 1;
-        self.loans
-            .record(now.saturating_duration_since(self.last_free));
+        let wait = now.saturating_duration_since(self.last_free);
+        self.loans.record(wait);
         // A process waiting on a semaphore takes the slot as it is put in;
         // counted again at once, the run still waits if it did.
         self.observe(now);
-        true
+        Some(Some(wait))
     }
 
     /// The slots the run uses: lent and not free in its pool, and its test
@@ -737,6 +935,7 @@ mod tests {
                 .enumerate()
                 .map(|(number, run)| (RunId::new(number as u64 + 1), run))
                 .collect(),
+            ..State::default()
         }
     }
 

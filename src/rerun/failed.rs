@@ -90,6 +90,40 @@ pub fn nextest(lines: impl Iterator<Item = io::Result<Line>>) -> io::Result<Vec<
         .collect())
 }
 
+/// The tests of a nextest run that its slow-timeout killed and no retry
+/// passed, in the order they first timed out (docs/host-pool.md#saturation).
+pub fn nextest_timeouts(
+    lines: impl Iterator<Item = io::Result<Line>>,
+) -> io::Result<Vec<NextestTest>> {
+    let mut tests: Vec<(NextestTest, bool)> = Vec::new();
+    for line in lines {
+        let line = line?;
+        if line.channel != Channel::Stderr {
+            continue;
+        }
+        let text = plain(&line);
+        let Some((status, test)) = nextest_status(&text) else {
+            continue;
+        };
+        let words: Vec<&str> = status.split_whitespace().collect();
+        let timed_out = if words.iter().any(|word| matches!(*word, "PASS" | "FLAKY")) {
+            false
+        } else if words.last() == Some(&"TIMEOUT") {
+            true
+        } else {
+            continue;
+        };
+        match tests.iter_mut().find(|(known, _)| *known == test) {
+            Some((_, verdict)) => *verdict = timed_out,
+            None => tests.push((test, timed_out)),
+        }
+    }
+    Ok(tests
+        .into_iter()
+        .filter_map(|(test, timed_out)| timed_out.then_some(test))
+        .collect())
+}
+
 /// A status line of nextest's about a test: its status (`FAIL`, `TRY 2
 /// FAIL`) and the test. `None` for any other line, among them the
 /// summary's and a test's own output, which nextest indents under it.
@@ -347,6 +381,19 @@ mod tests {
             binary: binary.to_owned(),
             name: name.to_owned(),
         }
+    }
+
+    /// Only the tests nextest's slow-timeout killed count, and a retry that
+    /// passed takes one back (#127).
+    #[test]
+    fn nextest_timeouts_are_the_tests_that_timed_out() {
+        let stderr = "        PASS [   0.010s] (1/4) app tests::fast\n\
+                      \x20    TIMEOUT [  60.001s] (2/4) app tests::nested_cargo\n\
+                      \x20       FAIL [   0.020s] (3/4) app tests::broken\n\
+                      \x20    TIMEOUT [  60.002s] (4/4) app tests::flaky\n\
+                      \x20 TRY 2 PASS [   1.000s] (4/4) app tests::flaky\n";
+        let timeouts = nextest_timeouts(lines(&[(Channel::Stderr, stderr)])).expect("lines");
+        assert_eq!(timeouts, [test("app", "tests::nested_cargo")]);
     }
 
     /// Under heli's compact controls, each failure shows twice, once
