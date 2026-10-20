@@ -215,8 +215,17 @@ struct Entry {
     started_at: SystemTime,
     /// The clients following it.
     attached: u32,
-    /// `cargo heli cancel` asked for its end.
+    /// Since when no client follows it, while it is in flight
+    /// (`super::detached`).
+    detached_since: Option<SystemTime>,
+    /// Weighed background for having had no client for a while
+    /// (`super::detached`); its own priority again once one attaches.
+    demoted: bool,
+    /// `cargo heli cancel` asked for its end, or the daemon cancelled it
+    /// for having no client.
     cancelled: bool,
+    /// Why the daemon cancelled it for having no client, when it did.
+    detached_cancel: Option<Detached>,
     state: State,
 }
 
@@ -290,6 +299,26 @@ pub struct Attached {
     /// For a client attached by key: the run's worktree, which may be
     /// another than the client's.
     pub keyed_in: Option<PathBuf>,
+    /// The run's own priority, which it is weighed by again now: it was
+    /// demoted for having no client (`super::detached`).
+    pub restored: Option<Priority>,
+}
+
+/// A run that runs with no client following it (`super::detached`).
+pub struct Unattended {
+    pub id: RunId,
+    /// For how long no client has followed it.
+    pub since: Duration,
+    /// Whether it is weighed background for it already.
+    pub demoted: bool,
+}
+
+/// Why a run was cancelled for having no client: for how long none
+/// followed it, and how many runs waited for slots then.
+#[derive(Debug, Clone, Copy)]
+pub struct Detached {
+    pub unattended: Duration,
+    pub waiting: usize,
 }
 
 /// Numbers runs for every daemon of one state directory.
@@ -410,12 +439,15 @@ impl Registry {
                     {
                         let live = Arc::clone(live);
                         entry.attached += 1;
+                        entry.detached_since = None;
+                        let restored = std::mem::take(&mut entry.demoted).then_some(entry.priority);
                         return Admission::Attached(Attached {
                             id,
                             live,
                             running_for: entry.started_at.elapsed().unwrap_or_default(),
                             keyed_in: matches!(same, Same::Key { .. })
                                 .then(|| entry.worktree.clone()),
+                            restored,
                         });
                     }
                     break;
@@ -460,7 +492,10 @@ impl Registry {
                 started_at: SystemTime::now(),
                 // The client that asked for it.
                 attached: 1,
+                detached_since: None,
+                demoted: false,
                 cancelled: false,
+                detached_cancel: None,
                 state: State::Telling,
             },
         );
@@ -583,7 +618,83 @@ impl Registry {
     pub fn detach(&self, id: RunId) {
         if let Some(entry) = self.lock().runs.get_mut(&id) {
             entry.attached = entry.attached.saturating_sub(1);
+            if entry.attached == 0 && entry.state.in_flight() {
+                entry.detached_since = Some(SystemTime::now());
+            }
         }
+    }
+
+    /// The runs that run with no client following them, and are not
+    /// cancelled (`super::detached`).
+    pub fn unattended(&self) -> Vec<Unattended> {
+        self.lock()
+            .runs
+            .iter()
+            .filter(|(_, entry)| {
+                matches!(entry.state, State::Running { .. })
+                    && !entry.cancelled
+                    && entry.attached == 0
+            })
+            .filter_map(|(&id, entry)| {
+                Some(Unattended {
+                    id,
+                    since: entry.detached_since?.elapsed().unwrap_or_default(),
+                    demoted: entry.demoted,
+                })
+            })
+            .collect()
+    }
+
+    /// Weighs run `id` background for having no client: whether it is
+    /// demoted now, which it is not when a client attached meanwhile, or
+    /// it was demoted already.
+    pub fn demote(&self, id: RunId) -> bool {
+        let mut inner = self.lock();
+        let Some(entry) = inner.runs.get_mut(&id) else {
+            return false;
+        };
+        if entry.attached > 0 || entry.demoted || !entry.state.in_flight() {
+            return false;
+        }
+        entry.demoted = true;
+        true
+    }
+
+    /// Marks run `id` cancelled for having no client, as `detached` says,
+    /// like [`Registry::cancel`] otherwise; the error says why not, among
+    /// others that a client attached meanwhile.
+    pub fn cancel_detached(
+        &self,
+        id: RunId,
+        detached: Detached,
+    ) -> Result<Option<Arc<Tree>>, String> {
+        let mut inner = self.lock();
+        let Some(entry) = inner.runs.get_mut(&id) else {
+            return Err(format!("no run {id} is in flight"));
+        };
+        if entry.attached > 0 {
+            return Err(format!("a client follows {id}"));
+        }
+        let tree = match &entry.state {
+            State::Done { exit, .. } => {
+                return Err(format!("{id} has already ended: {}", exit.describe()));
+            }
+            State::Running { tree, .. } => Some(Arc::clone(tree)),
+            State::Telling | State::Starting { .. } => None,
+        };
+        entry.cancelled = true;
+        entry.detached_cancel = Some(detached);
+        drop(inner);
+        self.changed.notify_all();
+        Ok(tree)
+    }
+
+    /// Why run `id` was cancelled for having no client, if it was.
+    pub fn detached_cancel(&self, id: RunId) -> Option<Detached> {
+        self.lock()
+            .runs
+            .get(&id)
+            .and_then(|entry| entry.detached_cancel)
     }
 
     /// Run `id` has ended with `code` (on Unix, of `signal`), and all its
@@ -596,6 +707,10 @@ impl Registry {
             code,
             signal,
             cancelled: inner.cancelled(id),
+            detached: inner
+                .runs
+                .get(&id)
+                .is_some_and(|entry| entry.detached_cancel.is_some()),
         };
         let followed = inner.runs.get(&id).is_some_and(|entry| entry.attached > 0);
         if followed {
@@ -697,7 +812,11 @@ impl Inner {
                 .collect(),
             class: Some(entry.class),
             profile: entry.profile.clone(),
-            priority: entry.priority,
+            priority: if entry.demoted {
+                Priority::Background
+            } else {
+                entry.priority
+            },
             rerun_of: entry.rerun_of.clone(),
             phase,
             started_at: clock::unix_seconds(entry.started_at),
@@ -707,6 +826,7 @@ impl Inner {
             slots: 0,
             share: 0.0,
             attached_clients: entry.attached,
+            detached_since: entry.detached_since.map(clock::unix_seconds),
             ended_at,
             exit,
         }

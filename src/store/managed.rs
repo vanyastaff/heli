@@ -1,6 +1,9 @@
-//! Provenance for a store created as an exclusively regenerable cache.
-//! Existing stores are never adopted, even when empty. Without this proof,
-//! an unknown workspace retains the conservative eviction policy.
+//! Provenance for a store heli created itself, as an exclusively
+//! regenerable cache: a marker in it, which `gc --json` reports as
+//! `managed_cache_root`. Existing stores never get one. The marker records
+//! where a store came from; it does not decide what is reclaimed: a build
+//! directory of no known workspace goes whole ([`unknown_is_reclaimable`])
+//! when it is of cargo's layout, in any store heli surveys (#134).
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -74,15 +77,15 @@ fn real_directory(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
-/// A Cargo-shaped unknown directory inside an owned root may use tier 5.
-/// An unfamiliar lock layout is never authorized by age alone.
+/// Whether the unknown build directory `dir` may be deleted whole (tier 7):
+/// when it is of cargo's layout. A `<2 hex>/<14 hex>` directory of its own
+/// in its store (a configured `store.paths` root, or a default store: the
+/// survey looks nowhere else), whose profile directories hold cargo's lock
+/// files. An unfamiliar lock layout is never authorized by age alone.
 pub fn unknown_is_reclaimable(dir: &super::Dir) -> bool {
     let Some(store) = &dir.store else {
         return false;
     };
-    if !owns(store) {
-        return false;
-    }
     let Ok(relative) = dir.path.strip_prefix(store) else {
         return false;
     };

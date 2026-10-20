@@ -32,8 +32,8 @@
 //!  "used":1000,"busy":0,"budget":900,"budget_unmet":false,"floor":null,
 //!  "volumes":[{"root":"D:\\","free":218103808000,"pending":0}],
 //!  "victims":[{"tier":1,"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
-//!              "bytes":300,"age":93600,"reason":"incremental unit untouched for 26 h"}],
-//!  "skipped":[]}
+//!              "bytes":300,"age":93600,"reason":"incremental unit untouched for 26 h","floor":false}],
+//!  "skipped":[],"left":{"budget":0,"floors":[]}}
 //! ```
 //!
 //! `kind` is `build`, `target`, `shared`, `scratch` or `home`
@@ -46,7 +46,10 @@
 //! (`crate::store::attribute`). A directory's `superseded` is
 //! the bytes of its superseded intermediates, which `by_category` counts
 //! too (0 but in a `target/` directory apart from its build directory);
-//! the document's `superseded` says the pass was `--superseded`. `used` is
+//! the document's `superseded` says the pass was `--superseded`. A
+//! directory's `kept` (absent above) says why it is not deleted whole,
+//! when a rule keeps it: busy, within its age, of no cargo layout, in its
+//! worktree, or kept whole over a budget that cannot be met. `used` is
 //! what every directory
 //! takes, `busy` what the busy ones among them take, and `budget` and
 //! `floor` are B and F in bytes (`null`: none); `budget_unmet` says the
@@ -55,8 +58,13 @@
 //! #122);
 //! each volume has its free bytes (`null`: unknown) and the bytes its trash
 //! still holds. `victims` are the ones planned in a dry run, else the ones
-//! evicted, in order; `skipped` are those that could not be, each with
-//! `why`.
+//! evicted, in order, a victim chosen under the floor with its age waived
+//! marked `floor`; `skipped` are those that could not be, each with
+//! `why`. `left` is what the victims do not free: bytes over the budget's
+//! target, and bytes under the floor on each volume. The text form then
+//! says so, and what is kept, in groups: `left     budget still 469.2 GiB
+//! over its target` and `kept     126 of no known workspace within
+//! unknown_hours (387.0 GiB); 23 live within dir_hours (300.0 GiB)`.
 
 use std::fs::File;
 
@@ -92,6 +100,20 @@ struct Listing<'a> {
     volumes: &'a [Volume],
     victims: &'a [Victim],
     skipped: Vec<Skipped<'a>>,
+    left: Left,
+}
+
+/// What the victims do not free.
+#[derive(Serialize)]
+struct Left {
+    budget: u64,
+    floors: Vec<Floor>,
+}
+
+#[derive(Serialize)]
+struct Floor {
+    root: String,
+    need: u64,
 }
 
 #[derive(Serialize)]
@@ -117,6 +139,13 @@ struct Entry {
     by_category: Sizes,
     /// Bytes in its superseded intermediates, also in `by_category`.
     superseded: u64,
+    /// Why it is not deleted whole, when a rule keeps it
+    /// (`crate::store::evict::kept`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept: Option<String>,
+    /// The group `kept` is counted in.
+    #[serde(skip)]
+    kept_group: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -157,6 +186,8 @@ impl Entry {
             size: sizes.total(),
             by_category: sizes,
             superseded: dir.superseded(config),
+            kept: None,
+            kept_group: None,
         }
     }
 }
@@ -187,7 +218,7 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
         dry_run,
         scope,
     );
-    let dirs: Vec<Entry> = pass
+    let mut dirs: Vec<Entry> = pass
         .dirs
         .iter()
         .map(|surveyed| Entry::of(&surveyed.dir, surveyed.state, &config.store))
@@ -197,6 +228,12 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
         let events = Events::configured(&locations, &config);
         for victim in &pass.victims {
             events.record("evict", evict::event(victim));
+        }
+    }
+    for (index, entry) in dirs.iter_mut().enumerate() {
+        if let Some(kept) = evict::kept(&pass, index, now) {
+            entry.kept_group = Some(kept.group);
+            entry.kept = Some(kept.why);
         }
     }
     let listing = Listing {
@@ -217,6 +254,18 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
             .iter()
             .map(|(victim, why)| Skipped { victim, why })
             .collect(),
+        left: Left {
+            budget: pass.left.budget,
+            floors: pass
+                .left
+                .floors
+                .iter()
+                .map(|(root, need)| Floor {
+                    root: root.to_string_lossy().into_owned(),
+                    need: *need,
+                })
+                .collect(),
+        },
     };
     if json {
         let text = serde_json::to_string(&listing).expect("BUG: the listing serializes");
@@ -254,10 +303,13 @@ fn fail(reason: &str) -> ! {
     std::process::exit(1)
 }
 
-/// One line per directory: kind, state, size, path, and whose it is; the
-/// budget and the floor; one line per victim; then the total.
+/// One line per directory: kind, state, size, path, and whose it is (and,
+/// when the pass leaves a goal unmet, why it is kept); the budget and the
+/// floor; one line per victim; what is left and what is kept; then the
+/// total.
 fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
     let mut text = String::new();
+    let left = pass.left_text();
     for entry in &listing.dirs {
         let kind = entry.kind.name();
         text.push_str(&format!(
@@ -274,6 +326,11 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
                 text.push_str(", last run: none");
             }
             text.push(')');
+        }
+        if left.is_some()
+            && let Some(kept) = &entry.kept
+        {
+            text.push_str(&format!("  kept: {kept}"));
         }
         text.push('\n');
     }
@@ -300,6 +357,13 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
             skipped.victim.reason,
             skipped.why
         ));
+    }
+    if let Some(left) = &left {
+        text.push_str(&format!("left     {left}\n"));
+        let groups = kept_groups(&listing.dirs);
+        if !groups.is_empty() {
+            text.push_str(&format!("kept     {}\n", groups.join("; ")));
+        }
     }
     let total = listing.dirs.iter().map(|entry| entry.size).sum();
     let freed: u64 = listing.victims.iter().map(|victim| victim.bytes).sum();
@@ -334,6 +398,29 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
         text.push_str(&hint(superseded));
     }
     text
+}
+
+/// What is kept, by group, most bytes first: `126 of no known workspace
+/// within unknown_hours (387.0 GiB)`.
+fn kept_groups(dirs: &[Entry]) -> Vec<String> {
+    let mut groups: Vec<(&'static str, usize, u64)> = Vec::new();
+    for entry in dirs {
+        let Some(group) = entry.kept_group else {
+            continue;
+        };
+        match groups.iter_mut().find(|(known, _, _)| *known == group) {
+            Some((_, count, bytes)) => {
+                *count += 1;
+                *bytes += entry.size;
+            }
+            None => groups.push((group, 1, entry.size)),
+        }
+    }
+    groups.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(b.0)));
+    groups
+        .into_iter()
+        .map(|(group, count, bytes)| format!("{count} {group} ({})", sizes::human(bytes)))
+        .collect()
 }
 
 /// The line that points at `gc --superseded` while `bytes` are superseded.

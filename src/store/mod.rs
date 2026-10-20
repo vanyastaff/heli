@@ -32,6 +32,7 @@ pub mod lease;
 pub mod managed;
 pub mod orphan;
 pub mod owner;
+pub mod placement;
 pub mod probe;
 pub mod record;
 pub mod recycle;

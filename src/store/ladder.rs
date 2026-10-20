@@ -16,6 +16,10 @@
 //!    tier 6 is the newest rung, and the cheapest, so it comes first;
 //! 0. scratch copies cargo tools left in the temporary directory
 //!    (`super::scratch`) untouched for 1 h (`scratch_hours`), oldest first;
+//! 7. build directories of no known workspace (`unknown`: bare or nested
+//!    cargo built in them, and no heli run) untouched for 1 h
+//!    (`unknown_hours`), oldest first: what tests that run cargo in
+//!    temporary workspaces leave behind;
 //! 1. `incremental/<unit>` directories untouched for 24 h (`unit_hours`),
 //!    oldest first across every directory;
 //! 2. orphans no worktree claimed for 24 h (`orphan_hours`), longest
@@ -37,13 +41,23 @@
 //! **Which directories.** A busy directory has no victims. An orphan
 //! without a repository, which no worktree can claim, does not wait out
 //! `orphan_hours` (#88). A build directory without an owner manifest that
-//! `super::attribute` cannot attribute (`unknown`: only bare cargo built
-//! in, and compiled no object file) has tiers 1 and 3, plus tier 5 inside a
-//! verified exclusively regenerable cache root (`super::managed`). It never
-//! counts as an orphan. A
-//! registered `target/` directory has tiers 6, 1, 3 and 4, and is never
-//! deleted whole: it is in the user's worktree. An isolated Cargo home has
-//! tier 2 or 5 only: it holds no intermediates, and is evicted whole.
+//! `super::attribute` cannot attribute (`unknown`: only bare or nested
+//! cargo built in, and compiled no object file) has tiers 1, 3 and 7, the
+//! last when it is of cargo's layout (`super::managed`). It never counts
+//! as an orphan. A registered `target/` directory has tiers 6, 1, 3 and 4,
+//! and is never deleted whole: it is in the user's worktree. An isolated
+//! Cargo home has tier 2 or 5 only: it holds no intermediates, and is
+//! evicted whole.
+//!
+//! **Under the floor.** A volume with less than F free really is full:
+//! the next build on it fails for lack of space, which costs more than any
+//! rebuild. So there the ages do not hold. Once the candidates above are
+//! spent, [`urgent`] takes, on that volume only, what no live workspace
+//! will miss (scratch copies, build directories of no known workspace, and
+//! orphans whatever `orphan_hours`), longest unused first; then the live
+//! directories' units, `incremental/` and tool caches; and last the live
+//! directories whole, longest idle first. Such a victim serves the floor,
+//! never the budget ([`Victim::floor`], #134).
 //!
 //! **Ages.** A unit is untouched since its newest file was written (a
 //! directory without files: since it was). A directory is idle since its
@@ -82,6 +96,9 @@ pub struct Policy {
     pub dir_age: u64,
     /// Tier 0: how long a scratch copy is untouched.
     pub scratch_age: u64,
+    /// Tier 7: how long a build directory of no known workspace is
+    /// untouched.
+    pub unknown_age: u64,
 }
 
 impl Policy {
@@ -96,6 +113,20 @@ impl Policy {
             idle_age: hours(config.idle_hours, 6),
             dir_age: hours(config.dir_hours, 168),
             scratch_age: hours(config.scratch_hours, 1),
+            unknown_age: hours(config.unknown_hours, 1),
+        }
+    }
+
+    /// The policy under the floor: the same limits, and no ages at all.
+    pub fn urgent(self) -> Self {
+        Self {
+            unit_age: 0,
+            orphan_age: 0,
+            idle_age: 0,
+            dir_age: 0,
+            scratch_age: 0,
+            unknown_age: 0,
+            ..self
         }
     }
 
@@ -136,11 +167,13 @@ pub fn now(seam: Option<&Seam>) -> u64 {
 
 /// A rung of the ladder, in the ladder's order. Its number names it, as
 /// `gc`, `status` and the event log show it, and does not order it: the
-/// newest rung, superseded intermediates, is 6, and comes first.
+/// newest rungs, superseded intermediates (6) and build directories of no
+/// known workspace (7): 6 comes first, 7 after scratch copies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
     Superseded,
     Scratch,
+    Unknown,
     Unit,
     Orphan,
     Incremental,
@@ -152,6 +185,7 @@ impl Tier {
     pub fn number(self) -> u8 {
         match self {
             Self::Scratch => 0,
+            Self::Unknown => 7,
             Self::Unit => 1,
             Self::Orphan => 2,
             Self::Incremental => 3,
@@ -312,6 +346,9 @@ pub struct Victim {
     pub age: u64,
     /// Its tier's rule, for people.
     pub reason: String,
+    /// Chosen for a volume under its floor, its tier's age waived
+    /// ([`urgent`]): it serves that floor, never the budget.
+    pub floor: bool,
 }
 
 /// Every victim the ladder allows in `dirs` at `now`, in the ladder's order;
@@ -322,6 +359,65 @@ pub fn candidates(
     tool_caches: &[String],
     now: u64,
 ) -> Vec<Victim> {
+    let mut victims = collect(dirs, policy, tool_caches, now, None, |_| true);
+    victims.sort_by(|a, b| {
+        (a.tier, std::cmp::Reverse(a.age), &a.path).cmp(&(
+            b.tier,
+            std::cmp::Reverse(b.age),
+            &b.path,
+        ))
+    });
+    victims
+}
+
+/// Every victim the ladder allows at `now` on the volumes `floors` names
+/// (each with what it still needs), whatever its tier's age: what goes
+/// under the floor once [`candidates`] are spent, in that order (the
+/// module docs). Each serves only its volume's floor ([`Victim::floor`]).
+/// Superseded intermediates have no age to waive, and are candidates
+/// already.
+pub fn urgent(
+    dirs: &[Surveyed],
+    policy: &Policy,
+    tool_caches: &[String],
+    now: u64,
+    floors: &[(PathBuf, u64)],
+) -> Vec<Victim> {
+    let under = |surveyed: &Surveyed| {
+        floors
+            .iter()
+            .any(|(root, need)| *need > 0 && surveyed.volume.as_deref() == Some(root.as_path()))
+    };
+    let mut victims = collect(dirs, &policy.urgent(), tool_caches, now, Some(now), under);
+    victims.retain(|victim| victim.tier != Tier::Superseded);
+    // What no live workspace will miss first, live directories whole last.
+    let rank = |victim: &Victim| match (victim.tier, dirs[victim.dir].state) {
+        (Tier::Scratch | Tier::Unknown | Tier::Orphan, _) => 0,
+        (Tier::Unit | Tier::Incremental | Tier::ToolCache, _) => 1,
+        (Tier::BuildDir | Tier::Superseded, _) => 2,
+    };
+    victims.sort_by(|a, b| {
+        (rank(a), std::cmp::Reverse(a.age), &a.path).cmp(&(
+            rank(b),
+            std::cmp::Reverse(b.age),
+            &b.path,
+        ))
+    });
+    victims
+}
+
+/// The victims `policy` allows in the directories of `dirs` that `select`
+/// chooses, in no particular order. With `floor` (the time now), they are
+/// chosen for a volume under its floor: an orphan no pass has noted yet
+/// is unclaimed since now, and each victim says so.
+fn collect(
+    dirs: &[Surveyed],
+    policy: &Policy,
+    tool_caches: &[String],
+    now: u64,
+    floor: Option<u64>,
+    select: impl Fn(&Surveyed) -> bool,
+) -> Vec<Victim> {
     let mut victims = Vec::new();
     for (index, surveyed) in dirs.iter().enumerate() {
         if surveyed.state == State::Busy {
@@ -329,10 +425,16 @@ pub fn candidates(
         }
         let root = &surveyed.dir.path;
         let idle = now.saturating_sub(surveyed.last_use);
-        if !surveyed.dir.kind.managed() {
+        if !surveyed.dir.kind.managed() || !select(surveyed) {
             continue;
         }
         let mut victim = |tier: Tier, path: PathBuf, bytes: u64, age: u64, reason: String| {
+            let reason = match (floor, &surveyed.volume) {
+                (Some(_), Some(volume)) => {
+                    format!("{reason}; {} under its floor", volume.display())
+                }
+                _ => reason,
+            };
             victims.push(Victim {
                 tier,
                 path,
@@ -340,6 +442,7 @@ pub fn candidates(
                 bytes,
                 age,
                 reason,
+                floor: floor.is_some(),
             });
         };
         if surveyed.dir.kind.incremental_rungs() {
@@ -380,18 +483,11 @@ pub fn candidates(
             }
         }
         for (tier, path, bytes, age, reason) in
-            super::kind::rungs(surveyed, policy, tool_caches, now, idle)
+            super::kind::rungs(surveyed, policy, tool_caches, now, idle, floor)
         {
             victim(tier, path, bytes, age, reason);
         }
     }
-    victims.sort_by(|a, b| {
-        (a.tier, std::cmp::Reverse(a.age), &a.path).cmp(&(
-            b.tier,
-            std::cmp::Reverse(b.age),
-            &b.path,
-        ))
-    });
     victims
 }
 
@@ -488,8 +584,10 @@ impl Goals {
 /// The victims to evict, from `candidates` in their order, until `goals`
 /// are met: each frees what it holds beyond the victims inside it taken
 /// before, and is taken only if it serves a goal not yet met (for an
-/// unmet budget, a live directory whole does not).
-pub fn plan(candidates: Vec<Victim>, dirs: &[Surveyed], mut goals: Goals) -> Vec<Victim> {
+/// unmet budget, a live directory whole does not; one chosen under the
+/// floor serves its floor only). What the victims do not free is left in
+/// `goals`.
+pub fn plan(candidates: Vec<Victim>, dirs: &[Surveyed], goals: &mut Goals) -> Vec<Victim> {
     let mut planned: Vec<Victim> = Vec::new();
     for mut victim in candidates {
         if !goals.any() {
@@ -519,7 +617,7 @@ pub fn plan(candidates: Vec<Victim>, dirs: &[Surveyed], mut goals: Goals) -> Vec
         let kept_whole = goals.budget_unmet
             && victim.tier == Tier::BuildDir
             && dirs[victim.dir].state == State::Live;
-        let serves_budget = goals.budget > 0 && !kept_whole;
+        let serves_budget = goals.budget > 0 && !kept_whole && !victim.floor;
         if !serves_budget && !serves_floor {
             continue;
         }

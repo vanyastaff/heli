@@ -13,7 +13,7 @@ fn a_relative_activity_override_cannot_delete_runtime_assets() {
     let store = fixture.path("store");
     fixture.configure(&format!(
         "[store]\npaths = ['{}']\nbudget_mb = 1\nunit_hours = 0\n\
-         orphan_hours = 0\nidle_hours = 0\ndir_hours = 0\n",
+         orphan_hours = 0\nidle_hours = 0\ndir_hours = 0\nunknown_hours = 0\n",
         store.display()
     ));
     fixture.start_daemon();

@@ -27,6 +27,21 @@ the default is the user's cache, `$XDG_CACHE_HOME/heli/build` (else
 `GetVolumePathNameW` on Windows, elsewhere the highest directory above the
 path on the same device.
 
+**Under the floor.** Once the volume of the store a run would build in
+has less free than `[store] floor_mb`, the next build there fails for lack
+of space (os error 112 on Windows), which costs more than the copies cargo
+makes across volumes. So a managed run whose build directory would land
+in such a store builds in the first configured `store.paths` entry whose
+volume is above the floor, through `CARGO_BUILD_BUILD_DIR=<that
+store>/{workspace-path-hash}`, which its nested cargos inherit; its
+clients get `cargo-heli: note: the volume of <store> is under its floor
+([store] floor_mb); building in <other> instead` (not with `--output
+quiet`). It starts cold there, and goes back to its own volume's store
+once that volume is above the floor again. heli asks cargo where the build
+directory is only while some store's volume is under the floor; an
+inherited `CARGO_BUILD_BUILD_DIR` and a `build-dir` outside every store
+heli manages are kept (`src/store/placement.rs`, #135).
+
 **Where setup writes it.** Each file is offered with its own question, as
 for the pool's variable ([host pool](host-pool.md), "Reach"):
 
@@ -220,10 +235,11 @@ without them, nothing is evicted. Over budget, heli evicts down to 85 % of
 B. Under the floor, it evicts on that volume until F is free there,
 counting what its trash still holds as free. It evicts what is cheapest to
 regenerate first, oldest first within each tier (the ages are `[store]
-scratch_hours`, `unit_hours`, `orphan_hours`, `idle_hours` and `dir_hours`).
-A tier's number names it and does not rank it: tier 6, the newest, comes
-first, so that the numbers `gc`, `status` and the event log already showed
-keep their meaning.
+scratch_hours`, `unknown_hours`, `unit_hours`, `orphan_hours`, `idle_hours`
+and `dir_hours`).
+A tier's number names it and does not rank it: tiers 6 and 7, the newest,
+come where they belong (6 first, 7 after 0), so that the numbers `gc`,
+`status` and the event log already showed keep their meaning.
 
 6. Superseded intermediates in registered `target/` directories ([accounting](#accounting)),
    whatever their age: cargo will not read them again. Reason:
@@ -238,6 +254,12 @@ keep their meaning.
    (`src/store/scratch.rs`). A cargo lock held anywhere inside makes it
    busy. Its trash is `.heli-trash` beside it, on its volume. It counts
    toward B, and `status` and `gc` list it as `scratch`.
+7. Build directories of no known workspace (`unknown`, below) untouched
+   for 1 h (`unknown_hours`), whole. Tests that run cargo in temporary
+   workspaces (trybuild, generated projects) leave one per workspace under
+   a user-wide `build-dir`, and on a host of agents they pile up by the
+   hundred in a day (#134). Reason: `build directory of no known
+   workspace, untouched for N h`.
 1. `incremental/<unit>` directories untouched for 24 h, oldest first across
    the store. Each unit ever built leaves one; in the example they make up
    114 GB of one worktree.
@@ -257,7 +279,7 @@ keep their meaning.
 
 A registered `target/` directory seen for two workspaces (a global `CARGO_TARGET_DIR` or `build.target-dir`) is `shared` from then on. It is not heli's to manage: it has no rungs, not even 1 and 3, and does not count toward B. `gc` and `status` list it as shared (#65).
 
-What depends on a directory's kind (build, target, scratch, shared or home) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches and its own rungs (6, 0, 2, 4 and 5); rungs 1 and 3 apply to every kind but shared and home.
+What depends on a directory's kind (build, target, scratch, shared or home) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches, its own rungs (6, 0, 7, 2, 4 and 5) and the rule that keeps it whole; rungs 1 and 3 apply to every kind but shared and home.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
 days, cargo-sweep's approach (out of scope for now).
@@ -269,6 +291,26 @@ whichever is later. A profile directory is `<dir>/<profile>/`, or
 taken before counts only what is left in it, and nothing inside a victim
 taken before is one. The clock is the test seam's in debug builds that set
 one ([runs](runs.md)).
+
+**Under the floor** a volume really is full: the next build on it fails
+for lack of space, which costs more than any rebuild. So there the ages
+do not hold. Once the ladder's own victims above are spent, heli takes on
+that volume, whatever their age: first what no live workspace will miss
+(scratch copies, build directories of no known workspace, orphans whatever
+`orphan_hours`), longest unused first; then the live directories' units,
+`incremental/` and tool caches; last the live directories whole, longest
+idle first, until F is free. Such a victim serves the floor only, never
+the budget; `gc` marks it `floor` in its JSON, its reason ends with
+`<volume> under its floor`, and so does the event log's `evict` event
+(#132, #134).
+
+**What is kept, and why.** When a pass cannot free all it has to, `gc`
+says what is left (`left` in its JSON: bytes over the budget's target and
+under each floor), each directory the rule that keeps it whole (`kept`:
+busy, within its age, not of cargo's layout, in its worktree, or kept
+whole over a budget that cannot be met), and the kept directories by
+group, most bytes first: `kept     23 live within dir_hours (300.0 GiB);
+4 busy (60.0 GiB)`. The daemon's log gets `could not free enough: …`.
 
 **A budget that cannot be met.** The ladder cannot touch a busy
 directory, so when the busy directories alone hold more than the target
@@ -298,20 +340,18 @@ Which directories have which tiers:
   temporary workspace's, attributed as in [accounting](#accounting)) can be claimed by none and
   does not wait (#88).
 - An **unknown** build directory, which only bare or nested cargo built in,
-  normally has tiers 1 and 3 only. Its first heli run gives it a manifest.
-  In an exclusively regenerable cache root created by heli, it also has
-  tier 5 after `dir_hours`, with a recognized Cargo lock layout and no held
-  locks. It remains unknown: ownership of a cache root does not establish
+  has tiers 1, 3 and 7. Its first heli run gives it a manifest. Tier 7
+  needs cargo's layout: a `<2 hex>/<14 hex>` directory of its own in a
+  store heli surveys (configured or default), whose profile directories
+  hold cargo's lock files, none of them held; this is checked again
+  before eviction. It remains unknown: being reclaimable establishes no
   workspace identity, orphan status or eligibility for recycling.
-- Only an explicitly configured `store.paths` root whose final directory
-  heli successfully creates receives `.heli-cache-root.json` (schema 1,
-  bound to its canonical path). Existing roots, even empty ones, and default
-  roots are never adopted. Missing, copied, malformed or unsupported markers
-  retain the conservative policy. `gc --dry-run` creates nothing.
-  Root provenance, real child directories and the Cargo lock layout are
-  checked again before eviction. `gc --json` exposes `managed_cache_root`.
-  Configure a fresh root for nested-Cargo reclamation; there is no implicit
-  migration of an existing store.
+- A configured `store.paths` root whose final directory heli creates
+  receives `.heli-cache-root.json` (schema 1, bound to its canonical
+  path), and `gc --json` reports it as `managed_cache_root`. It records
+  where a store came from and no longer decides what is reclaimed: until
+  0.0.5 an unknown directory went whole only in such a root, so stores
+  that existed before heli kept every nested build forever (#134).
 - A registered `target/` directory has tiers 1 and 3 where cargo keeps its
   intermediates there (no `build-dir`), tier 6 where it kept them before
   `build-dir` moved them, and tier 4. It is in the user's worktree, so it

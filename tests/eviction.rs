@@ -231,6 +231,16 @@ fn victims(document: &Value) -> Vec<(u64, PathBuf)> {
         .collect()
 }
 
+/// The `floor` flag of each victim, in order.
+fn floor_flags(document: &Value) -> Vec<bool> {
+    document["victims"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no victims: {document}"))
+        .iter()
+        .map(|victim| victim["floor"] == true)
+        .collect()
+}
+
 /// `path` as places compare here: canonical where it exists, else its
 /// parent's canonical form and its name.
 fn spelled(path: &Path) -> PathBuf {
@@ -599,7 +609,23 @@ fn the_floor_starts_eviction_within_the_budget() {
     let planned = gc(&fixture, &["gc", "--dry-run"]);
     let mut expected: Vec<(u64, PathBuf)> = units.iter().map(|unit| (1, spelled(unit))).collect();
     expected.insert(1, (1, spelled(&triple_unit)));
-    assert_eq!(victims(&planned), expected, "{planned}");
+    // The ladder's own candidates first; a floor no disk can meet then
+    // takes the rest of the volume, the ages waived: the `incremental/`
+    // holding the young unit, and the build directory whole last.
+    let all = victims(&planned);
+    assert_eq!(all[..expected.len()], expected[..], "{planned}");
+    let flags = floor_flags(&planned);
+    assert!(
+        flags[..expected.len()].iter().all(|floor| !floor),
+        "{planned}"
+    );
+    assert!(
+        flags[expected.len()..].iter().all(|floor| *floor),
+        "{planned}"
+    );
+    let young_incremental = young.parent().expect("incremental/");
+    assert!(all.contains(&(3, spelled(young_incremental))), "{planned}");
+    assert_eq!(all.last(), Some(&(5, spelled(&build))), "{planned}");
     assert!(not_a_unit.is_dir());
     let volumes = planned["volumes"].as_array().expect("volumes");
     assert!(
@@ -610,7 +636,8 @@ fn the_floor_starts_eviction_within_the_budget() {
     );
     gc(&fixture, &["gc"]);
     assert!(units.iter().all(|unit| !unit.exists()));
-    assert!(young.is_dir(), "a unit untouched for an hour stays");
+    assert!(!young.exists(), "under the floor, the young unit goes too");
+    assert!(!build.exists(), "and the build directory whole");
 
     let units = four_old_units(&fixture, clock, 1);
     configure(&fixture, "budget_mb = 1000000\nfloor_mb = 0\n");
@@ -705,10 +732,13 @@ fn a_busy_directory_is_never_touched() {
 
 /// A build directory only bare cargo checked in has no owner manifest, and
 /// no object file to attribute it by (#88): heli cannot tell whether its
-/// workspace lives. Its incremental units and its `incremental/` can go,
-/// but it is never deleted whole, however long it has been idle.
+/// workspace lives, or ever did (tests that run cargo in temporary
+/// workspaces leave such directories behind, #134). Within
+/// `unknown_hours` its incremental units and its `incremental/` go, and
+/// `gc` says what keeps the rest; untouched for longer, it goes whole
+/// (tier 7), in any store heli surveys.
 #[test]
-fn an_unknown_build_directory_is_never_deleted_whole() {
+fn an_unknown_build_directory_goes_whole_once_untouched_for_unknown_hours() {
     let fixture = Fixture::new("basic");
     configure(&fixture, "");
     let workspace = fixture.workspace();
@@ -725,10 +755,28 @@ fn an_unknown_build_directory_is_never_deleted_whole() {
     let unit = fake_unit(&incremental(build), "old-unit", 1000, now());
     std::fs::write(incremental(build).join("loose.bin"), [0u8; 100]).expect("a loose file");
     set_clock(&fixture, now() + 300 * HOUR);
-    configure(&fixture, "budget_mb = 0\n");
+    configure(&fixture, "budget_mb = 0\nunknown_hours = 1000\n");
 
     let listing = gc(&fixture, &["gc", "--dry-run"]);
-    assert_eq!(listed(&listing, build)["state"], "unknown", "{listing}");
+    let entry = listed(&listing, build);
+    assert_eq!(entry["state"], "unknown", "{listing}");
+    let kept = entry["kept"].as_str().unwrap_or_default();
+    assert!(
+        kept.starts_with("no known workspace, untouched for 300 h of 1000 h"),
+        "{listing}"
+    );
+    let output = fixture
+        .heli(["gc", "--dry-run"])
+        .output()
+        .expect("run heli gc --dry-run");
+    assert_success(&output, "cargo heli gc --dry-run");
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("kept: no known workspace, untouched for 300 h")
+            && stdout.contains("left     budget still")
+            && stdout.contains("kept     1 no known workspace within unknown_hours ("),
+        "{stdout}"
+    );
     let planned = victims(&listing);
     let mut expected: Vec<(u64, PathBuf)> = units(build)
         .iter()
@@ -756,6 +804,114 @@ fn an_unknown_build_directory_is_never_deleted_whole() {
     gc(&fixture, &["gc"]);
     assert!(build.join("debug").join("deps").is_dir(), "deps/ stays");
     assert!(!incremental(build).exists());
+
+    // Untouched for longer than unknown_hours (1 h by default), it goes
+    // whole.
+    configure(&fixture, "budget_mb = 0\n");
+    let listing = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(victims(&listing), [(7, spelled(build))], "{listing}");
+    assert!(listed(&listing, build)["kept"].is_null(), "{listing}");
+    gc(&fixture, &["gc"]);
+    assert!(!build.exists());
+}
+
+/// Under the floor, a volume really is full, and the ages do not hold on
+/// it: once the ladder's own candidates are spent, what no live workspace
+/// will miss goes first, longest unused first (a build directory of no
+/// known workspace, an orphan whatever `orphan_hours`), then the live
+/// directory's caches, and the live directory whole last. Within the
+/// budget and above the floor the same directories are kept, and `gc` says
+/// why (#132, #134).
+#[test]
+fn under_the_floor_what_no_workspace_will_miss_goes_first_whatever_its_age() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    use_store(&fixture, &main);
+    let clock = now() + 300 * HOUR;
+    // A live worktree, idle for half an hour.
+    let live = add_worktree(&main, "live");
+    let live_build = build_in(&fixture, &live, "echo-args");
+    // An orphan of the repository, which a worktree may still claim.
+    let gone = add_worktree(&main, "gone");
+    let gone_build = build_in(&fixture, &gone, "echo-args");
+    git(
+        &main,
+        &["worktree", "remove", "--force", &gone.to_string_lossy()],
+    );
+    // A build directory of no known workspace: bare cargo checked in the
+    // main worktree, which no heli run built in.
+    let output = fixture
+        .cargo(["check", "--quiet", "-p", "echo-args"])
+        .current_dir(&main)
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .expect("run cargo check");
+    assert_success(&output, "cargo check");
+    let unknown_build = build_dirs(&store(&fixture))
+        .into_iter()
+        .find(|build| !build.join(".heli").join("owner").exists())
+        .expect("the unknown build directory");
+    for build in [&live_build, &gone_build, &unknown_build] {
+        set_times(build, clock - 1800);
+    }
+    set_clock(&fixture, clock);
+
+    // Within the budget and above the floor: the ages hold, and each
+    // directory says what keeps it.
+    configure(&fixture, "budget_mb = 1000000\nfloor_mb = 0\n");
+    let within = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(victims(&within), [], "{within}");
+    let kept = |document: &Value, build: &Path| -> String {
+        listed(document, build)["kept"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} is not kept: {document}", build.display()))
+            .to_owned()
+    };
+    assert!(
+        kept(&within, &unknown_build)
+            .starts_with("no known workspace, untouched for 0 h of 1 h ([store] unknown_hours)"),
+        "{within}"
+    );
+    assert!(
+        kept(&within, &gone_build).starts_with("orphan no pass has noted yet"),
+        "{within}"
+    );
+    assert!(
+        kept(&within, &live_build).starts_with("live, idle for 0 h of 168 h ([store] dir_hours)"),
+        "{within}"
+    );
+
+    // Under a floor no disk can meet: what no workspace will miss first,
+    // the live directory whole last, every victim for the floor.
+    configure(&fixture, "budget_mb = 1000000\nfloor_mb = 1099511627776\n");
+    let under = gc(&fixture, &["gc", "--dry-run"]);
+    let planned = victims(&under);
+    assert_eq!(
+        planned[..2],
+        [(7, spelled(&unknown_build)), (2, spelled(&gone_build))],
+        "{under}"
+    );
+    assert_eq!(planned.last(), Some(&(5, spelled(&live_build))), "{under}");
+    assert!(
+        planned[2..planned.len() - 1]
+            .iter()
+            .all(|(tier, path)| matches!(tier, 1 | 3) && path.starts_with(spelled(&live_build))),
+        "{under}"
+    );
+    assert!(floor_flags(&under).iter().all(|floor| *floor), "{under}");
+    assert!(
+        under["victims"][0]["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("under its floor")),
+        "{under}"
+    );
+
+    gc(&fixture, &["gc"]);
+    assert!(!unknown_build.exists());
+    assert!(!gone_build.exists());
+    assert!(!live_build.exists());
 }
 
 /// Lock names change between cargo versions. A profile directory with
@@ -765,7 +921,8 @@ fn an_unknown_build_directory_is_never_deleted_whole() {
 #[test]
 fn an_unknown_lock_layout_is_busy_for_an_hour_after_a_change() {
     let fixture = Fixture::new("basic");
-    configure(&fixture, "budget_mb = 0\n");
+    // Neither directory goes whole here (tier 7): only the units count.
+    configure(&fixture, "budget_mb = 0\nunknown_hours = 1000\n");
     let build = store(&fixture).join("ab").join("0123456789abcd");
     let profile = build.join("debug");
     std::fs::create_dir_all(profile.join("deps")).expect("create deps/");
@@ -1227,7 +1384,10 @@ fn the_daemon_finds_orphans() {
     assert_eq!(victim["age"], 0, "unclaimed since the clock's now: {found}");
 }
 
-/// Under the floor, the daemon evicts by itself too.
+/// Under the floor, the daemon evicts by itself too: the ladder's own
+/// victims first (the old units), then, a floor no disk can meet, the
+/// rest of the volume with the ages waived, the build directory whole
+/// last.
 #[test]
 fn the_daemon_evicts_under_the_floor() {
     let fixture = Fixture::new("basic");
@@ -1242,13 +1402,40 @@ fn the_daemon_evicts_under_the_floor() {
     let build = build_in(&fixture, &workspace, "echo-args");
     let evictions = wait_for("the daemon's evictions", || {
         let evictions = fixture.events_named("evict");
-        (!evictions.is_empty()).then_some(evictions)
+        evictions
+            .iter()
+            .any(|event| {
+                event["tier"] == 5
+                    && spelled(Path::new(event["path"].as_str().expect("a path")))
+                        == spelled(&build)
+            })
+            .then_some(evictions)
     });
-    for event in &evictions {
-        assert_eq!(event["tier"], 1, "{evictions:?}");
+    let whole = evictions
+        .iter()
+        .position(|event| event["tier"] == 5)
+        .expect("the build directory whole");
+    assert_eq!(evictions[whole]["floor"], true, "{evictions:?}");
+    let units: Vec<&Value> = evictions
+        .iter()
+        .filter(|event| event["tier"] == 1)
+        .collect();
+    assert!(!units.is_empty(), "{evictions:?}");
+    for event in &units {
+        assert_eq!(
+            event["floor"], false,
+            "an old unit is the ladder's own: {event}"
+        );
         let path = spelled(Path::new(event["path"].as_str().expect("a path")));
         assert_eq!(path.parent(), Some(spelled(&incremental(&build)).as_path()));
     }
+    assert!(
+        evictions[..whole].iter().any(|event| event["tier"] == 1),
+        "{evictions:?}"
+    );
+    wait_for("the build directory to be gone", || {
+        (!build.exists()).then_some(())
+    });
 }
 
 /// A worktree that comes back at the same place makes its build directory

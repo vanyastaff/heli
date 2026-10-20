@@ -136,6 +136,9 @@ impl Accounts {
                 unmet.describe()
             ));
         }
+        if let Some(left) = pass.left_text() {
+            lines.push(format!("could not free enough: {left}"));
+        }
         if !pass.victims.is_empty() {
             let freed: u64 = pass.victims.iter().map(|victim| victim.bytes).sum();
             lines.push(format!(

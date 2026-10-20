@@ -191,7 +191,8 @@ else `interactive` when stdin and stdout are terminals and neither
 priority is a usage error (2). The run request carries it (absent:
 `normal`, so an older client's runs are normal), and a test run's build and
 test phases keep it. A client that attaches to a run in flight leaves the
-run's priority as it was.
+run's priority as it was. A run without a client for two minutes is
+weighed `background` until one attaches again ([runs](runs.md), "Detach").
 
 With the pool saturated by two background runs, an interactive run gets the
 next slot one of them gives back (Take back) and settles at 4/4.5 of the
