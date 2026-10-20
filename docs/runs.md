@@ -447,8 +447,10 @@ cargo heli recycle                                 (internal: the post-checkout 
     since <base>` and exits 0 without running anything.
   - It works with build, check, clippy, test, bench, doc, `nextest run`,
     `nextest list` and llvm-cov; heli refuses (exit 2) any other subcommand,
-    and `-p`, `--package`, `--workspace`, `--all`, `--exclude` or nextest's
-    `-E` beside it.
+    and `-p`, `--package`, `--workspace`, `--all` or `--exclude` beside it.
+    nextest's `-E` is not a chooser: a filterset selects among the tests of
+    the packages cargo builds, so beside the selection it filters within it,
+    as it does beside `-p` (`--affected nextest run -E 'not test(slow)'`).
   - `cargo heli changed` prints the selection, each package with why (its
     changed files, or the member it depends on), and the files in no
     package; `--json`, a versioned document (`schema` 1).

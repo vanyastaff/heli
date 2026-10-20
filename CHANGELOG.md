@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`--changed` and `--affected` take nextest's `-E`.** A filterset selects
+  among the tests of the packages cargo builds, so beside the selection it
+  filters within it, as it does beside `-p`; heli refused it as a package
+  chooser (`--affected chooses the packages itself; it cannot be combined
+  with -E`). `cargo heli --affected nextest run -E 'not test(slow)'` now
+  runs the tests of the changed members and their dependents that the
+  filterset keeps.
+
 ## 0.0.5
 
 After upgrading, run `cargo heli restart` so that the daemon is the new one:

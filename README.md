@@ -57,6 +57,7 @@ subcommand; `=REF` gives the base, else it is the upstream branch:
 ```text
 cargo heli --affected clippy --all-targets -- -D warnings
 cargo heli --affected=origin/main nextest run
+cargo heli --affected nextest run -E 'not test(slow)'
 cargo heli changed --affected
 ```
 

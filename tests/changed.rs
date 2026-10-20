@@ -183,6 +183,46 @@ fn a_run_with_changed_checks_only_the_changed_package() {
     );
 }
 
+/// nextest's `-E` is a test filter, not a package chooser: beside a
+/// selection it keeps the selected packages' tests that match, as it does
+/// beside `-p`; `package(…)` in it narrows the selection, and adds nothing.
+#[test]
+fn a_nextest_filterset_filters_within_the_selection() {
+    support::require_nextest();
+    let fixture = repository();
+    touch(&fixture, "leaf/src/lib.rs");
+    let run = |args: &[&str]| {
+        let output = fixture
+            .heli(["--output", "compact"].iter().chain(args))
+            .output()
+            .expect("run cargo-heli");
+        assert_success(&output, &format!("cargo heli {}", args.join(" ")));
+        output
+    };
+
+    // `leaf` alone, and of its two tests only `one`.
+    let changed = run(&["--changed=base", "nextest", "run", "-E", "test(one)"]);
+    let line = selection_line(&changed).expect("the selection line");
+    assert!(line.ends_with("): -p leaf"), "{line}");
+    let stderr = text(&changed.stderr);
+    assert!(
+        stderr.contains("1 test run: 1 passed, 1 skipped"),
+        "{stderr}"
+    );
+
+    // `leaf`, `mid` and `top`, and of their tests only `top`'s: nextest
+    // skips the two other test binaries whole.
+    let affected = run(&["--affected=base", "nextest", "run", "-E", "package(top)"]);
+    let line = selection_line(&affected).expect("the selection line");
+    assert!(
+        line.ends_with("): -p leaf -p mid -p top (+2 dependents)"),
+        "{line}"
+    );
+    let stderr = text(&affected.stderr);
+    assert!(stderr.contains("1 test run: 1 passed"), "{stderr}");
+    assert!(stderr.contains("2 binaries skipped"), "{stderr}");
+}
+
 /// An unchanged tree runs nothing: heli says so and exits 0.
 #[test]
 fn an_unchanged_tree_runs_nothing() {
@@ -235,7 +275,6 @@ fn a_selection_is_refused_where_it_cannot_apply() {
         &["--changed=base", "clippy", "--workspace"],
         &["--changed=base", "test", "--all"],
         &["--changed=base", "check", "--exclude", "top"],
-        &["--changed=base", "nextest", "run", "-E", "package(leaf)"],
     ] {
         assert_refused(&run(chooser), "cannot be combined");
     }
