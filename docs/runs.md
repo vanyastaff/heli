@@ -260,6 +260,20 @@ configuration and changes nothing. The `--json` document has `schema` 1,
      cancelled, and it takes no new clients. A run cancelled while it waits
      for its worktree never starts, and its clients exit 1. A process that
      starts a session of its own (on Unix) is not the run's any more.
+   - **No client** (#121). A run whose clients have all gone (killed, or an
+     agent that gave up on it) goes on to its end, since the same command
+     attaches to it again. But after two minutes without a client it is
+     weighed `background` ([host pool](host-pool.md), "Priorities") until
+     one attaches again (`rerun`, or the same command: Attach), which
+     restores its own priority: runs somebody waits for take its slots
+     first. After ten minutes without a client, while another run waits for
+     a slot, it is cancelled: its record ends with `cargo-heli: r17:
+     cancelled: no client followed it for 600 s while 3 runs waited for
+     slots`, `status` lists it as `cancelled (no client)` (`exit.detached`),
+     and the daemon's log says so, as it says when a run is demoted and
+     restored. `status` shows a run without a client with `detached_since`,
+     and in its text form with `no client for 72s` in place of the clients
+     attached ([observability](observability.md)).
 5. **Compile phase.** The environment gets the run pool ([host pool](host-pool.md)) and
    `HELI_RUN=<run id>`. heli sets no `-j`: under a jobserver, cargo ignores it.
 6. **Test phase** (test class only).
@@ -509,8 +523,9 @@ cargo heli recycle                                 (internal: the post-checkout 
   daemon: memory figures (`[test.memory]`) and a clock (`clock_ms`,
   milliseconds since 1970), read again at each look of the memory governor,
   which counts only the time between its readings, and of the eviction
-  ladder, for which it is the time now ([eviction](build-store.md#eviction); `gc` reads it too). Release
-  builds ignore it.
+  ladder, for which it is the time now ([eviction](build-store.md#eviction); `gc` reads it too), and
+  the grace periods of a run without a client (`detached_demote_ms`,
+  `detached_cancel_ms`; "Detach" above). Release builds ignore it.
 
 ## Output (G7)
 

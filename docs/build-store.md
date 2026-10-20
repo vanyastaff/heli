@@ -27,6 +27,21 @@ the default is the user's cache, `$XDG_CACHE_HOME/heli/build` (else
 `GetVolumePathNameW` on Windows, elsewhere the highest directory above the
 path on the same device.
 
+**Under the floor.** Once the volume of the store a run would build in
+has less free than `[store] floor_mb`, the next build there fails for lack
+of space (os error 112 on Windows), which costs more than the copies cargo
+makes across volumes. So a managed run whose build directory would land
+in such a store builds in the first configured `store.paths` entry whose
+volume is above the floor, through `CARGO_BUILD_BUILD_DIR=<that
+store>/{workspace-path-hash}`, which its nested cargos inherit; its
+clients get `cargo-heli: note: the volume of <store> is under its floor
+([store] floor_mb); building in <other> instead` (not with `--output
+quiet`). It starts cold there, and goes back to its own volume's store
+once that volume is above the floor again. heli asks cargo where the build
+directory is only while some store's volume is under the floor; an
+inherited `CARGO_BUILD_BUILD_DIR` and a `build-dir` outside every store
+heli manages are kept (`src/store/placement.rs`, #135).
+
 **Where setup writes it.** Each file is offered with its own question, as
 for the pool's variable ([host pool](host-pool.md), "Reach"):
 
