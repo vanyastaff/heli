@@ -91,7 +91,7 @@ const KEPT_RECENT: usize = 1 << 16;
 pub const SATURATED_AFTER: Duration = Duration::from_secs(5);
 
 /// How long the pool must stay unsaturated for a spell to end while two
-/// runs or more are active. A run that gives a slot back and asks for the
+/// runs or more are open. A run that gives a slot back and asks for the
 /// next one leaves it free for a tick or two; that is no end of the crowd.
 const CALM: Duration = Duration::from_secs(1);
 
@@ -523,8 +523,9 @@ impl Broker {
         } else if state.saturated.is_some() {
             let calm_since = *state.calm_since.get_or_insert(now);
             // Fewer than two runs left is an end at once: the broker may
-            // not look again before another comes.
-            if active >= 2 && now.saturating_duration_since(calm_since) < CALM {
+            // not look again before another comes. A run between two slots
+            // is no longer active for a moment, but still there.
+            if state.runs.len() >= 2 && now.saturating_duration_since(calm_since) < CALM {
                 return;
             }
             state.calm_since = None;
