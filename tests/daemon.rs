@@ -424,11 +424,12 @@ fn a_daemon_of_another_version_means_a_direct_run() {
     }
 }
 
-/// A newer client asks the daemon to retire: the daemon takes no new runs
-/// (they run directly, after one warning), finishes the runs in flight,
-/// then exits, and the next call starts a new daemon.
+/// A newer client asks the daemon to retire with a run in flight: the
+/// daemon hands over at once (docs/daemon.md, "Handover", #126), so the next
+/// call starts a new daemon and runs there, with no warning; the old one
+/// finishes its run, then exits.
 #[test]
-fn a_retiring_daemon_finishes_its_runs_then_exits() {
+fn a_retiring_daemon_hands_over_and_finishes_its_runs() {
     let fixture = Fixture::new("basic");
     let echo = fixture.echo_args();
     let gate = fixture.path("gate");
@@ -451,32 +452,30 @@ fn a_retiring_daemon_finishes_its_runs_then_exits() {
     // The daemon hangs up once it has taken the request.
     let _ = newer.read_to_end(&mut Vec::new());
 
-    let warning =
-        assert_ran_directly_with_one_warning(&fixture, &mut fixture.heli(Vec::<String>::new()));
-    assert!(warning.contains("shutting down"), "{warning}");
-    let status = fixture.status();
-    assert_eq!(support::daemon_pid(&status), Some(daemon), "still there");
-    assert_eq!(runs(&status).len(), 1, "with its run: {status}");
-
-    open(&gate);
-    let output = finish(call);
-    assert_success(&output, "the run in flight");
-    assert_eq!(text(&output.stdout), "arg: \"in flight\"\n");
-    fixture.wait_for_status("the daemon to exit", |status| status["daemon"].is_null());
-
     let output = fixture
         .heli(["exec", "--"])
         .arg(&echo)
         .output()
         .expect("run heli");
-    assert_success(&output, "a later call");
+    assert_success(&output, "a call meanwhile");
     assert_eq!(
         support::without_footer(&output.stderr),
         "echo-args: stderr\n",
         "no warning"
     );
-    let replacement = fixture.daemon_pid().expect("a new daemon");
+    let status = fixture.status();
+    let replacement = support::daemon_pid(&status).expect("a new daemon");
     assert_ne!(replacement, daemon);
+    assert_eq!(status["retiring"][0]["pid"], daemon, "{status}");
+
+    open(&gate);
+    let output = finish(call);
+    assert_success(&output, "the run in flight");
+    assert_eq!(text(&output.stdout), "arg: \"in flight\"\n");
+    fixture.wait_for_status("the old daemon to exit", |status| {
+        status["retiring"].as_array().is_some_and(Vec::is_empty)
+    });
+    assert_eq!(fixture.daemon_pid(), Some(replacement));
 }
 
 /// Only the user can open the daemon's endpoint: on Windows its DACL allows

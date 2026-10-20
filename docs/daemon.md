@@ -50,7 +50,8 @@ client talks only to a socket owned by its uid.
 the protocol version, each way. On a mismatch the client runs the command
 directly, with one warning line. A client newer than the daemon also asks it
 to retire: the daemon takes no new runs and exits once its runs in flight
-have finished, so the next call starts a current daemon. As it exits it
+have finished, so the next call starts a current daemon. With runs in
+flight it hands over at once ([below](#handover)). As it exits it
 first stops listening and releases the state directory's lock: the process
 itself may take a while to be gone (seen to take over 10 s on a loaded
 Windows host), and until then it would hold its endpoint, where a client
@@ -90,6 +91,46 @@ their inode. `doctor` says when the daemon is older than the client
 when an old program is still beside the new one. The Cargo home's own
 records are cargo's: `cargo install --list` keeps naming the version cargo
 installed there.
+
+<a id="handover"></a>**Handover** (#126). A daemon asked to retire (`stop`,
+`restart`, `self-upgrade`, a newer client) with runs in flight does not
+make the host wait for them: under a saturated pool they took 25 to 64
+minutes, and every new run meanwhile ran directly, with no record, run
+pool, test slots, result cache, `status`, `log` or `cancel`. It hands
+over instead, from its main thread:
+
+1. it stops listening, writes its record in `retiring/` in the state
+   directory (`retiring-<session>/` on Windows: `<pid>.json`, its version,
+   since when, and its runs in flight as `status` shows them, rewritten as
+   they end), releases the pool's lock on Unix (a semaphore has none) and
+   the state directory's lock, so the next client starts a new daemon at
+   once, which adopts the pool;
+2. it stops governing the pool (it returns the slots it withheld; top-up
+   and drain are the new daemon's, whose quiescence check already waits for
+   the old runs' compilers through the process scan) and keeping the
+   store, which the new daemon's accountant does;
+3. it serves its runs to their end, lending them slots from the host pool
+   as before, and exits once their clients have heard how they ended.
+
+It holds `<pid>.lock` in `retiring/` for as long as it lives, so a record
+whose daemon was killed is told apart and removed, whatever process has
+its pid now. A client the retiring daemon refuses meanwhile (the moment
+between the request to retire and the end of listening) is told so, and
+connects again within 5 s, which reaches or starts the new daemon. The new
+daemon's `status` lists the retiring daemons and their runs (`retiring`;
+with no daemon at all, the client reads the records itself), `log` reads
+their records from disk, and `cancel` of one of their runs leaves a
+`<pid>.cancel-<run>` request that the retiring daemon acts on within
+200 ms. On Windows the retiring daemon's clients keep their instances of
+the pipe, so the pipe stays, with every instance taken: a client that
+finds it busy and a retiring daemon alive starts the new daemon as when
+there is no pipe, and the new daemon creates its instances of that pipe
+instead of a first one, only while a retiring daemon lives.
+
+Each broker counts only its own runs, and sees the other's as bare cargo,
+so shares are approximate until the old runs end. A client of the same
+command as an old run in flight starts a run of its own on the new daemon,
+rather than attach to the old one.
 
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
