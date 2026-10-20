@@ -84,6 +84,13 @@ pub struct TestRun {
 
 /// The test run `request` asks for, or `None` for a run of another class
 /// (or of none: from a client older than run classes).
+impl TestRun {
+    /// The tool that runs its tests.
+    pub fn runner(&self) -> Runner {
+        self.runner
+    }
+}
+
 pub fn plan(request: &RunRequest) -> Option<TestRun> {
     if request.class != Some(Class::Test) {
         return None;

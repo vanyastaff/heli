@@ -156,7 +156,11 @@ pub fn main() -> ! {
             locations.run_counter_lock(),
             locations.run_logs(),
         )),
-        broker: Broker::start(Arc::clone(&pool)),
+        broker: Broker::start(Arc::clone(&pool), {
+            let events = Arc::clone(&events);
+            let slots = pool.status().slots;
+            Box::new(move |spell| events.record("saturated", saturated_event(spell, slots)))
+        }),
         pool,
         governor,
         events,
@@ -723,6 +727,12 @@ impl Daemon {
                 "{id}: no run pool ({error}); it draws from the host pool"
             ));
         }
+        if let Some(crowding) = self.broker.crowding(id)
+            && let Some(header) = crowding_header(id, request, &crowding, self.pool.status().slots)
+        {
+            let recorded = record.output(Channel::Stderr, header.as_bytes());
+            live.append(Channel::Stderr, header.into_bytes(), recorded);
+        }
         let mut run = Execution {
             request,
             epoch,
@@ -731,11 +741,14 @@ impl Daemon {
             live,
             record: &mut record,
         };
-        let ended = match test_run::plan(request) {
+        let plan = test_run::plan(request);
+        let ended = match &plan {
             None => self.phase(&mut run, &request.argv()),
-            Some(plan) => self.test(&mut run, &plan),
+            Some(plan) => self.test(&mut run, plan),
         };
+        let mut saturated = false;
         if let Some(loans) = self.broker.close(id) {
+            saturated = loans.saturated;
             self.events.record("loans", loans_event(id, &loans));
         }
         // Its build directory's source-state record
@@ -766,6 +779,40 @@ impl Daemon {
         drop(record);
         drop(_activity);
         live.end(Reply::exited(exit));
+        // A nextest run that failed while the pool was saturated: the tests
+        // its slow-timeout killed (docs/host-pool.md#saturation).
+        if saturated
+            && code != 0
+            && plan.is_some_and(|plan| plan.runner() == crate::class::Runner::Nextest)
+        {
+            self.record_timeouts(id);
+        }
+    }
+
+    /// Logs the tests of nextest run `id` that its slow-timeout killed, if
+    /// any, as a `timeouts` event: under a saturated pool, a test that runs
+    /// cargo itself waits for slots and times out.
+    fn record_timeouts(&self, id: RunId) {
+        let lines = match runlog::open(self.runlog.dir(), id) {
+            Ok(events) => runlog::select::Lines::new(events),
+            Err(_) => return,
+        };
+        match crate::rerun::failed::nextest_timeouts(lines) {
+            Ok(tests) if !tests.is_empty() => {
+                let names: Vec<String> = tests
+                    .iter()
+                    .map(|test| format!("{} {}", test.binary, test.name))
+                    .collect();
+                self.events.record(
+                    "timeouts",
+                    serde_json::json!({"run": id.to_string(), "tests": names}),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => self
+                .log
+                .write(&format!("cannot read the record of {id}: {error}")),
+        }
     }
 
     /// Runs `argv` as a phase of `run`, in a process tree of its own:
@@ -885,6 +932,7 @@ impl Daemon {
                 desktop: place.desktop,
             }),
             pool: Some(self.pool.status()),
+            saturation: Some(status::Saturation::of(&self.broker.pressure())),
             memory: self.governor.memory(),
             runs: self.runs(),
             disk: Some(self.accounts.disk()),
@@ -1060,6 +1108,70 @@ fn test_header(id: RunId, slots: u32, share: f64, waited: Duration) -> String {
     }
 }
 
+/// The `saturated` event: a spell of saturation of the pool of `slots` that
+/// lasted `pool::broker::SATURATED_AFTER` or more has ended
+/// (docs/host-pool.md#saturation).
+fn saturated_event(spell: &crate::pool::broker::Spell, slots: u32) -> serde_json::Value {
+    serde_json::json!({
+        "since": spell.since_unix,
+        "seconds": spell.lasted.as_secs(),
+        "slots": slots,
+        "most_active": spell.most_active,
+        "most_waiting": spell.most_waiting,
+    })
+}
+
+/// How many `-p` a run may name before heli counts it as a run of the whole
+/// workspace, for [`crowding_header`].
+const MANY_PACKAGES: usize = 8;
+
+/// The header line of run `id` joining a saturated pool of `slots`
+/// (docs/host-pool.md#saturation): only for a cargo command that builds
+/// and selects the whole workspace (`--workspace`, `--all`, or
+/// [`MANY_PACKAGES`] `-p` or more), the runs that would narrow themselves.
+fn crowding_header(
+    id: RunId,
+    request: &RunRequest,
+    crowding: &crate::pool::broker::Crowding,
+    slots: u32,
+) -> Option<String> {
+    if matches!(request.class, None | Some(Class::Exec)) || !whole_workspace(&request.argv()) {
+        return None;
+    }
+    Some(format!(
+        "cargo-heli: {id}: {} runs share {slots} slots, saturated for {} s; this run gets about {}. \
+         Narrow it (--affected, -p) or run it with --priority background.\n",
+        crowding.runs,
+        crowding.saturated_for.as_secs(),
+        status::slots(crowding.share),
+    ))
+}
+
+/// Whether `argv` selects a whole workspace: `--workspace` or `--all`, or
+/// [`MANY_PACKAGES`] packages or more, before any `--`.
+fn whole_workspace(argv: &[OsString]) -> bool {
+    let mut packages = 0;
+    let mut args = argv.iter().skip(1).map(|arg| arg.to_string_lossy());
+    while let Some(arg) = args.next() {
+        match arg.as_ref() {
+            "--" => break,
+            "--workspace" | "--all" => return true,
+            "-p" | "--package" => {
+                args.next();
+                packages += 1;
+            }
+            other
+                if other.starts_with("--package=")
+                    || (other.starts_with("-p") && other.len() > 2) =>
+            {
+                packages += 1;
+            }
+            _ => {}
+        }
+    }
+    packages >= MANY_PACKAGES
+}
+
 /// The event that tells how run `id`'s loans went: how many slots were lent
 /// to its pool and taken back, the most it used, and how long it waited for
 /// a lent slot (at most: from when its pool was last seen with a free
@@ -1155,5 +1267,34 @@ mod connection_tests {
         drop(held);
         assert_eq!(open.load(Ordering::SeqCst), 0);
         assert!(Connection::claim(&open).is_some());
+    }
+}
+
+#[cfg(test)]
+mod crowding_tests {
+    use std::ffi::OsString;
+
+    use super::whole_workspace;
+
+    fn argv(args: &str) -> Vec<OsString> {
+        args.split(' ').map(OsString::from).collect()
+    }
+
+    /// `--workspace`, `--all` and eight packages or more select the whole
+    /// workspace; fewer packages, or flags after `--`, do not (#127).
+    #[test]
+    fn a_whole_workspace_is_told_from_a_narrow_run() {
+        assert!(whole_workspace(&argv("cargo build --workspace")));
+        assert!(whole_workspace(&argv("cargo nextest run --all")));
+        let many = (0..8)
+            .map(|n| format!("-p c{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(whole_workspace(&argv(&format!("cargo test {many}"))));
+        let mixed = "cargo test -pa --package b --package=c -p d -p e -p f -p g -ph";
+        assert!(whole_workspace(&argv(mixed)));
+        assert!(!whole_workspace(&argv("cargo test -p a -p b")));
+        assert!(!whole_workspace(&argv("cargo test -p a -- --workspace")));
+        assert!(!whole_workspace(&argv("cargo build")));
     }
 }

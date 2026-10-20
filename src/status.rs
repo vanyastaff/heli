@@ -11,6 +11,8 @@
 //!            "protocol":1,"started_at":1791910980,"session":1,
 //!            "window_station":"WinSta0","desktop":"Default","interactive":true},
 //!  "pool":{"slots":32,"free":20,"withheld":0,"in_use":12},
+//!  "saturation":{"active_runs":3,"waiting_runs":0,"saturated_s":null,
+//!                "wait_p50_ms":40,"wait_p90_ms":2300,"window_s":600},
 //!  "memory":{"total":68719476736,"available":44291850240,
 //!            "commit_available":42521726976,
 //!            "low_watermark":6871947673,"high_watermark":11166914969},
@@ -104,6 +106,9 @@ pub struct Status {
     /// Absent from a daemon older than the pool.
     #[serde(default)]
     pub pool: Option<Pool>,
+    /// The pool's saturation; absent from a daemon older than it (#127).
+    #[serde(default)]
+    pub saturation: Option<Saturation>,
     /// Absent from a daemon older than the memory governor.
     #[serde(default)]
     pub memory: Option<Memory>,
@@ -228,6 +233,82 @@ pub struct Pool {
     pub withheld: u32,
     /// Slots that builds hold: `slots - free - withheld`, never below 0.
     pub in_use: u32,
+}
+
+/// What the broker counts of the pool's saturation
+/// (docs/host-pool.md#saturation).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Saturation {
+    /// The runs that use slots or wait for one (`crate::pool::broker`).
+    pub active_runs: u32,
+    /// The runs that wait for a slot while the pool is saturated; 0 while
+    /// it is not (docs/host-pool.md#saturation).
+    pub waiting_runs: u32,
+    /// How long the pool has been saturated, in seconds, while it is.
+    pub saturated_s: Option<u64>,
+    /// The median and the 90th percentile of the runs' waits for a lent
+    /// slot over the last `window_s` seconds, in milliseconds; `null`
+    /// without any.
+    pub wait_p50_ms: Option<u64>,
+    pub wait_p90_ms: Option<u64>,
+    pub window_s: u64,
+}
+
+impl Saturation {
+    /// What the broker counts of `pressure`.
+    pub fn of(pressure: &crate::pool::broker::Pressure) -> Self {
+        let millis =
+            |wait: std::time::Duration| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            active_runs: pressure.active_runs,
+            waiting_runs: pressure.waiting_runs,
+            saturated_s: pressure.saturated_for.map(|lasted| lasted.as_secs()),
+            wait_p50_ms: pressure.wait_p50.map(millis),
+            wait_p90_ms: pressure.wait_p90.map(millis),
+            window_s: crate::pool::broker::WINDOW.as_secs(),
+        }
+    }
+
+    /// The text after the pool's slot counts: the waiting runs and the
+    /// waits, when there is something to say: while the pool is saturated,
+    /// or when one wait in ten took a second or more.
+    fn text(&self) -> String {
+        let mut text = String::new();
+        if let Some(saturated) = self.saturated_s {
+            text.push_str(&format!(
+                "; saturated for {}, {} of {} runs waiting for slots",
+                duration(saturated * 1000),
+                self.waiting_runs,
+                self.active_runs
+            ));
+        }
+        // Waits under a second are no news: a run's first slot takes a tick.
+        if let (Some(p50), Some(p90)) = (self.wait_p50_ms, self.wait_p90_ms)
+            && (p90 >= 1000 || self.saturated_s.is_some())
+        {
+            text.push_str(&format!(
+                "; slot wait p50 {}, p90 {} (last {} min)",
+                duration(p50),
+                duration(p90),
+                self.window_s / 60
+            ));
+        }
+        text
+    }
+}
+
+/// `millis` as `45 s`, `5.6 min` or `1.2 h` (`120 ms` under a second).
+fn duration(millis: u64) -> String {
+    let seconds = millis as f64 / 1000.0;
+    if millis < 1000 {
+        format!("{millis} ms")
+    } else if seconds < 120.0 {
+        format!("{seconds:.0} s")
+    } else if seconds < 7200.0 {
+        format!("{:.1} min", seconds / 60.0)
+    } else {
+        format!("{:.1} h", seconds / 3600.0)
+    }
 }
 
 /// The memory the governor saw last, and its watermarks, in bytes.
@@ -408,6 +489,7 @@ impl Status {
             disk: None,
             last_gc: None,
             unmet_budget: None,
+            saturation: None,
         }
     }
 
@@ -452,8 +534,15 @@ impl Status {
         };
         if let Some(pool) = &self.pool {
             text.push_str(&format!(
-                "pool    {} slots: {} in use, {} free, {} withheld\n",
-                pool.slots, pool.in_use, pool.free, pool.withheld
+                "pool    {} slots: {} in use, {} free, {} withheld{}\n",
+                pool.slots,
+                pool.in_use,
+                pool.free,
+                pool.withheld,
+                self.saturation
+                    .as_ref()
+                    .map(Saturation::text)
+                    .unwrap_or_default()
             ));
         }
         if let Some(memory) = &self.memory {

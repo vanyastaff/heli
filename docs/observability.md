@@ -25,6 +25,12 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `null` when none answers;
 - `pool`: `slots`, `free`, `withheld`, `in_use` (`slots − free − withheld`,
   never below 0), or `null` when no daemon answers;
+- `saturation`: what the broker counts of the pool's [saturation](host-pool.md#saturation):
+  `active_runs`, `waiting_runs` (0 while the pool is not saturated),
+  `saturated_s` (how long it has been, `null` while it is not),
+  `wait_p50_ms` and `wait_p90_ms` (the runs' waits for a lent slot over
+  the last `window_s` seconds, `null` without any); `null` when no daemon
+  answers;
 - `memory`: the governor's last sample, in bytes: `total`, `available`,
   plus `commit_available` on Windows, and the `low_watermark` and
   `high_watermark`; `null` when no daemon answers or memory cannot be read;
@@ -64,7 +70,7 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   text form says it on a `budget` line:
   `budget  100.0 GiB cannot be met for 3600s: 18 busy directories hold 200.0 GiB, more than 85 % of it; live directories are kept whole`.
 
-There is also a rotating log of admissions, loans, withholdings, top-ups,
+There is also a rotating log of admissions, loans, saturation, withholdings, top-ups,
 drains and evictions, and `cargo heli gc --dry-run`.
 
 **The event log** is `events.log` in the state directory
@@ -85,6 +91,11 @@ drains and evictions, and `cargo heli gc --dry-run`.
   `most` (the most slots it was seen using), `wait_median_ms` and
   `wait_longest_ms` (how long it waited for a lent slot, at most; `null`
   without loans);
+- `saturated`, when a spell of [saturation](host-pool.md#saturation) of 5 s or
+  more ends: `since` (seconds since 1970), `seconds`, `slots`,
+  `most_active` and `most_waiting`;
+- `timeouts`, when a nextest run that failed while the pool was saturated
+  had tests its slow-timeout killed: `run` and `tests` (`<binary> <test>`);
 - `recycle`, when a worktree got an orphan's build directory ([recycling](build-store.md#recycling)):
   `trigger` (`run`, `hook` or `look`), `workspace` and `to` (the new
   workspace, and the build directory's path now), `donor` and `from` (the

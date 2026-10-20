@@ -25,6 +25,11 @@
 //!   workspace and the path it had, and `invalidated`, the units whose
 //!   fingerprints the path scan deleted. The hook writes its event itself,
 //!   to the log of its logon session's daemon;
+//! - `saturated`: a spell of saturation of the pool ended
+//!   (`crate::pool::broker::Spell`): `since`, `seconds`, `slots`,
+//!   `most_active` and `most_waiting`;
+//! - `timeouts`: a nextest run that failed while the pool was saturated had
+//!   tests its slow-timeout killed: `run` and `tests`;
 //! - `evict`: an eviction pass (the daemon's, or `cargo heli gc`'s, which
 //!   writes to the same log) renamed a victim into the trash
 //!   (`crate::store::evict`): `tier`, `path`, `bytes` and `reason`.

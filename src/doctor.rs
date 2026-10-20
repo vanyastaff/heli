@@ -114,6 +114,79 @@ pub struct Inputs {
     /// The programs an upgrade put aside beside this one and could not
     /// delete yet (`crate::upgrade::aside`).
     pub old_programs: Vec<PathBuf>,
+    /// The running daemon's host pool's slots and saturation, when one
+    /// answers.
+    pub pool: Option<(u32, crate::status::Saturation)>,
+    /// Now, in seconds since 1970: what "the last hour" of the event log
+    /// counts back from.
+    pub now: u64,
+}
+
+/// How far back doctor reads the event log for the pool's saturation.
+const HOUR: u64 = 3600;
+
+/// What the event log and the pool say of the pool's saturation over the
+/// last hour (docs/host-pool.md#saturation).
+#[derive(Debug, Default, PartialEq)]
+struct Saturation {
+    /// Seconds of the last hour that the pool was saturated.
+    seconds: u64,
+    /// The most runs active, and waiting, at once, and the pool's slots.
+    most_active: u64,
+    most_waiting: u64,
+    slots: u64,
+    /// The tests nextest's slow-timeout killed in runs during saturation.
+    timeouts: Vec<String>,
+}
+
+/// The pool's saturation over the hour before `now`, from the `saturated`
+/// and `timeouts` events in `events` and the spell going on in `pool`.
+fn saturation(
+    events: &[String],
+    pool: Option<&(u32, crate::status::Saturation)>,
+    now: u64,
+) -> Saturation {
+    let start = now.saturating_sub(HOUR);
+    let mut found = Saturation::default();
+    for line in events {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let number = |key: &str| event[key].as_u64().unwrap_or(0);
+        match event["event"].as_str() {
+            Some("saturated") => {
+                let since = number("since");
+                let end = since.saturating_add(number("seconds"));
+                if end <= start {
+                    continue;
+                }
+                found.seconds += end.min(now).saturating_sub(since.max(start));
+                found.most_active = found.most_active.max(number("most_active"));
+                found.most_waiting = found.most_waiting.max(number("most_waiting"));
+                found.slots = found.slots.max(number("slots"));
+            }
+            Some("timeouts") if number("at") >= start => {
+                if let Some(tests) = event["tests"].as_array() {
+                    found.timeouts.extend(
+                        tests
+                            .iter()
+                            .filter_map(|test| Some(test.as_str()?.to_owned())),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((slots, now)) = pool
+        && let Some(lasted) = now.saturated_s
+    {
+        found.seconds += lasted.min(HOUR);
+        found.most_active = found.most_active.max(u64::from(now.active_runs));
+        found.most_waiting = found.most_waiting.max(u64::from(now.waiting_runs));
+        found.slots = found.slots.max(u64::from(*slots));
+    }
+    found.seconds = found.seconds.min(HOUR);
+    found
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -255,7 +328,11 @@ pub fn gather(cwd: &Path) -> Inputs {
     inputs.daemon_version = status
         .as_ref()
         .and_then(|status| status.daemon.as_ref()?.version.clone());
+    inputs.pool = status
+        .as_ref()
+        .and_then(|status| Some((status.pool.as_ref()?.slots, status.saturation.clone()?)));
     inputs.unmet_budget = status.and_then(|status| status.unmet_budget);
+    inputs.now = crate::clock::now();
     if let Some(home) = inputs.cargo_home.clone()
         && let Ok(text) = std::fs::read_to_string(home.join(".crates.toml"))
     {
@@ -554,6 +631,37 @@ pub fn diagnose(inputs: &Inputs) -> Report {
             "Raise [store] budget_mb above what the workspaces that build at once take, and set [store] floor_mb so that the volume stays protected while the store is over its budget.",
         );
     }
+    let saturation = saturation(&inputs.events, inputs.pool.as_ref(), inputs.now);
+    if saturation.seconds > HOUR / 2 {
+        add(
+            "pool-saturated",
+            "note",
+            format!(
+                "The host pool was saturated for {} min of the last hour: up to {} runs shared its {} slots, {} of them waiting for a slot at once.",
+                saturation.seconds / 60,
+                saturation.most_active,
+                saturation.slots,
+                saturation.most_waiting
+            ),
+            "Narrow the runs: `--affected` (it also takes nextest's -E), short -p lists instead of --workspace, and --priority background for sweeps. `cargo heli status` shows the waiting runs and the slot waits.",
+        );
+    }
+    if !saturation.timeouts.is_empty() {
+        let mut tests = saturation.timeouts.clone();
+        tests.sort();
+        tests.dedup();
+        let shown = tests.iter().take(5).cloned().collect::<Vec<_>>().join(", ");
+        add(
+            "nested-cargo-timeouts",
+            "warn",
+            format!(
+                "nextest's slow-timeout killed {} test(s) while the pool was saturated in the last hour: {shown}{}. A test that runs cargo itself waits for pool slots like any build and times out under load.",
+                tests.len(),
+                if tests.len() > 5 { ", …" } else { "" }
+            ),
+            "Give such tests a longer slow-timeout in .config/nextest.toml (an override for them), or run them alone; and narrow the runs that saturate the pool.",
+        );
+    }
     if let Some(threads) =
         env("RUST_TEST_THREADS").or_else(|| env_table_test_threads(&inputs.configs))
     {
@@ -800,6 +908,66 @@ mod tests {
             report.findings[1]
         );
         assert_eq!(ids(&diagnose(&with(60 << 30))), ["store-unused"]);
+    }
+
+    /// A pool saturated for most of the last hour, by the event log and
+    /// the spell going on, is reported, and so are the tests nextest timed
+    /// out meanwhile (#127).
+    #[test]
+    fn a_saturated_pool_and_its_timeouts_are_reported() {
+        let now = 10_000;
+        let spell = |since: u64, seconds: u64| {
+            format!(
+                r#"{{"at":{},"event":"saturated","since":{since},"seconds":{seconds},"slots":32,"most_active":18,"most_waiting":17}}"#,
+                since + seconds
+            )
+        };
+        let mut inputs = Inputs {
+            events: vec![
+                spell(1_000, 600),
+                spell(now - 3_000, 1_200),
+                spell(now - 1_500, 300),
+            ],
+            now,
+            ..Inputs::default()
+        };
+        assert_eq!(
+            saturation(&inputs.events, None, now).seconds,
+            1_500,
+            "the spell an hour ago is not counted"
+        );
+        assert_eq!(ids(&diagnose(&inputs)), Vec::<&str>::new());
+        inputs.pool = Some((
+            32,
+            crate::status::Saturation {
+                active_runs: 18,
+                waiting_runs: 16,
+                saturated_s: Some(600),
+                wait_p50_ms: Some(45_000),
+                wait_p90_ms: Some(336_000),
+                window_s: 600,
+            },
+        ));
+        inputs.events.push(format!(
+            r#"{{"at":{},"event":"timeouts","run":"r9","tests":["facade facade_consumer_check"]}}"#,
+            now - 60
+        ));
+        let report = diagnose(&inputs);
+        assert_eq!(ids(&report), ["pool-saturated", "nested-cargo-timeouts"]);
+        assert!(
+            report.findings[0]
+                .message
+                .contains("35 min of the last hour: up to 18 runs shared its 32 slots, 17 of them"),
+            "{:?}",
+            report.findings[0]
+        );
+        assert!(
+            report.findings[1]
+                .message
+                .contains("facade facade_consumer_check"),
+            "{:?}",
+            report.findings[1]
+        );
     }
 
     /// A budget the daemon's passes cannot meet is reported, with what
