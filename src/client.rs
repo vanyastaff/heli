@@ -886,7 +886,7 @@ fn reach(locations: &Locations, start: Option<u32>) -> Result<Option<Stream>, St
     // A daemon whose endpoint is busy is there: the client waits for it as
     // long as for its answer.
     let busy_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let stream = match ipc::connect(&locations.endpoint, busy_deadline) {
+    let stream = match connect(locations, busy_deadline) {
         Ok(stream) => stream,
         Err(error) if ipc::is_absent(&error) => match start {
             None => return Ok(None),
@@ -902,6 +902,31 @@ fn reach(locations: &Locations, start: Option<u32>) -> Result<Option<Stream>, St
         Err(error) => return Err(launch::StartError::Unreachable(error).describe(locations)),
     };
     handshake(stream).map(Some)
+}
+
+/// How long a client waits for a busy pipe before it looks for a retiring
+/// daemon that holds it.
+const RETIRING_LOOK: Duration = Duration::from_millis(250);
+
+/// Connects to the endpoint. A busy endpoint is a daemon's, which the
+/// client waits for, up to `busy_deadline`; on Windows that daemon may be
+/// a retiring one whose runs hold every instance of the pipe, with no new
+/// daemon yet (docs/daemon.md, "Handover"): that endpoint counts as
+/// absent, so a new daemon is started and joins the pipe.
+fn connect(locations: &Locations, busy_deadline: Instant) -> std::io::Result<Stream> {
+    let first = busy_deadline.min(Instant::now() + RETIRING_LOOK);
+    match ipc::connect(&locations.endpoint, first) {
+        Err(error)
+            if ipc::is_busy(&error)
+                && !crate::daemon::retiring::live(&locations.retiring_dir()).is_empty() =>
+        {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+        Err(error) if ipc::is_busy(&error) && Instant::now() < busy_deadline => {
+            ipc::connect(&locations.endpoint, busy_deadline)
+        }
+        result => result,
+    }
 }
 
 /// Starts a daemon and connects to it, or to the one that won a race to

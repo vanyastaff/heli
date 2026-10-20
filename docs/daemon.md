@@ -122,8 +122,10 @@ with no daemon at all, the client reads the records itself), `log` reads
 their records from disk, and `cancel` of one of their runs leaves a
 `<pid>.cancel-<run>` request that the retiring daemon acts on within
 200 ms. On Windows the retiring daemon's clients keep their instances of
-the pipe, so the pipe stays; the new daemon then creates its instances of
-that pipe instead of a first one, only while a retiring daemon lives.
+the pipe, so the pipe stays, with every instance taken: a client that
+finds it busy and a retiring daemon alive starts the new daemon as when
+there is no pipe, and the new daemon creates its instances of that pipe
+instead of a first one, only while a retiring daemon lives.
 
 Each broker counts only its own runs, and sees the other's as bare cargo,
 so shares are approximate until the old runs end. A client of the same
