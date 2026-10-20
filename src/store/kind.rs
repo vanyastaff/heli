@@ -5,7 +5,7 @@
 //!
 //! | Kind    | Busy while a cargo lock is held | Trash                   | Tool caches | Its own rungs (`super::ladder`)                |
 //! |---------|---------------------------------|-------------------------|-------------|------------------------------------------------|
-//! | build   | anywhere inside                 | `<store>/.trash`        | none        | 2 orphan, 5 whole directory                    |
+//! | build   | anywhere inside                 | `<store>/.trash`        | none        | 2 orphan, 5 whole directory, 7 of no known workspace |
 //! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 6 superseded intermediates, 4 tool caches      |
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
 //! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
@@ -116,13 +116,15 @@ pub type Rung = (Tier, PathBuf, u64, u64, String);
 
 /// The victims the rungs particular to `surveyed`'s kind allow at `now`
 /// (the incremental rungs, shared by every kind, are the ladder's own);
-/// `idle` is how long it has been idle.
+/// `idle` is how long it has been idle. Under the floor (`floor`, the time
+/// now), an orphan no pass has noted yet is unclaimed since now.
 pub fn rungs(
     surveyed: &Surveyed,
     policy: &Policy,
     tool_caches: &[String],
     now: u64,
     idle: u64,
+    floor: Option<u64>,
 ) -> Vec<Rung> {
     let root = &surveyed.dir.path;
     let whole = |tier: Tier, age: u64, reason: String| {
@@ -130,7 +132,7 @@ pub fn rungs(
     };
     match (surveyed.dir.kind, surveyed.state) {
         (Kind::Build, State::Orphan) => {
-            let Some(since) = surveyed.orphaned_since else {
+            let Some(since) = surveyed.orphaned_since.or(floor) else {
                 return Vec::new();
             };
             let unclaimed = now.saturating_sub(since);
@@ -150,11 +152,7 @@ pub fn rungs(
                 format!("orphan unclaimed for {}", hours(unclaimed)),
             )
         }
-        (Kind::Build, state)
-            if state == State::Live
-                || (state == State::Unknown
-                    && super::managed::unknown_is_reclaimable(&surveyed.dir)) =>
-        {
+        (Kind::Build, State::Live) => {
             if idle < policy.dir_age {
                 return Vec::new();
             }
@@ -164,7 +162,20 @@ pub fn rungs(
                 format!("build directory idle for {}", hours(idle)),
             )
         }
-        (Kind::Build, _) => Vec::new(),
+        (Kind::Build, State::Unknown) => {
+            if idle < policy.unknown_age || !super::managed::unknown_is_reclaimable(&surveyed.dir) {
+                return Vec::new();
+            }
+            whole(
+                Tier::Unknown,
+                idle,
+                format!(
+                    "build directory of no known workspace, untouched for {}",
+                    hours(idle)
+                ),
+            )
+        }
+        (Kind::Build, State::Busy) => Vec::new(),
         (Kind::Scratch, _) => {
             let untouched = now.saturating_sub(surveyed.measure.newest.unwrap_or(0));
             if untouched < policy.scratch_age {
@@ -221,5 +232,88 @@ pub fn rungs(
             rungs
         }
         (Kind::SharedTarget, _) => Vec::new(),
+    }
+}
+
+/// Why a directory is not deleted whole ([`kept`]): the rule, for people,
+/// and the group `gc` counts it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub group: &'static str,
+    pub why: String,
+}
+
+/// Why `surveyed`, idle for `idle` at `now`, is not deleted whole by the
+/// rungs of its kind: the rule that keeps it. `None` when they allow it
+/// whole (the plan may still leave it: over an unmet budget, or once the
+/// goals are met).
+pub fn kept(surveyed: &Surveyed, policy: &Policy, now: u64, idle: u64) -> Option<Kept> {
+    let kept = |group: &'static str, why: String| Some(Kept { group, why });
+    let of = |age: u64, limit: u64, setting: &str| {
+        format!("{} of {} ([store] {setting})", hours(age), hours(limit))
+    };
+    match (surveyed.dir.kind, surveyed.state) {
+        (_, State::Busy) => kept("busy", "busy: a cargo builds in it".to_owned()),
+        (Kind::Build, State::Orphan) => {
+            let claimable = surveyed
+                .dir
+                .owner
+                .as_ref()
+                .is_none_or(|owner| owner.repository.is_some());
+            if !claimable {
+                return None;
+            }
+            let Some(since) = surveyed.orphaned_since else {
+                return kept(
+                    "orphan within orphan_hours",
+                    "orphan no pass has noted yet: unclaimed from the next pass on".to_owned(),
+                );
+            };
+            let unclaimed = now.saturating_sub(since);
+            (unclaimed < policy.orphan_age).then(|| Kept {
+                group: "orphan within orphan_hours",
+                why: format!(
+                    "orphan unclaimed for {}: a worktree of its repository may claim it",
+                    of(unclaimed, policy.orphan_age, "orphan_hours")
+                ),
+            })
+        }
+        (Kind::Build, State::Live) => (idle < policy.dir_age).then(|| Kept {
+            group: "live within dir_hours",
+            why: format!("live, idle for {}", of(idle, policy.dir_age, "dir_hours")),
+        }),
+        (Kind::Build, State::Unknown) => {
+            if !super::managed::unknown_is_reclaimable(&surveyed.dir) {
+                return kept(
+                    "no known workspace, not cargo's layout",
+                    "no known workspace, and not of cargo's layout: never deleted whole".to_owned(),
+                );
+            }
+            (idle < policy.unknown_age).then(|| Kept {
+                group: "no known workspace within unknown_hours",
+                why: format!(
+                    "no known workspace, untouched for {}",
+                    of(idle, policy.unknown_age, "unknown_hours")
+                ),
+            })
+        }
+        (Kind::Scratch, _) => {
+            let untouched = now.saturating_sub(surveyed.measure.newest.unwrap_or(0));
+            (untouched < policy.scratch_age).then(|| Kept {
+                group: "scratch within scratch_hours",
+                why: format!(
+                    "scratch copy untouched for {}",
+                    of(untouched, policy.scratch_age, "scratch_hours")
+                ),
+            })
+        }
+        (Kind::Target, _) => kept(
+            "target/ in its worktree",
+            "target/ in its worktree: never deleted whole".to_owned(),
+        ),
+        (Kind::SharedTarget, _) => kept(
+            "shared",
+            "shared by workspaces: not heli's to manage".to_owned(),
+        ),
     }
 }

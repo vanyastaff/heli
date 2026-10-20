@@ -47,6 +47,7 @@
 //! idle_hours = 6
 //! dir_hours = 168
 //! scratch_hours = 1    # tier 0: scratch copies cargo-mutants left behind
+//! unknown_hours = 1    # tier 7: build directories of no known workspace
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -170,6 +171,10 @@ pub struct StoreConfig {
     /// Tier 0: scratch copies cargo tools left behind, untouched this many
     /// hours; default 1 (`crate::store::scratch`).
     pub scratch_hours: Option<u64>,
+    /// Tier 7: build directories of no known workspace (bare or nested
+    /// cargo built in them, and no heli run), untouched this many hours;
+    /// default 1.
+    pub unknown_hours: Option<u64>,
 }
 
 /// Tool caches heli knows without configuration: cargo-llvm-cov's own
