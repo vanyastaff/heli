@@ -94,7 +94,8 @@ drains and evictions, and `cargo heli gc --dry-run`.
   got their recorded times, else `null`). The hook writes it itself, to the
   log of its logon session's daemon;
 - `evict`, for each victim an eviction pass of the daemon's or of `gc`
-  renamed into the trash ([eviction](build-store.md#eviction)): `tier`, `path`, `bytes` and `reason`.
+  renamed into the trash ([eviction](build-store.md#eviction)): `tier`, `path`, `bytes`, `reason`,
+  and `floor` (chosen for a volume under its floor, its age waived).
 
 Past `[event_log] max_kb` (default 1024) it becomes `<name>.1`, replacing
 the one before, and the next event starts a new file.
