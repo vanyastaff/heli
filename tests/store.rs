@@ -552,6 +552,8 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
         "{unknown:?}"
     );
     assert_eq!(unknown[0]["repository"], Value::Null, "{unknown:?}");
+    // It records no run: not one at the epoch (#119).
+    assert_eq!(unknown[0]["last_run"], Value::Null, "{unknown:?}");
 
     let output = fixture
         .heli(["gc", "--dry-run"])
@@ -564,6 +566,14 @@ fn a_build_directory_is_busy_then_live_then_orphan() {
         stdout.lines().any(|line| line.starts_with("build ")
             && line.contains(" orphan ")
             && line.contains(&shown)),
+        "{stdout}"
+    );
+    let attributed = unknown[0]["path"].as_str().expect("a path");
+    assert!(
+        stdout.lines().any(|line| line.starts_with("build ")
+            && line.contains(attributed)
+            && line.contains(", last run: none)")
+            && !line.contains("s ago")),
         "{stdout}"
     );
     // Without a budget or a floor, nothing is evicted.

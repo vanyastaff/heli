@@ -39,7 +39,9 @@
 //! `kind` is `build` or `target`; `state` is `busy`, `live`, `orphan` or
 //! `unknown` (`crate::store::State`). `store` is `null` for a `target/`
 //! directory; `workspace`, `repository`, `created_at` and `last_run` are
-//! `null` where no owner manifest says them. A directory's `superseded` is
+//! `null` where no owner manifest says them, and `last_run` also for a
+//! directory attributed to its workspace without a run of heli's
+//! (`crate::store::attribute`). A directory's `superseded` is
 //! the bytes of its superseded intermediates, which `by_category` counts
 //! too (0 but in a `target/` directory apart from its build directory);
 //! the document's `superseded` says the pass was `--superseded`. `used` is
@@ -93,7 +95,13 @@ struct Entry {
     workspace: Option<String>,
     repository: Option<String>,
     created_at: Option<u64>,
+    /// When the last run started; none for a directory attributed to its
+    /// workspace without a run of heli's.
     last_run: Option<u64>,
+    /// The owner manifest records no run (`crate::store::attribute`): the
+    /// text says so, where it would say the last run's age.
+    #[serde(skip)]
+    no_run: bool,
     /// Bytes in its files.
     size: u64,
     by_category: Sizes,
@@ -128,7 +136,14 @@ impl Entry {
                 .and_then(|owner| owner.repository.as_deref())
                 .map(text),
             created_at: dir.owner.as_ref().map(|owner| owner.created_at),
-            last_run: dir.owner.as_ref().map(|owner| owner.last_run),
+            // An attributed manifest has 0 for its last run: no run, not
+            // one at the epoch (#119).
+            last_run: dir
+                .owner
+                .as_ref()
+                .map(|owner| owner.last_run)
+                .filter(|&at| at != 0),
+            no_run: dir.owner.as_ref().is_some_and(|owner| owner.last_run == 0),
             size: sizes.total(),
             by_category: sizes,
             superseded: dir.superseded(config),
@@ -236,6 +251,8 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
             text.push_str(&format!("  ({workspace}"));
             if let Some(last_run) = entry.last_run {
                 text.push_str(&format!(", last run {}s ago", now.saturating_sub(last_run)));
+            } else if entry.no_run {
+                text.push_str(", last run: none");
             }
             text.push(')');
         }
