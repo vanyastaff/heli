@@ -5,8 +5,12 @@
 //! asks for in compact and quiet mode, become the diagnostics they carry as
 //! rustc renders them, on stderr, once each, and its artifact and
 //! build-script records are left out; every other line is as it was
-//! recorded. `--tail` and `--grep` work on these lines. `--raw` prints every
-//! output event as it was recorded instead, byte for byte.
+//! recorded. A record that held cargo's JSON ends with one line on stderr
+//! saying what it said ([`Summary`]): `cargo-heli: r17: no diagnostics; 15
+//! artifacts (1 rebuilt); --raw for cargo's messages`, so that a clean run
+//! reads as what it did, not as nothing (#123). `--tail` and `--grep` work
+//! on these lines. `--raw` prints every output event as it was recorded
+//! instead, byte for byte.
 //!
 //! **Adding a selector**:
 //!
@@ -19,8 +23,10 @@
 //! 3. Its case in [`apply`]: a function over the record's [`Event`]s, or
 //!    over its [`Lines`], that writes what it picks to `out`.
 
+use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::io;
+use std::rc::Rc;
 
 use regex::bytes::Regex;
 use serde::{Deserialize, Serialize};
@@ -67,14 +73,14 @@ pub fn apply(
             }
             Ok(())
         }
-        Select::All => rendered(Lines::new(events))
+        Select::All => rendered(run, Lines::new(events))
             .try_for_each(|line| line.and_then(|line| out(line.channel, &line.bytes))),
-        Select::Tail(count) => tail(*count, rendered(Lines::new(events)), out),
+        Select::Tail(count) => tail(*count, rendered(run, Lines::new(events)), out),
         Select::Grep(pattern) => {
             let pattern = Regex::new(pattern).map_err(|error| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("bad pattern: {error}"))
             })?;
-            grep(&pattern, rendered(Lines::new(events)), out)
+            grep(&pattern, rendered(run, Lines::new(events)), out)
         }
         Select::Errors => errors(Lines::new(events), out),
         Select::Test(name) => {
@@ -196,16 +202,21 @@ fn errors(lines: impl Iterator<Item = io::Result<Line>>, out: &mut Out<'_>) -> i
     Ok(())
 }
 
-/// `lines` as a person would have seen the run: a line of stdout that is
-/// one of cargo's JSON messages becomes the diagnostic it carries, as rustc
-/// renders it, on stderr, where cargo prints it (each diagnostic once, as
-/// cargo prints a repeated one once); its artifact, build-script and
-/// build-finished records are left out. Every other line is as recorded.
+/// `lines` as a person would have seen the run `run`: a line of stdout
+/// that is one of cargo's JSON messages becomes the diagnostic it carries,
+/// as rustc renders it, on stderr, where cargo prints it (each diagnostic
+/// once, as cargo prints a repeated one once); its artifact, build-script
+/// and build-finished records are left out, and what they said ends the
+/// view as one line on stderr ([`Summary::line`]). Every other line is as
+/// recorded.
 fn rendered(
+    run: RunId,
     lines: impl Iterator<Item = io::Result<Line>>,
 ) -> impl Iterator<Item = io::Result<Line>> {
+    let summary = Rc::new(RefCell::new(Summary::default()));
+    let counted = Rc::clone(&summary);
     let mut seen = HashSet::new();
-    lines.flat_map(move |line| {
+    let body = lines.flat_map(move |line| {
         let line = match line {
             Ok(line) => line,
             Err(error) => return vec![Err(error)],
@@ -213,13 +224,29 @@ fn rendered(
         if line.channel != Channel::Stdout {
             return vec![Ok(line)];
         }
-        match Message::parse(&line.bytes) {
-            None => vec![Ok(line)],
-            Some(Message::Other) => Vec::new(),
-            Some(Message::Diagnostic(diagnostic)) => {
+        let Some(message) = Message::parse(&line.bytes) else {
+            return vec![Ok(line)];
+        };
+        let mut summary = counted.borrow_mut();
+        summary.json = true;
+        summary.last_event = line.event;
+        match message {
+            Message::Artifact { fresh } => {
+                summary.artifacts += 1;
+                summary.rebuilt += usize::from(!fresh);
+                Vec::new()
+            }
+            Message::BuildFinished { success } => {
+                summary.finished = Some(success);
+                Vec::new()
+            }
+            Message::Other => Vec::new(),
+            Message::Diagnostic(diagnostic) => {
                 if !seen.insert(diagnostic.identity().to_owned()) {
                     return Vec::new();
                 }
+                summary.errors += usize::from(diagnostic.is_error());
+                summary.warnings += usize::from(diagnostic.is_warning());
                 // One line each, so that `--tail` counts and `--grep`
                 // matches the lines a person reads.
                 diagnostic
@@ -235,7 +262,76 @@ fn rendered(
                     .collect()
             }
         }
-    })
+    });
+    // Chained, so that the line comes once every line before it has been
+    // counted.
+    body.chain(std::iter::once_with(move || summary.borrow().line(run).map(Ok)).flatten())
+}
+
+/// What a record's cargo JSON said besides the diagnostics [`rendered`]
+/// shows: the line that ends the rendered view of a compact or quiet run.
+#[derive(Default)]
+struct Summary {
+    /// The record held cargo's JSON at all: the run asked for it.
+    json: bool,
+    /// Units cargo reported, and those among them it rebuilt.
+    artifacts: usize,
+    rebuilt: usize,
+    /// Diagnostics shown, each once.
+    errors: usize,
+    warnings: usize,
+    /// Whether the build succeeded, when cargo said it had ended.
+    finished: Option<bool>,
+    /// The event of the last JSON message.
+    last_event: u64,
+}
+
+impl Summary {
+    /// `cargo-heli: r17: no diagnostics; 15 artifacts (1 rebuilt); --raw
+    /// for cargo's messages`, on stderr; `build failed` after the artifacts
+    /// when cargo reported a failure without a diagnostic (a build script,
+    /// the linker), `build not finished` when it reported no end (the run
+    /// is in flight, or was cancelled). None when the record held no JSON.
+    fn line(&self, run: RunId) -> Option<Line> {
+        if !self.json {
+            return None;
+        }
+        let diagnostics = match (self.errors, self.warnings) {
+            (0, 0) => "no diagnostics".to_owned(),
+            (errors, 0) => count(errors, "error"),
+            (0, warnings) => count(warnings, "warning"),
+            (errors, warnings) => {
+                format!("{}, {}", count(errors, "error"), count(warnings, "warning"))
+            }
+        };
+        let artifacts = match (self.artifacts, self.rebuilt) {
+            (0, _) => "no artifacts".to_owned(),
+            (artifacts, 0) => format!("{} (all fresh)", count(artifacts, "artifact")),
+            (artifacts, rebuilt) => format!("{} ({rebuilt} rebuilt)", count(artifacts, "artifact")),
+        };
+        let mut text = format!("cargo-heli: {run}: {diagnostics}; {artifacts}");
+        match self.finished {
+            Some(true) => {}
+            Some(false) if self.errors == 0 => text.push_str("; build failed"),
+            Some(false) => {}
+            None => text.push_str("; build not finished"),
+        }
+        text.push_str("; --raw for cargo's messages\n");
+        Some(Line {
+            channel: Channel::Stderr,
+            event: self.last_event,
+            bytes: text.into_bytes(),
+        })
+    }
+}
+
+/// `1 error`, `2 errors`.
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
 }
 
 /// The lines that match `pattern`, without their line ends.

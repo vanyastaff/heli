@@ -123,7 +123,11 @@ pub fn with_json_messages(args: &[OsString]) -> Vec<OsString> {
 pub enum Message {
     /// A diagnostic from rustc, clippy or rustdoc.
     Diagnostic(Diagnostic),
-    /// Any other message: an artifact, a build script run, the build's end.
+    /// A unit cargo compiled, or found fresh (`compiler-artifact`).
+    Artifact { fresh: bool },
+    /// The build's end (`build-finished`), and whether it succeeded.
+    BuildFinished { success: bool },
+    /// Any other message: a build script run.
     Other,
 }
 
@@ -141,9 +145,13 @@ impl Message {
                 serde_json::from_value(message).ok().map(Self::Diagnostic)
             }
             ("compiler-message", None) => None,
-            ("compiler-artifact" | "build-script-executed" | "build-finished", _) => {
-                Some(Self::Other)
-            }
+            ("compiler-artifact", _) => Some(Self::Artifact {
+                fresh: raw.fresh.unwrap_or(false),
+            }),
+            ("build-finished", _) => Some(Self::BuildFinished {
+                success: raw.success.unwrap_or(false),
+            }),
+            ("build-script-executed", _) => Some(Self::Other),
             _ => None,
         }
     }
@@ -154,6 +162,12 @@ struct Raw {
     reason: String,
     #[serde(default)]
     message: Option<serde_json::Value>,
+    /// Of `compiler-artifact`: the unit was up to date.
+    #[serde(default)]
+    fresh: Option<bool>,
+    /// Of `build-finished`.
+    #[serde(default)]
+    success: Option<bool>,
 }
 
 /// A diagnostic, as cargo relays it from the compiler.
@@ -187,6 +201,11 @@ impl Diagnostic {
     /// error`).
     pub fn is_error(&self) -> bool {
         self.level.starts_with("error")
+    }
+
+    /// Whether it is a warning (notes and helps are neither).
+    pub fn is_warning(&self) -> bool {
+        self.level == "warning"
     }
 
     /// The diagnostic as rustc renders it, ending a line.
@@ -286,7 +305,7 @@ impl Diagnostics {
     pub fn json_line(&mut self, line: &[u8], out: &mut Sink) -> bool {
         match Message::parse(line) {
             None => return false,
-            Some(Message::Other) => {}
+            Some(Message::Artifact { .. } | Message::BuildFinished { .. } | Message::Other) => {}
             Some(Message::Diagnostic(diagnostic)) => self.diagnostic(&diagnostic, out),
         }
         true
