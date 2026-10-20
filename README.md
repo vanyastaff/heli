@@ -76,8 +76,9 @@ cross-worktree package-cache blocking case. Global application resources such
 as fixed ports and desktop windows remain the project's responsibility.
 
 Artifact GC is opt-in, protects active managed commands and resumes at idle.
-It is not a hard disk quota; private native Cargo homes are retained outside
-the artifact budget. See [the operating guide](docs/multi-agent.md) for store
+It is not a hard disk quota. Private native Cargo homes count toward the
+artifact budget, and the home of a removed worktree is retired like its build
+directory. See [the operating guide](docs/multi-agent.md) for store
 placement, budgets, credentials, fallback and supported-tool limits.
 
 How heli works, part by part, is in [the architecture docs](docs/architecture.md);

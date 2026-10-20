@@ -62,7 +62,7 @@ impl Accounts {
     /// The main worktree is never new, and is left to its first run.
     pub(super) fn look(&self, registry: &Registry, looked: &mut BTreeSet<PathBuf>) {
         let mut repositories: Vec<PathBuf> = Vec::new();
-        for dir in store::survey(&self.config, registry) {
+        for dir in store::survey(&self.config, registry, &self.state_dir) {
             let Some(repository) = dir
                 .owner
                 .as_ref()

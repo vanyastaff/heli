@@ -105,7 +105,14 @@ impl Accounts {
                 return;
             }
         };
-        let mut pass = evict::plan(&self.config, registry, now, false, evict::Scope::Ladder);
+        let mut pass = evict::plan(
+            &self.config,
+            registry,
+            &self.state_dir,
+            now,
+            false,
+            evict::Scope::Ladder,
+        );
         evict::execute(&mut pass, now);
         let unmet = pass.unmet_budget();
         self.note_budget(unmet);
@@ -240,7 +247,7 @@ impl Accounts {
         let mut last_error = String::new();
         loop {
             let registry = Registry::load(&self.state_dir);
-            for trash in trash::all(&self.config, &registry) {
+            for trash in trash::all(&self.config, &registry, &self.state_dir) {
                 if let Err(error) = trash::empty(&trash) {
                     let error = format!("cannot empty {} yet: {error}", trash.display());
                     if error != last_error {

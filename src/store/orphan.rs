@@ -1,6 +1,7 @@
 //! Since when an orphan is unclaimed: `.heli/orphaned` in a build
-//! directory, which heli writes when an eviction pass first finds the
-//! directory an orphan (its workspace is gone):
+//! directory, or in an isolated Cargo home (`super::home`), which heli
+//! writes when an eviction pass first finds the directory an orphan (its
+//! workspace is gone):
 //!
 //! ```json
 //! {"workspace":"D:\\flui\\.claude\\worktrees\\agent-a64b","since":1791911112}
@@ -71,14 +72,15 @@ pub fn note(dir: &Dir, state: State, now: u64) -> io::Result<Option<u64>> {
     }
 }
 
-/// Brings the notes of the build directories among `dirs` up to date at
-/// `now`, by whether their workspace exists alone (no lock is tried).
+/// Brings the notes of the build directories and homes among `dirs` up to
+/// date at `now`, by whether their workspace exists alone (no lock is
+/// tried).
 pub fn keep(dirs: &[Dir], now: u64) {
     for dir in dirs {
-        let (super::Kind::Build, Some(owner)) = (dir.kind, &dir.owner) else {
+        let (super::Kind::Build | super::Kind::Home, Some(owner)) = (dir.kind, &dir.owner) else {
             continue;
         };
-        let state = if owner.workspace.join("Cargo.toml").is_file() {
+        let state = if dir.kind.workspace_exists(&owner.workspace) {
             State::Live
         } else {
             State::Orphan
