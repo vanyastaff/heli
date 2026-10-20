@@ -3,7 +3,8 @@
 //! Under cargo's lock, a victim is only renamed into the trash of its
 //! directory, which is on its volume, so the rename takes constant time:
 //! `<store>/.trash/` for a build directory's, `<target>/.heli-trash/` for a
-//! registered `target/` directory's. What is in the trash is deleted later,
+//! registered `target/` directory's, `.heli-trash/` beside the scratch
+//! copies and the isolated Cargo homes for theirs. What is in the trash is deleted later,
 //! with no lock held, at low I/O priority ([`lower_io_priority`]): a cargo
 //! that starts meanwhile finds its directory without the victim, and is not
 //! held up. A trash that is a link is never used, and deleting never goes
@@ -21,8 +22,9 @@ use super::registry::Registry;
 use crate::config::StoreConfig;
 
 /// Every trash there may be: each store's, each registered `target/`
-/// directory's, and the scratch copies' (`super::scratch::trash`).
-pub fn all(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
+/// directory's, the scratch copies' (`super::scratch::trash`) and the
+/// isolated Cargo homes' under `state_dir` (`super::home::trash`).
+pub fn all(config: &StoreConfig, registry: &Registry, state_dir: &Path) -> Vec<PathBuf> {
     let stores = super::stores(config, registry)
         .into_iter()
         .map(|store| store.join(STORE_TRASH));
@@ -32,7 +34,7 @@ pub fn all(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
         .map(|target| target.path.join(TARGET_TRASH));
     stores
         .chain(targets)
-        .chain(std::iter::once(super::scratch::trash()))
+        .chain([super::scratch::trash(), super::home::trash(state_dir)])
         .collect()
 }
 

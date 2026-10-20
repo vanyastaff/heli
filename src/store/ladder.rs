@@ -25,14 +25,17 @@
 //! 1. `incremental/<unit>` directories untouched for 24 h (`unit_hours`),
 //!    oldest first across every directory;
 //! 2. orphans no worktree claimed for 24 h (`orphan_hours`), longest
-//!    unclaimed first (`super::orphan`);
+//!    unclaimed first (`super::orphan`), and the isolated Cargo homes
+//!    (`super::home`) of removed worktrees unclaimed that long, and of no
+//!    known worktree idle that long;
 //! 3. all of a profile's `incremental/` in directories idle for 6 h
 //!    (`idle_hours`), longest idle first;
 //! 4. the tool caches (`[store] tool_caches`, and the built-in
 //!    `llvm-cov-target`) of registered `target/`
 //!    directories idle for 6 h, longest idle first;
 //! 5. whole build directories of live workspaces idle for 7 days
-//!    (`dir_hours`, 168), longest idle first.
+//!    (`dir_hours`, 168), longest idle first, and the isolated Cargo homes
+//!    of live worktrees idle that long.
 //!
 //! A victim inside one taken before only counts the bytes left in it; one
 //! inside a victim taken before is not one.
@@ -44,7 +47,9 @@
 //! cargo built in, and compiled no object file) has tiers 1, 3 and 7, the
 //! last when it is of cargo's layout (`super::managed`). It never counts
 //! as an orphan. A registered `target/` directory has tiers 6, 1, 3 and 4,
-//! and is never deleted whole: it is in the user's worktree.
+//! and is never deleted whole: it is in the user's worktree. An isolated
+//! Cargo home has tier 2 or 5 only: it holds no intermediates, and is
+//! evicted whole.
 //!
 //! **Under the floor.** A volume with less than F free really is full:
 //! the next build on it fails for lack of space, which costs more than any
@@ -454,39 +459,41 @@ fn collect(
                 floor: floor.is_some(),
             });
         };
-        for incremental in incremental_dirs(root) {
-            let mut all = Measure::default();
-            let Ok(entries) = std::fs::read_dir(&incremental) else {
-                continue;
-            };
-            for entry in entries.filter_map(Result::ok) {
-                let Ok(kind) = entry.file_type() else {
+        if surveyed.dir.kind.incremental_rungs() {
+            for incremental in incremental_dirs(root) {
+                let mut all = Measure::default();
+                let Ok(entries) = std::fs::read_dir(&incremental) else {
                     continue;
                 };
-                let unit = measure(&entry.path());
-                all.add(unit);
-                if !kind.is_dir() {
-                    continue;
+                for entry in entries.filter_map(Result::ok) {
+                    let Ok(kind) = entry.file_type() else {
+                        continue;
+                    };
+                    let unit = measure(&entry.path());
+                    all.add(unit);
+                    if !kind.is_dir() {
+                        continue;
+                    }
+                    let untouched = now.saturating_sub(unit.newest.unwrap_or(0));
+                    if untouched >= policy.unit_age {
+                        victim(
+                            Tier::Unit,
+                            entry.path(),
+                            unit.bytes,
+                            untouched,
+                            format!("incremental unit untouched for {}", hours(untouched)),
+                        );
+                    }
                 }
-                let untouched = now.saturating_sub(unit.newest.unwrap_or(0));
-                if untouched >= policy.unit_age {
+                if idle >= policy.idle_age {
                     victim(
-                        Tier::Unit,
-                        entry.path(),
-                        unit.bytes,
-                        untouched,
-                        format!("incremental unit untouched for {}", hours(untouched)),
+                        Tier::Incremental,
+                        incremental,
+                        all.bytes,
+                        idle,
+                        format!("incremental/ of a directory idle for {}", hours(idle)),
                     );
                 }
-            }
-            if idle >= policy.idle_age {
-                victim(
-                    Tier::Incremental,
-                    incremental,
-                    all.bytes,
-                    idle,
-                    format!("incremental/ of a directory idle for {}", hours(idle)),
-                );
             }
         }
         for (tier, path, bytes, age, reason) in

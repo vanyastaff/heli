@@ -9,14 +9,17 @@
 //! | target  | in its profile directories      | `<target>/.heli-trash`  | configured  | 6 superseded intermediates, 4 tool caches      |
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
 //! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
+//! | home    | in its package-cache locks      | `.heli-trash` beside it | none        | 2 orphan or unknown, 5 whole home              |
 //! | crate   | anywhere inside                 | `<store>/.trash`        | none        | 8 entry no build directory links               |
 //!
-//! Every kind but shared also has the ladder's incremental rungs, 1 and 3.
-//! A shared `target/` directory, seen for more than one workspace (a global
-//! `CARGO_TARGET_DIR` or `build.target-dir`), is not heli's to manage: it
-//! has no rungs at all, and does not count toward the budget (#65).
+//! Every kind but shared, home and crate also has the ladder's incremental
+//! rungs, 1 and 3. A shared `target/` directory, seen for more than one workspace
+//! (a global `CARGO_TARGET_DIR` or `build.target-dir`), is not heli's to
+//! manage: it has no rungs at all, and does not count toward the budget
+//! (#65). An isolated Cargo home (`super::home`) holds no intermediates,
+//! and is only ever evicted whole (#120).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
@@ -48,6 +51,8 @@ pub enum Kind {
     /// An entry of the shared crates in a store (`crate::crates`): it
     /// counts only what no build directory links.
     Crate,
+    /// An isolated Cargo home of a worktree (`super::home`).
+    Home,
 }
 
 /// Where a cargo's lock makes a directory busy.
@@ -58,6 +63,9 @@ pub enum LockScope {
     /// Only in its profile directories: a `target/` directory's nested tool
     /// caches protect their own victims at eviction, not unrelated ones.
     Profiles,
+    /// In the package-cache locks at its root, which cargo holds for a
+    /// build (`super::home::LOCKS`).
+    PackageCache,
 }
 
 impl Kind {
@@ -69,6 +77,7 @@ impl Kind {
             Self::Scratch => "scratch",
             Self::SharedTarget => "shared",
             Self::Crate => "crate",
+            Self::Home => "home",
         }
     }
 
@@ -83,6 +92,31 @@ impl Kind {
         match self {
             Self::Build | Self::Scratch | Self::Crate => LockScope::Anywhere,
             Self::Target | Self::SharedTarget => LockScope::Profiles,
+            Self::Home => LockScope::PackageCache,
+        }
+    }
+
+    /// Whether directories of this kind have the ladder's incremental
+    /// rungs, 1 and 3: all but a shared `target/` directory, which has no
+    /// rungs, and a home, which holds no intermediates.
+    pub fn incremental_rungs(self) -> bool {
+        match self {
+            Self::Build | Self::Target | Self::Scratch => true,
+            Self::SharedTarget | Self::Home | Self::Crate => false,
+        }
+    }
+
+    /// Whether `workspace`, the workspace of a directory of this kind,
+    /// still exists: its `Cargo.toml`, since a removed worktree can leave
+    /// files behind; for a home, which belongs to a worktree, the
+    /// worktree's `.git` entry, or, outside any repository, its
+    /// `Cargo.toml` (`super::home::worktree_exists`).
+    pub fn workspace_exists(self, workspace: &Path) -> bool {
+        match self {
+            Self::Home => super::home::worktree_exists(workspace),
+            Self::Build | Self::Target | Self::Scratch | Self::SharedTarget | Self::Crate => {
+                workspace.join("Cargo.toml").is_file()
+            }
         }
     }
 }
@@ -94,6 +128,8 @@ impl Dir {
             Kind::Build | Kind::Crate => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
             Kind::Target | Kind::SharedTarget => Some(self.path.join(TARGET_TRASH)),
             Kind::Scratch => Some(super::scratch::trash()),
+            // Beside it: a home is directly under the homes' base.
+            Kind::Home => self.path.parent().map(|base| base.join(super::home::TRASH)),
         }
     }
 
@@ -102,7 +138,7 @@ impl Dir {
     pub fn own_trash(&self) -> Option<&'static str> {
         match self.kind {
             Kind::Target | Kind::SharedTarget => Some(TARGET_TRASH),
-            Kind::Build | Kind::Scratch | Kind::Crate => None,
+            Kind::Build | Kind::Scratch | Kind::Crate | Kind::Home => None,
         }
     }
 
@@ -110,7 +146,9 @@ impl Dir {
     pub fn tool_caches(&self, config: &StoreConfig) -> Vec<String> {
         match self.kind {
             Kind::Target => config.tool_cache_patterns(),
-            Kind::Build | Kind::Scratch | Kind::SharedTarget | Kind::Crate => Vec::new(),
+            Kind::Build | Kind::Scratch | Kind::SharedTarget | Kind::Crate | Kind::Home => {
+                Vec::new()
+            }
         }
     }
 }
@@ -251,6 +289,49 @@ pub fn rungs(
             )
         }
         (Kind::Crate, _) => Vec::new(),
+        // A home of a removed worktree waits out `orphan_hours` like an
+        // orphan build directory, so a worktree that is being moved or
+        // repaired keeps it; nothing claims it otherwise (#120).
+        (Kind::Home, State::Orphan) => {
+            let Some(since) = surveyed.orphaned_since.or(floor) else {
+                return Vec::new();
+            };
+            let unclaimed = now.saturating_sub(since);
+            if unclaimed < policy.orphan_age {
+                return Vec::new();
+            }
+            whole(
+                Tier::Orphan,
+                unclaimed,
+                format!(
+                    "Cargo home of a removed worktree, unclaimed for {}",
+                    hours(unclaimed)
+                ),
+            )
+        }
+        // Nothing heli knows selects a home without an owner manifest (one
+        // an older heli published): an orphan too, once idle that long.
+        (Kind::Home, State::Unknown) => {
+            if idle < policy.orphan_age {
+                return Vec::new();
+            }
+            whole(
+                Tier::Orphan,
+                idle,
+                format!("Cargo home of no known worktree, idle for {}", hours(idle)),
+            )
+        }
+        (Kind::Home, State::Live) => {
+            if idle < policy.dir_age {
+                return Vec::new();
+            }
+            whole(
+                Tier::BuildDir,
+                idle,
+                format!("Cargo home idle for {}", hours(idle)),
+            )
+        }
+        (Kind::Home, State::Busy) => Vec::new(),
     }
 }
 
@@ -343,6 +424,36 @@ pub fn kept(surveyed: &Surveyed, policy: &Policy, now: u64, idle: u64) -> Option
             why: format!(
                 "shared crate unused for {}",
                 of(idle, policy.crate_age, "crate_hours")
+            ),
+        }),
+        (Kind::Home, State::Orphan) => {
+            let Some(since) = surveyed.orphaned_since else {
+                return kept(
+                    "orphan within orphan_hours",
+                    "Cargo home of a removed worktree no pass has noted yet".to_owned(),
+                );
+            };
+            let unclaimed = now.saturating_sub(since);
+            (unclaimed < policy.orphan_age).then(|| Kept {
+                group: "orphan within orphan_hours",
+                why: format!(
+                    "Cargo home of a removed worktree, unclaimed for {}",
+                    of(unclaimed, policy.orphan_age, "orphan_hours")
+                ),
+            })
+        }
+        (Kind::Home, State::Unknown) => (idle < policy.orphan_age).then(|| Kept {
+            group: "orphan within orphan_hours",
+            why: format!(
+                "Cargo home of no known worktree, idle for {}",
+                of(idle, policy.orphan_age, "orphan_hours")
+            ),
+        }),
+        (Kind::Home, State::Live) => (idle < policy.dir_age).then(|| Kept {
+            group: "live within dir_hours",
+            why: format!(
+                "live Cargo home, idle for {}",
+                of(idle, policy.dir_age, "dir_hours")
             ),
         }),
     }

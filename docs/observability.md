@@ -59,9 +59,12 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   without one), `used` and `by_category` (`incremental`, `deps`,
   `build_scripts`, `fingerprints`, `tool_caches`, `other`, in bytes); and
   `targets`, one entry per registered `target/` directory, with `path`,
-  `used` and `by_category`; and `crates`, one entry per store's shared
-  crates ([shared crates](build-store.md#shared-crates)), with `path` and
-  `used`, what no build directory links. `null` when no daemon answers;
+  `used` and `by_category`; `scratch`, one entry per scratch copy a cargo
+  tool left behind, and `homes`, one entry per isolated Cargo home of a
+  worktree ([build store](build-store.md#accounting)), each with the same
+  fields; and `crates`, one entry per store's shared crates ([shared
+  crates](build-store.md#shared-crates)), with `path` and `used`, what no
+  build directory links. `null` when no daemon answers;
 - `last_gc`: the daemon's last eviction pass that evicted anything ([eviction](build-store.md#eviction)):
   `at`, and `evicted`, one entry per victim with its `path`, `tier` and
   `bytes`; `null` before the first, and when no daemon answers;

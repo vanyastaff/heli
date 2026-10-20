@@ -238,6 +238,7 @@ impl Accounts {
                     stores
                 },
             ),
+            homes: of_kinds(&[Kind::Home]),
         }
     }
 
@@ -256,7 +257,7 @@ impl Accounts {
             };
             let registry = Registry::load(&self.state_dir);
             self.look(&registry, &mut looked);
-            let dirs = store::survey(&self.config, &registry);
+            let dirs = store::survey(&self.config, &registry, &self.state_dir);
             self.released(&dirs, &mut held);
             let stores = store::stores(&self.config, &registry);
             for dir in &dirs {

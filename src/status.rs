@@ -37,7 +37,11 @@
 //!                      "by_category":{"incremental":0,"deps":0,"build_scripts":0,
 //!                                     "fingerprints":0,"tool_caches":20,"other":100},
 //!                      "superseded":0}],
-//!          "scratch":[]},
+//!          "scratch":[],
+//!          "homes":[{"path":"C:\\Users\\vanya\\.heli\\state\\h\\3f2a…","used":800,
+//!                    "by_category":{"incremental":0,"deps":0,"build_scripts":0,
+//!                                   "fingerprints":0,"tool_caches":0,"other":800},
+//!                    "superseded":0}]},
 //!  "last_gc":{"at":1791911000,
 //!             "evicted":[{"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
 //!                         "tier":1,"bytes":300}]}}
@@ -196,6 +200,11 @@ pub struct Disk {
     /// what no build directory links.
     #[serde(default)]
     pub crates: Vec<TargetUse>,
+    /// One entry per isolated Cargo home of a worktree
+    /// (`crate::store::home`); absent from a daemon older than their
+    /// accounting.
+    #[serde(default)]
+    pub homes: Vec<TargetUse>,
 }
 
 /// A store's build directories, added up.
@@ -574,6 +583,14 @@ impl Status {
                 ));
                 label = "";
             }
+            for home in &disk.homes {
+                text.push_str(&format!(
+                    "{label:<6}  home {}  {}\n",
+                    home.path,
+                    sizes::human(home.used)
+                ));
+                label = "";
+            }
         }
         if let Some(unmet) = &self.unmet_budget {
             text.push_str(&format!(
@@ -710,6 +727,7 @@ mod disk_tests {
                 targets: vec![target("/a/target", 3072), target("/b/target", 0)],
                 scratch: Vec::new(),
                 crates: Vec::new(),
+                homes: vec![target("/state/h/3f2a", 0)],
             }),
             ..Status::without_daemon()
         };
@@ -722,6 +740,7 @@ mod disk_tests {
             text.contains("target /b/target  4.0 KiB (deps 4.0 KiB)\n"),
             "{text}"
         );
+        assert!(text.contains("home /state/h/3f2a  4.0 KiB\n"), "{text}");
         assert!(
             text.contains("3.0 KiB superseded by the build store: cargo heli gc --superseded\n"),
             "{text}"

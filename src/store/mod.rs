@@ -13,8 +13,10 @@
 //! that volume, and `<volume>/.heli/build` otherwise.
 //!
 //! **Accounting** ([`survey`], [`Dir`], [`owner`], [`registry`], [`sizes`]):
-//! every directory the store accounts for, whose it is, its state and its
-//! sizes by category.
+//! every directory the store accounts for (the build directories, the
+//! registered `target/` directories, the scratch copies cargo tools leave
+//! and the isolated Cargo homes of worktrees, [`home`]), whose it is, its
+//! state and its sizes by category.
 //!
 //! **Eviction** (docs/build-store.md#eviction): the [`ladder`] says what to
 //! evict over the budget or under the floor, an [`evict`] pass renames it into
@@ -23,6 +25,7 @@
 
 pub mod attribute;
 pub mod evict;
+pub mod home;
 pub mod kind;
 pub mod ladder;
 pub mod lease;
@@ -125,12 +128,17 @@ impl Dir {
         })
     }
 
-    /// Its state, as of now. A workspace exists while its `Cargo.toml` does:
-    /// a removed worktree can leave files behind. (Eviction also counts a
-    /// directory of an unknown lock layout busy while it changed within the
-    /// hour: [`busy_for_eviction`].)
+    /// Its state, as of now: busy where its kind looks for cargo's locks
+    /// ([`Kind::lock_scope`]), else by whether its workspace exists
+    /// ([`Kind::workspace_exists`]). (Eviction also counts a directory of
+    /// an unknown lock layout busy while it changed within the hour:
+    /// [`busy_for_eviction`].)
     pub fn state(&self) -> State {
-        if busy(&self.path) {
+        let held = match self.kind.lock_scope() {
+            kind::LockScope::PackageCache => home::busy(&self.path),
+            kind::LockScope::Anywhere | kind::LockScope::Profiles => busy(&self.path),
+        };
+        if held {
             return State::Busy;
         }
         if self.kind == Kind::Crate {
@@ -142,7 +150,7 @@ impl Dir {
             };
         }
         match &self.workspace {
-            Some(workspace) if workspace.join("Cargo.toml").is_file() => State::Live,
+            Some(workspace) if self.kind.workspace_exists(workspace) => State::Live,
             Some(_) => State::Orphan,
             None => State::Unknown,
         }
@@ -167,8 +175,10 @@ pub fn stores(config: &StoreConfig, registry: &Registry) -> Vec<PathBuf> {
 }
 
 /// Every directory the store accounts for: the build directories in each of
-/// the [`stores`], then the registered `target/` directories that exist.
-pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
+/// the [`stores`], then the registered `target/` directories that exist,
+/// the scratch copies cargo tools left ([`scratch`]) and the isolated Cargo
+/// homes under `state_dir` ([`home`]).
+pub fn survey(config: &StoreConfig, registry: &Registry, state_dir: &Path) -> Vec<Dir> {
     let mut dirs = Vec::new();
     for store in stores(config, registry) {
         for path in build_dirs(&store) {
@@ -228,6 +238,17 @@ pub fn survey(config: &StoreConfig, registry: &Registry) -> Vec<Dir> {
             separation: None,
         });
     }
+    for path in home::find(state_dir) {
+        let owner = owner::read(&path);
+        dirs.push(Dir {
+            kind: Kind::Home,
+            workspace: owner.as_ref().map(|owner| owner.workspace.clone()),
+            owner,
+            path,
+            store: None,
+            separation: None,
+        });
+    }
     dirs
 }
 
@@ -280,10 +301,10 @@ pub fn busy(dir: &Path) -> bool {
     lock_dirs(dir).iter().any(|profile| held(profile))
 }
 
-/// Whether eviction counts `dir` busy at `now` (seconds since 1970): a
-/// Cargo holds a known lock where its kind looks for one
-/// ([`Kind::lock_scope`]), or its lock layout is unknown and it changed
-/// within the last [`RECENT`] seconds.
+/// Whether eviction counts `dir` busy at `now` (seconds since 1970): a run
+/// is in flight in its workspace ([`in_use`]), a Cargo holds a known lock
+/// where its kind looks for one ([`Kind::lock_scope`]), or its lock layout
+/// is unknown and it changed within the last [`RECENT`] seconds.
 ///
 /// **Unknown layout.** Lock names change between cargo versions. A profile
 /// directory that holds cargo's intermediates (`deps/`, `incremental/`,
@@ -293,6 +314,10 @@ pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
     if in_use(dir) {
         return true;
     }
+    // A home has no profile directories, so no unknown layout either.
+    if dir.kind.lock_scope() == kind::LockScope::PackageCache {
+        return home::busy(&dir.path);
+    }
     let profiles = lock_dirs(&dir.path);
     let busy = match dir.kind.lock_scope() {
         kind::LockScope::Anywhere => locks_inside(&dir.path).map_or(true, |locks| {
@@ -301,6 +326,7 @@ pub fn busy_for_eviction(dir: &Dir, now: u64) -> bool {
                 .any(|path| matches!(try_lock(path), Lock::Held))
         }),
         kind::LockScope::Profiles => profiles.iter().any(|profile| held(profile)),
+        kind::LockScope::PackageCache => unreachable!("decided above"),
     };
     busy || (unknown_layout(&profiles) && recently_changed(&dir.path, now))
 }

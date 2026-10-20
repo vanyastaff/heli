@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use super::kind::Kept;
+use super::kind::{Kept, LockScope};
 use super::ladder::{self, Goals, Policy, Surveyed, Tier, Victim};
 use super::registry::Registry;
 use super::{Dir, Kind, Lock, State, orphan, trash};
@@ -95,13 +95,14 @@ pub struct Pass {
 pub fn plan(
     config: &StoreConfig,
     registry: &Registry,
+    state_dir: &Path,
     now: u64,
     dry_run: bool,
     scope: Scope,
 ) -> Pass {
     let policy = Policy::of(config);
     let mut dirs: Vec<Surveyed> = Vec::new();
-    for dir in super::survey(config, registry) {
+    for dir in super::survey(config, registry, state_dir) {
         // A target directory that is a store's build directory is that.
         if dirs
             .iter()
@@ -121,7 +122,9 @@ pub fn plan(
     }
     if !dry_run {
         for surveyed in &dirs {
-            if surveyed.dir.kind == Kind::Build && surveyed.state == State::Live {
+            if matches!(surveyed.dir.kind, Kind::Build | Kind::Home)
+                && surveyed.state == State::Live
+            {
                 let _ = orphan::note(&surveyed.dir, State::Live, now);
             }
         }
@@ -134,7 +137,7 @@ pub fn plan(
         .filter(|surveyed| surveyed.state == State::Busy)
         .collect();
     let busy_bytes = busy.iter().map(|surveyed| surveyed.measure.bytes).sum();
-    let volumes = volumes(config, registry, &dirs);
+    let volumes = volumes(config, registry, state_dir, &dirs);
     let goals = goals(&policy, used, busy_bytes, &volumes);
     let mut pass = Pass {
         runtime_busy,
@@ -246,7 +249,12 @@ pub fn event(victim: &Victim) -> serde_json::Value {
 }
 
 /// The volumes of `dirs`, with their free space and what their trash holds.
-fn volumes(config: &StoreConfig, registry: &Registry, dirs: &[Surveyed]) -> Vec<Volume> {
+fn volumes(
+    config: &StoreConfig,
+    registry: &Registry,
+    state_dir: &Path,
+    dirs: &[Surveyed],
+) -> Vec<Volume> {
     let mut volumes: Vec<Volume> = Vec::new();
     for root in dirs.iter().filter_map(|surveyed| surveyed.volume.as_ref()) {
         if volumes.iter().any(|known| known.root == *root) {
@@ -258,7 +266,7 @@ fn volumes(config: &StoreConfig, registry: &Registry, dirs: &[Surveyed]) -> Vec<
             pending: 0,
         });
     }
-    for trash in trash::all(config, registry) {
+    for trash in trash::all(config, registry, state_dir) {
         let pending = trash::pending(&trash);
         if pending == 0 {
             continue;
@@ -381,7 +389,15 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     let Some(trash) = surveyed.dir.trash() else {
         return Err("no trash".to_owned());
     };
-    let profiles = super::lock_dirs(root);
+    let home = surveyed.dir.kind.lock_scope() == LockScope::PackageCache;
+    // A home has no profile directories: cargo's locks there are at its
+    // root (`super::home::LOCKS`), and its files, a million, hold no nested
+    // cargo cache worth a walk.
+    let profiles = if home {
+        Vec::new()
+    } else {
+        super::lock_dirs(root)
+    };
     let mut outer = Vec::new();
     let mut inner = Vec::new();
     for profile in &profiles {
@@ -394,13 +410,17 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
             }
         }
     }
-    // A whole directory may contain a build-script's nested Cargo cache.
-    // Recheck these locks after planning, including on Unix where rename
-    // does not fail just because an active descendant has an open file.
-    inner.extend(
-        super::locks_inside(&victim.path)
-            .map_err(|error| format!("cannot inspect nested Cargo locks: {error}"))?,
-    );
+    if home {
+        inner.extend(super::home::locks(root));
+    } else {
+        // A whole directory may contain a build-script's nested Cargo cache.
+        // Recheck these locks after planning, including on Unix where rename
+        // does not fail just because an active descendant has an open file.
+        inner.extend(
+            super::locks_inside(&victim.path)
+                .map_err(|error| format!("cannot inspect nested Cargo locks: {error}"))?,
+        );
+    }
     inner.sort();
     inner.dedup();
     let _outer = hold(&outer)?;
@@ -414,7 +434,7 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     if super::unknown_layout(&profiles) && super::recently_changed(root, now) {
         return Err("busy: changed within the hour".to_owned());
     }
-    if victim.tier == Tier::Orphan && !still_orphan(&surveyed.dir) {
+    if victim.tier == Tier::Orphan && !still_orphan(&surveyed.dir, surveyed.state) {
         return Err("no longer an orphan".to_owned());
     }
     if victim.tier == Tier::Superseded
@@ -526,11 +546,14 @@ fn reached_without_links(root: &Path, victim: &Path) -> bool {
     true
 }
 
-/// Whether build directory `dir` is still the orphan it was: its owner
-/// manifest names the same workspace, which is still gone.
-fn still_orphan(dir: &Dir) -> bool {
-    let Some(owner) = super::owner::read(&dir.path) else {
-        return false;
-    };
-    dir.owner.as_ref() == Some(&owner) && !owner.workspace.join("Cargo.toml").is_file()
+/// Whether `dir`, surveyed in `state`, is still the orphan it was: its
+/// owner manifest names the same workspace, which is still gone; or, for a
+/// home of no known worktree (`super::home`), no run recorded one since.
+fn still_orphan(dir: &Dir, state: State) -> bool {
+    match super::owner::read(&dir.path) {
+        Some(owner) => {
+            dir.owner.as_ref() == Some(&owner) && !dir.kind.workspace_exists(&owner.workspace)
+        }
+        None => dir.kind == Kind::Home && state == State::Unknown,
+    }
 }
