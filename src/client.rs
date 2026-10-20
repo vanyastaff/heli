@@ -184,10 +184,20 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
             eprintln!("cargo-heli: cannot prepare isolated Cargo home: {reason}");
             std::process::exit(USAGE);
         });
-    let dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
+    let mut dependency_env = dependency_environment(prepared.as_ref()).unwrap_or_else(|reason| {
         eprintln!("cargo-heli: {reason}");
         std::process::exit(USAGE);
     });
+    // A store whose volume is under its floor sends the build elsewhere
+    // (`crate::store::placement`, #135).
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some((build_dir, note)) = crate::store::placement::here(&config.store, &cwd)
+    {
+        if mode != output::Mode::Quiet {
+            eprintln!("{note}");
+        }
+        dependency_env.push(("CARGO_BUILD_BUILD_DIR", build_dir.into_os_string()));
+    }
     // Held until this process ends, with the run: heli's own eviction and a
     // tool that deletes build output never delete at the same time.
     let _cleaning = (!invocation.exec)
