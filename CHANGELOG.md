@@ -12,6 +12,10 @@
   `cargo-heli <version> = []` in `.crates.toml`. `doctor` now says when the
   daemon is older than the client, when `.crates.toml` records such a
   failed install, and when an old program put aside is still there (#125).
+- **`cargo heli gc --orphans`** reclaims every build directory and isolated
+  Cargo home whose worktree is gone, whatever the budget and
+  `orphan_hours`: after `git worktree remove`, one command frees its disk.
+  `gc` ends with a hint while orphans are left (#144).
 
 ### Fixed
 
