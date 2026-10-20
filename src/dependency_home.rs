@@ -15,7 +15,8 @@ use sha2::{Digest, Sha256};
 
 use crate::dependencies::Epoch;
 
-const MARKER: &str = ".heli-private-home.json";
+/// The file that marks a private Cargo home as one, in it.
+pub const MARKER: &str = ".heli-private-home.json";
 const CREDENTIALS: [&str; 2] = ["credentials", "credentials.toml"];
 
 pub struct Prepared {
@@ -80,6 +81,17 @@ pub fn prepare(epoch_path: Option<&Path>, home_base: &Path) -> Result<Prepared, 
         )?,
         None => publish_context(&original, &workspace, None, &home_base)?,
     };
+    // Whose the home is, for the build store (`crate::store::home`): the
+    // home of a removed worktree is retired. Not for an epoch's home, which
+    // the epoch's own GC covers.
+    if epoch.is_none()
+        && let Err(error) = crate::store::home::record_use(&home, &workspace, crate::clock::now())
+    {
+        eprintln!(
+            "cargo-heli: cannot record the worktree of Cargo home {}: {error}",
+            home.display()
+        );
+    }
     Ok(Prepared {
         epoch,
         home,

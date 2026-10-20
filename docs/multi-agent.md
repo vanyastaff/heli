@@ -58,8 +58,10 @@ flags as needed; Heli does not insert a lockfile-generation step.
 Nested Cargo and nested Heli retain the parent's chosen home, including
 generated projects with additional dependencies. Credentials/configuration
 changes select a new home generation for a new outer invocation, while live
-nested consumers retain the existing generation. Homes are protected and
-retained; their bytes are outside the artifact GC budget. Original home
+nested consumers retain the existing generation. Homes are protected while
+a cargo builds with them; their bytes count toward the artifact GC budget,
+and the home of a removed worktree is retired like its build directory
+([build store](build-store.md#accounting)). Original home
 `config.toml` keeps its relative path origins; legacy home `config` is
 refused rather than silently rebased. Cargo 1.99+ is required.
 

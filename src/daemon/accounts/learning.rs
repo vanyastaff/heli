@@ -159,7 +159,7 @@ impl Accounts {
         }
         drop(prepared);
         let registry = Registry::load(&self.state_dir);
-        let repositories: Vec<PathBuf> = store::survey(&self.config, &registry)
+        let repositories: Vec<PathBuf> = store::survey(&self.config, &registry, &self.state_dir)
             .into_iter()
             .filter(|dir| dir.kind == Kind::Build && dir.state() == State::Orphan)
             .filter_map(|dir| dir.owner?.repository)

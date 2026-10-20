@@ -36,10 +36,12 @@
 //!  "skipped":[]}
 //! ```
 //!
-//! `kind` is `build` or `target`; `state` is `busy`, `live`, `orphan` or
-//! `unknown` (`crate::store::State`). `store` is `null` for a `target/`
+//! `kind` is `build`, `target`, `shared`, `scratch` or `home`
+//! (`crate::store::Kind`); `state` is `busy`, `live`, `orphan` or
+//! `unknown` (`crate::store::State`). `store` is `null` but for a build
 //! directory; `workspace`, `repository`, `created_at` and `last_run` are
-//! `null` where no owner manifest says them, and `last_run` also for a
+//! `null` where no owner manifest says them (for a `home`, the workspace
+//! is its worktree, `crate::store::home`), and `last_run` also for a
 //! directory attributed to its workspace without a run of heli's
 //! (`crate::store::attribute`). A directory's `superseded` is
 //! the bytes of its superseded intermediates, which `by_category` counts
@@ -177,7 +179,14 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
     } else {
         Scope::Ladder
     };
-    let mut pass = evict::plan(&config.store, &registry, now, dry_run, scope);
+    let mut pass = evict::plan(
+        &config.store,
+        &registry,
+        &locations.state_dir,
+        now,
+        dry_run,
+        scope,
+    );
     let dirs: Vec<Entry> = pass
         .dirs
         .iter()
@@ -217,7 +226,7 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
     }
     if !dry_run {
         trash::lower_io_priority();
-        for trash in trash::all(&config.store, &registry) {
+        for trash in trash::all(&config.store, &registry, &locations.state_dir) {
             if let Err(error) = trash::empty(&trash) {
                 eprintln!("cargo-heli: cannot empty {} yet: {error}", trash.display());
             }
