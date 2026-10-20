@@ -298,8 +298,13 @@ pub enum Reply {
     /// client whose request [`RunRequest::reads_spawned`].
     Spawned,
     /// The daemon takes no runs (it is retiring); nothing was started.
+    /// With `handover`, it is handing its endpoint over to a new daemon
+    /// (docs/daemon.md, "Handover"): the client connects again, and the new
+    /// one takes the run. Absent (false) from an older daemon.
     Refused {
         reason: String,
+        #[serde(default)]
+        handover: bool,
     },
     /// The run's key already passed: nothing runs, and the client exits 0.
     /// `run` is the run that passed, in `worktree`, at `at` (seconds since
@@ -335,9 +340,13 @@ pub enum Reply {
     /// The run was cancelled: none of its processes is left.
     Cancelled,
     /// The daemon takes no more runs, and exits once the `runs` in flight
-    /// have ended (at once without any).
+    /// have ended (at once without any). With `handover`, it hands its
+    /// endpoint over at once (docs/daemon.md, "Handover"); absent (false)
+    /// from an older daemon, which keeps it until it exits.
     Stopping {
         runs: u32,
+        #[serde(default)]
+        handover: bool,
     },
     /// The run was not cancelled; `message` says why.
     CancelFailed {

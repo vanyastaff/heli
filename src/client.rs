@@ -228,16 +228,39 @@ pub fn run(mut invocation: Invocation, depth: u32) -> ! {
             }
             Ok(Some(stream)) => {
                 let plan = output::plan(&invocation, mode);
-                match submit(
-                    stream,
-                    &invocation,
-                    &plan,
-                    &child_depth,
-                    prepared.as_ref(),
-                    &dependency_env,
-                ) {
-                    Ok(never) => match never {},
-                    Err(reason) => Route::Fallback { reason },
+                let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
+                let mut stream = stream;
+                loop {
+                    match submit(
+                        stream,
+                        &invocation,
+                        &plan,
+                        &child_depth,
+                        prepared.as_ref(),
+                        &dependency_env,
+                    ) {
+                        Ok(never) => match never {},
+                        // The daemon hands over to a new one
+                        // (docs/daemon.md, "Handover"): connect again, which
+                        // reaches it, or starts it.
+                        Err(NotTaken { handover: true, .. }) if Instant::now() < deadline => {
+                            std::thread::sleep(HANDOVER_PAUSE);
+                            match reach(&locations, Some(depth)) {
+                                Ok(Some(next)) => stream = next,
+                                Ok(None) => {
+                                    break Route::Fallback {
+                                        reason: "no heli daemon answered".to_owned(),
+                                    };
+                                }
+                                Err(reason) => break Route::Fallback { reason },
+                            }
+                        }
+                        Err(not_taken) => {
+                            break Route::Fallback {
+                                reason: not_taken.reason,
+                            };
+                        }
+                    }
                 }
             }
             Ok(None) => Route::Fallback {
@@ -783,7 +806,7 @@ fn stop_daemon(now: bool, yes: bool, restart: Option<u32>) -> Result<(), String>
     let asked = protocol::write_message(&mut stream, &Request::Stop)
         .and_then(|()| protocol::read_message::<Reply>(&mut stream));
     let runs = match asked {
-        Ok(Reply::Stopping { runs }) => Some(runs),
+        Ok(Reply::Stopping { runs, handover }) => Some((runs, handover)),
         // Older than `stop`: it retires as after a version mismatch.
         Ok(Reply::Unsupported) => {
             let _ = unsupported(&mut stream);
@@ -794,9 +817,12 @@ fn stop_daemon(now: bool, yes: bool, restart: Option<u32>) -> Result<(), String>
     };
     drop(stream);
     match runs {
-        Some(0) => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
+        Some((0, _)) => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
         _ if now => eprintln!("cargo-heli: the heli daemon (pid {pid}) exits now"),
-        Some(runs) => eprintln!(
+        Some((runs, true)) => eprintln!(
+            "cargo-heli: the heli daemon (pid {pid}) hands over to a new daemon, which takes the new runs; it exits once its {runs} run(s) in flight end"
+        ),
+        Some((runs, false)) => eprintln!(
             "cargo-heli: the heli daemon (pid {pid}) takes no new runs and exits once its {runs} run(s) in flight end"
         ),
         None => eprintln!(
@@ -851,7 +877,12 @@ fn query_status() -> Result<Status, String> {
 
 fn query_status_at(locations: &Locations) -> Result<Status, String> {
     let Some(mut stream) = reach(locations, None)? else {
-        return Ok(Status::without_daemon());
+        // A daemon that handed over may still serve its runs, with no new
+        // daemon yet (docs/daemon.md, "Handover").
+        return Ok(Status {
+            retiring: crate::daemon::retiring::live(&locations.retiring_dir()),
+            ..Status::without_daemon()
+        });
     };
     let asked = protocol::write_message(&mut stream, &Request::Status)
         .and_then(|()| protocol::read_message::<Reply>(&mut stream));
@@ -869,7 +900,7 @@ fn reach(locations: &Locations, start: Option<u32>) -> Result<Option<Stream>, St
     // A daemon whose endpoint is busy is there: the client waits for it as
     // long as for its answer.
     let busy_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let stream = match ipc::connect(&locations.endpoint, busy_deadline) {
+    let stream = match connect(locations, busy_deadline) {
         Ok(stream) => stream,
         Err(error) if ipc::is_absent(&error) => match start {
             None => return Ok(None),
@@ -885,6 +916,31 @@ fn reach(locations: &Locations, start: Option<u32>) -> Result<Option<Stream>, St
         Err(error) => return Err(launch::StartError::Unreachable(error).describe(locations)),
     };
     handshake(stream).map(Some)
+}
+
+/// How long a client waits for a busy pipe before it looks for a retiring
+/// daemon that holds it.
+const RETIRING_LOOK: Duration = Duration::from_millis(250);
+
+/// Connects to the endpoint. A busy endpoint is a daemon's, which the
+/// client waits for, up to `busy_deadline`; on Windows that daemon may be
+/// a retiring one whose runs hold every instance of the pipe, with no new
+/// daemon yet (docs/daemon.md, "Handover"): that endpoint counts as
+/// absent, so a new daemon is started and joins the pipe.
+fn connect(locations: &Locations, busy_deadline: Instant) -> std::io::Result<Stream> {
+    let first = busy_deadline.min(Instant::now() + RETIRING_LOOK);
+    match ipc::connect(&locations.endpoint, first) {
+        Err(error)
+            if ipc::is_busy(&error)
+                && !crate::daemon::retiring::live(&locations.retiring_dir()).is_empty() =>
+        {
+            Err(std::io::ErrorKind::NotFound.into())
+        }
+        Err(error) if ipc::is_busy(&error) && Instant::now() < busy_deadline => {
+            ipc::connect(&locations.endpoint, busy_deadline)
+        }
+        result => result,
+    }
 }
 
 /// Starts a daemon and connects to it, or to the one that won a race to
@@ -950,6 +1006,26 @@ fn unsupported(stream: &mut Stream) -> String {
         .to_owned()
 }
 
+/// How long a client waits before it connects again to a daemon that hands
+/// over: it stops listening at once, but on its main thread.
+const HANDOVER_PAUSE: Duration = Duration::from_millis(50);
+
+/// Why the daemon did not take a run, and whether it hands over to a new
+/// daemon, which would (docs/daemon.md, "Handover").
+struct NotTaken {
+    reason: String,
+    handover: bool,
+}
+
+impl From<String> for NotTaken {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            handover: false,
+        }
+    }
+}
+
 /// Hands the run to the daemon, as `plan` says, and follows it to its end.
 /// Returns only when the daemon did not start it, with the reason.
 fn submit(
@@ -959,7 +1035,7 @@ fn submit(
     child_depth: &OsString,
     prepared: Option<&crate::dependency_home::Prepared>,
     dependency_env: &[(&str, OsString)],
-) -> Result<std::convert::Infallible, String> {
+) -> Result<std::convert::Infallible, NotTaken> {
     let cwd = std::env::current_dir()
         .map_err(|error| format!("cannot read the working directory: {error}"))?;
     let mut overrides = vec![(nesting::VAR, child_depth.clone())];
@@ -1020,16 +1096,16 @@ fn submit(
             // A daemon older than `Spawned` may start the command any time
             // after `Started`.
             let spawned = !spawned_follows;
-            follow(stream, invocation, run, started, printer, spawned)
+            follow(stream, invocation, run, started, printer, spawned).map_err(NotTaken::from)
         }
         Ok(Reply::Passed { run, worktree, at }) => already_passed(run, &worktree, at),
         Ok(Reply::SpawnFailed { not_found, message }) => {
             direct::report_spawn_failure(&invocation.program, not_found, &message)
         }
-        Ok(Reply::Refused { reason }) => Err(reason),
-        Ok(Reply::Unsupported) => Err(unsupported(&mut stream)),
-        Ok(other) => Err(format!("the heli daemon answered {other:?} to a run")),
-        Err(error) => Err(format!("the heli daemon did not take the run: {error}")),
+        Ok(Reply::Refused { reason, handover }) => Err(NotTaken { reason, handover }),
+        Ok(Reply::Unsupported) => Err(unsupported(&mut stream).into()),
+        Ok(other) => Err(format!("the heli daemon answered {other:?} to a run").into()),
+        Err(error) => Err(format!("the heli daemon did not take the run: {error}").into()),
     }
 }
 
