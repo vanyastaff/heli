@@ -184,13 +184,35 @@ own; `setup` says so, and a repository's `build-dir` leaves them out.
 Registered `target/` directories
 have the same states, from the same locks and their registered workspace.
 
+**Isolated Cargo homes** (#120, `src/store/home.rs`). With `[cargo] home =
+"isolated"` ([worktree Cargo homes](#worktree-cargo-homes)), each worktree
+gets a Cargo home of its own under the state directory, `<state>/h/<32 hex
+digits>`, holding its registry index, `.crate` files, extracted sources and
+git checkouts: on a host whose agents make and drop worktrees all day, 67
+homes took 53.6 GB and two million files, most of them of worktrees long
+gone. The store accounts for them as it does for build directories. A
+home's marker does not name its worktree (the identity hashes it), so the
+client that selects a home for a run writes the home's `.heli/owner`, the
+same manifest, with the worktree as `workspace` (its nearest checkout root,
+or the directory the run started in outside a repository), no `repository`,
+and the run's start as `last_run`. The home is then **busy** while a cargo
+holds `.package-cache-mutate` there (shared, for the whole of a build) or
+`.package-cache` (exclusively, while it downloads), or a run is in flight in
+its worktree; **live** while the worktree's `.git` entry exists (a removed
+worktree can leave files behind), or, outside a repository, its
+`Cargo.toml`; an **orphan** once the worktree is gone; and **unknown**
+without a manifest, as a home an older heli published is until a run
+selects it again: nothing heli knows selects it. `status` and `gc` list
+homes as `home`, and they count toward the budget.
+
 `cargo heli gc --dry-run` lists every directory, build and target, with its
 state, size, workspace and repository, and the victims an eviction pass
 would take ([eviction](#eviction)), and deletes nothing; `gc` without `--dry-run` evicts
 them. It reads the store itself and needs no daemon. `--json` prints a
 versioned document (`schema`, now 1): `dry_run`; `dirs`, one entry per
-directory, with `kind` (`build` or `target`), `path`, `store`, `state`,
-`workspace`, `repository`, `created_at`, `last_run` (`null` for a directory
+directory, with `kind` (`build`, `target`, `shared`, `scratch` or `home`),
+`path`, `store`, `state`, `workspace` (a home's worktree), `repository`,
+`created_at`, `last_run` (`null` for a directory
 attributed without a run, which the text lists as `last run: none`), `size` and
 `by_category`, and `superseded` (bytes, above); `used` (what every directory takes), `budget` and `floor`
 (bytes, `null` without one); `volumes`, each with `root`, `free` (`null`
@@ -205,8 +227,8 @@ floor, and nothing else; `--dry-run` combines with it.
 ## Eviction
 
 The budget is B for all build directories plus registered `target/`
-directories (`[store] budget_mb`), with a free-space floor F on each volume
-that holds a store or a registered `target/` directory (`[store]
+directories, scratch copies and isolated Cargo homes (`[store] budget_mb`),
+with a free-space floor F on each volume that holds one of them (`[store]
 floor_mb`). Neither has a default until that is settled
 ([open questions](architecture.md#open-questions)):
 without them, nothing is evicted. Over budget, heli evicts down to 85 % of
@@ -242,17 +264,22 @@ come where they belong (6 first, 7 after 0), so that the numbers `gc`,
    the store. Each unit ever built leaves one; in the example they make up
    114 GB of one worktree.
 2. Orphans that no new worktree claimed within 24 h ([recycling](#recycling)), longest
-   unclaimed first.
+   unclaimed first; and the isolated Cargo homes ([accounting](#accounting)) of
+   removed worktrees unclaimed that long, and of no known worktree idle
+   that long. Reasons: `Cargo home of a removed worktree, unclaimed for
+   26 h`, `Cargo home of no known worktree, idle for 26 h`.
 3. All of a profile's `incremental/` in directories idle for 6 h.
 4. Tool caches in the `target/` of worktrees idle for 6 h: cargo-llvm-cov's
    `llvm-cov-target`, built in, and patterns in the configuration, for
    example `tests/trybuild`, and for flui `cli-template-check` and
    `facade-consumer-check`.
-5. Whole build directories of live workspaces idle for 7 days.
+5. Whole build directories of live workspaces idle for 7 days, and the
+   isolated Cargo homes of live worktrees idle that long (reason: `Cargo
+   home idle for 170 h`).
 
 A registered `target/` directory seen for two workspaces (a global `CARGO_TARGET_DIR` or `build.target-dir`) is `shared` from then on. It is not heli's to manage: it has no rungs, not even 1 and 3, and does not count toward B. `gc` and `status` list it as shared (#65).
 
-What depends on a directory's kind (build, target, scratch or shared) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches, its own rungs (6, 0, 7, 2, 4 and 5) and the rule that keeps it whole; rungs 1 and 3 apply to every kind.
+What depends on a directory's kind (build, target, scratch, shared or home) lives in one place, `src/store/kind.rs`: where a cargo lock makes it busy, its trash, its tool caches, its own rungs (6, 0, 7, 2, 4 and 5) and the rule that keeps it whole; rungs 1 and 3 apply to every kind but shared and home.
 
 Later, between 4 and 5: units in `deps/` and `.fingerprint/` unused for 7
 days, cargo-sweep's approach (out of scope for now).
@@ -332,6 +359,16 @@ Which directories have which tiers:
   the profile locks like the others, so a held `.cargo-lock` or
   `.cargo-artifact-lock` skips it, and only if it is still untouched since
   the separation.
+- An isolated Cargo home has tier 2 (an orphan, or unknown) or tier 5 (of a
+  live worktree) and no other: it holds no intermediates, and is evicted
+  whole, into `<state>/h/.heli-trash` beside it, under its package-cache
+  locks. The home of a removed worktree waits out `orphan_hours` like an
+  orphan build directory, noted in its `.heli/orphaned`, so a worktree
+  being moved or repaired keeps it; a worktree that runs again after its
+  home went gets a new one, and downloads again. Before the rename, an
+  orphan must still be one (its manifest names the same worktree, still
+  gone), and an unknown home must still have no manifest: a run that
+  selected it meanwhile wrote one.
 
 Safety rules:
 
@@ -782,8 +819,8 @@ This immutable-source profile requires explicit preparation and selection.
 The native home profile in [worktree Cargo homes](#worktree-cargo-homes) needs no epoch publisher or vendor prepass;
 automatic epoch publication is an optional storage optimization, not a
 prerequisite for independent Cargo downloads. Capacity accounting for
-sources/staging/private homes/lease metadata and automatic private-home
-reclamation remain unfinished. Legacy home `config` is
+sources, staging and lease metadata remains unfinished; private native
+homes are counted and retired as [worktree Cargo homes](#worktree-cargo-homes) says (#120). Legacy home `config` is
 explicitly refused because Cargo includes require `.toml`; copying it would
 change relative-path semantics. Arbitrary cargo extensions, competing
 home-bin/PATH extension precedence and tools mutating the Cargo home need
@@ -875,9 +912,15 @@ inside an inherited isolated command is refused rather than escaping its
 parent's context. Use an outer shared command for home maintenance. Arbitrary
 extensions and executables may interpret Cargo home themselves; their full
 compatibility remains part of #38. Existing Cargo 1.99+ and legacy home
-`config` limitations apply. Private native homes are retained and are outside
-artifact-store accounting; automatic retirement requires lifetime ownership
-before deletion. No hard resource bound follows from this profile.
+`config` limitations apply. Private native homes are directories the build
+store accounts for ([accounting](#accounting), #120): each counts toward
+the budget, `status` and `gc` list it as `home` with its worktree, and the
+ladder retires the home of a removed worktree (tier 2, once unclaimed for
+`orphan_hours`), one of no known worktree (tier 2, once idle that long) and
+one of a live worktree idle for `dir_hours` (tier 5), never one a cargo
+builds with ([eviction](#eviction)). Nothing else bounds what the profile
+takes; a shared read-only `.crate` cache across homes, which would cut it
+several times, is not done.
 
 Acceptance must exercise the public CLI with two actual Git worktrees and
 a localhost registry: delay A's real download and observe B's build-script
