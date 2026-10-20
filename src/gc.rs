@@ -1,4 +1,4 @@
-//! `cargo heli gc [--superseded] [--dry-run] [--json]`: every directory the build store
+//! `cargo heli gc [--superseded | --orphans] [--dry-run] [--json]`: every directory the build store
 //! accounts for (`crate::store::survey`), with its state and size, and an
 //! eviction pass over them (docs/build-store.md#eviction,
 //! `crate::store::evict`): over the budget or under the floor, the victims the
@@ -13,6 +13,14 @@
 //! them. Without it, the text form ends with a hint while any are left:
 //! `58.3 GiB superseded by the build store: cargo heli gc --superseded`.
 //!
+//! **`--orphans`** reclaims every orphan build directory and Cargo home
+//! (`crate::store::State::Orphan`: its worktree is gone) whole now, whatever
+//! the budget, the floor and `orphan_hours`, and nothing else (#144): after
+//! `git worktree remove`, one command frees its disk. A run in flight in
+//! its workspace, or a worktree back at that place, keeps it. Without it,
+//! the text form ends with a hint while orphans are left:
+//! `100.0 GiB in 9 orphans: cargo heli gc --orphans`.
+//!
 //! It reads the store itself, as of now, and needs no daemon: the
 //! configuration names the stores, the budget, the floor and the ages, the
 //! registry in the state directory the registered `target/` directories,
@@ -24,7 +32,7 @@
 //! added:
 //!
 //! ```json
-//! {"schema":1,"dry_run":true,"superseded":false,"dirs":[
+//! {"schema":1,"dry_run":true,"superseded":false,"orphans":false,"dirs":[
 //!   {"kind":"build","path":"D:\\.heli\\build\\28\\4ec2fa37745150",
 //!    "store":"D:\\.heli\\build","state":"live","workspace":"D:\\flui",
 //!    "repository":"D:\\flui\\.git","created_at":1791910980,
@@ -46,7 +54,8 @@
 //! (`crate::store::attribute`). A directory's `superseded` is
 //! the bytes of its superseded intermediates, which `by_category` counts
 //! too (0 but in a `target/` directory apart from its build directory);
-//! the document's `superseded` says the pass was `--superseded`. A
+//! the document's `superseded` says the pass was `--superseded`, and its
+//! `orphans` that it was `--orphans`. A
 //! directory's `kept` (absent above) says why it is not deleted whole,
 //! when a rule keeps it: busy, within its age, of no cargo layout, in its
 //! worktree, or kept whole over a budget that cannot be met. `used` is
@@ -88,6 +97,8 @@ struct Listing<'a> {
     dry_run: bool,
     /// The pass was `--superseded`.
     superseded: bool,
+    /// The pass was `--orphans`.
+    orphans: bool,
     runtime_busy: bool,
     dirs: Vec<Entry>,
     used: u64,
@@ -192,8 +203,9 @@ impl Entry {
     }
 }
 
-/// `cargo heli gc`; `superseded` for `--superseded`.
-pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
+/// `cargo heli gc`; `superseded` for `--superseded`, `orphans` for
+/// `--orphans`.
+pub fn main(dry_run: bool, json: bool, superseded: bool, orphans: bool) -> ! {
     let (locations, config, registry) = match Locations::resolve().and_then(|locations| {
         let config = Config::load(&locations.config)?;
         let registry = Registry::load(&locations.state_dir);
@@ -207,6 +219,8 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
     let _evicting = (!dry_run).then(|| evict_lock(&locations));
     let scope = if superseded {
         Scope::Superseded
+    } else if orphans {
+        Scope::Orphans
     } else {
         Scope::Ladder
     };
@@ -240,6 +254,7 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
         schema: SCHEMA,
         dry_run,
         superseded,
+        orphans,
         runtime_busy: pass.runtime_busy,
         dirs,
         used: pass.used,
@@ -336,6 +351,8 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
     }
     if listing.superseded {
         text.push_str("reclaiming superseded intermediates, whatever the budget (--superseded)\n");
+    } else if listing.orphans {
+        text.push_str("reclaiming orphans, whatever the budget and orphan_hours (--orphans)\n");
     } else {
         text.push_str(&limits(pass));
     }
@@ -397,6 +414,22 @@ fn to_text(listing: &Listing, pass: &Pass, now: u64) -> String {
     if !listing.superseded && superseded > 0 {
         text.push_str(&hint(superseded));
     }
+    let orphans: Vec<&Entry> = listing
+        .dirs
+        .iter()
+        .filter(|entry| {
+            entry.state == State::Orphan
+                && matches!(entry.kind, Kind::Build | Kind::Home)
+                && !listing
+                    .victims
+                    .iter()
+                    .any(|victim| victim.path.to_string_lossy() == entry.path)
+        })
+        .collect();
+    if !listing.orphans && !orphans.is_empty() {
+        let bytes = orphans.iter().map(|entry| entry.size).sum();
+        text.push_str(&orphan_hint(orphans.len(), bytes));
+    }
     text
 }
 
@@ -427,6 +460,16 @@ fn kept_groups(dirs: &[Entry]) -> Vec<String> {
 pub fn hint(bytes: u64) -> String {
     format!(
         "{} superseded by the build store: cargo heli gc --superseded\n",
+        sizes::human(bytes)
+    )
+}
+
+/// The hint at the end of the text form while `count` orphans of `bytes`
+/// are left.
+fn orphan_hint(count: usize, bytes: u64) -> String {
+    let orphans = if count == 1 { "orphan" } else { "orphans" };
+    format!(
+        "{} in {count} {orphans}: cargo heli gc --orphans\n",
         sizes::human(bytes)
     )
 }

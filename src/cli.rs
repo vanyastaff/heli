@@ -69,11 +69,13 @@ pub enum Action {
     },
     /// List the build store's directories and evict what the ladder says,
     /// or with `dry_run` only name it; as JSON with `json`. With
-    /// `superseded`, reclaim every superseded directory instead.
+    /// `superseded`, reclaim every superseded directory instead; with
+    /// `orphans`, every orphan build directory and Cargo home.
     Gc {
         dry_run: bool,
         json: bool,
         superseded: bool,
+        orphans: bool,
     },
     /// Explain how the installed cargo tools and the cargo configuration
     /// interact with heli; as JSON with `json`.
@@ -400,8 +402,12 @@ enum Command {
         /// Reclaim, whatever the budget, every directory of intermediates in
         /// a registered target/ directory that the build store superseded,
         /// and nothing else.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "orphans")]
         superseded: bool,
+        /// Reclaim, whatever the budget and orphan_hours, every build
+        /// directory and Cargo home whose worktree is gone, and nothing else.
+        #[arg(long)]
+        orphans: bool,
     },
     /// Explain how the installed cargo tools and the cargo configuration
     /// (`jobs`, `target-dir`, `build-dir`, wrappers, linkers) interact with
@@ -577,10 +583,12 @@ pub fn parse(
             dry_run,
             json,
             superseded,
+            orphans,
         } => Action::Gc {
             dry_run,
             json,
             superseded,
+            orphans,
         },
         Command::Doctor { json } => Action::Doctor { json },
         Command::Setup {

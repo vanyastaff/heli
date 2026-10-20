@@ -432,7 +432,7 @@ cargo heli status [--json]
 cargo heli log <run> [--errors | --test <name> | --tail <n> | --grep <re> | --raw]
 cargo heli cancel <run>
 cargo heli rerun [<run>] [--failed [--then-all]]
-cargo heli gc [--dry-run] [--json]
+cargo heli gc [--superseded | --orphans] [--dry-run] [--json]
 cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli stop [--now [--yes]]

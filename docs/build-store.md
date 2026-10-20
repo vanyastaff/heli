@@ -222,7 +222,14 @@ in a dry run, else evicted, in order, each with `tier`, `path`, `bytes`,
 victims that could not be evicted, each also with `why`. The document's
 `superseded` says whether the pass was `gc --superseded`, which reclaims
 every superseded directory now (tier 6, [eviction](#eviction)), whatever the budget and the
-floor, and nothing else; `--dry-run` combines with it.
+floor, and nothing else; `--dry-run` combines with it. Its `orphans` says
+whether the pass was `gc --orphans` (#144), which reclaims every orphan
+build directory and isolated Cargo home whole now (tier 2), whatever the
+budget, the floor and `orphan_hours`, and nothing else: after `git worktree
+remove`, one command frees its disk, and recycling no longer gets it. A
+run in flight in its workspace, or a worktree back in its place, keeps it,
+as for any orphan victim. Without `--orphans`, the text form ends with a
+hint while any are left: `100.0 GiB in 9 orphans: cargo heli gc --orphans`.
 
 ## Eviction
 
@@ -568,7 +575,8 @@ every minute while a budget or a floor is set, or `gc`'s. That pass writes
 it names the owner manifest's workspace and is no older than its last run;
 a directory found live loses it, and `gc --dry-run` writes none. An orphan
 becomes evictable (tier 2) only after 24 h unclaimed, and no other tier
-deletes it whole, so recycling has at least that long to claim it. A
+deletes it whole, so recycling has at least that long to claim it, unless
+someone asks for its disk with `gc --orphans` ([accounting](#accounting)). A
 recycled directory names its new workspace, so its old note no longer
 counts. Recycling never takes a directory that is already in the trash:
 `<store>/.trash/` is not a build directory (`<2 hex digits>/<hex digits>`),

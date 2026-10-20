@@ -61,6 +61,9 @@ pub enum Scope {
     /// Every superseded directory, whatever the budget and the floor
     /// (`gc --superseded`).
     Superseded,
+    /// Every orphan build directory and Cargo home, whole, whatever the
+    /// budget, the floor and `orphan_hours` (`gc --orphans`, #144).
+    Orphans,
 }
 
 /// What a pass found and did.
@@ -155,17 +158,22 @@ pub fn plan(
     if scope == Scope::Ladder && !goals.any() {
         return pass;
     }
-    let tool_caches = config.tool_cache_patterns();
-    let mut candidates = ladder::candidates(&pass.dirs, &policy, &tool_caches, now);
-    // Under the floor, the ages do not hold on that volume: what the
-    // ladder allows there whatever the age follows, for the floor only.
-    candidates.extend(ladder::urgent(
-        &pass.dirs,
-        &policy,
-        &tool_caches,
-        now,
-        &goals.floors,
-    ));
+    let mut candidates = if scope == Scope::Orphans {
+        ladder::orphans(&pass.dirs, now)
+    } else {
+        let tool_caches = config.tool_cache_patterns();
+        let mut candidates = ladder::candidates(&pass.dirs, &policy, &tool_caches, now);
+        // Under the floor, the ages do not hold on that volume: what the
+        // ladder allows there whatever the age follows, for the floor only.
+        candidates.extend(ladder::urgent(
+            &pass.dirs,
+            &policy,
+            &tool_caches,
+            now,
+            &goals.floors,
+        ));
+        candidates
+    };
     // What changed since the oldest run in flight started may be in use
     // (`super::changed_in_flight`): left out before the ladder chooses, so
     // that it chooses something else.
@@ -189,6 +197,10 @@ pub fn plan(
                 .into_iter()
                 .filter(|victim| victim.tier == Tier::Superseded)
                 .collect()
+        }
+        Scope::Orphans => {
+            left = Goals::default();
+            candidates
         }
     };
     pass.left = left;

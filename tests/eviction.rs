@@ -1384,6 +1384,55 @@ fn the_daemon_finds_orphans() {
     assert_eq!(victim["age"], 0, "unclaimed since the clock's now: {found}");
 }
 
+/// `gc --orphans` reclaims the build directory of a removed worktree at
+/// once, well within the budget and `orphan_hours`, which the plain pass
+/// leaves alone and names in its hint; the main worktree's is kept (#144).
+#[test]
+fn orphans_go_whatever_the_budget_with_gc_orphans() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "budget_mb = 1000000\n");
+    let main = fixture.workspace();
+    init_repo(&main);
+    use_store(&fixture, &main);
+    let linked = add_worktree(&main, "linked");
+    let orphan = build_in(&fixture, &linked, "echo-args");
+    let live = build_in(&fixture, &main, "echo-args");
+    git(
+        &main,
+        &["worktree", "remove", "--force", &linked.to_string_lossy()],
+    );
+
+    let planned = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(listed(&planned, &orphan)["state"], "orphan", "{planned}");
+    assert!(victims(&planned).is_empty(), "within the budget: {planned}");
+    let output = fixture
+        .heli(["gc", "--dry-run"])
+        .output()
+        .expect("run heli gc");
+    assert_success(&output, "cargo heli gc --dry-run");
+    assert!(
+        text(&output.stdout).contains("in 1 orphan: cargo heli gc --orphans"),
+        "{}",
+        text(&output.stdout)
+    );
+
+    let named = gc(&fixture, &["gc", "--orphans", "--dry-run"]);
+    assert_eq!(named["orphans"], true, "{named}");
+    assert_eq!(victims(&named), vec![(2, spelled(&orphan))], "{named}");
+    assert!(orphan.exists(), "a dry run deletes nothing");
+
+    // The daemon holds a run's lease a little after it ends: until then
+    // the orphan is skipped as in flight.
+    let evicted = wait_for("gc --orphans to evict the orphan", || {
+        let evicted = gc(&fixture, &["gc", "--orphans"]);
+        (!orphan.exists()).then_some(evicted)
+    });
+    assert_eq!(victims(&evicted), vec![(2, spelled(&orphan))], "{evicted}");
+    assert!(live.exists(), "the main worktree's directory stays");
+    let after = gc(&fixture, &["gc", "--orphans", "--dry-run"]);
+    assert!(victims(&after).is_empty(), "{after}");
+}
+
 /// Under the floor, the daemon evicts by itself too: the ladder's own
 /// victims first (the old units), then, a floor no disk can meet, the
 /// rest of the volume with the ages waived, the build directory whole

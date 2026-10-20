@@ -42,6 +42,10 @@ hands over at once, so the restart no longer waits for its runs.
   `budget_unmet`, the pass keeps the live directories whole instead of
   deleting what the next build rebuilds, and the daemon logs one line an
   hour instead of the same pass every minute (#122).
+- **`cargo heli gc --orphans`** reclaims every build directory and isolated
+  Cargo home whose worktree is gone, whatever the budget and
+  `orphan_hours`: after `git worktree remove`, one command frees its disk.
+  `gc` ends with a hint while orphans are left (#144).
 
 ### Changed
 
