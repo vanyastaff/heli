@@ -43,6 +43,7 @@
 
 pub mod accounts;
 pub mod advisory;
+pub mod detached;
 pub mod events;
 pub mod execute;
 pub mod governor;
@@ -187,6 +188,11 @@ pub fn main() -> ! {
                 lent,
             )
         });
+    }
+    {
+        let daemon = Arc::clone(&daemon);
+        let config = locations.config.clone();
+        std::thread::spawn(move || daemon.watch_detached(&config));
     }
     if let Some(owner) = owner::pid() {
         let daemon = Arc::clone(&daemon);
@@ -576,6 +582,11 @@ impl Daemon {
     /// which asked for the same run (`request`).
     fn attach(&self, mut stream: Stream, request: &RunRequest, run: Attached) {
         let _pin = self.runlog.pin(run.id);
+        if let Some(priority) = run.restored {
+            self.broker.reweigh(run.id, priority);
+            self.log
+                .write(&format!("{}: a client attached: {priority} again", run.id));
+        }
         let started = Reply::Started {
             run: run.id,
             attached: Some(u64::try_from(run.running_for.as_millis()).unwrap_or(u64::MAX)),
@@ -747,6 +758,11 @@ impl Daemon {
             Some(plan) => self.test(&mut run, plan),
         };
         let mut saturated = false;
+        if let Some(detached) = self.registry.detached_cancel(id) {
+            let line = detached::record_line(id, detached);
+            let recorded = record.output(Channel::Stderr, line.as_bytes());
+            live.append(Channel::Stderr, line.into_bytes(), recorded);
+        }
         if let Some(loans) = self.broker.close(id) {
             saturated = loans.saturated;
             self.events.record("loans", loans_event(id, &loans));

@@ -291,6 +291,31 @@ impl Broker {
         state.runs.get(&id).map_or(0.0, |run| shares.of(run))
     }
 
+    /// Weighs run `id` as `priority` from now on: demoted for having no
+    /// client, or its own priority again (`crate::daemon::detached`).
+    pub fn reweigh(self: &Arc<Self>, id: RunId, priority: Priority) {
+        let mut state = self.lock();
+        let Some(run) = state.runs.get_mut(&id) else {
+            return;
+        };
+        run.weight = priority.weight();
+        self.balance(&mut state);
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// How many runs other than `except` may be waiting for a slot, counted
+    /// now.
+    pub fn waiting(&self, except: RunId) -> usize {
+        let mut state = self.lock();
+        state.observe(Instant::now());
+        state
+            .runs
+            .iter()
+            .filter(|(id, run)| **id != except && run.waiting())
+            .count()
+    }
+
     /// Takes up to `wanted` test slots for run `id`, waiting for them at
     /// most `within`, and returns how many it got. The daemon holds them
     /// until [`Broker::release_test_slots`].

@@ -47,6 +47,7 @@
 //! idle_hours = 6
 //! dir_hours = 168
 //! scratch_hours = 1    # tier 0: scratch copies cargo-mutants left behind
+//! unknown_hours = 1    # tier 7: build directories of no known workspace
 //! ```
 //!
 //! Every setting is optional, and a missing file means every default. Keys
@@ -60,9 +61,11 @@
 //!
 //! **The test seam.** Debug builds also read a `[test]` table ([`Seam`]):
 //! memory figures, and a clock for the memory governor and the eviction
-//! ladder, which tests set instead of the machine's. The daemon reads it
-//! again each time the governor or the ladder looks ([`current_seam`]), so a
-//! test can change them while it runs. Release builds ignore the table.
+//! ladder, which tests set instead of the machine's, and the grace periods
+//! of a run without a client (`crate::daemon::detached`). The daemon reads
+//! it again each time the governor, the ladder or the watch on detached
+//! runs looks ([`current_seam`]), so a test can change them while it runs.
+//! Release builds ignore the table.
 
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -94,6 +97,10 @@ pub struct ClientConfig {
     pub cargo: CargoConfig,
     pub output: OutputConfig,
     pub profiles: crate::profiles::Profiles,
+    /// `[store]`, for placement under the floor
+    /// (`crate::store::placement`); the default when it does not parse,
+    /// since the store is the daemon's to report on.
+    pub store: StoreConfig,
 }
 
 impl ClientConfig {
@@ -124,6 +131,11 @@ impl ClientConfig {
             cargo,
             output,
             profiles,
+            store: value
+                .get("store")
+                .cloned()
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default(),
         })
     }
 }
@@ -170,6 +182,10 @@ pub struct StoreConfig {
     /// Tier 0: scratch copies cargo tools left behind, untouched this many
     /// hours; default 1 (`crate::store::scratch`).
     pub scratch_hours: Option<u64>,
+    /// Tier 7: build directories of no known workspace (bare or nested
+    /// cargo built in them, and no heli run), untouched this many hours;
+    /// default 1.
+    pub unknown_hours: Option<u64>,
 }
 
 /// Tool caches heli knows without configuration: cargo-llvm-cov's own
@@ -254,6 +270,14 @@ pub struct Seam {
     pub clock_ms: Option<u64>,
     /// `[test.memory]`: memory figures; `None`: the machine's.
     pub memory: Option<InjectedMemory>,
+    /// How long a run goes without a client before it is weighed
+    /// background, in milliseconds; `None`:
+    /// `crate::daemon::detached::DEMOTE_AFTER`.
+    pub detached_demote_ms: Option<u64>,
+    /// How long a run goes without a client before it is cancelled while
+    /// another run waits for a slot, in milliseconds; `None`:
+    /// `crate::daemon::detached::CANCEL_AFTER`.
+    pub detached_cancel_ms: Option<u64>,
 }
 
 /// Memory figures in megabytes, injected for tests.

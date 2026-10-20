@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+use super::kind::Kept;
 use super::ladder::{self, Goals, Policy, Surveyed, Tier, Victim};
 use super::registry::Registry;
 use super::{Dir, Kind, Lock, State, orphan, trash};
@@ -79,6 +80,8 @@ pub struct Pass {
     pub volumes: Vec<Volume>,
     /// What the pass had to free.
     pub goals: Goals,
+    /// What its victims do not free: the goals left unmet by the plan.
+    pub left: Goals,
     /// The victims: planned in a dry run, else evicted, in order.
     pub victims: Vec<Victim>,
     /// Victims that could not be evicted, and why.
@@ -142,14 +145,24 @@ pub fn plan(
         used,
         volumes,
         goals: goals.clone(),
+        left: Goals::default(),
         victims: Vec::new(),
         skipped: Vec::new(),
     };
     if scope == Scope::Ladder && !goals.any() {
         return pass;
     }
-    let mut candidates =
-        ladder::candidates(&pass.dirs, &policy, &config.tool_cache_patterns(), now);
+    let tool_caches = config.tool_cache_patterns();
+    let mut candidates = ladder::candidates(&pass.dirs, &policy, &tool_caches, now);
+    // Under the floor, the ages do not hold on that volume: what the
+    // ladder allows there whatever the age follows, for the floor only.
+    candidates.extend(ladder::urgent(
+        &pass.dirs,
+        &policy,
+        &tool_caches,
+        now,
+        &goals.floors,
+    ));
     // What changed since the oldest run in flight started may be in use
     // (`super::changed_in_flight`): left out before the ladder chooses, so
     // that it chooses something else.
@@ -164,14 +177,43 @@ pub fn plan(
                 .map(|victim| (victim, IN_FLIGHT.to_owned())),
         );
     }
+    let mut left = goals;
     pass.victims = match scope {
-        Scope::Ladder => ladder::plan(candidates, &pass.dirs, goals),
-        Scope::Superseded => candidates
-            .into_iter()
-            .filter(|victim| victim.tier == Tier::Superseded)
-            .collect(),
+        Scope::Ladder => ladder::plan(candidates, &pass.dirs, &mut left),
+        Scope::Superseded => {
+            left = Goals::default();
+            candidates
+                .into_iter()
+                .filter(|victim| victim.tier == Tier::Superseded)
+                .collect()
+        }
     };
+    pass.left = left;
     pass
+}
+
+/// Why the directory `index` of `pass` is not deleted whole at `now`, when
+/// it is not: busy, kept by a rule of its kind (`super::kind::kept`), or
+/// kept whole over a budget the pass cannot meet. `None` for one the pass
+/// planned, or evicted, whole, and for one nothing keeps.
+pub fn kept(pass: &Pass, index: usize, now: u64) -> Option<Kept> {
+    let surveyed = &pass.dirs[index];
+    if pass
+        .victims
+        .iter()
+        .any(|victim| victim.dir == index && victim.path == surveyed.dir.path)
+    {
+        return None;
+    }
+    let idle = now.saturating_sub(surveyed.last_use);
+    if let Some(kept) = super::kind::kept(surveyed, &pass.policy, now, idle) {
+        return Some(kept);
+    }
+    (pass.goals.budget_unmet && surveyed.dir.kind == Kind::Build && surveyed.state == State::Live)
+        .then(|| Kept {
+            group: "live, kept whole: the budget cannot be met",
+            why: "live, kept whole: the budget cannot be met (#122)".to_owned(),
+        })
 }
 
 /// Evicts the victims `pass` planned, at `now`, in order: those that could
@@ -191,13 +233,15 @@ pub fn execute(pass: &mut Pass, now: u64) {
 }
 
 /// The fields of the event log's `evict` event for `victim`: its `tier`,
-/// `path`, `bytes` and `reason`.
+/// `path`, `bytes`, `reason`, and whether it was chosen under the floor
+/// (`floor`).
 pub fn event(victim: &Victim) -> serde_json::Value {
     serde_json::json!({
         "tier": victim.tier,
         "path": victim.path.to_string_lossy(),
         "bytes": victim.bytes,
         "reason": victim.reason,
+        "floor": victim.floor,
     })
 }
 
@@ -259,6 +303,29 @@ fn goals(policy: &Policy, used: u64, busy: u64, volumes: &[Volume]) -> Goals {
 }
 
 impl Pass {
+    /// What the pass could not free ([`Pass::left`]), for people: `budget
+    /// still 469.2 GiB over its target; D:\ still 49.9 GiB under its
+    /// floor`. `None` when its victims free all it had to.
+    pub fn left_text(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.left.budget > 0 {
+            parts.push(format!(
+                "budget still {} over its target",
+                super::sizes::human(self.left.budget)
+            ));
+        }
+        for (root, need) in &self.left.floors {
+            if *need > 0 {
+                parts.push(format!(
+                    "{} still {} under its floor",
+                    root.display(),
+                    super::sizes::human(*need)
+                ));
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("; "))
+    }
+
     /// The budget the pass could not meet, when the busy directories alone
     /// hold more than its target ([`Goals::budget_unmet`]).
     pub fn unmet_budget(&self) -> Option<UnmetBudget> {
@@ -338,13 +405,8 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     inner.dedup();
     let _outer = hold(&outer)?;
     let inner = hold(&inner)?;
-    if victim.tier == Tier::BuildDir
-        && surveyed.state == State::Unknown
-        && !super::managed::unknown_is_reclaimable(&surveyed.dir)
-    {
-        return Err(
-            "unknown directory has no verified managed cache root or lock layout".to_owned(),
-        );
+    if victim.tier == Tier::Unknown && !super::managed::unknown_is_reclaimable(&surveyed.dir) {
+        return Err("unknown directory is not of cargo's layout".to_owned());
     }
     if super::unknown_layout(&profiles) && super::recently_changed(root, now) {
         return Err("busy: changed within the hour".to_owned());
