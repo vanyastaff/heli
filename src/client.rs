@@ -1077,6 +1077,7 @@ fn follow(
                     code,
                     signal,
                     cancelled,
+                    detached: false,
                 };
                 printer.exited(&run.to_string(), exit, started.elapsed());
                 exit_as(code, signal)

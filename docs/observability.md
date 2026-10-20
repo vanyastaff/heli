@@ -31,7 +31,8 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
 - `runs`: one entry per run, with `id`, `worktree` (the nearest directory
   holding `.git`, else the working directory), `argv`, `class`, `priority`
   (`interactive`, `normal` or `background`, [host pool](host-pool.md); the text form shows it when
-  not `normal`), `phase`
+  not `normal`; `background` also for a run demoted for having no client,
+  [runs](runs.md) "Detach"), `phase`
   (running for a run of one phase; building, testing, done; `unknown` for
   a newer daemon's phase the client does not know), `slots` (the
   host pool's slots it uses: lent to its run pool and not free there, plus
@@ -39,11 +40,16 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   need not be whole), `waiting_since` (`null` unless the run waits),
   `waiting_for`
   (the ids of the runs it waits for at the worktree lock),
-  `attached_clients` (the clients following it now), `rerun_of` (the run a
+  `attached_clients` (the clients following it now), `detached_since`
+  (since when no client follows a run in flight; `null` while one does;
+  the text form says `no client for 72s` in place of `0 attached`,
+  [runs](runs.md) "Detach"), `rerun_of` (the run a
   rerun reruns, [runs](runs.md) "Reruns"; `null` for any other run, and the text form
   adds `rerun of r17` to the run's state), `started_at`, and
   once it has ended `ended_at` and `exit` (`code`, `signal` on Unix,
-  `cancelled`), else `null`. The runs in flight are listed, and the last
+  `cancelled`, and `detached` when the daemon cancelled it for having no
+  client, which the text form shows as `cancelled (no client)`), else
+  `null`. The runs in flight are listed, and the last
   32 runs that ended while no client followed them, as done: nobody else
   was told how they ended. A run whose clients heard its end leaves the
   list; a done run holds no worktree lock and counts as no run in flight
