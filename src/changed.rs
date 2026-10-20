@@ -60,7 +60,9 @@ const SUPPORTED: &str =
 
 /// Why heli refuses `flag` (`--changed` or `--affected`) for `cargo <args>`:
 /// a subcommand that takes no `-p`, or arguments that already choose the
-/// packages.
+/// packages. nextest's `-E` is not one of those: a filterset selects among
+/// the tests of the packages cargo builds, so beside the selection it
+/// filters within it, as it does beside `-p`.
 pub fn refusal(flag: &str, args: &[OsString]) -> Option<String> {
     let Some((subcommand, rest)) = crate::class::subcommand(args) else {
         return Some(format!("{flag} needs a cargo subcommand"));
@@ -95,14 +97,10 @@ pub fn refusal(flag: &str, args: &[OsString]) -> Option<String> {
 }
 
 /// Whether the cargo argument `arg` chooses packages: `-p`, `--package`,
-/// `--workspace`, `--all`, `--exclude`, or nextest's `-E`.
+/// `--workspace`, `--all` or `--exclude`.
 fn chooses_packages(arg: &str) -> bool {
     let name = arg.split_once('=').map_or(arg, |(name, _)| name);
-    matches!(
-        name,
-        "--package" | "--workspace" | "--all" | "--exclude" | "--filterset" | "--filter-expr"
-    ) || arg.starts_with("-p")
-        || arg.starts_with("-E")
+    matches!(name, "--package" | "--workspace" | "--all" | "--exclude") || arg.starts_with("-p")
 }
 
 /// The commit a selection compares with.
@@ -632,13 +630,17 @@ mod tests {
     }
 
     /// Only subcommands that take `-p` take a selection, and not with
-    /// arguments that choose packages already.
+    /// arguments that choose packages already; nextest's filterset, which
+    /// filters within the selection, is not one.
     #[test]
     fn a_selection_is_refused_where_it_cannot_apply() {
         for ok in [
             &["clippy", "--all-targets", "--", "-D", "warnings"][..],
             &["+nightly", "test"],
             &["nextest", "run", "--", "-p"],
+            &["nextest", "run", "-E", "package(a)"],
+            &["nextest", "run", "--filterset=test(t)"],
+            &["nextest", "run", "--filter-expr", "not test(t)"],
             &["nextest", "list"],
             &["llvm-cov", "nextest"],
         ] {
@@ -651,7 +653,6 @@ mod tests {
             &["clippy", "--workspace"],
             &["build", "--all"],
             &["check", "--exclude", "a"],
-            &["nextest", "run", "-E", "package(a)"],
             &["fmt"],
             &["run"],
             &["nextest", "archive"],
