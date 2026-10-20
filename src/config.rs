@@ -94,6 +94,10 @@ pub struct ClientConfig {
     pub cargo: CargoConfig,
     pub output: OutputConfig,
     pub profiles: crate::profiles::Profiles,
+    /// `[store]`, for placement under the floor
+    /// (`crate::store::placement`); the default when it does not parse,
+    /// since the store is the daemon's to report on.
+    pub store: StoreConfig,
 }
 
 impl ClientConfig {
@@ -124,6 +128,11 @@ impl ClientConfig {
             cargo,
             output,
             profiles,
+            store: value
+                .get("store")
+                .cloned()
+                .and_then(|value| value.try_into().ok())
+                .unwrap_or_default(),
         })
     }
 }
