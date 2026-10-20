@@ -425,6 +425,9 @@ fn evict(surveyed: &Surveyed, victim: &Victim, now: u64) -> Result<(), String> {
     inner.dedup();
     let _outer = hold(&outer)?;
     let inner = hold(&inner)?;
+    if victim.tier == Tier::Crate && crate::crates::linked(&victim.path) {
+        return Err("a build directory links it now".to_owned());
+    }
     if victim.tier == Tier::Unknown && !super::managed::unknown_is_reclaimable(&surveyed.dir) {
         return Err("unknown directory is not of cargo's layout".to_owned());
     }

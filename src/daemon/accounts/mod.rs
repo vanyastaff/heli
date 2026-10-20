@@ -224,6 +224,25 @@ impl Accounts {
             stores,
             targets: of_kinds(&[Kind::Target, Kind::SharedTarget]),
             scratch: of_kinds(&[Kind::Scratch]),
+            crates: of_kinds(&[Kind::Crate]).into_iter().fold(
+                Vec::new(),
+                |mut stores: Vec<TargetUse>, entry| {
+                    // One line per store's `.crates/`, not one per entry.
+                    let dir = Path::new(&entry.path)
+                        .parent()
+                        .and_then(Path::parent)
+                        .map_or_else(|| entry.path.clone(), text);
+                    match stores.iter_mut().find(|known| known.path == dir) {
+                        Some(known) => known.used += entry.used,
+                        None => stores.push(TargetUse {
+                            path: dir,
+                            used: entry.used,
+                            ..entry
+                        }),
+                    }
+                    stores
+                },
+            ),
             homes: of_kinds(&[Kind::Home]),
         }
     }

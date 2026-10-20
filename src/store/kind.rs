@@ -10,9 +10,10 @@
 //! | scratch | anywhere inside                 | `.heli-trash` beside it | none        | 0 whole copy                                   |
 //! | shared  | in its profile directories      | `<target>/.heli-trash`  | none        | none                                           |
 //! | home    | in its package-cache locks      | `.heli-trash` beside it | none        | 2 orphan or unknown, 5 whole home              |
+//! | crate   | anywhere inside                 | `<store>/.trash`        | none        | 8 entry no build directory links               |
 //!
-//! Every kind but shared and home also has the ladder's incremental rungs,
-//! 1 and 3. A shared `target/` directory, seen for more than one workspace
+//! Every kind but shared, home and crate also has the ladder's incremental
+//! rungs, 1 and 3. A shared `target/` directory, seen for more than one workspace
 //! (a global `CARGO_TARGET_DIR` or `build.target-dir`), is not heli's to
 //! manage: it has no rungs at all, and does not count toward the budget
 //! (#65). An isolated Cargo home (`super::home`) holds no intermediates,
@@ -47,6 +48,9 @@ pub enum Kind {
     /// (`super::registry::Target::shared`).
     #[serde(rename = "shared")]
     SharedTarget,
+    /// An entry of the shared crates in a store (`crate::crates`): it
+    /// counts only what no build directory links.
+    Crate,
     /// An isolated Cargo home of a worktree (`super::home`).
     Home,
 }
@@ -72,6 +76,7 @@ impl Kind {
             Self::Target => "target",
             Self::Scratch => "scratch",
             Self::SharedTarget => "shared",
+            Self::Crate => "crate",
             Self::Home => "home",
         }
     }
@@ -85,7 +90,7 @@ impl Kind {
     /// Where a cargo's lock makes a directory of this kind busy.
     pub fn lock_scope(self) -> LockScope {
         match self {
-            Self::Build | Self::Scratch => LockScope::Anywhere,
+            Self::Build | Self::Scratch | Self::Crate => LockScope::Anywhere,
             Self::Target | Self::SharedTarget => LockScope::Profiles,
             Self::Home => LockScope::PackageCache,
         }
@@ -97,7 +102,7 @@ impl Kind {
     pub fn incremental_rungs(self) -> bool {
         match self {
             Self::Build | Self::Target | Self::Scratch => true,
-            Self::SharedTarget | Self::Home => false,
+            Self::SharedTarget | Self::Home | Self::Crate => false,
         }
     }
 
@@ -109,7 +114,7 @@ impl Kind {
     pub fn workspace_exists(self, workspace: &Path) -> bool {
         match self {
             Self::Home => super::home::worktree_exists(workspace),
-            Self::Build | Self::Target | Self::Scratch | Self::SharedTarget => {
+            Self::Build | Self::Target | Self::Scratch | Self::SharedTarget | Self::Crate => {
                 workspace.join("Cargo.toml").is_file()
             }
         }
@@ -120,7 +125,7 @@ impl Dir {
     /// Where an eviction renames its victims, on its volume.
     pub fn trash(&self) -> Option<PathBuf> {
         match self.kind {
-            Kind::Build => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
+            Kind::Build | Kind::Crate => self.store.as_ref().map(|store| store.join(STORE_TRASH)),
             Kind::Target | Kind::SharedTarget => Some(self.path.join(TARGET_TRASH)),
             Kind::Scratch => Some(super::scratch::trash()),
             // Beside it: a home is directly under the homes' base.
@@ -133,7 +138,7 @@ impl Dir {
     pub fn own_trash(&self) -> Option<&'static str> {
         match self.kind {
             Kind::Target | Kind::SharedTarget => Some(TARGET_TRASH),
-            Kind::Build | Kind::Scratch | Kind::Home => None,
+            Kind::Build | Kind::Scratch | Kind::Crate | Kind::Home => None,
         }
     }
 
@@ -141,7 +146,9 @@ impl Dir {
     pub fn tool_caches(&self, config: &StoreConfig) -> Vec<String> {
         match self.kind {
             Kind::Target => config.tool_cache_patterns(),
-            Kind::Build | Kind::Scratch | Kind::SharedTarget | Kind::Home => Vec::new(),
+            Kind::Build | Kind::Scratch | Kind::SharedTarget | Kind::Crate | Kind::Home => {
+                Vec::new()
+            }
         }
     }
 }
@@ -268,6 +275,20 @@ pub fn rungs(
             rungs
         }
         (Kind::SharedTarget, _) => Vec::new(),
+        (Kind::Crate, State::Unknown) => {
+            if idle < policy.crate_age {
+                return Vec::new();
+            }
+            whole(
+                Tier::Crate,
+                idle,
+                format!(
+                    "shared crate no build directory links, unused for {}",
+                    hours(idle)
+                ),
+            )
+        }
+        (Kind::Crate, _) => Vec::new(),
         // A home of a removed worktree waits out `orphan_hours` like an
         // orphan build directory, so a worktree that is being moved or
         // repaired keeps it; nothing claims it otherwise (#120).
@@ -394,6 +415,17 @@ pub fn kept(surveyed: &Surveyed, policy: &Policy, now: u64, idle: u64) -> Option
             "shared",
             "shared by workspaces: not heli's to manage".to_owned(),
         ),
+        (Kind::Crate, State::Live) => kept(
+            "shared crates linked into build directories",
+            "linked into build directories: it goes with them".to_owned(),
+        ),
+        (Kind::Crate, _) => (idle < policy.crate_age).then(|| Kept {
+            group: "shared crates within crate_hours",
+            why: format!(
+                "shared crate unused for {}",
+                of(idle, policy.crate_age, "crate_hours")
+            ),
+        }),
         (Kind::Home, State::Orphan) => {
             let Some(since) = surveyed.orphaned_since else {
                 return kept(

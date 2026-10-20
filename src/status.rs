@@ -213,6 +213,10 @@ pub struct Disk {
     /// (`crate::store::scratch`).
     #[serde(default)]
     pub scratch: Vec<TargetUse>,
+    /// One entry per store's shared crates (`crate::crates`), counting
+    /// what no build directory links.
+    #[serde(default)]
+    pub crates: Vec<TargetUse>,
     /// One entry per isolated Cargo home of a worktree
     /// (`crate::store::home`); absent from a daemon older than their
     /// accounting.
@@ -565,6 +569,14 @@ impl Status {
                 text.push_str(&format!("{label:<6}  {}", crate::gc::hint(superseded)));
                 label = "";
             }
+            for crates in &disk.crates {
+                text.push_str(&format!(
+                    "{label:<6}  crates {}  {} not linked into a build directory\n",
+                    crates.path,
+                    sizes::human(crates.used)
+                ));
+                label = "";
+            }
             for scratch in &disk.scratch {
                 text.push_str(&format!(
                     "{label:<6}  scratch {}  {}\n",
@@ -751,6 +763,7 @@ mod disk_tests {
                 stores: Vec::new(),
                 targets: vec![target("/a/target", 3072), target("/b/target", 0)],
                 scratch: Vec::new(),
+                crates: Vec::new(),
                 homes: vec![target("/state/h/3f2a", 0)],
             }),
             ..Status::without_daemon()

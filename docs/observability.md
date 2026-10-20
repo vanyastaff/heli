@@ -62,7 +62,9 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `used` and `by_category`; `scratch`, one entry per scratch copy a cargo
   tool left behind, and `homes`, one entry per isolated Cargo home of a
   worktree ([build store](build-store.md#accounting)), each with the same
-  fields. `null` when no daemon answers;
+  fields; and `crates`, one entry per store's shared crates ([shared
+  crates](build-store.md#shared-crates)), with `path` and `used`, what no
+  build directory links. `null` when no daemon answers;
 - `retiring`: the daemons that handed over to this one and still serve
   their runs ([handover](daemon.md#handover)), each with `pid`, `version`,
   `since` and `runs` (as in `runs`, as the retiring daemon last wrote
