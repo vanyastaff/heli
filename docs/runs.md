@@ -679,7 +679,14 @@ seen the run. Every line is as recorded, except cargo's JSON messages, which
 heli asks for in compact and quiet mode. Each diagnostic becomes its
 rendering, on stderr where cargo prints it, once however many targets
 reported it. Artifact, build-script and build-finished records are left
-out (#69). At most one selector picks a part of it:
+out (#69), and one line on stderr ends the view with what they said:
+`cargo-heli: r17: no diagnostics; 15 artifacts (1 rebuilt); --raw for
+cargo's messages`, the errors and warnings counted once each, the
+artifacts with how many cargo rebuilt (`all fresh` when none), then `build
+failed` when cargo reported a failure without a diagnostic, or `build not
+finished` when it reported no end (a run in flight, or cancelled). So a run
+that passed with nothing to say reads as what it did, not as nothing
+(#123). At most one selector picks a part of it:
 
 - `--raw`: the record byte for byte, cargo's JSON included, for tools and
   for runs that asked for `--message-format json` themselves;

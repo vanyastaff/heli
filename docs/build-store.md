@@ -175,7 +175,8 @@ would take ([eviction](#eviction)), and deletes nothing; `gc` without `--dry-run
 them. It reads the store itself and needs no daemon. `--json` prints a
 versioned document (`schema`, now 1): `dry_run`; `dirs`, one entry per
 directory, with `kind` (`build` or `target`), `path`, `store`, `state`,
-`workspace`, `repository`, `created_at`, `last_run`, `size` and
+`workspace`, `repository`, `created_at`, `last_run` (`null` for a directory
+attributed without a run, which the text lists as `last run: none`), `size` and
 `by_category`, and `superseded` (bytes, above); `used` (what every directory takes), `budget` and `floor`
 (bytes, `null` without one); `volumes`, each with `root`, `free` (`null`
 when unknown) and `pending` (bytes still in its trash); `victims`, planned

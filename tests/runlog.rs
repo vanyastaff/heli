@@ -625,6 +625,13 @@ fn log_renders_a_compact_runs_json() {
         stderr.contains("warning: "),
         "the warnings, rendered: {stderr}"
     );
+    // The view ends with what cargo's other messages said (#123).
+    let last = stderr.lines().last().expect("a last line");
+    assert!(
+        last.starts_with(&format!("cargo-heli: {run}: "))
+            && last.contains(" warnings; 1 artifact (1 rebuilt); --raw for cargo's messages"),
+        "{stderr}"
+    );
 
     let grepped = log(&fixture, &[&run, "--grep", "^warning"]);
     let grepped = text(&grepped.stderr);
@@ -645,5 +652,53 @@ fn log_renders_a_compact_runs_json() {
         text(&raw.stdout).contains("\"reason\":\"compiler-message\""),
         "{}",
         text(&raw.stdout)
+    );
+}
+
+/// A compact run that passed with no diagnostics records cargo's JSON and
+/// nothing else, which the default view renders as nothing at all: one line
+/// on stderr says what the run did instead, so that a clean run does not
+/// read as a run that did nothing (#123). It is a line like any other for
+/// `--tail`; `--raw` stays cargo's messages alone.
+#[test]
+fn log_of_a_clean_compact_run_says_what_it_did() {
+    let fixture = Fixture::new("basic");
+    let check = |args: &[&str]| {
+        let output = fixture
+            .heli(["--no-cache", "check", "-p", "echo-args"])
+            .args(args)
+            .env("HELI_OUTPUT", "compact")
+            .output()
+            .expect("run heli check");
+        support::assert_success(&output, "cargo heli check");
+        support::split_footer(&output.stderr).1.run
+    };
+
+    let run = check(&[]);
+    let logged = log(&fixture, &[&run]);
+    support::assert_success(&logged, "cargo heli log");
+    assert!(logged.stdout.is_empty(), "{}", text(&logged.stdout));
+    assert_eq!(
+        text(&logged.stderr),
+        format!(
+            "cargo-heli: {run}: no diagnostics; 1 artifact (1 rebuilt); --raw for cargo's messages\n"
+        )
+    );
+    let raw = log(&fixture, &[&run, "--raw"]);
+    assert!(
+        !text(&raw.stderr).contains("no diagnostics"),
+        "{}",
+        text(&raw.stderr)
+    );
+
+    // Checked again, the unit is fresh.
+    let again = check(&["--locked"]);
+    let logged = log(&fixture, &[&again, "--tail", "20"]);
+    support::assert_success(&logged, "cargo heli log --tail");
+    assert_eq!(
+        text(&logged.stderr),
+        format!(
+            "cargo-heli: {again}: no diagnostics; 1 artifact (all fresh); --raw for cargo's messages\n"
+        )
     );
 }
