@@ -50,7 +50,8 @@
 //!
 //! **Saturation** (docs/host-pool.md, "Saturation"): the pool is saturated
 //! while the host pool has no free slot, two runs or more are active and
-//! one of them waits. Nothing changes for that: no run is held back. The
+//! one of them waits; a spell of it ends once it has not been for [`CALM`].
+//! Nothing changes for that: no run is held back. The
 //! broker only counts it, for `status` and the runs' stderr
 //! ([`Broker::pressure`], [`Broker::crowding`]), and reports each spell
 //! that lasted [`SATURATED_AFTER`] or more as it ends ([`Spell`]). It also
@@ -89,6 +90,11 @@ const KEPT_RECENT: usize = 1 << 16;
 /// for moments as its units start and end; a few seconds of it is no news.
 pub const SATURATED_AFTER: Duration = Duration::from_secs(5);
 
+/// How long the pool must stay unsaturated for a spell to end while two
+/// runs or more are active. A run that gives a slot back and asks for the
+/// next one leaves it free for a tick or two; that is no end of the crowd.
+const CALM: Duration = Duration::from_secs(1);
+
 pub struct Broker {
     host: Arc<Pool>,
     /// Told of each spell of saturation that lasted [`SATURATED_AFTER`], as
@@ -106,6 +112,9 @@ struct State {
     runs: BTreeMap<RunId, Run>,
     /// The spell of saturation going on, if one is.
     saturated: Option<Spell>,
+    /// Since when the pool has not been saturated, while a spell goes on:
+    /// the spell ends after [`CALM`] of it.
+    calm_since: Option<Instant>,
     /// Every run's waits for a lent slot over the last [`WINDOW`], each
     /// with when it ended, oldest first.
     recent: VecDeque<(Instant, Duration)>,
@@ -472,6 +481,7 @@ impl Broker {
         let waiting = state.waiting();
         let saturated = active >= 2 && waiting >= 1 && self.host.free().unwrap_or(0) == 0;
         if saturated {
+            state.calm_since = None;
             let spell = state.saturated.get_or_insert_with(|| Spell {
                 since: now,
                 since_unix: crate::clock::now(),
@@ -485,8 +495,16 @@ impl Broker {
             for run in state.runs.values_mut() {
                 run.loans.saturated = true;
             }
-        } else if let Some(mut spell) = state.saturated.take() {
-            spell.lasted = now.saturating_duration_since(spell.since);
+        } else if state.saturated.is_some() {
+            let calm_since = *state.calm_since.get_or_insert(now);
+            // Fewer than two runs left is an end at once: the broker may
+            // not look again before another comes.
+            if active >= 2 && now.saturating_duration_since(calm_since) < CALM {
+                return;
+            }
+            state.calm_since = None;
+            let mut spell = state.saturated.take().expect("BUG: a spell just seen");
+            spell.lasted = calm_since.saturating_duration_since(spell.since);
             if spell.lasted >= SATURATED_AFTER {
                 (self.report)(&spell);
             }

@@ -203,7 +203,9 @@ share ([runs](runs.md)). The memory governor treats every priority alike.
 ## Saturation
 
 The pool is **saturated** while the host pool has no free slot, two runs
-or more are active, and one of them waits for a slot (#127). heli queues
+or more are active, and one of them waits for a slot (#127); a spell of
+it ends only after a second without (a slot given back and taken again
+leaves it free for a moment). heli queues
 nothing for it (G1): each run keeps its share, and a run of the whole
 workspace among 17 others gets a slot or two, its tests one thread. What
 heli does is say so, where the agents and the operator look:
