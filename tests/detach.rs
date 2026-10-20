@@ -546,11 +546,18 @@ fn a_run_without_a_client_is_cancelled_while_another_waits_for_a_slot() {
         )) && stderr.contains(" while 1 run waited for slots\n"),
         "{stderr}"
     );
-    let log = fixture.daemon_log();
-    assert!(
-        log.contains(&format!("cancelled {first}: no client for ")),
-        "{log}"
-    );
+    // The watcher logs the cancel right after the kill, which the run's
+    // own thread may outrun to its end.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let logged = format!("cancelled {first}: no client for ");
+    while !(fixture.daemon_log().contains(&logged) && !fixture.events_named("cancel").is_empty()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}",
+            fixture.daemon_log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let events = fixture.events_named("cancel");
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["run"], first, "{events:?}");
