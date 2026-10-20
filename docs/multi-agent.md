@@ -108,10 +108,11 @@ dir_hours = 1
 
 These numbers are examples, not measured universal sizing requirements. Leave
 new cache roots absent, then run `cargo heli ensure` with this configuration.
-Only heli's successful creation of a new root establishes its exclusively
-regenerable-cache provenance. Existing roots are not adopted. Inspect
-`cargo heli gc --dry-run --json` before a real collection; each build directory
-reports `managed_cache_root`.
+Build directories of no known workspace, which nested cargos in tests leave,
+go once untouched for `unknown_hours` (1 h by default), in any configured
+store. Under `floor_mb` the ages are waived on a full volume. Inspect
+`cargo heli gc --dry-run --json` before a real collection; each directory a
+rule keeps whole says why (`kept`).
 
 For foreground checks and tests, use:
 

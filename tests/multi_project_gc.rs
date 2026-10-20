@@ -10,7 +10,7 @@ fn configured() -> (Fixture, std::path::PathBuf) {
     let store = fixture.path("store");
     fixture.configure(&format!(
         "[store]\npaths = ['{}']\nbudget_mb = 16\nunit_hours = 0\n\
-         orphan_hours = 0\nidle_hours = 0\ndir_hours = 0\n",
+         orphan_hours = 0\nidle_hours = 0\ndir_hours = 0\nunknown_hours = 0\n",
         store.display()
     ));
     (fixture, store)
@@ -70,24 +70,25 @@ fn nested_cargo_artifacts_can_be_reclaimed_under_the_shared_budget() {
     reclaimed(&fixture);
 }
 
+/// A store that existed before heli gets no provenance marker, and is
+/// reclaimed from all the same: it is configured as heli's, and a nested
+/// cargo's build directory in it is of cargo's layout (#134).
 #[test]
-fn an_existing_store_is_not_adopted_even_when_initially_empty() {
+fn an_existing_store_is_reclaimed_from_without_a_marker() {
     let (fixture, store) = configured();
     std::fs::create_dir(&store).expect("preexisting store");
     nested_build(&fixture, &store);
-    let listing = gc(&fixture);
-    assert!(
-        listing["used"].as_u64().expect("bytes") >= 64 << 20,
-        "{listing}"
-    );
+    let listing = survey(&fixture);
     assert!(
         listing["dirs"]
             .as_array()
             .expect("dirs")
             .iter()
-            .any(|dir| { dir["state"] == "unknown" && dir["managed_cache_root"] == false }),
+            .all(|dir| dir["managed_cache_root"] == false),
         "{listing}"
     );
+    assert!(!store.join(".heli-cache-root.json").exists());
+    reclaimed(&fixture);
 }
 
 #[test]
@@ -101,8 +102,10 @@ fn dry_run_never_creates_or_claims_a_store() {
     assert!(!store.exists(), "dry-run created a cache root");
 }
 
+/// A marker heli cannot read only unmarks the store: reclamation does not
+/// depend on it.
 #[test]
-fn a_broken_ownership_marker_does_not_authorize_unknown_eviction() {
+fn a_broken_ownership_marker_only_unmarks_the_store() {
     let (fixture, store) = configured();
     fixture.start_daemon();
     let marker = store.join(".heli-cache-root.json");
@@ -111,11 +114,16 @@ fn a_broken_ownership_marker_does_not_authorize_unknown_eviction() {
     value["schema"] = 99.into();
     std::fs::write(marker, value.to_string()).expect("replace the marker");
     nested_build(&fixture, &store);
-    let listing = gc(&fixture);
+    let listing = survey(&fixture);
     assert!(
-        listing["used"].as_u64().expect("bytes") >= 64 << 20,
+        listing["dirs"]
+            .as_array()
+            .expect("dirs")
+            .iter()
+            .all(|dir| dir["managed_cache_root"] == false),
         "{listing}"
     );
+    reclaimed(&fixture);
 }
 
 #[test]
@@ -180,34 +188,41 @@ fn gc_preserves_a_busy_nested_cargo_then_reclaims_it_after_completion() {
     assert!(!busy.exists(), "completed nested cache was not reclaimed");
 }
 
+/// Another existing directory, configured as a store, is heli's by that
+/// configuration: a cargo-shaped build directory in it is reclaimed once
+/// untouched for `unknown_hours`, marker or not.
 #[test]
-fn a_copied_marker_does_not_claim_another_existing_store() {
-    let (fixture, store) = configured();
-    fixture.start_daemon();
+fn a_configured_store_is_reclaimed_from_marker_or_not() {
+    let (fixture, _store) = configured();
     let other = fixture.path("other-store");
     let profile = other.join("ab").join("1234").join("debug");
     std::fs::create_dir_all(profile.join("deps")).expect("other store");
-    std::fs::copy(
-        store.join(".heli-cache-root.json"),
-        other.join(".heli-cache-root.json"),
-    )
-    .expect("copy marker");
     std::fs::File::create(profile.join(".cargo-build-lock")).expect("Cargo lock");
     let artifact = profile.join("deps").join("unrelated-artifact");
     let file = std::fs::File::create(&artifact).expect("artifact");
     file.set_len(64 << 20).expect("size");
     drop(file);
     fixture.configure(&format!(
-        "[store]\npaths = ['{}']\nbudget_mb = 16\ndir_hours = 0\n",
+        "[store]\npaths = ['{}']\nbudget_mb = 16\nunknown_hours = 1000\n",
         other.display()
     ));
     let listing = gc(&fixture);
     assert!(
         artifact.exists(),
-        "a copied marker authorized another cache root"
+        "within unknown_hours it stays: {listing}"
     );
+    fixture.configure(&format!(
+        "[store]\npaths = ['{}']\nbudget_mb = 16\nunknown_hours = 0\n",
+        other.display()
+    ));
+    let listing = gc(&fixture);
+    assert!(!artifact.exists(), "{listing}");
     assert!(
-        listing["used"].as_u64().expect("bytes") >= 64 << 20,
+        listing["victims"]
+            .as_array()
+            .expect("victims")
+            .iter()
+            .any(|victim| victim["tier"] == 7),
         "{listing}"
     );
 }

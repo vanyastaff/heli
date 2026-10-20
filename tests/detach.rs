@@ -90,7 +90,7 @@ fn a_killed_clients_build_goes_on_to_its_end() {
     assert_eq!(run["attached_clients"], 0, "{status}");
     assert_eq!(
         run["exit"],
-        json!({"code": 0, "signal": null, "cancelled": false}),
+        json!({"code": 0, "signal": null, "cancelled": false, "detached": false}),
         "{status}"
     );
     let started = run["started_at"].as_u64().expect("a start");
@@ -418,4 +418,155 @@ fn a_run_listed_as_done_holds_no_worktree_lock() {
         "{}",
         text(&output.stderr)
     );
+}
+
+/// A run that has had no client for a while (here 300 ms; two minutes
+/// otherwise) is weighed `background` until a client attaches again, and
+/// `status` shows since when it has none; while no other run waits for a
+/// slot, it is never cancelled for it. The same command attaches to it
+/// again, which restores its own priority.
+#[test]
+fn a_run_without_a_client_is_weighed_background_until_one_attaches() {
+    let fixture = Fixture::new("basic");
+    fixture.configure("[test]\ndetached_demote_ms = 300\ndetached_cancel_ms = 600\n");
+    let echo = fixture.echo_args();
+    let gate = fixture.path("gate");
+    let call = || {
+        let mut call = fixture.heli(["exec", "--"]);
+        call.arg(&echo)
+            .arg("alone")
+            .env("ECHO_WAIT_FOR", &gate)
+            .env("ECHO_PID", "1");
+        start(&mut call)
+    };
+    let killed = call();
+    let status = fixture.wait_for_status("the run", |status| runs(status).len() == 1);
+    let id = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    assert_eq!(runs(&status)[0]["detached_since"], Value::Null, "{status}");
+    fixture.wait_for_run_output(&id);
+    support::kill_tree(killed.id());
+    let _ = finish(killed);
+    let status = fixture.wait_for_status("the run to be weighed background", |status| {
+        listed(status, &id).is_some_and(|run| run["priority"] == "background")
+    });
+    let run = listed(&status, &id).expect("listed");
+    assert_eq!(run["attached_clients"], 0, "{status}");
+    assert_eq!(run["phase"], "running", "{status}");
+    assert!(run["detached_since"].as_u64().is_some(), "{status}");
+    let line = status_line(&fixture, &id);
+    assert!(
+        line.contains("  running, no client for ") && line.contains("  background  "),
+        "{line}"
+    );
+    // Nobody waits for a slot: it goes on, however long it has no client.
+    std::thread::sleep(Duration::from_millis(1500));
+    let status = fixture.status();
+    let run = listed(&status, &id).expect("listed");
+    assert_eq!(run["exit"], Value::Null, "{status}");
+    let log = fixture.daemon_log();
+    assert!(
+        log.contains(&format!("{id}: no client for "))
+            && log.contains("background until one attaches"),
+        "{log}"
+    );
+
+    let again = call();
+    let status = fixture.wait_for_status("the call again to attach", |status| {
+        listed(status, &id).is_some_and(|run| run["attached_clients"] == 1)
+    });
+    let run = listed(&status, &id).expect("listed");
+    assert_eq!(run["priority"], "normal", "{status}");
+    assert_eq!(run["detached_since"], Value::Null, "{status}");
+    std::fs::write(&gate, "").expect("open the gate");
+    let again = finish(again);
+    assert_success(&again, "the call again");
+    let log = fixture.daemon_log();
+    assert!(
+        log.contains(&format!("{id}: a client attached: normal again")),
+        "{log}"
+    );
+}
+
+/// A run that has had no client for longer (here 1 s; ten minutes
+/// otherwise) while another run waits for a slot is cancelled: its record
+/// and `status` say so, the daemon's log and the event log too, and the
+/// run that waited gets the slot.
+#[test]
+fn a_run_without_a_client_is_cancelled_while_another_waits_for_a_slot() {
+    let fixture = Fixture::new("basic");
+    fixture.configure(
+        "[pool]\nslots = 1\n\n[test]\ndetached_demote_ms = 100\ndetached_cancel_ms = 1000\n",
+    );
+    let jobs = fixture.binary("jobs");
+    // `jobs` (see run_pools.rs): workers that take a slot each, hold it a
+    // moment and ask for the next, so the run always has work pending.
+    let start_jobs = |name: &str| {
+        let mut command = fixture.heli(["exec", "--"]);
+        command
+            .arg(&jobs)
+            .env("JOBS_WORKERS", "2")
+            .env("JOBS_HOLD_MS", "50")
+            .env("JOBS_GAP_MS", "2")
+            .env("JOBS_STOP", fixture.path(&format!("{name}.stop")))
+            .env("JOBS_IDLE", fixture.path(&format!("{name}.idle")))
+            .env("JOBS_PID", fixture.path(&format!("{name}.pid")));
+        start(&mut command)
+    };
+    let abandoned = start_jobs("abandoned");
+    let status = fixture.wait_for_status("the first run", |status| runs(status).len() == 1);
+    let first = runs(&status)[0]["id"].as_str().expect("an id").to_owned();
+    fixture.wait_for_status("the first run to use the slot", |status| {
+        listed(status, &first).is_some_and(|run| run["slots"] == 1)
+    });
+    support::kill_tree(abandoned.id());
+    let _ = finish(abandoned);
+    fixture.wait_for_status("its client to be gone", |status| {
+        listed(status, &first).is_some_and(|run| run["attached_clients"] == 0)
+    });
+
+    let waiting = start_jobs("waiting");
+    let status = fixture.wait_for_status("the second run", |status| runs(status).len() == 2);
+    let second = runs(&status)
+        .iter()
+        .map(|run| run["id"].as_str().expect("an id").to_owned())
+        .find(|id| *id != first)
+        .expect("the second run");
+    let status = fixture.wait_for_status("the abandoned run to be cancelled", |status| {
+        listed(status, &first).is_some_and(|run| run["phase"] == "done")
+    });
+    let run = listed(&status, &first).expect("listed");
+    assert_eq!(run["exit"]["cancelled"], true, "{status}");
+    assert_eq!(run["exit"]["detached"], true, "{status}");
+    let line = status_line(&fixture, &first);
+    assert!(line.contains("  done, cancelled (no client), "), "{line}");
+    let stderr = logged_stderr(&fixture, &first);
+    assert!(
+        stderr.contains(&format!(
+            "cargo-heli: {first}: cancelled: no client followed it for "
+        )) && stderr.contains(" while 1 run waited for slots\n"),
+        "{stderr}"
+    );
+    // The watcher logs the cancel right after the kill, which the run's
+    // own thread may outrun to its end.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let logged = format!("cancelled {first}: no client for ");
+    while !(fixture.daemon_log().contains(&logged) && !fixture.events_named("cancel").is_empty()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{}",
+            fixture.daemon_log()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let events = fixture.events_named("cancel");
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["run"], first, "{events:?}");
+    assert_eq!(events[0]["why"], "no client", "{events:?}");
+    assert_eq!(events[0]["waiting"], 1, "{events:?}");
+
+    fixture.wait_for_status("the run that waited to get the slot", |status| {
+        listed(status, &second).is_some_and(|run| run["slots"] == 1)
+    });
+    std::fs::write(fixture.path("waiting.stop"), "").expect("stop the second run");
+    assert_success(&finish(waiting), "the run that waited");
 }
