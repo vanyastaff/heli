@@ -72,6 +72,10 @@ pub struct Pass {
     pub dirs: Vec<Surveyed>,
     /// What every directory takes together.
     pub used: u64,
+    /// The busy directories (a cargo builds in them), and what they take:
+    /// the ladder cannot touch them.
+    pub busy_dirs: usize,
+    pub busy_bytes: u64,
     pub volumes: Vec<Volume>,
     /// What the pass had to free.
     pub goals: Goals,
@@ -121,16 +125,19 @@ pub fn plan(
     }
     let runtime_busy = dirs.iter().any(|surveyed| super::in_use(&surveyed.dir));
     // A shared `target/` directory is not heli's to manage (`super::kind`).
-    let used = dirs
-        .iter()
-        .filter(|surveyed| surveyed.dir.kind.managed())
-        .map(|surveyed| surveyed.measure.bytes)
-        .sum();
+    let managed = || dirs.iter().filter(|surveyed| surveyed.dir.kind.managed());
+    let used = managed().map(|surveyed| surveyed.measure.bytes).sum();
+    let busy: Vec<&Surveyed> = managed()
+        .filter(|surveyed| surveyed.state == State::Busy)
+        .collect();
+    let busy_bytes = busy.iter().map(|surveyed| surveyed.measure.bytes).sum();
     let volumes = volumes(config, registry, &dirs);
-    let goals = goals(&policy, used, &volumes);
+    let goals = goals(&policy, used, busy_bytes, &volumes);
     let mut pass = Pass {
         runtime_busy,
         policy,
+        busy_dirs: busy.len(),
+        busy_bytes,
         dirs,
         used,
         volumes,
@@ -223,12 +230,16 @@ fn volumes(config: &StoreConfig, registry: &Registry, dirs: &[Surveyed]) -> Vec<
     volumes
 }
 
-/// What `policy` asks to free when the directories take `used` and the
-/// volumes are as `volumes` say.
-fn goals(policy: &Policy, used: u64, volumes: &[Volume]) -> Goals {
-    let budget = match policy.budget {
-        Some(budget) if used > budget => used - Policy::target(budget),
-        _ => 0,
+/// What `policy` asks to free when the directories take `used`, the busy
+/// ones among them `busy`, and the volumes are as `volumes` say. The
+/// budget cannot be met when the busy directories alone hold more than
+/// its target.
+fn goals(policy: &Policy, used: u64, busy: u64, volumes: &[Volume]) -> Goals {
+    let (budget, budget_unmet) = match policy.budget {
+        Some(budget) if used > budget => {
+            (used - Policy::target(budget), busy > Policy::target(budget))
+        }
+        _ => (0, false),
     };
     let floors = match policy.floor {
         None => Vec::new(),
@@ -240,7 +251,57 @@ fn goals(policy: &Policy, used: u64, volumes: &[Volume]) -> Goals {
             })
             .collect(),
     };
-    Goals { budget, floors }
+    Goals {
+        budget,
+        budget_unmet,
+        floors,
+    }
+}
+
+impl Pass {
+    /// The budget the pass could not meet, when the busy directories alone
+    /// hold more than its target ([`Goals::budget_unmet`]).
+    pub fn unmet_budget(&self) -> Option<UnmetBudget> {
+        self.goals.budget_unmet.then(|| UnmetBudget {
+            budget: self.policy.budget.unwrap_or(0),
+            used: self.used,
+            busy_dirs: self.busy_dirs,
+            busy_bytes: self.busy_bytes,
+        })
+    }
+}
+
+/// A budget a pass could not meet: what the busy directories hold is more
+/// than the budget's target, so only victims of a free tier served it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnmetBudget {
+    pub budget: u64,
+    pub used: u64,
+    pub busy_dirs: usize,
+    pub busy_bytes: u64,
+}
+
+impl UnmetBudget {
+    /// `budget 100.0 GiB cannot be met: 18 busy directories hold 200.0 GiB,
+    /// more than 85 % of it`.
+    pub fn describe(&self) -> String {
+        format!(
+            "budget {} cannot be met: {}",
+            super::sizes::human(self.budget),
+            self.holders()
+        )
+    }
+
+    /// What holds the budget: `18 busy directories hold 200.0 GiB, more
+    /// than 85 % of it`.
+    pub fn holders(&self) -> String {
+        format!(
+            "{} busy director{} hold {}, more than 85 % of it",
+            self.busy_dirs,
+            if self.busy_dirs == 1 { "y" } else { "ies" },
+            super::sizes::human(self.busy_bytes)
+        )
+    }
 }
 
 /// Evicts `victim` from `surveyed`: renames it into the trash under cargo's

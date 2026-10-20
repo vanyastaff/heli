@@ -29,7 +29,7 @@
 //!    "store":"D:\\.heli\\build","state":"live","workspace":"D:\\flui",
 //!    "repository":"D:\\flui\\.git","created_at":1791910980,
 //!    "last_run":1791911112,"size":1000,"by_category":{…},"superseded":0}],
-//!  "used":1000,"budget":900,"floor":null,
+//!  "used":1000,"busy":0,"budget":900,"budget_unmet":false,"floor":null,
 //!  "volumes":[{"root":"D:\\","free":218103808000,"pending":0}],
 //!  "victims":[{"tier":1,"path":"D:\\.heli\\build\\28\\4ec2fa37745150\\debug\\incremental\\flui_view-0x1yz",
 //!              "bytes":300,"age":93600,"reason":"incremental unit untouched for 26 h"}],
@@ -44,7 +44,11 @@
 //! too (0 but in a `target/` directory apart from its build directory);
 //! the document's `superseded` says the pass was `--superseded`. `used` is
 //! what every directory
-//! takes, and `budget` and `floor` are B and F in bytes (`null`: none);
+//! takes, `busy` what the busy ones among them take, and `budget` and
+//! `floor` are B and F in bytes (`null`: none); `budget_unmet` says the
+//! busy directories alone hold more than the budget's target, so that the
+//! pass kept the live directories whole (docs/build-store.md#eviction,
+//! #122);
 //! each volume has its free bytes (`null`: unknown) and the bytes its trash
 //! still holds. `victims` are the ones planned in a dry run, else the ones
 //! evicted, in order; `skipped` are those that could not be, each with
@@ -75,7 +79,11 @@ struct Listing<'a> {
     runtime_busy: bool,
     dirs: Vec<Entry>,
     used: u64,
+    /// What the busy directories take.
+    busy: u64,
     budget: Option<u64>,
+    /// The busy directories alone hold more than the budget's target.
+    budget_unmet: bool,
     floor: Option<u64>,
     volumes: &'a [Volume],
     victims: &'a [Victim],
@@ -174,7 +182,9 @@ pub fn main(dry_run: bool, json: bool, superseded: bool) -> ! {
         runtime_busy: pass.runtime_busy,
         dirs,
         used: pass.used,
+        busy: pass.busy_bytes,
         budget: pass.policy.budget,
+        budget_unmet: pass.goals.budget_unmet,
         floor: pass.policy.floor,
         volumes: &pass.volumes,
         victims: &pass.victims,
@@ -322,6 +332,12 @@ fn limits(pass: &Pass) -> String {
             sizes::human(budget)
         )),
         None => text.push_str(&format!("budget  none, {} used", sizes::human(pass.used))),
+    }
+    if let Some(unmet) = pass.unmet_budget() {
+        text.push_str(&format!(
+            "; cannot be met: {}; live directories are kept whole",
+            unmet.holders()
+        ));
     }
     if let Some(floor) = policy.floor {
         for volume in &pass.volumes {

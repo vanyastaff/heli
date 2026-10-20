@@ -1838,3 +1838,197 @@ fn superseded_intermediates_wait_for_a_held_lock() {
     let done = gc(&fixture, &["gc", "--superseded"]);
     assert_eq!(victims(&done), expected, "{done}");
 }
+
+/// When the busy directories alone hold more than the budget's target, no
+/// pass can meet the budget: evicting a live workspace's directory would
+/// only have it rebuilt. Then the orphan goes, the live directory is kept
+/// whole (its other rungs go), and `gc --dry-run` says why; a floor is
+/// served from every rung as ever. Once the busy directory is free, the budget
+/// can be met, and the live directories are victims again (#122).
+#[test]
+fn an_unmet_budget_spares_live_directories() {
+    let fixture = Fixture::new("basic");
+    configure(&fixture, "");
+    let main = fixture.workspace();
+    init_repo(&main);
+    use_store(&fixture, &main);
+    let clock = now() + 300 * HOUR;
+    // A live worktree, idle for long: its unit and its whole directory
+    // are victims whenever the budget can be met.
+    let live = add_worktree(&main, "live");
+    let live_build = build_in(&fixture, &live, "echo-args");
+    set_times(&live_build, clock - 200 * HOUR);
+    // An orphan: a worktree removed after it built.
+    let gone = add_worktree(&main, "gone");
+    let gone_build = build_in(&fixture, &gone, "echo-args");
+    set_times(&gone_build, clock - 200 * HOUR);
+    git(
+        &main,
+        &["worktree", "remove", "--force", &gone.to_string_lossy()],
+    );
+    // A pass that evicts nothing finds the orphan: unclaimed from then on.
+    set_clock(&fixture, clock - 30 * HOUR);
+    gc(&fixture, &["gc"]);
+    // The main workspace is busy: a bare cargo holds its locks.
+    let busy_build = build_in(&fixture, &main, "echo-args");
+    let gate = fixture.path("gate");
+    let running = fixture
+        .cargo(["build", "--quiet", "-p", "gated"])
+        .current_dir(&main)
+        .env_remove("CARGO_TARGET_DIR")
+        .env("HELI_FIXTURE_GATE", &gate)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("start cargo build");
+    wait_for("the build directory to be busy", || {
+        let listing = gc(&fixture, &["gc", "--dry-run"]);
+        (listed(&listing, &busy_build)["state"] == "busy").then_some(())
+    });
+    set_clock(&fixture, clock);
+
+    // Budget 0: the busy directory alone is over its target.
+    configure(&fixture, "budget_mb = 0\norphan_hours = 0\n");
+    let planned = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(planned["budget_unmet"], true, "{planned}");
+    assert!(
+        planned["busy"].as_u64().is_some_and(|busy| busy > 0),
+        "{planned}"
+    );
+    let victims_planned = victims(&planned);
+    assert!(
+        victims_planned.contains(&(2, spelled(&gone_build))),
+        "the orphan goes: {planned}"
+    );
+    assert!(
+        !victims_planned.contains(&(5, spelled(&live_build))),
+        "the live directory is kept whole: {planned}"
+    );
+    let output = fixture
+        .heli(["gc", "--dry-run"])
+        .output()
+        .expect("run heli gc --dry-run");
+    assert_success(&output, "cargo heli gc --dry-run");
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.contains("cannot be met: 2 busy directories hold")
+            && stdout.contains("live directories are kept whole"),
+        "{stdout}"
+    );
+
+    // A floor is served from every rung: the volume really is full.
+    configure(
+        &fixture,
+        "budget_mb = 0\norphan_hours = 0\nfloor_mb = 1099511627776\n",
+    );
+    let for_floor = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(for_floor["budget_unmet"], true, "{for_floor}");
+    assert!(
+        victims(&for_floor).contains(&(5, spelled(&live_build))),
+        "the floor takes the live directory whole: {for_floor}"
+    );
+
+    // The busy directory freed, the budget can be met again.
+    std::fs::write(&gate, "").expect("open the gate");
+    let output = running.wait_with_output().expect("wait for the build");
+    assert_success(&output, "bare cargo build -p gated");
+    configure(&fixture, "budget_mb = 0\norphan_hours = 0\n");
+    let after = gc(&fixture, &["gc", "--dry-run"]);
+    assert_eq!(after["budget_unmet"], false, "{after}");
+    assert_eq!(after["busy"], 0, "{after}");
+    assert!(
+        victims(&after).contains(&(5, spelled(&live_build))),
+        "{after}"
+    );
+}
+
+/// A pass that evicts nothing and finds the same as the pass before (the
+/// same directories left alone for a run in flight, the same victims
+/// skipped, the same budget that cannot be met) writes nothing to the
+/// daemon's log: the lines are written once, however many passes follow.
+/// `status` says the budget cannot be met while the run is in flight, and
+/// stops saying so once it ended and the pass evicted (#122).
+#[test]
+fn passes_that_find_the_same_are_logged_once() {
+    let fixture = Fixture::new("basic");
+    let echo = fixture.echo_args();
+    set_clock(&fixture, now() + 100 * HOUR);
+    configure(
+        &fixture,
+        "budget_mb = 0\nidle_hours = 1000\ndir_hours = 1000\n",
+    );
+    let workspace = fixture.workspace();
+    use_store(&fixture, &workspace);
+    // A run in flight in the workspace holds its runtime lease (#108): the
+    // workspace's directory is busy, and alone over the budget's target.
+    let ready = fixture.path("exec-started");
+    let release = fixture.path("exec-release");
+    let mut child = heli_in(&fixture, &workspace, &["exec", "--"])
+        .arg(&echo)
+        .env("ECHO_STARTS", &ready)
+        .env("ECHO_WAIT_FOR", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the run in flight to start", || {
+        ready.is_file().then_some(())
+    });
+    build_in(&fixture, &workspace, "echo-args");
+    let left_alone = "eviction left alone the directories of workspaces a run is in flight in";
+    wait_for("a pass that leaves the workspace alone", || {
+        fixture.daemon_log().contains(left_alone).then_some(())
+    });
+    let status = fixture.wait_for_status("a budget that cannot be met", |status| {
+        !status["unmet_budget"].is_null()
+    });
+    assert_eq!(status["unmet_budget"]["budget"], 0, "{status}");
+    // The workspace's build directory, and its registered `target/`.
+    assert_eq!(status["unmet_budget"]["busy_dirs"], 2, "{status}");
+    assert!(
+        status["unmet_budget"]["busy_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "{status}"
+    );
+    let output = fixture.heli(["status"]).output().expect("run heli status");
+    assert_success(&output, "cargo heli status");
+    assert!(
+        text(&output.stdout).contains("budget  0 B cannot be met for ")
+            && text(&output.stdout).contains("s: 2 busy directories hold"),
+        "{}",
+        text(&output.stdout)
+    );
+    // Each run that ends has the accountant look again, and over the
+    // budget, make a pass: three more passes that find the same.
+    for _ in 0..3 {
+        let output = heli_in(&fixture, &workspace, &["exec", "--"])
+            .arg(&echo)
+            .output()
+            .expect("run heli exec");
+        assert_success(&output, "cargo heli exec");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let log = fixture.daemon_log();
+    let count = |needle: &str| log.lines().filter(|line| line.contains(needle)).count();
+    assert_eq!(count(left_alone), 1, "{log}");
+    assert_eq!(count("cannot be met"), 1, "{log}");
+    assert_eq!(count("evicted "), 0, "{log}");
+
+    std::fs::write(&release, "go").unwrap();
+    assert!(child.wait().unwrap().success());
+    wait_for("the deferred eviction", || {
+        (!fixture.events_named("evict").is_empty()).then_some(())
+    });
+    wait_for("the eviction in the daemon's log", || {
+        fixture
+            .daemon_log()
+            .lines()
+            .any(|line| line.contains("evicted 1 victim, "))
+            .then_some(())
+    });
+    fixture.wait_for_status("a budget that can be met", |status| {
+        status["unmet_budget"].is_null()
+    });
+}

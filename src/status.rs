@@ -115,6 +115,50 @@ pub struct Status {
     /// daemon older than eviction.
     #[serde(default)]
     pub last_gc: Option<LastGc>,
+    /// The budget the daemon's eviction passes cannot meet, while the busy
+    /// directories alone hold more than its target (#122); absent from an
+    /// older daemon, and while the budget can be met.
+    #[serde(default)]
+    pub unmet_budget: Option<UnmetBudget>,
+}
+
+/// A budget the daemon's eviction passes cannot meet
+/// (`crate::store::evict::UnmetBudget`): the busy directories alone hold
+/// more than 85 % of it, so live directories are kept whole.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct UnmetBudget {
+    /// B, in bytes.
+    pub budget: u64,
+    /// What every directory takes, in bytes.
+    pub used: u64,
+    /// The busy directories, and what they take, in bytes.
+    pub busy_dirs: usize,
+    pub busy_bytes: u64,
+    /// Since when the budget cannot be met, in seconds since 1970.
+    pub since: u64,
+}
+
+impl UnmetBudget {
+    /// `budget 100.0 GiB cannot be met: 18 busy directories hold 200.0 GiB,
+    /// more than 85 % of it`.
+    pub fn describe(&self) -> String {
+        self.figures().describe()
+    }
+
+    /// What holds the budget: `18 busy directories hold 200.0 GiB, more
+    /// than 85 % of it`.
+    pub fn holders(&self) -> String {
+        self.figures().holders()
+    }
+
+    fn figures(&self) -> crate::store::evict::UnmetBudget {
+        crate::store::evict::UnmetBudget {
+            budget: self.budget,
+            used: self.used,
+            busy_dirs: self.busy_dirs,
+            busy_bytes: self.busy_bytes,
+        }
+    }
 }
 
 /// An eviction pass of the daemon's (`crate::store::evict`).
@@ -363,6 +407,7 @@ impl Status {
             runs: Vec::new(),
             disk: None,
             last_gc: None,
+            unmet_budget: None,
         }
     }
 
@@ -504,6 +549,14 @@ impl Status {
                 label = "";
             }
         }
+        if let Some(unmet) = &self.unmet_budget {
+            text.push_str(&format!(
+                "budget  {} cannot be met for {}s: {}; live directories are kept whole\n",
+                sizes::human(unmet.budget),
+                now.saturating_sub(unmet.since),
+                unmet.holders()
+            ));
+        }
         if let Some(gc) = &self.last_gc {
             let freed = gc.evicted.iter().map(|evicted| evicted.bytes).sum();
             text.push_str(&format!(
@@ -581,8 +634,37 @@ mod version_tests {
 
 #[cfg(test)]
 mod disk_tests {
-    use super::{Disk, Status, TargetUse};
+    use super::{Disk, Status, TargetUse, UnmetBudget};
     use crate::store::sizes::Sizes;
+
+    /// A budget the daemon cannot meet is one line of the text form, with
+    /// what holds it and for how long (#122); without one, no line.
+    #[test]
+    fn an_unmet_budget_is_shown() {
+        let status = Status {
+            unmet_budget: Some(UnmetBudget {
+                budget: 100 << 30,
+                used: 386 << 30,
+                busy_dirs: 18,
+                busy_bytes: 200 << 30,
+                since: 1000,
+            }),
+            ..Status::without_daemon()
+        };
+        let text = status.to_text(4600);
+        assert!(
+            text.contains(
+                "budget  100.0 GiB cannot be met for 3600s: 18 busy directories hold 200.0 GiB, more than 85 % of it; live directories are kept whole\n"
+            ),
+            "{text}"
+        );
+        assert!(!Status::without_daemon().to_text(0).contains("budget"));
+        let older: Status = serde_json::from_value(serde_json::json!({
+            "schema": super::SCHEMA, "daemon": null, "runs": []
+        }))
+        .expect("an older status");
+        assert!(older.unmet_budget.is_none());
+    }
 
     #[test]
     fn superseded_intermediates_are_shown_with_a_hint() {

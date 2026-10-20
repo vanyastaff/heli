@@ -56,7 +56,13 @@ are whole seconds since 1970 (UTC); `status` never starts a daemon.
   `used` and `by_category`. `null` when no daemon answers;
 - `last_gc`: the daemon's last eviction pass that evicted anything ([eviction](build-store.md#eviction)):
   `at`, and `evicted`, one entry per victim with its `path`, `tier` and
-  `bytes`; `null` before the first, and when no daemon answers.
+  `bytes`; `null` before the first, and when no daemon answers;
+- `unmet_budget`: the budget the daemon's passes cannot meet, while the
+  busy directories alone hold more than its target ([eviction](build-store.md#eviction)):
+  `budget`, `used`, `busy_dirs`, `busy_bytes` (bytes) and `since`;
+  `null` while the budget can be met, and when no daemon answers. The
+  text form says it on a `budget` line:
+  `budget  100.0 GiB cannot be met for 3600s: 18 busy directories hold 200.0 GiB, more than 85 % of it; live directories are kept whole`.
 
 There is also a rotating log of admissions, loans, withholdings, top-ups,
 drains and evictions, and `cargo heli gc --dry-run`.

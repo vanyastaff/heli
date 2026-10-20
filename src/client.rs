@@ -826,10 +826,9 @@ fn start_reporting(locations: &Locations, depth: u32) -> Result<(), String> {
     }
 }
 
-/// The running daemon's cargo-heli version: `None` when none answers, or
-/// when it is older than that field.
-pub fn daemon_version() -> Option<String> {
-    query_status().ok()?.daemon?.version
+/// The running daemon's status: `None` when none answers.
+pub fn daemon_status() -> Option<Status> {
+    query_status().ok().filter(|status| status.daemon.is_some())
 }
 
 fn query_status() -> Result<Status, String> {
