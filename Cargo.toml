@@ -1,6 +1,6 @@
 [package]
 name = "cargo-heli"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 rust-version = "1.99"
 description = "Host-level scheduling for cargo on machines shared by many agents"
