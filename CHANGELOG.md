@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.0.6
+
+After upgrading, run `cargo heli self-upgrade` from now on; this once,
+upgrade by hand as before (0.0.5 has no `self-upgrade`), then run `cargo
+heli restart`: most changes below are the daemon's. A retiring daemon now
+hands over at once, so the restart no longer waits for its runs.
 
 ### Added
 
@@ -12,13 +17,54 @@
   `cargo-heli <version> = []` in `.crates.toml`. `doctor` now says when the
   daemon is older than the client, when `.crates.toml` records such a
   failed install, and when an old program put aside is still there (#125).
+- **Shared crates** (`[store] shared_crates = true`, off by default). heli
+  becomes cargo's `rustc-wrapper` and compiles each registry crate once per
+  store into `<store>/.crates`, keyed by the compiler and its arguments,
+  then hard-links it into every build directory that asks for the same
+  compilation: tokio built in one worktree is not built again in the next,
+  nor in another project that builds it alike. A shared crate no build
+  directory links goes after `crate_hours` (24) as tier 8
+  (docs/build-store.md#shared-crates, #139).
+- **Isolated Cargo homes are accounted for** (`[cargo] home =
+  "isolated"`). Each worktree's home is in `status` (`disk.homes`), `gc`
+  and the budget; the home of a removed worktree is an orphan and goes after
+  `orphan_hours`, and a live one after `dir_hours` idle (#120).
+- **The pool says when it is saturated.** `status` has a `saturation`
+  object (active and waiting runs, how long it has been saturated), a run
+  of `--workspace` that waits for slots says so on stderr, and `doctor`
+  reports a pool saturated for long and nested cargo that timed out
+  waiting (#127).
+- **A run without a client** (its terminal or agent gone) is weighed as a
+  background run after 2 minutes, and cancelled after 10 when other runs
+  wait for slots (#121).
+- **`gc` says when the budget cannot be met**: when busy directories alone
+  hold more than the budget's target, `gc`, `status` and `doctor` report
+  `budget_unmet`, the pass keeps the live directories whole instead of
+  deleting what the next build rebuilds, and the daemon logs one line an
+  hour instead of the same pass every minute (#122).
 - **`cargo heli gc --orphans`** reclaims every build directory and isolated
   Cargo home whose worktree is gone, whatever the budget and
   `orphan_hours`: after `git worktree remove`, one command frees its disk.
   `gc` ends with a hint while orphans are left (#144).
 
+### Changed
+
+- **Retire by handover.** `restart` and `self-upgrade` no longer wait for
+  the old daemon's runs: it stops listening and finishes them, while a new
+  daemon takes new runs at once, and on Windows joins the same pipe (#126).
+
 ### Fixed
 
+- **Build directories of no known workspace are reclaimed**: those cargo
+  made for nested and temporary workspaces (trybuild, generated projects)
+  go whole after `unknown_hours` (1) as tier 7, and under the floor the
+  ages are waived, what no live workspace misses going first. `gc` says
+  what it keeps and why (`kept:`) (#132, #133, #134).
+- **A store volume under its floor** sends new build directories to the
+  next configured store with room, instead of filling the volume (#135).
+- **`gc` lists a directory attributed without a run** as `last run: none`
+  (#119), and `cargo heli log` of a clean
+  compact run ends with what cargo's messages said (#123).
 - **`--changed` and `--affected` take nextest's `-E`.** A filterset selects
   among the tests of the packages cargo builds, so beside the selection it
   filters within it, as it does beside `-p`; heli refused it as a package
