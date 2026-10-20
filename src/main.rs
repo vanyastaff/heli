@@ -132,7 +132,8 @@ fn main() {
             dry_run,
             json,
             superseded,
-        } => gc::main(dry_run, json, superseded),
+            orphans,
+        } => gc::main(dry_run, json, superseded, orphans),
         cli::Action::Doctor { json } => doctor::main(json),
         cli::Action::Dependencies(command) => {
             let result = match command {

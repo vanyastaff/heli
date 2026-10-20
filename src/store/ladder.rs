@@ -420,6 +420,37 @@ pub fn urgent(
     victims
 }
 
+/// Every orphan build directory and Cargo home of `dirs`, whole, whatever
+/// the budget, the floor and `orphan_hours` (`gc --orphans`, #144): its
+/// worktree is gone, so only recycling could want it, and the person asked
+/// for the disk back. Oldest orphan first.
+pub fn orphans(dirs: &[Surveyed], now: u64) -> Vec<Victim> {
+    let mut victims: Vec<Victim> = dirs
+        .iter()
+        .enumerate()
+        .filter(|(_, surveyed)| {
+            surveyed.state == State::Orphan
+                && matches!(surveyed.dir.kind, super::Kind::Build | super::Kind::Home)
+        })
+        .map(|(index, surveyed)| {
+            let unclaimed = now.saturating_sub(surveyed.orphaned_since.unwrap_or(now));
+            Victim {
+                tier: Tier::Orphan,
+                path: surveyed.dir.path.clone(),
+                dir: index,
+                bytes: surveyed.measure.bytes,
+                age: unclaimed,
+                reason: format!("orphan unclaimed for {} (--orphans)", hours(unclaimed)),
+                floor: false,
+            }
+        })
+        .collect();
+    victims.sort_by(|a, b| {
+        (std::cmp::Reverse(a.age), &a.path).cmp(&(std::cmp::Reverse(b.age), &b.path))
+    });
+    victims
+}
+
 /// The victims `policy` allows in the directories of `dirs` that `select`
 /// chooses, in no particular order. With `floor` (the time now), they are
 /// chosen for a volume under its floor: an orphan no pass has noted yet
