@@ -92,8 +92,8 @@ impl Governor {
             .clone()
     }
 
-    /// Governs `pool` until the daemon exits, recording what it does in
-    /// `events`, and its errors in `log`. `registry` holds the heli runs in
+    /// Governs `pool` until the daemon exits or hands over (`handed_over`),
+    /// recording what it does in `events`, and its errors in `log`. `registry` holds the heli runs in
     /// flight, and `lent` tells the slots lent to their run pools (Σ lent).
     pub(super) fn run(
         &self,
@@ -102,6 +102,7 @@ impl Governor {
         events: &Events,
         log: &Log,
         lent: impl Fn() -> u32,
+        handed_over: &std::sync::atomic::AtomicBool,
     ) -> ! {
         let started = Instant::now();
         let mut seam = self.seam;
@@ -109,6 +110,10 @@ impl Governor {
         let mut quiet_since: Option<u64> = None;
         let mut unreadable = false;
         loop {
+            // The pool is a new daemon's after a handover: it governs it.
+            while handed_over.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
             if let Some(current) = config::current_seam(&self.config_file) {
                 seam = current;
             }

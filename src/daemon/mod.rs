@@ -29,7 +29,10 @@
 //! - a request it does not know: answer that it is unsupported;
 //! - **retire**, from a newer client (of another protocol version, or with a
 //!   request this daemon does not know): accept no more runs and exit once
-//!   the runs in flight have reported their exits.
+//!   the runs in flight have reported their exits. With runs in flight, it
+//!   hands over at once ([`retiring`]): it stops listening, releases the
+//!   lock, stops governing the pool and the store, and serves its runs to
+//!   their end, while a new daemon takes every new run.
 //!
 //! What the daemon owns for its whole life (the lock, then the host pool,
 //! `crate::pool`, and its broker, its memory [`governor`], the event log
@@ -52,6 +55,7 @@ pub mod live;
 pub mod owner;
 pub mod registry;
 pub mod results;
+pub mod retiring;
 pub mod test_run;
 pub mod tree;
 pub mod warden;
@@ -97,6 +101,9 @@ const BIND_WAIT: Duration = Duration::from_secs(5);
 /// there ([`Daemon::exit_if_retired`]), before it exits where it is.
 const WAKE_WAIT: Duration = Duration::from_secs(1);
 
+/// The longest `cancel` waits for a retiring daemon to end a run of its.
+const CANCEL_WAIT: Duration = Duration::from_secs(10);
+
 /// The longest a test run waits for its test slots (docs/runs.md, "Where a
 /// run can wait").
 const TEST_SLOT_WAIT: Duration = Duration::from_secs(5);
@@ -141,6 +148,7 @@ pub fn main() -> ! {
     let governor = Governor::new(&config, locations.config.clone())
         .unwrap_or_else(|error| fail(Some(&log), &error));
     let events = Arc::new(Events::configured(&locations, &config));
+    let handed_over = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let _warden = start_warden(&locations, &log);
 
@@ -151,6 +159,7 @@ pub fn main() -> ! {
             locations.config.clone(),
             log.clone(),
             Arc::clone(&events),
+            Arc::clone(&handed_over),
         ),
         registry: Registry::new(RunIds::new(
             locations.run_counter(),
@@ -170,6 +179,9 @@ pub fn main() -> ! {
         exiting: AtomicBool::new(false),
         waker: Mutex::new(None),
         lock,
+        retiring_dir: locations.retiring_dir(),
+        handing_over: AtomicBool::new(false),
+        handed_over,
     });
     {
         let daemon = Arc::clone(&daemon);
@@ -182,6 +194,7 @@ pub fn main() -> ! {
                 &daemon.events,
                 &daemon.log,
                 lent,
+                &daemon.handed_over,
             )
         });
     }
@@ -199,7 +212,7 @@ pub fn main() -> ! {
     }
     // Listening last: a client that finds the endpoint finds the daemon
     // ready to accept it.
-    let mut listener = bind(&locations, &daemon.log);
+    let mut listener = bind(&locations, &daemon.log, &daemon.retiring_dir);
     daemon.log.write(&format!(
         "started, pid {}, protocol {}, endpoint {}",
         std::process::id(),
@@ -211,6 +224,9 @@ pub fn main() -> ! {
         let accepted = listener.accept();
         if daemon.exiting.load(Ordering::SeqCst) {
             daemon.exit(listener);
+        }
+        if daemon.handing_over.load(Ordering::SeqCst) {
+            daemon.hand_over(listener);
         }
         match accepted {
             Ok(stream) => match Connection::claim(&open) {
@@ -265,11 +281,37 @@ impl Drop for Connection {
 /// lock, so a pipe already there on Windows is a predecessor's that has
 /// released the lock but not yet closed its last connections as its process
 /// goes (or someone else's): it tries again for [`BIND_WAIT`].
-fn bind(locations: &Locations, log: &Log) -> ipc::Listener {
+///
+/// A retiring daemon that handed over ([`retiring`]) keeps its clients'
+/// connections, so on Windows the pipe stays there for as long as it serves
+/// its runs: with one alive, the daemon joins its pipe instead, as the next
+/// instances of it. The retiring daemon no longer waits for clients on it,
+/// so every new client reaches this one; and a client still talks only to
+/// a pipe owned by its user.
+fn bind(locations: &Locations, log: &Log, retiring_dir: &Path) -> ipc::Listener {
     let deadline = Instant::now() + BIND_WAIT;
     loop {
         match ipc::Listener::bind(&locations.endpoint) {
             Ok(listener) => return listener,
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && !retiring::live(retiring_dir).is_empty() =>
+            {
+                match ipc::Listener::join(&locations.endpoint) {
+                    Ok(listener) => {
+                        log.write("joined the pipe of a retiring daemon");
+                        return listener;
+                    }
+                    Err(error) => fail(
+                        Some(log),
+                        &format!(
+                            "cannot join the pipe at {}: {error}",
+                            locations.endpoint.display()
+                        ),
+                    ),
+                }
+            }
             Err(error)
                 if cfg!(windows)
                     && error.kind() == std::io::ErrorKind::PermissionDenied
@@ -357,15 +399,25 @@ struct Daemon {
     /// does.
     waker: Mutex<Option<Stream>>,
     /// Held until the daemon exits: a retired daemon releases it as it
-    /// exits ([`Daemon::exit`]), and the operating system when the process
-    /// is gone, even killed.
+    /// exits ([`Daemon::exit`]) or hands over ([`Daemon::hand_over`]), and
+    /// the operating system when the process is gone, even killed.
     lock: File,
+    /// Where retiring daemons keep their records ([`retiring`]).
+    retiring_dir: PathBuf,
+    /// Retiring with runs in flight: the main thread hands over
+    /// ([`Daemon::hand_over`]).
+    handing_over: AtomicBool,
+    /// Handed over: the governor and the accountant stop.
+    handed_over: Arc<AtomicBool>,
 }
 
 /// Whether the daemon still takes runs, and how many it is serving.
 #[derive(Default)]
 struct Lifecycle {
     retiring: bool,
+    /// Handed over ([`Daemon::hand_over`]): the endpoint and the lock are
+    /// another daemon's.
+    handed_over: bool,
     /// Runs admitted whose clients have not yet been told the exit.
     serving: usize,
 }
@@ -426,7 +478,13 @@ impl Daemon {
             .filter(|(_, run)| run.exit.is_none())
             .count();
         let runs = u32::try_from(runs).unwrap_or(u32::MAX);
-        let _ = protocol::write_message(&mut stream, &Reply::Stopping { runs });
+        let _ = protocol::write_message(
+            &mut stream,
+            &Reply::Stopping {
+                runs,
+                handover: true,
+            },
+        );
         drop(stream);
         self.log.write(&format!(
             "a client asked this daemon to stop, with {runs} runs in flight"
@@ -466,6 +524,10 @@ impl Daemon {
     /// cancelled.
     fn cancel(&self, mut stream: Stream, request: &CancelRequest) {
         let run = &request.run;
+        if let Some(reply) = self.cancel_retiring(run) {
+            let _ = protocol::write_message(&mut stream, &reply);
+            return;
+        }
         let cancelled = run
             .parse::<RunId>()
             .map_err(|_| format!("no run {run} is in flight"))
@@ -485,6 +547,42 @@ impl Daemon {
             },
         };
         let _ = protocol::write_message(&mut stream, &reply);
+    }
+
+    /// Cancels run `run` of a retiring daemon (docs/daemon.md, "Handover"),
+    /// when one lists it: asks it to, then answers once its record no longer
+    /// lists the run, within [`CANCEL_WAIT`]. `None` when no retiring daemon
+    /// has it.
+    fn cancel_retiring(&self, run: &str) -> Option<Reply> {
+        let lists = |pid: u32| {
+            retiring::live(&self.retiring_dir).iter().any(|record| {
+                record.pid == pid && record.runs.iter().any(|listed| listed.id == run)
+            })
+        };
+        let pid = retiring::live(&self.retiring_dir)
+            .into_iter()
+            .find(|record| record.runs.iter().any(|listed| listed.id == run))?
+            .pid;
+        if let Err(error) = retiring::ask_cancel(&self.retiring_dir, pid, run) {
+            return Some(Reply::CancelFailed {
+                message: format!("cannot ask the retiring daemon {pid} to cancel {run}: {error}"),
+            });
+        }
+        let deadline = Instant::now() + CANCEL_WAIT;
+        while lists(pid) {
+            if Instant::now() >= deadline {
+                return Some(Reply::CancelFailed {
+                    message: format!(
+                        "the retiring daemon {pid} did not end {run} within {} s",
+                        CANCEL_WAIT.as_secs()
+                    ),
+                });
+            }
+            std::thread::sleep(retiring::LOOK);
+        }
+        self.log
+            .write(&format!("cancelled {run} of the retiring daemon {pid}"));
+        Some(Reply::Cancelled)
     }
 
     /// Executes `request` for the client on `stream`, or attaches the
@@ -566,7 +664,10 @@ impl Daemon {
                 if !retiring {
                     self.log.write(&reason);
                 }
-                let _ = protocol::write_message(&mut stream, &Reply::Refused { reason });
+                // A daemon retiring with runs in flight hands over: the
+                // client then reaches the new one.
+                let handover = retiring && self.lifecycle().serving > 1;
+                let _ = protocol::write_message(&mut stream, &Reply::Refused { reason, handover });
             }
         }
         // The client heard how its run ended (or left) before a retiring
@@ -906,6 +1007,7 @@ impl Daemon {
             disk: Some(self.accounts.disk()),
             last_gc: self.accounts.last_gc(),
             unmet_budget: self.accounts.unmet_budget(),
+            retiring: retiring::live(&self.retiring_dir),
         }
     }
 
@@ -934,27 +1036,128 @@ impl Daemon {
         (Serving(self), lifecycle.retiring)
     }
 
-    /// Takes no more runs, and exits once the runs in flight are served.
+    /// Takes no more runs, and exits once the runs in flight are served:
+    /// at once without any; with some, it hands over first
+    /// ([`Daemon::hand_over`]), which the main thread does.
     fn retire(&self) {
         let mut lifecycle = self.lifecycle();
         lifecycle.retiring = true;
+        if lifecycle.serving > 0 && !self.handing_over.swap(true, Ordering::SeqCst) {
+            self.wake_main_thread();
+        }
         self.exit_if_retired(&lifecycle);
+    }
+
+    /// Wakes the main thread from its wait for the next client, with a
+    /// connection of the daemon's own, kept open until the daemon exits.
+    /// `false` when none could be made.
+    fn wake_main_thread(&self) -> bool {
+        match ipc::connect(&self.endpoint, Instant::now() + WAKE_WAIT) {
+            Ok(waker) => {
+                *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Hands over (docs/daemon.md, "Handover"), from the main thread, which
+    /// owns `listener`: stops listening, writes its record ([`retiring`]),
+    /// releases the lock, so that the next client starts a new daemon at
+    /// once, and stops governing the pool and the store, which are the new
+    /// daemon's now. Then it serves its runs to their end: it rewrites its
+    /// record as they end, cancels those the new daemon asks it to, and
+    /// exits once the last one's clients have heard how it ended.
+    fn hand_over(&self, listener: ipc::Listener) -> ! {
+        drop(listener);
+        let record = |runs: Vec<status::Run>| retiring::Record {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            since: clock::now(),
+            runs,
+        };
+        let in_flight = || -> Vec<status::Run> {
+            self.runs()
+                .into_iter()
+                .filter(|run| run.exit.is_none())
+                .collect()
+        };
+        let mut runs = in_flight();
+        let mut first = record(runs.clone());
+        let handover = match retiring::Handover::begin(&self.retiring_dir, &first) {
+            Ok(handover) => Some(handover),
+            Err(error) => {
+                self.log
+                    .write(&format!("cannot write the retiring record: {error}"));
+                None
+            }
+        };
+        if let Err(error) = self.pool.disown() {
+            self.log
+                .write(&format!("cannot release the pool's lock: {error}"));
+        }
+        let _ = self.lock.unlock();
+        self.handed_over.store(true, Ordering::SeqCst);
+        if let Err(error) = self.pool.return_withheld() {
+            self.log
+                .write(&format!("cannot return the withheld slots: {error}"));
+        }
+        self.lifecycle().handed_over = true;
+        self.log.write(&format!(
+            "handed over with {} runs in flight; a new daemon takes the new runs",
+            runs.len()
+        ));
+        loop {
+            if self.lifecycle().serving == 0 {
+                if let Some(handover) = &handover {
+                    handover.end();
+                }
+                self.log.write("retired");
+                std::process::exit(0);
+            }
+            if let Some(handover) = &handover {
+                for run in handover.cancels() {
+                    let cancelled = run
+                        .parse::<RunId>()
+                        .map_err(|_| format!("no run {run}"))
+                        .and_then(|id| self.registry.cancel(id));
+                    match cancelled.map(|tree| tree.map_or(Ok(()), |tree| tree.kill())) {
+                        Ok(Ok(())) => self.log.write(&format!("cancelled {run}")),
+                        Ok(Err(error)) => self.log.write(&format!("cannot cancel {run}: {error}")),
+                        Err(message) => self.log.write(&message),
+                    }
+                }
+                let now = in_flight();
+                let ids = |runs: &[status::Run]| -> Vec<String> {
+                    runs.iter().map(|run| run.id.clone()).collect()
+                };
+                if ids(&now) != ids(&runs) {
+                    runs = now;
+                    first.runs = runs.clone();
+                    if let Err(error) = handover.update(&first) {
+                        self.log
+                            .write(&format!("cannot write the retiring record: {error}"));
+                    }
+                }
+            }
+            std::thread::sleep(retiring::LOOK);
+        }
     }
 
     /// Once retired with no run left, has the main thread exit: a
     /// connection of the daemon's own wakes it from its wait for the next
     /// client. When none can be made, exits here.
+    /// After a handover the main thread exits by itself
+    /// ([`Daemon::hand_over`]): the endpoint is another daemon's.
     fn exit_if_retired(&self, lifecycle: &Lifecycle) {
         if lifecycle.retiring
             && lifecycle.serving == 0
+            && !self.handing_over.load(Ordering::SeqCst)
             && !self.exiting.swap(true, Ordering::SeqCst)
         {
             self.log.write("retired");
-            match ipc::connect(&self.endpoint, Instant::now() + WAKE_WAIT) {
-                Ok(waker) => {
-                    *self.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker)
-                }
-                Err(_) => std::process::exit(0),
+            if !self.wake_main_thread() {
+                std::process::exit(0);
             }
         }
     }

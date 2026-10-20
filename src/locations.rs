@@ -106,6 +106,12 @@ impl Locations {
         self.state_dir.join(session_suffixed("daemon", ".log"))
     }
 
+    /// Where retiring daemons keep their records (`crate::daemon::retiring`):
+    /// one directory per user (and, on Windows, per logon session).
+    pub fn retiring_dir(&self) -> PathBuf {
+        self.state_dir.join(session_suffixed("retiring", ""))
+    }
+
     /// The daemon's event log (`crate::daemon::events`).
     pub fn event_log(&self) -> PathBuf {
         self.state_dir.join(session_suffixed("events", ".log"))

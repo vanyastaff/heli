@@ -239,6 +239,14 @@ impl Pool {
         }))
     }
 
+    /// Gives up owning the pool, for a daemon that hands over
+    /// (`crate::daemon::retiring`): a new daemon adopts it, and this one
+    /// still lends its slots to its own runs. On Unix it releases the
+    /// pool's lock; a semaphore has none.
+    pub fn disown(&self) -> io::Result<()> {
+        self.jobserver.disown()
+    }
+
     /// Whether a process other than this one may hold the pool open, and so
     /// may hold slots it will give back. Where it cannot be known, it may.
     pub fn held_by_others(&self) -> bool {

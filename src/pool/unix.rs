@@ -111,6 +111,16 @@ impl Jobserver {
         Ok((jobserver, opened))
     }
 
+    /// Releases the pool's lock, for a daemon that hands over
+    /// (`crate::daemon::retiring`): the new daemon owns the pool from then
+    /// on, and this one still lends its slots to its own runs.
+    pub fn disown(&self) -> io::Result<()> {
+        match &self._owner {
+            Some(owner) => owner.unlock(),
+            None => Ok(()),
+        }
+    }
+
     /// A new, empty FIFO at `path`, whose directory exists, for up to
     /// `maximum` slots. A FIFO of this user's already there is replaced.
     pub fn create_empty(path: &OsStr, maximum: u32) -> io::Result<Self> {

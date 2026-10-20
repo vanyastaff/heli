@@ -96,6 +96,11 @@ impl Jobserver {
         Ok((jobserver, opened))
     }
 
+    /// A semaphore has no owner to release: a new daemon adopts it.
+    pub fn disown(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// A new semaphore `name` with no free slot and room for `maximum`. A
     /// semaphore of that name that some process holds is refused.
     pub fn create_empty(name: &OsStr, maximum: u32) -> io::Result<Self> {
