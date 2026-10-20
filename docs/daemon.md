@@ -72,6 +72,25 @@ as no class, and a reply it does not know is skipped while it follows a run
 (elsewhere it is an answer it did not expect). A daemon still sends a new
 reply only to a client whose request says it reads it.
 
+**Upgrading.** `cargo heli self-upgrade [--now [--yes]] [--to <version> |
+--path <dir>]` installs the new version into `<state directory>/upgrade`
+(`cargo install cargo-heli --locked --force --root …`, with
+`CARGO_MAKEFLAGS` unset so that the build does not wait on a saturated
+pool), moves it into the running program's place, and runs `restart` with
+the new program. `cargo install` alone cannot do the middle step while
+anything runs the program: on Windows a mapped image can be neither
+overwritten nor deleted, and the daemon and every client waiting on a run
+are such images (the install then leaves `cargo-heli <version> = []` in the
+Cargo home's `.crates.toml`, and no program). A mapped image can be
+renamed, so the old program goes aside as `<name>.old-<version>` beside the
+new one, and the next upgrade deletes it once nothing runs it. Elsewhere
+the new file is renamed over the old one, and the processes running it keep
+their inode. `doctor` says when the daemon is older than the client
+(`status` does too), when `.crates.toml` records such a failed install, and
+when an old program is still beside the new one. The Cargo home's own
+records are cargo's: `cargo install --list` keeps naming the version cargo
+installed there.
+
 **Starting on demand.** When no daemon answers, the client starts one, and
 any client falls back to running the command directly when the daemon does
 not start, listen or answer within 5 s.

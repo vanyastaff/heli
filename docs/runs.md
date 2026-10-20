@@ -423,6 +423,7 @@ cargo heli setup [--print] [--autostart | --no-autostart]
 cargo heli ensure
 cargo heli stop [--now [--yes]]
 cargo heli restart [--now [--yes]]
+cargo heli self-upgrade [--now [--yes]] [--to VERSION | --path DIR]
 cargo heli daemon [--detach | --warden]            (internal)
 cargo heli recycle                                 (internal: the post-checkout hook, [recycling](build-store.md#recycling))
 ```
